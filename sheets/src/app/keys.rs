@@ -30,6 +30,48 @@ impl App {
         if focused.is_some() && focused != Some(grid_id) {
             return;
         }
+        // Tapping Alt alone toggles KeyTips (Alt, H, O, I ...).
+        let (alt, ctrl_down, any_input) = ctx.input(|i| {
+            (
+                i.modifiers.alt,
+                i.modifiers.ctrl,
+                i.events.iter().any(|e| matches!(e, Event::Key { pressed: true, .. } | Event::PointerButton { .. } | Event::Text(_))),
+            )
+        });
+        if alt && !self.prev_alt {
+            self.alt_clean = !ctrl_down;
+        }
+        if any_input && alt {
+            self.alt_clean = false;
+        }
+        if !alt && self.prev_alt && self.alt_clean && self.edit.is_none() {
+            self.keytips = if self.keytips.is_some() { None } else { Some(String::new()) };
+        }
+        self.prev_alt = alt;
+        if self.keytips.is_some() {
+            let events = ctx.input(|i| i.events.clone());
+            for ev in events {
+                match ev {
+                    Event::Key { key: Key::Escape, pressed: true, .. } => {
+                        if let Some(s) = &mut self.keytips {
+                            if s.pop().is_none() {
+                                self.keytips = None;
+                            }
+                        }
+                    }
+                    Event::Key { key, pressed: true, modifiers, .. } if !modifiers.ctrl => match key_char(key) {
+                        Some(ch) => self.keytip_key(ctx, ch),
+                        None => self.keytips = None,
+                    },
+                    Event::PointerButton { pressed: true, .. } => self.keytips = None,
+                    _ => {}
+                }
+                if self.keytips.is_none() {
+                    break;
+                }
+            }
+            return;
+        }
         let events = ctx.input(|i| i.events.clone());
         for ev in events {
             if self.dialog.is_some() || self.backstage.is_some() {
@@ -53,6 +95,9 @@ impl App {
                     }
                     None => self.copy(ctx, true),
                 },
+                Event::Paste(_) if self.edit.is_none() && ctx.input(|i| i.modifiers.alt) => {
+                    self.dialog = Some(Dialog::PasteSpecial { mode: 0, transpose: false });
+                }
                 Event::Paste(s) => match &mut self.edit {
                     Some(e) => e.insert(s.trim_end_matches(['\r', '\n'])),
                     None => self.paste_text(&s),
@@ -83,6 +128,51 @@ impl App {
                     e.insert(t);
                 }
             }
+        }
+        self.autocomplete_value();
+    }
+
+    /// Cell AutoComplete: completes text from matching entries in the same column.
+    fn autocomplete_value(&mut self) {
+        let Some(e) = &self.edit else { return };
+        if e.is_formula() || e.in_bar || e.cursor != e.text.len() || e.text.is_empty() || e.text.contains('\n') {
+            return;
+        }
+        let typed = e.text.clone();
+        if typed.chars().all(|c| c.is_ascii_digit() || ".,-+ ".contains(c)) {
+            return;
+        }
+        let lower = typed.to_lowercase();
+        let sh = &self.wb.sheets[e.sheet];
+        let (row, col) = (e.row, e.col);
+        let mut found: Option<String> = None;
+        for dir in [-1i64, 1] {
+            let mut r = row as i64 + dir;
+            let mut n = 0;
+            while r >= 0 && r < MAX_ROWS as i64 && n < 20_000 {
+                match sh.value(r as u32, col) {
+                    crate::model::Value::Text(t) => {
+                        if t.chars().count() > typed.chars().count() && t.to_lowercase().starts_with(&lower) {
+                            match &found {
+                                None => found = Some(t.clone()),
+                                Some(f) if f.to_lowercase() != t.to_lowercase() => return,
+                                _ => {}
+                            }
+                        }
+                    }
+                    crate::model::Value::Empty => break,
+                    _ => {}
+                }
+                r += dir;
+                n += 1;
+            }
+        }
+        if let (Some(f), Some(e)) = (found, &mut self.edit) {
+            let n = typed.chars().count();
+            let split = f.char_indices().nth(n).map(|(b, _)| b).unwrap_or(f.len());
+            e.text = f.clone();
+            e.cursor = e.text.len();
+            e.anchor = split;
         }
     }
 
@@ -140,6 +230,7 @@ impl App {
                     Key::ArrowLeft => (0, -1),
                     _ => (0, 1),
                 };
+                self.tab_origin = None;
                 if ctrl { self.jump(dr, dc, m.shift) } else { self.move_active(dr, dc, m.shift) }
             }
             Key::Enter => {
@@ -209,6 +300,10 @@ impl App {
                 v.active = a;
             }
             Key::Equals if m.alt => self.autosum("SUM"),
+            k if m.alt && !ctrl && key_char(k).is_some() => {
+                self.keytips = Some(String::new());
+                self.keytip_key(ctx, key_char(k).unwrap());
+            }
             _ if ctrl => self.on_ctrl_key(ctx, key, m),
             _ => {}
         }
@@ -295,8 +390,7 @@ impl App {
         match key {
             Key::Enter => {
                 if m.alt {
-                    ed!(|e: &mut super::Editor| e.insert("
-"));
+                    ed!(|e: &mut super::Editor| e.insert("\n"));
                     return;
                 }
                 if self.commit_edit(ctrl) && !ctrl {
@@ -370,5 +464,15 @@ impl App {
             _ => {}
         }
         let _ = ctx;
+    }
+}
+
+/// Letter or digit for a key, used by KeyTips.
+fn key_char(k: Key) -> Option<char> {
+    let n = k.name();
+    let mut it = n.chars();
+    match (it.next(), it.next()) {
+        (Some(c), None) if c.is_ascii_alphanumeric() => Some(c.to_ascii_uppercase()),
+        _ => None,
     }
 }

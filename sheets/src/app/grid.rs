@@ -404,6 +404,7 @@ impl App {
 
     fn on_press(&mut self, lay: &Layout, pos: Pos2, mods: egui::Modifiers, dbl: bool) {
         self.filter_popup = None;
+        self.tab_origin = None;
         // Scrollbars
         if lay.vbar.contains(pos) {
             let (thumb, _) = self.vthumb(lay);

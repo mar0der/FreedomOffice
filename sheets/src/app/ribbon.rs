@@ -101,6 +101,13 @@ fn icon_job(icon: &str, is_icon: bool, label: &str, size: f32, vertical: bool, c
     job
 }
 
+/// Large ribbon button that opens a dropdown menu.
+fn big_menu(ui: &mut egui::Ui, job: LayoutJob, add: impl FnOnce(&mut egui::Ui)) -> egui::Response {
+    let r = ui.add(egui::Button::new(job).min_size(Vec2::new(54.0, GROUP_H - 4.0)));
+    egui::Popup::menu(&r).show(add);
+    r
+}
+
 impl App {
     fn ib(&self, code: char, fallback: &'static str, label: &str, size: f32, vertical: bool) -> LayoutJob {
         let (g, is_icon) = self.icon(code, fallback);
@@ -200,7 +207,9 @@ impl App {
             ui.add_space(10.0);
             // File tab
             let file = egui::Button::new(RichText::new("File").size(13.0).color(Color32::WHITE)).fill(theme::ACCENT).min_size(Vec2::new(52.0, 26.0));
-            if ui.add(file).clicked() {
+            let file_resp = ui.add(file);
+            self.keytip_badge(ui, file_resp.rect.center_bottom(), "File");
+            if file_resp.clicked() {
                 self.commit_edit(false);
                 self.backstage = Some(Backstage::Home);
             }
@@ -229,6 +238,7 @@ impl App {
                         Stroke::new(3.0, theme::ACCENT),
                     );
                 }
+                self.keytip_badge(ui, rect.center_bottom(), name);
                 if resp.clicked() {
                     if self.tab == t && !self.ribbon_collapsed {
                         // single click on active tab does nothing; double-click collapses
@@ -274,7 +284,7 @@ impl App {
         let st = self.active_style();
         self.group(ui, "Clipboard", |app, ui| {
             let job = app.ib(ic::PASTE, "📋", "Paste", 22.0, true);
-            ui.menu_button(job, |ui| {
+            big_menu(ui, job, |ui| {
                 for (label, m) in [
                     ("Paste", PasteMode::All),
                     ("Values", PasteMode::Values),
@@ -782,7 +792,7 @@ impl App {
         });
         self.group(ui, "Symbols", |app, ui| {
             let job = icon_job("Ω", false, "Symbol", 22.0, true, theme::TEXT);
-            ui.menu_button(job, |ui| {
+            big_menu(ui, job, |ui| {
                 ui.set_min_width(240.0);
                 let syms = "©®™€£¥¢°±×÷≤≥≠≈∞√πΣµΩαβγΔ→←↑↓↔✓✗•…§¶†‰½¼¾²³";
                 egui::Grid::new("syms").spacing(Vec2::new(2.0, 2.0)).show(ui, |ui| {
@@ -847,7 +857,7 @@ impl App {
                 app.dialog = Some(Dialog::insert_function());
             }
             let job = icon_job("Σ", false, "AutoSum", 22.0, true, theme::TEXT);
-            ui.menu_button(job, |ui| app.autosum_menu(ui));
+            big_menu(ui, job, |ui| app.autosum_menu(ui));
             for (cat, label) in [
                 ("Financial", "Financial"),
                 ("Logical", "Logical"),
@@ -858,7 +868,7 @@ impl App {
                 ("Statistical", "More\nFunctions"),
             ] {
                 let job = icon_job("▤", false, label, 18.0, true, theme::TEXT);
-                ui.menu_button(job, |ui| {
+                big_menu(ui, job, |ui| {
                     egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
                         ui.set_min_width(170.0);
                         let cats: &[&str] = if cat == "Statistical" { &["Statistical", "Information"] } else { &[cat] };

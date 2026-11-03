@@ -6,6 +6,7 @@ mod dialogs;
 mod editor;
 mod grid;
 mod keys;
+mod keytips;
 mod ribbon;
 mod theme;
 
@@ -146,6 +147,12 @@ pub struct App {
     pub stats_cache: Option<((usize, Range, u64), Option<(f64, usize, usize, f64)>)>,
     pub last_font_color: u32,
     pub last_fill: u32,
+    /// Column where a Tab-entry run started (Enter returns there).
+    pub tab_origin: Option<u32>,
+    /// Active Alt key sequence (KeyTips), e.g. "HO".
+    pub keytips: Option<String>,
+    alt_clean: bool,
+    prev_alt: bool,
 }
 
 const MAX_UNDO: usize = 100;
@@ -196,6 +203,10 @@ impl App {
             stats_cache: None,
             last_font_color: 0xFF0000,
             last_fill: 0xFFFF00,
+            tab_origin: None,
+            keytips: None,
+            alt_clean: false,
+            prev_alt: false,
         };
         if let Some(p) = path {
             app.open_path(p);
@@ -782,6 +793,7 @@ impl eframe::App for App {
                 .show(ctx, |ui| self.sheet_tabs_ui(ui));
             egui::CentralPanel::default().frame(egui::Frame::NONE.fill(egui::Color32::WHITE)).show(ctx, |ui| self.grid_ui(ui));
             self.popups_ui(ctx);
+            self.keytips_ui(ctx);
         }
         self.dialogs_ui(ctx);
     }

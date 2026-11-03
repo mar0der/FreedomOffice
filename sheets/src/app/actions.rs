@@ -239,6 +239,19 @@ impl App {
     pub fn move_in_selection(&mut self, dr: i64, dc: i64) {
         let sel = self.sel();
         if sel.is_single() || self.expand_merges(Range::cell(self.active().0, self.active().1)) == sel {
+            if dc != 0 {
+                if self.tab_origin.is_none() {
+                    self.tab_origin = Some(self.active().1);
+                }
+            } else if dr > 0 {
+                if let Some(c) = self.tab_origin.take() {
+                    let r = self.active().0;
+                    self.select(r + 1, c, false);
+                    return;
+                }
+            } else {
+                self.tab_origin = None;
+            }
             self.move_active(dr, dc, false);
             return;
         }

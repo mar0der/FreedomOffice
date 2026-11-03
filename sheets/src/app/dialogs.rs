@@ -38,6 +38,7 @@ pub enum Dialog {
     ConfirmDeleteSheet(usize),
     Stats,
     Shortcuts,
+    PasteSpecial { mode: u8, transpose: bool },
 }
 
 impl Dialog {
@@ -617,6 +618,34 @@ impl App {
                             keep = false;
                         }
                     });
+                });
+            }
+            Dialog::PasteSpecial { mode, transpose } => {
+                win("Paste Special").show(ctx, |ui| {
+                    ui.set_min_width(260.0);
+                    ui.label(RichText::new("Paste").strong());
+                    for (i, l) in ["All", "Formulas", "Values", "Formats"].iter().enumerate() {
+                        ui.radio_value(mode, i as u8, *l);
+                    }
+                    ui.separator();
+                    ui.checkbox(transpose, "Transpose");
+                    let (ok, cancel) = ok_cancel(ui);
+                    if ok {
+                        use super::actions::PasteMode;
+                        let m = if *transpose {
+                            PasteMode::Transpose
+                        } else {
+                            [PasteMode::All, PasteMode::Formulas, PasteMode::Values, PasteMode::Formats][*mode as usize]
+                        };
+                        if self.clip.is_some() {
+                            self.paste_internal(m);
+                        } else {
+                            self.status = Some("Copy something first, then use Paste Special.".into());
+                        }
+                        keep = false;
+                    } else if cancel {
+                        keep = false;
+                    }
                 });
             }
             Dialog::Stats => {
