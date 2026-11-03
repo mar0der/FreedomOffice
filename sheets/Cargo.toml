@@ -1,0 +1,29 @@
+[package]
+name = "freedom-sheets"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "FreedomOffice Sheets - a lightweight, open source spreadsheet application"
+license = "MIT"
+repository = "https://github.com/mar0der/FreedomOffice"
+
+[[bin]]
+name = "FreedomSheets"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.33", default-features = false, features = ["glow", "default_fonts"] }
+calamine = "0.38"
+rust_xlsxwriter = "0.102"
+rfd = "0.17"
+zip = { version = "9", default-features = false, features = ["deflate"] }
+quick-xml = "0.42"
+csv = "1.3"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+raw-window-handle = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm"] }
+
+[build-dependencies]
+embed-resource = "3"
