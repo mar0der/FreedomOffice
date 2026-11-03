@@ -402,6 +402,7 @@ pub struct Sheet {
     pub gridlines: bool,
     pub tab_color: Option<u32>,
     pub view: SheetView,
+    pub charts: Vec<crate::chart::Chart>,
 }
 
 impl Sheet {
@@ -419,6 +420,7 @@ impl Sheet {
             gridlines: true,
             tab_color: None,
             view: SheetView::default(),
+            charts: Vec::new(),
         }
     }
 
