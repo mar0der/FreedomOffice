@@ -2,6 +2,7 @@
 
 mod charts;
 mod extras;
+mod page;
 
 use std::collections::HashMap;
 use std::io::{Read, Seek};
@@ -67,10 +68,14 @@ pub fn read<R: Read + Seek>(src: R) -> Result<Workbook, String> {
         }
         let mut sheet = Sheet::new(&sh.name);
         sheet.hidden = sh.hidden;
+        for (_, name, text) in info.print_names.iter().filter(|(idx, _, _)| *idx == i) {
+            page::apply_defined_name(name, text, &mut sheet.page);
+        }
         if let Some(x) = pkg.text(&path) {
             let ctx = SheetCtx { shared: &shared, xf: &xf, theme: &theme, date1904: info.date1904 };
             parse_sheet(&x, &ctx, &mut sheet);
             extras::parse_sheet_extras(&x, &theme, &dxfs, &mut sheet);
+            page::parse_page_setup(&x, &mut sheet.page);
             charts::read(&mut pkg, &path, &mut sheet);
         }
         let srels = format!("{}_rels/{}.rels", dir_of(&path), file_of(&path));
@@ -355,6 +360,8 @@ struct SheetEntry {
 struct WorkbookInfo {
     sheets: Vec<SheetEntry>,
     names: Vec<(String, String)>,
+    /// `_xlnm.Print_Area` / `_xlnm.Print_Titles`: (localSheetId, name, reference).
+    print_names: Vec<(usize, String, String)>,
     active: usize,
     date1904: bool,
 }
@@ -381,6 +388,10 @@ fn parse_workbook(xml: &str) -> WorkbookInfo {
                     let name = attr(&e, "name").unwrap_or_default();
                     let text = read_text(&mut rd, "definedName");
                     let text = strip_future_prefixes(text.trim().trim_start_matches('='));
+                    let print = name.eq_ignore_ascii_case("_xlnm.Print_Area") || name.eq_ignore_ascii_case("_xlnm.Print_Titles");
+                    if let Some(idx) = attr(&e, "localSheetId").and_then(|v| v.parse().ok()).filter(|_| print) {
+                        info.print_names.push((idx, name.clone(), text.clone()));
+                    }
                     if !name.is_empty()
                         && !name.starts_with("_xlnm.")
                         && !text.is_empty()

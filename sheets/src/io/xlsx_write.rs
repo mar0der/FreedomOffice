@@ -2,6 +2,7 @@
 
 mod charts;
 mod extras;
+mod page;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -151,6 +152,7 @@ fn write_sheet(wb: &Workbook, sh: &Sheet, ws: &mut Worksheet, formats: &mut Hash
     }
     charts::write(wb, sh, ws)?;
     extras::write_sheet_extras(sh, ws);
+    page::write(&sh.page, ws);
     Ok(())
 }
 
