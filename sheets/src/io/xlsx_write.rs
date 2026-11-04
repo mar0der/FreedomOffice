@@ -24,9 +24,10 @@ pub fn write(wb: &Workbook, path: &Path) -> Result<(), String> {
 fn build(wb: &Workbook) -> Result<XWorkbook, XlsxError> {
     let mut book = XWorkbook::new();
     let mut formats: HashMap<u32, Format> = HashMap::new();
+    let mut used: Vec<String> = Vec::new();
     for (i, sh) in wb.sheets.iter().enumerate() {
         let ws = book.add_worksheet();
-        ws.set_name(&sh.name)?;
+        ws.set_name(safe_sheet_name(&sh.name, i, &mut used))?;
         write_sheet(wb, sh, ws, &mut formats)?;
         if i == wb.active {
             ws.set_active(true);
@@ -86,7 +87,7 @@ fn write_sheet(wb: &Workbook, sh: &Sheet, ws: &mut Worksheet, formats: &mut Hash
         ws.merge_range(m.r1, m.c1 as u16, m.r2, m.c2 as u16, "", &fmt)?;
     }
 
-    for (&r, row) in &sh.rows {
+    for (&r, row) in sh.rows.range(..MAX_ROWS) {
         for (&c, cell) in row {
             if c >= MAX_COLS {
                 continue;
@@ -276,4 +277,34 @@ fn to_format(s: &Style) -> Format {
         f = f.set_border_bottom(border(b.bottom));
     }
     f
+}
+
+/// A sheet name the file format accepts: no []:*?/\\, at most 31 chars, unique (case-insensitive).
+fn safe_sheet_name(name: &str, index: usize, used: &mut Vec<String>) -> String {
+    let mut base: String = name.chars().map(|c| if "[]:*?/\\".contains(c) { '_' } else { c }).collect();
+    base = base.trim_matches('\'').to_string();
+    if base.trim().is_empty() {
+        base = format!("Sheet{}", index + 1);
+    }
+    let cut = |s: &str, n: usize| s.chars().take(n).collect::<String>();
+    let mut candidate = cut(&base, 31);
+    let mut k = 2;
+    while used.iter().any(|u| u.eq_ignore_ascii_case(&candidate)) {
+        let suffix = format!(" ({k})");
+        candidate = format!("{}{}", cut(&base, 31 - suffix.chars().count()), suffix);
+        k += 1;
+    }
+    used.push(candidate.clone());
+    candidate
+}
+
+#[cfg(test)]
+mod name_tests {
+    #[test]
+    fn sheet_names_are_made_valid() {
+        let mut used = Vec::new();
+        assert_eq!(super::safe_sheet_name("Q1/Q2 [draft]", 0, &mut used), "Q1_Q2 _draft_");
+        assert_eq!(super::safe_sheet_name("A very long sheet name that exceeds the limit", 1, &mut used).chars().count(), 31);
+        assert_eq!(super::safe_sheet_name("q1_q2 _draft_", 2, &mut used), "q1_q2 _draft_ (2)");
+    }
 }

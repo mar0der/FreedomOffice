@@ -119,6 +119,38 @@ pub fn general(n: f64) -> String {
     }
 }
 
+/// Full-precision text for editing (15 significant digits, like the formula bar).
+pub fn edit_number(n: f64) -> String {
+    if n == 0.0 || !n.is_finite() {
+        return general(n);
+    }
+    let exp = n.abs().log10().floor() as i32;
+    if !(-9..15).contains(&exp) {
+        let s = format!("{:.14E}", n);
+        let (mant, e) = s.split_once('E').unwrap_or((&s, "0"));
+        let mant = if mant.contains('.') { mant.trim_end_matches('0').trim_end_matches('.') } else { mant };
+        let e: i32 = e.parse().unwrap_or(0);
+        return format!("{}E{}{:02}", mant, if e < 0 { '-' } else { '+' }, e.abs());
+    }
+    let decimals = (14 - exp).clamp(0, 20) as usize;
+    let s = format!("{:.*}", decimals, n);
+    let s = if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.').to_string() } else { s };
+    if s == "-0" { "0".into() } else { s }
+}
+
+/// Editing text for a date/time-formatted serial (re-enterable by `parse_input`).
+pub fn edit_date(n: f64) -> String {
+    let has_time = n.fract().abs() > 1e-9;
+    if n < 1.0 && n >= 0.0 {
+        return format_value(&Value::Number(n), "h:mm:ss AM/PM").text;
+    }
+    if has_time {
+        format_value(&Value::Number(n), "m/d/yyyy h:mm:ss").text
+    } else {
+        format_value(&Value::Number(n), "m/d/yyyy").text
+    }
+}
+
 pub fn value_to_text(v: &Value) -> String {
     match v {
         Value::Empty => String::new(),
@@ -873,6 +905,22 @@ mod tests {
         assert_eq!(f(1234.5, "\"$\"#,##0.00"), "$1,234.50");
         assert_eq!(f(0.0, "_(* #,##0.00_);_(* (#,##0.00);_(* \"-\"??_);_(@_)").trim(), "-");
         assert_eq!(f(1.5, "[h]:mm"), "36:00");
+    }
+
+    #[test]
+    fn edit_text_round_trips() {
+        for n in [123456789012.0, 1.0 / 3.0, 0.1 + 0.2, 1e20, 1.5e-12, -42.125, 46330.0] {
+            let t = edit_number(n);
+            let back = match parse_input(&t).0 {
+                Value::Number(x) => x,
+                v => panic!("{t} -> {v:?}"),
+            };
+            assert!((back - n).abs() <= n.abs() * 1e-14, "{n} -> {t} -> {back}");
+        }
+        assert_eq!(edit_number(123456789012.0), "123456789012");
+        assert_eq!(edit_number(1.0 / 3.0), "0.333333333333333");
+        assert_eq!(parse_input(&edit_date(46330.0)).0, Value::Number(46330.0));
+        assert_eq!(parse_input(&edit_date(46330.5)).0, Value::Number(46330.5));
     }
 
     #[test]

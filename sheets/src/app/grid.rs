@@ -826,8 +826,13 @@ impl App {
                     self.drop_selection(&ctx, r, c, copy);
                 }
             }
-            Drag::ResizeCol(..) | Drag::ResizeRow(..) => {
+            Drag::ResizeCol(..) => {
                 self.dirty = true;
+                self.status = None;
+            }
+            Drag::ResizeRow(..) => {
+                // Dragging a row to zero height hides it, which SUBTOTAL/AGGREGATE can see.
+                self.changed();
                 self.status = None;
             }
             _ => {}

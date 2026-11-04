@@ -132,7 +132,7 @@ impl<'a, R: Read + Seek> Package<'a, R> {
         let key = path.trim_start_matches('/').replace('\\', "/").to_ascii_lowercase();
         let name = self.names.get(&key)?.clone();
         let mut f = self.zip.by_name(&name).ok()?;
-        let mut buf = Vec::with_capacity(f.size() as usize);
+        let mut buf = Vec::with_capacity((f.size() as usize).min(64 << 20));
         f.read_to_end(&mut buf).ok()?;
         let s = match String::from_utf8(buf) {
             Ok(s) => s,
@@ -618,7 +618,7 @@ fn parse_color(e: &BytesStart, theme: &Theme, palette: &[u32]) -> Option<u32> {
         match k.as_str() {
             "rgb" => {
                 let v = v.trim();
-                let v = if v.len() > 6 { &v[v.len() - 6..] } else { v };
+                let v = if v.len() > 6 { v.get(v.len() - 6..).unwrap_or("") } else { v };
                 rgb = u32::from_str_radix(v, 16).ok();
             }
             "theme" => th = v.parse::<usize>().ok(),
@@ -677,7 +677,7 @@ fn parse_styles(xml: &str, theme: &Theme, wb: &mut Workbook) -> XfMap {
                 Ok(Event::Start(e)) if local(&e) == "indexedColors" => in_idx = true,
                 Ok(Event::Start(e)) | Ok(Event::Empty(e)) if in_idx && local(&e) == "rgbColor" => {
                     let v = attr(&e, "rgb").unwrap_or_default();
-                    let v = if v.len() > 6 { v[v.len() - 6..].to_string() } else { v };
+                    let v = if v.len() > 6 { v.get(v.len() - 6..).unwrap_or("").to_string() } else { v };
                     custom.push(u32::from_str_radix(&v, 16).unwrap_or(0));
                 }
                 Ok(Event::End(e)) if e.name().0.ends_with("indexedColors") => break,
@@ -1069,7 +1069,7 @@ fn parse_sheet(xml: &str, ctx: &SheetCtx, sheet: &mut Sheet) {
                     }
                     "tabColor" => sheet.tab_color = parse_color(e, ctx.theme, &INDEXED),
                     "col" => {
-                        let min = attr(e, "min").and_then(|v| v.parse::<u32>().ok()).unwrap_or(1).max(1);
+                        let min = attr(e, "min").and_then(|v| v.parse::<u32>().ok()).unwrap_or(1).clamp(1, MAX_COLS);
                         let max = attr(e, "max").and_then(|v| v.parse::<u32>().ok()).unwrap_or(min).clamp(min, MAX_COLS);
                         let hidden = attr_bool(e, "hidden").unwrap_or(false);
                         let px = attr(e, "width").and_then(|v| parse_f(&v)).map(width_to_px);
@@ -1231,6 +1231,9 @@ fn finish_cell(cb: CellBuf, ctx: &SheetCtx, shared_f: &mut HashMap<String, Share
                 }
             }
         }
+    }
+    if cb.row >= MAX_ROWS || cb.col >= MAX_COLS {
+        return;
     }
     let cell = Cell { value, formula: f.map(Box::new), style };
     sheet.set(cb.row, cb.col, Some(cell));

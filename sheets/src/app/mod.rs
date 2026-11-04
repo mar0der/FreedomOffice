@@ -555,13 +555,26 @@ impl App {
         let (r, c) = self.active();
         let text = match initial {
             Some(t) => t,
-            None => self.sheet().get(r, c).map(|c| c.input_text()).unwrap_or_default(),
+            None => self.edit_text(r, c),
         };
         self.edit = Some(Editor::new(self.wb.active, r, c, text, mode));
         self.clip_clear_if_cut_target();
     }
 
     fn clip_clear_if_cut_target(&mut self) {}
+
+    /// What the formula bar / editor shows for a cell (dates edit as dates).
+    pub fn edit_text(&self, r: u32, c: u32) -> String {
+        let Some(cell) = self.sheet().get(r, c) else { return String::new() };
+        if cell.formula.is_none() {
+            if let crate::model::Value::Number(n) = cell.value {
+                if crate::numfmt::is_date_format(&self.wb.style(cell.style).num_fmt) && n >= 0.0 {
+                    return crate::numfmt::edit_date(n);
+                }
+            }
+        }
+        cell.input_text()
+    }
 
     pub fn cancel_edit(&mut self) {
         if let Some(e) = self.edit.take() {

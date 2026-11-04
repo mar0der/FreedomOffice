@@ -139,7 +139,7 @@ impl App {
                 let own = sh.get(r, c).filter(|x| !x.value.is_empty() || x.formula.is_some());
                 let (t, color) = match own.is_none().then(|| sh.spill_anchor_of(r, c)).flatten().and_then(|(ar, ac)| sh.get(ar, ac)) {
                     Some(anchor) => (anchor.input_text(), Color32::from_gray(150)),
-                    None => (sh.get(r, c).map(|c| c.input_text()).unwrap_or_default(), Color32::BLACK),
+                    None => (if sh.get(r, c).is_some() { self.edit_text(r, c) } else { String::new() }, Color32::BLACK),
                 };
                 let first = t.lines().next().unwrap_or("").to_string();
                 let more = t.lines().count() > 1;
@@ -188,7 +188,10 @@ impl App {
                 // select word
                 let c = e.cursor;
                 let t = &e.text;
-                let start = t[..c].rfind(|ch: char| !ch.is_alphanumeric()).map(|i| i + 1).unwrap_or(0);
+                let start = t[..c]
+                    .rfind(|ch: char| !ch.is_alphanumeric())
+                    .map(|i| i + t[i..].chars().next().map_or(1, char::len_utf8))
+                    .unwrap_or(0);
                 let end = t[c..].find(|ch: char| !ch.is_alphanumeric()).map(|i| c + i).unwrap_or(t.len());
                 e.anchor = start;
                 e.cursor = end;

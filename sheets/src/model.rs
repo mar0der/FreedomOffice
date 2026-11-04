@@ -355,7 +355,7 @@ impl Cell {
         }
         match &self.value {
             Value::Empty => String::new(),
-            Value::Number(n) => crate::numfmt::general(*n),
+            Value::Number(n) => crate::numfmt::edit_number(*n),
             Value::Text(s) => {
                 // Text that would otherwise be read as a number/formula keeps its apostrophe.
                 if s.starts_with('=') || crate::numfmt::parse_number(s).is_some() {

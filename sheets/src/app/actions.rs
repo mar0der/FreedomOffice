@@ -563,7 +563,11 @@ impl App {
         }
         let sel = self.sel_clipped();
         let si = self.wb.active;
-        self.push_undo(&[Scope::Range(si, sel)]);
+        if formats {
+            self.push_undo(&[Scope::Sheet(si)]);
+        } else {
+            self.push_undo(&[Scope::Range(si, sel)]);
+        }
         let keys: Vec<(u32, u32)> = self.wb.sheets[si].iter_range(sel).map(|(r, c, _)| (r, c)).collect();
         for (r, c) in keys {
             let sh = &mut self.wb.sheets[si];
@@ -690,6 +694,20 @@ impl App {
 
     fn structure(&mut self, rows: bool, at: u32, n: i64) {
         self.commit_edit(false);
+        if n > 0 {
+            let limit = if rows { MAX_ROWS } else { MAX_COLS } as i64;
+            let last = match self.sheet().extent() {
+                Some((er, ec)) => (if rows { er } else { ec }) as i64,
+                None => -1,
+            };
+            if last >= at as i64 && last + n >= limit {
+                self.dialog = Some(Dialog::Message {
+                    title: "Insert".into(),
+                    text: "To prevent possible loss of data, FreedomOffice Sheets can't shift nonblank cells off of the worksheet.\n\nSelect fewer rows or columns to insert, or delete data at the end of the sheet.".into(),
+                });
+                return;
+            }
+        }
         self.push_undo(&[Scope::All]);
         let si = self.wb.active;
         Self::shift_sheet(&mut self.wb.sheets[si], rows, at, n);
@@ -802,7 +820,7 @@ impl App {
         for r in sel_full.r1..=sel_full.r2.min(sel.r2.max(sel_full.r1) + 1000) {
             if hide { sh.hidden_rows.insert(r) } else { sh.hidden_rows.remove(&r) };
         }
-        self.dirty = true;
+        self.changed();
     }
 
     pub fn hide_cols(&mut self, hide: bool) {
@@ -844,7 +862,7 @@ impl App {
                 sh.hidden_rows.remove(&r);
             }
         }
-        self.dirty = true;
+        self.changed();
     }
 
     fn text_width(&mut self, ctx: &egui::Context, cell: &Cell) -> f32 {
@@ -1185,7 +1203,11 @@ impl App {
         let Some((styles, h, w, sticky)) = self.format_painter.clone() else { return };
         let sel = self.sel_clipped();
         let si = self.wb.active;
-        let target = if sel.is_single() { Range::new(sel.r1, sel.c1, sel.r1 + h - 1, sel.c1 + w - 1) } else { sel };
+        let target = if sel.is_single() {
+            Range::new(sel.r1, sel.c1, (sel.r1 + h - 1).min(MAX_ROWS - 1), (sel.c1 + w - 1).min(MAX_COLS - 1))
+        } else {
+            sel
+        };
         self.push_undo(&[Scope::Range(si, target)]);
         for r in target.r1..=target.r2 {
             for c in target.c1..=target.c2 {
@@ -1461,13 +1483,23 @@ impl App {
         for (r, c) in old {
             sh.remove(r, c);
         }
+        let mut moved: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
         for (i, (orig, cells)) in rows.into_iter().enumerate() {
             let nr = data.r1 + i as u32;
+            moved.insert(orig, nr);
             for (c, mut cell) in cells {
                 shift_cell(&mut cell, nr as i64 - orig as i64, 0);
                 sh.set(nr, c, Some(cell));
             }
         }
+        let remap = |m: &mut std::collections::HashMap<(u32, u32), String>| {
+            *m = m
+                .drain()
+                .map(|((r, c), t)| if data.contains(r, c) { ((moved.get(&r).copied().unwrap_or(r), c), t) } else { ((r, c), t) })
+                .collect();
+        };
+        remap(&mut sh.notes);
+        remap(&mut sh.links);
         self.changed();
     }
 
@@ -1485,7 +1517,7 @@ impl App {
             let rg = if self.sel().is_single() { self.current_region() } else { self.sel_clipped() };
             self.sheet_mut().filter = Some(crate::model::AutoFilter { range: rg, excluded: Default::default() });
         }
-        self.dirty = true;
+        self.changed();
     }
 
     pub fn apply_filter(&mut self) {
@@ -1523,7 +1555,8 @@ impl App {
             sh.hidden_rows.insert(r);
         }
         sh.filter = Some(f);
-        self.dirty = true;
+        // SUBTOTAL(101..)/AGGREGATE ignore hidden rows, so totals change with the filter.
+        self.changed();
     }
 
     pub fn clear_filter(&mut self) {
@@ -1815,7 +1848,8 @@ impl App {
         let base = copy.name.clone();
         let mut k = 2;
         loop {
-            let n = format!("{base} ({k})");
+            let suffix = format!(" ({k})");
+            let n = format!("{}{}", base.chars().take(31 - suffix.chars().count()).collect::<String>(), suffix);
             if self.wb.sheet_index(&n).is_none() {
                 copy.name = n;
                 break;
@@ -2102,23 +2136,46 @@ impl App {
     }
 }
 
+/// Case-insensitive match of `needle` at byte `start` of `hay`; returns the end byte.
+fn match_ci_at(hay: &str, start: usize, needle: &[char]) -> Option<usize> {
+    let mut k = 0;
+    let mut end = start;
+    for (j, ch) in hay[start..].char_indices() {
+        if k == needle.len() {
+            break;
+        }
+        for lc in ch.to_lowercase() {
+            if k < needle.len() && lc == needle[k] {
+                k += 1;
+            } else {
+                return None;
+            }
+        }
+        end = start + j + ch.len_utf8();
+    }
+    (k == needle.len()).then_some(end)
+}
+
 fn replace_ci(text: &str, what: &str, with: &str) -> String {
     if what.is_empty() {
         return text.to_string();
     }
-    let lt = text.to_lowercase();
-    let lw = what.to_lowercase();
-    if lt.len() != text.len() {
-        return text.replace(what, with);
-    }
+    let needle: Vec<char> = what.chars().flat_map(|c| c.to_lowercase()).collect();
     let mut out = String::new();
     let mut i = 0;
-    while let Some(p) = lt[i..].find(&lw) {
-        out.push_str(&text[i..i + p]);
-        out.push_str(with);
-        i += p + lw.len();
+    while i < text.len() {
+        match match_ci_at(text, i, &needle) {
+            Some(end) if end > i => {
+                out.push_str(with);
+                i = end;
+            }
+            _ => {
+                let ch = text[i..].chars().next().unwrap_or(' ');
+                out.push(ch);
+                i += ch.len_utf8().max(1);
+            }
+        }
     }
-    out.push_str(&text[i..]);
     out
 }
 
