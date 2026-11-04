@@ -380,6 +380,11 @@ impl App {
         if self.on_sel_border(lay, pos) {
             return CursorIcon::Move;
         }
+        if let (Some(r), Some(c)) = (lay.row_at(pos.y), lay.col_at(pos.x)) {
+            if self.sheet().links.contains_key(&(r, c)) {
+                return CursorIcon::PointingHand;
+            }
+        }
         CursorIcon::Cell
     }
 
@@ -603,6 +608,11 @@ impl App {
             }
             self.select(r, c, mods.shift);
             self.drag = Drag::Cells;
+            if !mods.shift {
+                if let Some(t) = self.sheet().links.get(&(r, c)).cloned() {
+                    self.pending_link = Some(((r, c), t));
+                }
+            }
         }
     }
 
@@ -794,6 +804,11 @@ impl App {
             Drag::Cells => {
                 if self.format_painter.is_some() {
                     self.apply_format_painter();
+                }
+                if let Some((cell, t)) = self.pending_link.take() {
+                    if self.sel().is_single() && self.active() == cell {
+                        self.follow_link(&t);
+                    }
                 }
             }
             Drag::Move(dr, dc) => {
@@ -1481,6 +1496,23 @@ impl App {
             }
             ui.separator();
             let (ar, ac) = self.active();
+            let has_link = self.sheet().links.contains_key(&(ar, ac));
+            if ui.button(if has_link { "Edit Hyperlink..." } else { "Link..." }).clicked() {
+                self.open_link_dialog();
+                ui.close();
+            }
+            if has_link {
+                if ui.button("Open Hyperlink").clicked() {
+                    if let Some(t) = self.sheet().links.get(&(ar, ac)).cloned() {
+                        self.follow_link(&t);
+                    }
+                    ui.close();
+                }
+                if ui.button("Remove Hyperlink").clicked() {
+                    self.set_link(ar, ac, "", None);
+                    ui.close();
+                }
+            }
             let has_note = self.sheet().notes.contains_key(&(ar, ac));
             if ui.button(if has_note { "Edit Note" } else { "New Note" }).clicked() {
                 self.edit_note();

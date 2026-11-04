@@ -94,6 +94,23 @@ fn write_sheet(wb: &Workbook, sh: &Sheet, ws: &mut Worksheet, formats: &mut Hash
         }
     }
 
+    let mut links: Vec<_> = sh.links.iter().filter(|((r, c), _)| *r < MAX_ROWS && *c < MAX_COLS).collect();
+    links.sort_by_key(|(k, _)| **k);
+    for (&(r, c), target) in links {
+        let (text, style) = match sh.get(r, c) {
+            Some(cell) => (crate::numfmt::format_value(&cell.value, &wb.style(cell.style).num_fmt).text, cell.style),
+            None => (target.clone(), 0),
+        };
+        let url = match target.strip_prefix('#') {
+            Some(loc) => format!("internal:{loc}"),
+            None => target.clone(),
+        };
+        let fmt = format_for(wb, formats, style).clone();
+        let link = rust_xlsxwriter::Url::new(url).set_text(if text.is_empty() { target.clone() } else { text });
+        // Links that the writer rejects (unusual schemes, too long) are skipped rather than failing the save.
+        let _ = ws.write_url_with_format(r, c as u16, link, &fmt);
+    }
+
     if sh.freeze != (0, 0) {
         ws.set_freeze_panes(sh.freeze.0.min(MAX_ROWS - 1), sh.freeze.1.min(MAX_COLS - 1) as u16)?;
     }

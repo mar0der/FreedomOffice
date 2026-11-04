@@ -536,6 +536,7 @@ impl App {
         }
         if contents && formats {
             self.wb.sheets[si].notes.retain(|(r, c), _| !sel.contains(*r, *c));
+            self.wb.sheets[si].links.retain(|(r, c), _| !sel.contains(*r, *c));
         }
         self.changed();
     }
@@ -576,6 +577,14 @@ impl App {
             sh.col_w = sh.col_w.drain().filter_map(|(c, w)| map(c).map(|nc| (nc, w))).collect();
             sh.hidden_cols = sh.hidden_cols.drain().filter_map(map).collect();
         }
+        sh.links = sh
+            .links
+            .drain()
+            .filter_map(|((r, c), t)| {
+                let k = if rows { map(r).map(|nr| (nr, c)) } else { map(c).map(|nc| (r, nc)) };
+                k.map(|k| (k, t))
+            })
+            .collect();
         sh.notes = sh
             .notes
             .drain()
@@ -1829,6 +1838,83 @@ impl App {
         self.paste_internal(PasteMode::All);
         if copy {
             self.clip = None;
+        }
+    }
+}
+
+impl App {
+    // ------------------------------------------------------------------
+    // Hyperlinks
+    // ------------------------------------------------------------------
+
+    pub fn open_link_dialog(&mut self) {
+        self.commit_edit(false);
+        let (r, c) = self.active();
+        let sh = self.sheet();
+        let text = sh.get(r, c).map(|x| crate::numfmt::value_to_text(&x.value)).unwrap_or_default();
+        let address = sh.links.get(&(r, c)).cloned().unwrap_or_default();
+        self.dialog = Some(Dialog::Link { r, c, text, address, focus: true });
+    }
+
+    pub fn set_link(&mut self, r: u32, c: u32, text: &str, address: Option<&str>) {
+        let si = self.wb.active;
+        self.push_undo(&[Scope::Sheet(si)]);
+        match address.map(str::trim).filter(|a| !a.is_empty()) {
+            Some(a) => {
+                let a = if a.contains("://") || a.starts_with("mailto:") || a.starts_with('#') {
+                    a.to_string()
+                } else if a.contains('@') && !a.contains(' ') {
+                    format!("mailto:{a}")
+                } else if crate::model::Range::parse(a.rsplit('!').next().unwrap_or("")).is_some() {
+                    format!("#{a}")
+                } else {
+                    format!("https://{a}")
+                };
+                self.wb.sheets[si].links.insert((r, c), a.clone());
+                let shown = if text.trim().is_empty() { a.trim_start_matches('#').to_string() } else { text.to_string() };
+                let style = self.wb.sheets[si].get(r, c).map(|x| x.style).unwrap_or(0);
+                let mut st = self.wb.style(style).clone();
+                st.color = Some(0x0563C1);
+                st.underline = true;
+                let sid = self.wb.intern_style(st);
+                let has_formula = self.wb.sheets[si].get(r, c).is_some_and(|x| x.formula.is_some());
+                let cell = self.wb.sheets[si].cell_mut(r, c);
+                if !has_formula {
+                    cell.value = Value::Text(shown);
+                }
+                cell.style = sid;
+            }
+            None => {
+                self.wb.sheets[si].links.remove(&(r, c));
+                let style = self.wb.sheets[si].get(r, c).map(|x| x.style).unwrap_or(0);
+                let mut st = self.wb.style(style).clone();
+                if st.color == Some(0x0563C1) {
+                    st.color = None;
+                    st.underline = false;
+                }
+                let sid = self.wb.intern_style(st);
+                if self.wb.sheets[si].get(r, c).is_some() {
+                    self.wb.sheets[si].cell_mut(r, c).style = sid;
+                }
+            }
+        }
+        self.changed();
+    }
+
+    /// Follows a hyperlink: places in the workbook are selected; web and mail links open externally.
+    pub fn follow_link(&mut self, target: &str) {
+        if let Some(loc) = target.strip_prefix('#') {
+            if !self.go_to(loc) {
+                self.status = Some(format!("Reference isn't valid: {loc}"));
+            }
+            return;
+        }
+        let lower = target.to_ascii_lowercase();
+        if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("mailto:") {
+            let _ = std::process::Command::new("rundll32").args(["url.dll,FileProtocolHandler", target]).spawn();
+            self.status = Some(format!("Opening {target}"));
+        } else {
+            self.status = Some(format!("Links of this type aren't opened automatically: {target}"));
         }
     }
 }

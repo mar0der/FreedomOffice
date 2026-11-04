@@ -356,7 +356,7 @@ impl App {
                 self.commit_edit(false);
                 self.backstage = Some(super::chrome::Backstage::Print);
             }
-            Key::K => {}
+            Key::K => self.open_link_dialog(),
             Key::Semicolon | Key::Colon => self.insert_now(shift || key == Key::Colon),
             Key::Backtick if shift => self.set_num_fmt("General"),
             Key::Backtick => self.show_formulas = !self.show_formulas,

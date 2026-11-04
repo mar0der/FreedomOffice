@@ -74,6 +74,20 @@ pub fn read<R: Read + Seek>(src: R) -> Result<Workbook, String> {
         }
         let srels = format!("{}_rels/{}.rels", dir_of(&path), file_of(&path));
         if let Some(rx) = pkg.text(&srels) {
+            let rels_list = parse_rels(&rx);
+            for v in sheet.links.values_mut() {
+                if let Some(rest) = v.strip_prefix("rid:") {
+                    let (id, frag) = match rest.split_once('#') {
+                        Some((a, b)) => (a.to_string(), format!("#{b}")),
+                        None => (rest.to_string(), String::new()),
+                    };
+                    *v = match rels_list.iter().find(|r| r.id == id) {
+                        Some(r) => format!("{}{}", r.target, frag),
+                        None => String::new(),
+                    };
+                }
+            }
+            sheet.links.retain(|_, v| !v.is_empty());
             for r in parse_rels(&rx) {
                 if r.ty.ends_with("/comments") {
                     let cp = resolve(&dir_of(&path), &r.target);
@@ -1064,6 +1078,18 @@ fn parse_sheet(xml: &str, ctx: &SheetCtx, sheet: &mut Sheet) {
                             }
                         }
                     }
+                    "hyperlink" => {
+                        if let Some((r, c)) = attr(e, "ref").and_then(|v| parse_ref(v.split(':').next().unwrap_or(""))) {
+                            let rid = attr(e, "r:id").or_else(|| attr(e, "id"));
+                            let loc = attr(e, "location");
+                            if let Some(rid) = rid {
+                                let extra = loc.map(|l| format!("#{l}")).unwrap_or_default();
+                                sheet.links.insert((r, c), format!("rid:{rid}{extra}"));
+                            } else if let Some(l) = loc {
+                                sheet.links.insert((r, c), format!("#{l}"));
+                            }
+                        }
+                    }
                     "mergeCell" => {
                         if let Some(rg) = attr(e, "ref").and_then(|v| Range::parse(&v)) {
                             if !rg.is_single() {
@@ -1079,7 +1105,7 @@ fn parse_sheet(xml: &str, ctx: &SheetCtx, sheet: &mut Sheet) {
                             skip(&mut rd, e);
                         }
                     }
-                    "extLst" | "AlternateContent" | "conditionalFormatting" | "dataValidations" | "hyperlinks"
+                    "extLst" | "AlternateContent" | "conditionalFormatting" | "dataValidations"
                         if is_start =>
                     {
                         skip(&mut rd, e)

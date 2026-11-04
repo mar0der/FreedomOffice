@@ -118,6 +118,7 @@ pub const KEYTIPS: &[(&str, &str)] = &[
     ("NC", "Insert Sheet Columns"),
     ("NS", "Insert Sheet"),
     ("NF", "Insert Function..."),
+    ("NI", "Link..."),
     // Formulas
     ("MF", "Insert Function..."),
     ("MUS", "AutoSum"),
@@ -292,6 +293,7 @@ impl App {
             "HUM" => self.autosum("MAX"),
             "HUI" => self.autosum("MIN"),
             "HUF" | "NF" | "MF" => self.dialog = Some(Dialog::insert_function()),
+            "NI" => self.open_link_dialog(),
             "HFID" => self.fill_down(),
             "HFIR" => self.fill_right(),
             "HEA" => self.clear(true, true),

@@ -829,6 +829,12 @@ impl App {
                 app.dialog = Some(Dialog::insert_function());
             }
         });
+        self.group(ui, "Links", |app, ui| {
+            let job = icon_job("🔗", false, "Link", 20.0, true, theme::TEXT);
+            if big_btn(ui, job, 50.0, false).on_hover_text("Insert Link (Ctrl+K)").clicked() {
+                app.open_link_dialog();
+            }
+        });
         self.group(ui, "Date & Time", |app, ui| {
             ui.vertical(|ui| {
                 if ui.button("📅 Today's Date (Ctrl+;)").clicked() {

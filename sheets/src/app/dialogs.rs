@@ -40,6 +40,7 @@ pub enum Dialog {
     Shortcuts,
     PasteSpecial { mode: u8, transpose: bool },
     Note { r: u32, c: u32, text: String, focus: bool },
+    Link { r: u32, c: u32, text: String, address: String, focus: bool },
     CondFmt(Box<super::condfmt_ui::CfDialog>),
     Validation(Box<super::validation_ui::DvDialog>),
     DvAlert(Box<super::validation_ui::DvAlert>),
@@ -652,6 +653,40 @@ impl App {
                         if ui.add(egui::Button::new("Cancel").min_size(Vec2::new(76.0, 24.0))).clicked()
                             || ui.input(|i| i.key_pressed(egui::Key::Escape))
                         {
+                            keep = false;
+                        }
+                    });
+                });
+            }
+            Dialog::Link { r, c, text, address, focus } => {
+                let (r, c) = (*r, *c);
+                win("Insert Hyperlink").show(ctx, |ui| {
+                    ui.set_min_width(420.0);
+                    egui::Grid::new("link_grid").num_columns(2).spacing(Vec2::new(10.0, 8.0)).show(ui, |ui| {
+                        ui.label("Text to display:");
+                        ui.add(egui::TextEdit::singleline(text).desired_width(320.0));
+                        ui.end_row();
+                        ui.label("Address:");
+                        let a = ui.add(egui::TextEdit::singleline(address).desired_width(320.0).hint_text("https://...  or  Sheet2!A1"));
+                        if *focus {
+                            a.request_focus();
+                            *focus = false;
+                        }
+                        ui.end_row();
+                    });
+                    ui.label(RichText::new("Web address, e-mail address, or a place in this document (e.g. Sheet2!B5).").size(11.0).color(theme::TEXT_DIM));
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.add(egui::Button::new("OK").min_size(Vec2::new(76.0, 24.0)).fill(theme::ACCENT_LIGHT)).clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            let (t, a) = (text.clone(), address.clone());
+                            self.set_link(r, c, &t, Some(&a));
+                            keep = false;
+                        }
+                        if ui.add(egui::Button::new("Remove Link").min_size(Vec2::new(96.0, 24.0))).clicked() {
+                            self.set_link(r, c, "", None);
+                            keep = false;
+                        }
+                        if ui.add(egui::Button::new("Cancel").min_size(Vec2::new(76.0, 24.0))).clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                             keep = false;
                         }
                     });

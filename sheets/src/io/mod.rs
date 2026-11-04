@@ -312,3 +312,35 @@ mod tests {
         assert!(save(&Workbook::new(), Path::new("x.ods")).is_err());
     }
 }
+
+#[cfg(test)]
+mod extras_roundtrip {
+    use crate::model::{cell_from_input, Workbook};
+
+    #[test]
+    fn notes_links_rotation_survive_xlsx() {
+        let mut wb = Workbook::new();
+        let c = cell_from_input(&mut wb, "Docs", 0);
+        wb.sheets[0].set(0, 0, c);
+        let c = cell_from_input(&mut wb, "Jump", 0);
+        wb.sheets[0].set(1, 0, c);
+        wb.sheets[0].links.insert((0, 0), "https://example.com/docs".into());
+        wb.sheets[0].links.insert((1, 0), "#Sheet1!C5".into());
+        wb.sheets[0].notes.insert((2, 1), "Check this value".into());
+        let mut st = wb.style(0).clone();
+        st.rotation = 90;
+        let id = wb.intern_style(st);
+        let mut c = cell_from_input(&mut wb, "Up", 0).unwrap();
+        c.style = id;
+        wb.sheets[0].set(3, 0, Some(c));
+        let p = std::env::temp_dir().join("freedom_extras_roundtrip.xlsx");
+        super::save(&wb, &p).unwrap();
+        let back = super::load(&p).unwrap();
+        let sh = &back.sheets[0];
+        assert_eq!(sh.links.get(&(0, 0)).map(String::as_str), Some("https://example.com/docs"));
+        assert_eq!(sh.links.get(&(1, 0)).map(String::as_str), Some("#Sheet1!C5"));
+        assert_eq!(sh.notes.get(&(2, 1)).map(String::as_str), Some("Check this value"));
+        let rot = sh.get(3, 0).map(|c| back.style(c.style).rotation);
+        assert_eq!(rot, Some(90));
+    }
+}
