@@ -197,6 +197,9 @@ pub struct FontManager {
     failed: HashSet<String>,
     pending: Vec<(String, String, bool, bool)>,
     cache: HashMap<String, FontFamily>,
+    /// Families already active in egui (fonts set via `set_fonts` apply from the next pass).
+    usable: HashSet<String>,
+    staged: Vec<String>,
     pub icons: Icons,
     ui_fallbacks: Vec<String>,
 }
@@ -255,6 +258,8 @@ impl FontManager {
             failed: HashSet::new(),
             pending: Vec::new(),
             cache: HashMap::new(),
+            usable: HashSet::new(),
+            staged: Vec::new(),
             icons: Icons { available: icons },
             ui_fallbacks,
         };
@@ -263,6 +268,7 @@ impl FontManager {
             fm.load_now(DEFAULT_CELL_FONT, b, i);
         }
         ctx.set_fonts(fm.defs.clone());
+        fm.usable = fm.loaded.clone();
         fm
     }
 
@@ -330,12 +336,14 @@ impl FontManager {
         if let Some(f) = self.cache.get(&key) {
             return f.clone();
         }
-        if self.loaded.contains(&key) {
+        if self.usable.contains(&key) {
             let f = FontFamily::Name(key.clone().into());
             self.cache.insert(key, f.clone());
             return f;
         }
-        if !self.failed.contains(&key) {
+        if self.loaded.contains(&key) {
+            // loaded this frame, active from the next one
+        } else if !self.failed.contains(&key) {
             if !self.pending.iter().any(|p| p.0 == key) {
                 self.pending.push((key.clone(), name.to_string(), bold, italic));
             }
@@ -346,22 +354,30 @@ impl FontManager {
             return f;
         }
         let dk = Self::key(DEFAULT_CELL_FONT, bold, italic);
-        if self.loaded.contains(&dk) { FontFamily::Name(dk.into()) } else { FontFamily::Proportional }
+        if self.usable.contains(&dk) { FontFamily::Name(dk.into()) } else { FontFamily::Proportional }
     }
 
     /// Applies lazily loaded fonts. Call once per frame before drawing.
     pub fn flush(&mut self, ctx: &egui::Context) {
+        if !self.staged.is_empty() {
+            self.usable.extend(self.staged.drain(..));
+            self.cache.clear();
+        }
         if self.pending.is_empty() {
             return;
         }
         let pending = std::mem::take(&mut self.pending);
         let mut changed = false;
-        for (_, name, b, i) in pending {
-            changed |= self.load_now(&name, b, i);
+        for (key, name, b, i) in pending {
+            if self.load_now(&name, b, i) {
+                self.staged.push(key);
+                changed = true;
+            }
         }
         self.cache.clear();
         if changed {
             ctx.set_fonts(self.defs.clone());
+            ctx.request_repaint();
         }
     }
 }
