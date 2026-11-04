@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use eframe::egui;
 
 use crate::model::{cell_from_input, Cell, Range, Sheet, SheetView, Style, Workbook};
+pub use chrome::Backstage;
 pub use editor::{EditMode, Editor};
 use theme::FontManager;
 

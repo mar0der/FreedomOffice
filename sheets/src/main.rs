@@ -17,7 +17,10 @@ mod validation;
 use eframe::egui;
 
 fn main() -> eframe::Result<()> {
-    let path = std::env::args_os().nth(1).map(std::path::PathBuf::from);
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    // "--print-preview" opens File > Print right away (like a print-preview shortcut).
+    let preview = args.iter().any(|a| a == "--print-preview");
+    let path = args.iter().find(|a| !a.to_string_lossy().starts_with("--")).map(std::path::PathBuf::from);
     let icon = egui::IconData { rgba: icon::icon_rgba(64), width: 64, height: 64 };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -27,5 +30,11 @@ fn main() -> eframe::Result<()> {
             .with_icon(std::sync::Arc::new(icon)),
         ..Default::default()
     };
-    eframe::run_native("FreedomOffice Sheets", options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, path)))))
+    eframe::run_native("FreedomOffice Sheets", options, Box::new(move |cc| {
+            let mut app = app::App::new(cc, path);
+            if preview {
+                app.backstage = Some(app::Backstage::Print);
+            }
+            Ok(Box::new(app))
+        }))
 }

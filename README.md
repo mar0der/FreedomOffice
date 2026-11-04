@@ -47,6 +47,12 @@ and run it. To open a file, use **File → Open**, `Ctrl+O`, or drag a workbook 
 **Charts**
 - Column, bar, line, area, pie, doughnut and scatter charts that update live, with title, legend and data labels
 
+**Printing**
+- File → Print (`Ctrl+P`) with printer choice, Printer Properties, copies, pages, one/two-sided, collation, orientation, paper size, margins and scaling, plus a live page preview
+- Prints directly to any installed Windows printer with the real fonts; File → Export creates a PDF
+- Page Setup dialog (page, margins, header/footer, sheet tabs), print area, rows/columns to repeat on every page, manual page breaks, gridlines and headings, fit to N pages wide/tall, page-break lines in the grid
+- Page setup is saved in the `.xlsx`
+
 **Files**
 
 | Format | Open | Save |
@@ -55,7 +61,7 @@ and run it. To open a file, use **File → Open**, `Ctrl+O`, or drag a workbook 
 | Excel 97-2003 `.xls`, binary `.xlsb` | ✓ (values and formulas) | |
 | OpenDocument `.ods` | ✓ (values and formulas) | |
 | CSV / TSV / text | ✓ (delimiter and encoding detection) | ✓ |
-| PDF | | ✓ (File → Print / Export to PDF) |
+| PDF | | ✓ (File → Export) |
 
 ## Keyboard shortcuts (selection)
 

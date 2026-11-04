@@ -412,7 +412,8 @@ pub fn apply_style(ctx: &egui::Context) {
     w.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
     w.inactive.weak_bg_fill = Color32::TRANSPARENT;
     w.inactive.bg_fill = Color32::WHITE;
-    w.inactive.bg_stroke = Stroke::NONE;
+    // visible outlines for checkboxes, number boxes, combo boxes and dialog buttons
+    w.inactive.bg_stroke = Stroke::new(1.0, Color32::from_gray(170));
     w.inactive.fg_stroke = Stroke::new(1.0, TEXT);
     w.inactive.corner_radius = egui::CornerRadius::same(3);
     w.hovered.weak_bg_fill = HOVER;

@@ -206,6 +206,8 @@ impl App {
 
     pub fn ribbon_ui(&mut self, ui: &mut egui::Ui) {
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+        // ribbon buttons are flat until hovered
+        ui.visuals_mut().widgets.inactive.bg_stroke = Stroke::NONE;
         // Tab strip
         let strip = ui.horizontal(|ui| {
             ui.set_height(30.0);
