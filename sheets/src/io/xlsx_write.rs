@@ -1,6 +1,7 @@
 //! .xlsx writer built on rust_xlsxwriter.
 
 mod charts;
+mod extras;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -109,6 +110,7 @@ fn write_sheet(wb: &Workbook, sh: &Sheet, ws: &mut Worksheet, formats: &mut Hash
         }
     }
     charts::write(wb, sh, ws)?;
+    extras::write_sheet_extras(sh, ws);
     Ok(())
 }
 

@@ -1,6 +1,7 @@
 //! Streaming .xlsx/.xlsm reader (zip + quick-xml) that keeps formatting.
 
 mod charts;
+mod extras;
 
 use std::collections::HashMap;
 use std::io::{Read, Seek};
@@ -49,6 +50,7 @@ pub fn read<R: Read + Seek>(src: R) -> Result<Workbook, String> {
         Some(x) => parse_styles(x, &theme, &mut wb),
         None => XfMap { ids: vec![0], date: vec![false] },
     };
+    let dxfs = styles_xml.as_deref().map(|x| extras::parse_dxfs(x, &theme)).unwrap_or_default();
 
     let mut active = 0;
     for (i, sh) in info.sheets.iter().enumerate() {
@@ -67,6 +69,7 @@ pub fn read<R: Read + Seek>(src: R) -> Result<Workbook, String> {
         if let Some(x) = pkg.text(&path) {
             let ctx = SheetCtx { shared: &shared, xf: &xf, theme: &theme, date1904: info.date1904 };
             parse_sheet(&x, &ctx, &mut sheet);
+            extras::parse_sheet_extras(&x, &theme, &dxfs, &mut sheet);
             charts::read(&mut pkg, &path, &mut sheet);
         }
         let srels = format!("{}_rels/{}.rels", dir_of(&path), file_of(&path));

@@ -25,6 +25,9 @@ impl App {
             }
             return;
         }
+        if self.dv_popup_open() {
+            return; // the validation list handles its own keys
+        }
         let grid_id = egui::Id::new("grid");
         let focused = ctx.memory(|m| m.focused());
         if focused.is_some() && focused != Some(grid_id) {
@@ -225,6 +228,9 @@ impl App {
         match key {
             Key::ArrowUp | Key::ArrowDown | Key::ArrowLeft | Key::ArrowRight => {
                 if m.alt {
+                    if key == Key::ArrowDown {
+                        self.dv_open_dropdown();
+                    }
                     return;
                 }
                 let (dr, dc) = match key {

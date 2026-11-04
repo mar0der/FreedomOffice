@@ -40,6 +40,9 @@ pub enum Dialog {
     Shortcuts,
     PasteSpecial { mode: u8, transpose: bool },
     Note { r: u32, c: u32, text: String, focus: bool },
+    CondFmt(Box<super::condfmt_ui::CfDialog>),
+    Validation(Box<super::validation_ui::DvDialog>),
+    DvAlert(Box<super::validation_ui::DvAlert>),
 }
 
 impl Dialog {
@@ -186,6 +189,9 @@ impl App {
         let mut keep = true;
         let win = |title: &str| egui::Window::new(title).collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, -40.0]);
         match &mut d {
+            Dialog::CondFmt(cf) => keep = self.cf_dialog_ui(ctx, cf),
+            Dialog::Validation(dv) => keep = self.dv_dialog_ui(ctx, dv),
+            Dialog::DvAlert(a) => keep = self.dv_alert_ui(ctx, a),
             Dialog::Message { title, text } => {
                 win(title).show(ctx, |ui| {
                     ui.set_min_width(320.0);

@@ -490,6 +490,7 @@ impl App {
             });
         });
         self.group(ui, "Styles", |app, ui| {
+            app.cf_ribbon_button(ui);
             let job = app.ib(ic::TABLE, "▤", "Cell\nStyles", 20.0, true);
             ui.menu_button(job, |ui| {
                 ui.set_min_width(170.0);
@@ -955,6 +956,7 @@ impl App {
             if ui.add(egui::Button::new(job).min_size(Vec2::new(66.0, GROUP_H - 4.0))).clicked() {
                 app.open_remove_duplicates();
             }
+            app.dv_ribbon_button(ui);
         });
     }
 

@@ -460,6 +460,15 @@ impl App {
             return;
         }
 
+        // Validation list arrow next to the active cell
+        if self.dv_arrow_rect(lay).is_some_and(|r| r.contains(pos)) {
+            if self.edit.is_some() && !self.commit_edit(false) {
+                return;
+            }
+            self.dv_open_dropdown();
+            return;
+        }
+
         // Filter dropdown buttons
         if let Some(c) = self.filter_button_at(lay, pos) {
             if self.edit.is_some() && !self.commit_edit(false) {
@@ -871,10 +880,12 @@ impl App {
             style: Style,
             shown: Shown,
             fill: Option<Color32>,
+            cf: Option<crate::condfmt::CfOverride>,
         }
         let mut items: Vec<Item> = Vec::new();
         let mut merge_done: Vec<Range> = Vec::new();
         let show_formulas = self.show_formulas;
+        let cf = self.cf_frame(si);
 
         for &(r, y, h) in &vis_rows {
             for &(c, x, w) in &vis_cols {
@@ -891,8 +902,21 @@ impl App {
                     cp.rect_filled(rect.shrink(0.5), 0.0, Color32::WHITE);
                 }
                 let sh = &self.wb.sheets[si];
-                let Some(cell) = sh.get(anchor.0, anchor.1) else { continue };
-                let style = self.wb.style(cell.style).clone();
+                let ov = cf.eval(&self.wb, si, anchor.0, anchor.1);
+                let Some(cell) = sh.get(anchor.0, anchor.1) else {
+                    // Conditional formats can also mark empty cells (e.g. "Blanks").
+                    if let Some(o) = ov {
+                        let mut style = Style::default();
+                        super::condfmt_ui::apply_override(&mut style, &o);
+                        let shown = Shown { text: String::new(), color: None, align: HAlign::General, is_number: false };
+                        items.push(Item { rect, clip: rect, fill: style.fill.map(rgb), style, shown, cf: Some(o) });
+                    }
+                    continue;
+                };
+                let mut style = self.wb.style(cell.style).clone();
+                if let Some(o) = &ov {
+                    super::condfmt_ui::apply_override(&mut style, o);
+                }
                 let fill = style.fill.map(rgb);
                 if editing == Some(anchor) {
                     if let Some(f) = fill {
@@ -900,8 +924,11 @@ impl App {
                     }
                     continue;
                 }
-                let s = shown(&cell.value, &style, cell.formula.as_ref().map(|f| f.text.as_str()), show_formulas);
-                items.push(Item { rect, clip: rect, style, shown: s, fill });
+                let mut s = shown(&cell.value, &style, cell.formula.as_ref().map(|f| f.text.as_str()), show_formulas);
+                if ov.as_ref().is_some_and(|o| o.color.is_some()) {
+                    s.color = None;
+                }
+                items.push(Item { rect, clip: rect, style, shown: s, fill, cf: ov });
             }
         }
 
@@ -909,6 +936,9 @@ impl App {
         for it in &items {
             if let Some(f) = it.fill {
                 cp.rect_filled(Rect::from_min_max(it.rect.min - Vec2::splat(0.5), it.rect.max + Vec2::splat(0.5)), 0.0, f);
+            }
+            if let Some(bar) = it.cf.as_ref().and_then(|o| o.bar) {
+                super::condfmt_ui::paint_data_bar(&cp, it.rect, &bar);
             }
         }
 
@@ -1024,6 +1054,11 @@ impl App {
                 draw_border(&cp, rect, b.top, b.bottom, b.left, b.right);
             }
         }
+        for it in &items {
+            if let Some(c) = it.cf.as_ref().and_then(|o| o.border) {
+                cp.rect_stroke(it.rect.translate(Vec2::splat(-0.5)), 0.0, Stroke::new(1.0, rgb(c)), StrokeKind::Middle);
+            }
+        }
 
         // Note markers (red triangle in the top-right corner)
         let notes: Vec<(u32, u32)> = self.wb.sheets[si].notes.keys().copied().collect();
@@ -1064,13 +1099,28 @@ impl App {
         if !sel.is_single() {
             cp.rect_filled(sel_rect, 0.0, theme::sel_fill());
             let act = self.range_rect(lay, self.sheet().merge_at(ar, ac).unwrap_or(Range::cell(ar, ac)));
-            let fill = self.sheet().get(ar, ac).and_then(|c| self.wb.style(c.style).fill).map(rgb).unwrap_or(Color32::WHITE);
+            let act_cf = cf.eval(&self.wb, si, ar, ac);
+            let fill = act_cf
+                .as_ref()
+                .and_then(|o| o.fill)
+                .or_else(|| self.sheet().get(ar, ac).and_then(|c| self.wb.style(c.style).fill))
+                .map(rgb)
+                .unwrap_or(Color32::WHITE);
             if editing.is_none() {
                 cp.rect_filled(act.shrink(0.5), 0.0, fill.gamma_multiply(1.0));
+                if let Some(bar) = act_cf.as_ref().and_then(|o| o.bar) {
+                    super::condfmt_ui::paint_data_bar(&cp, act, &bar);
+                }
                 // redraw active cell text above the white-out
                 if let Some(cell) = self.wb.sheets[si].get(ar, ac) {
-                    let style = self.wb.style(cell.style).clone();
-                    let s = shown(&cell.value, &style, cell.formula.as_ref().map(|f| f.text.as_str()), show_formulas);
+                    let mut style = self.wb.style(cell.style).clone();
+                    if let Some(o) = &act_cf {
+                        super::condfmt_ui::apply_override(&mut style, o);
+                    }
+                    let mut s = shown(&cell.value, &style, cell.formula.as_ref().map(|f| f.text.as_str()), show_formulas);
+                    if act_cf.as_ref().is_some_and(|o| o.color.is_some()) {
+                        s.color = None;
+                    }
                     if !s.text.is_empty() {
                         let font = self.cell_font(&style);
                         let color = s.color.or(style.color.map(rgb)).unwrap_or(Color32::BLACK);
@@ -1156,6 +1206,8 @@ impl App {
         }
 
         self.paint_charts(ui, lay);
+        // Validation list arrow
+        self.dv_paint_arrow(&cp, lay, ui.input(|i| i.pointer.hover_pos()));
 
         // In-cell editor
         self.paint_editor(ui, lay);

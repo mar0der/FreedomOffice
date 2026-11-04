@@ -560,3 +560,21 @@ pub fn eval_formula(wb: &Workbook, sheet: usize, r: u32, c: u32, src: &str) -> V
     let res = ev.eval(&e);
     ev.top_value(res)
 }
+
+/// Evaluates a parsed expression in the context of a cell (conditional formats, validation).
+pub fn eval_expr(wb: &Workbook, sheet: usize, r: u32, c: u32, e: &Expr) -> Value {
+    let mut ev = Evaluator::new(wb);
+    ev.cur = (sheet, r, c);
+    let res = ev.eval(e);
+    ev.top_value(res)
+}
+
+/// Evaluates a parsed expression to a grid of values, expanding ranges (validation lists).
+pub fn eval_grid(wb: &Workbook, sheet: usize, r: u32, c: u32, e: &Expr) -> Vec<Vec<Value>> {
+    let mut ev = Evaluator::new(wb);
+    ev.cur = (sheet, r, c);
+    match ev.eval(e) {
+        Ok(v) => ev.grid(v),
+        Err(k) => vec![vec![Value::Error(k)]],
+    }
+}

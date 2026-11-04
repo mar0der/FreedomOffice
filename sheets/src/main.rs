@@ -4,12 +4,14 @@
 
 mod app;
 mod chart;
+mod condfmt;
 mod formula;
 mod icon;
 mod io;
 mod model;
 mod numfmt;
 mod pdf;
+mod validation;
 
 use eframe::egui;
 

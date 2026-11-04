@@ -727,6 +727,7 @@ impl App {
             }
         }
         self.filter_popup_ui(ctx);
+        self.dv_popups_ui(ctx);
     }
 
     fn filter_popup_ui(&mut self, ctx: &egui::Context) {
