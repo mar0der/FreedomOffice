@@ -45,6 +45,8 @@ pub struct Clip {
     pub cells: Vec<ClipCell>,
     pub text: String,
     pub cut: bool,
+    /// Notes inside the copied range: (row offset, col offset, text).
+    pub notes: Vec<(u32, u32, String)>,
 }
 
 /// Undo snapshot of part of the workbook.
@@ -80,6 +82,8 @@ pub enum Drag {
     Point((u32, u32)),
     VScroll(f32, u32),
     HScroll(f32, u32),
+    /// Dragging the selection by its border; (row, col) offset of the grabbed cell.
+    Move(u32, u32),
 }
 
 pub enum Pending {
@@ -153,6 +157,8 @@ pub struct App {
     pub keytips: Option<String>,
     alt_clean: bool,
     prev_alt: bool,
+    pub hover_cell: Option<(u32, u32)>,
+    pub show_all_notes: bool,
 }
 
 const MAX_UNDO: usize = 100;
@@ -207,6 +213,8 @@ impl App {
             keytips: None,
             alt_clean: false,
             prev_alt: false,
+            hover_cell: None,
+            show_all_notes: false,
         };
         if let Some(p) = path {
             app.open_path(p);

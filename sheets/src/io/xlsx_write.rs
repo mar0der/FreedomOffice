@@ -61,6 +61,11 @@ fn write_sheet(wb: &Workbook, sh: &Sheet, ws: &mut Worksheet, formats: &mut Hash
     for &r in sh.hidden_rows.iter().filter(|r| **r < MAX_ROWS) {
         ws.set_row_hidden(r)?;
     }
+    let mut notes: Vec<_> = sh.notes.iter().filter(|((r, c), _)| *r < MAX_ROWS && *c < MAX_COLS).collect();
+    notes.sort_by_key(|(k, _)| **k);
+    for (&(r, c), text) in notes {
+        ws.insert_note(r, c as u16, &rust_xlsxwriter::Note::new(text).add_author_prefix(false))?;
+    }
 
     // Merges first: merge_range writes the top-left cell and blank-fills the rest,
     // the real cell contents are written over them below.

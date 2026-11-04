@@ -305,6 +305,11 @@ impl App {
         }
 
         let Some(pos) = pos else { return };
+        self.hover_cell = if hovered && lay.cells.contains(pos) && self.drag == Drag::None {
+            Some((lay.row_near(pos.y), lay.col_near(pos.x)))
+        } else {
+            None
+        };
 
         // Cursor icon
         if hovered && self.drag == Drag::None {
@@ -358,7 +363,23 @@ impl App {
         if self.filter_button_at(lay, pos).is_some() {
             return CursorIcon::Default;
         }
+        if self.on_sel_border(lay, pos) {
+            return CursorIcon::Move;
+        }
         CursorIcon::Cell
+    }
+
+    /// True when the pointer is on the selection outline (drag to move it).
+    fn on_sel_border(&self, lay: &Layout, pos: Pos2) -> bool {
+        if self.edit.is_some() || !lay.cells.contains(pos) {
+            return false;
+        }
+        let sel = self.sel();
+        if sel.is_full_cols() || sel.is_full_rows() {
+            return false;
+        }
+        let r = self.range_rect(lay, sel);
+        r.expand(3.0).contains(pos) && !r.shrink(3.0).contains(pos)
     }
 
     fn col_border_at(&self, lay: &Layout, x: f32) -> Option<u32> {
@@ -478,6 +499,14 @@ impl App {
                 self.drag = Drag::Fill(self.sel());
                 return;
             }
+        }
+        // Drag the selection by its border
+        if self.on_sel_border(lay, pos) {
+            let sel = self.sel();
+            let r = lay.row_near(pos.y).clamp(sel.r1, sel.r2) - sel.r1;
+            let c = lay.col_near(pos.x).clamp(sel.c1, sel.c2) - sel.c1;
+            self.drag = Drag::Move(r, c);
+            return;
         }
 
         // Corner: select all
@@ -685,7 +714,7 @@ impl App {
                 }
                 self.status = Some(format!("Height: {:.2} ({} pixels)", h * 0.75, h.round()));
             }
-            Drag::Fill(_) => {
+            Drag::Fill(_) | Drag::Move(..) => {
                 if outside {
                     self.autoscroll(lay, pos);
                 }
@@ -742,6 +771,14 @@ impl App {
             Drag::Cells => {
                 if self.format_painter.is_some() {
                     self.apply_format_painter();
+                }
+            }
+            Drag::Move(dr, dc) => {
+                let r = lay.row_near(pos.y).saturating_sub(dr);
+                let c = lay.col_near(pos.x).saturating_sub(dc);
+                let copy = self.ctx.as_ref().is_some_and(|x| x.input(|i| i.modifiers.ctrl));
+                if let Some(ctx) = self.ctx.clone() {
+                    self.drop_selection(&ctx, r, c, copy);
                 }
             }
             Drag::ResizeCol(..) | Drag::ResizeRow(..) => {
@@ -984,6 +1021,19 @@ impl App {
             }
         }
 
+        // Note markers (red triangle in the top-right corner)
+        let notes: Vec<(u32, u32)> = self.wb.sheets[si].notes.keys().copied().collect();
+        for (r, c) in &notes {
+            if let (Some((t, _)), Some((_, rx))) = (lay.row_span(*r), lay.col_span(*c)) {
+                let s = 6.0 * z.max(0.7);
+                cp.add(egui::Shape::convex_polygon(
+                    vec![Pos2::new(rx - s - 1.0, t), Pos2::new(rx - 1.0, t), Pos2::new(rx - 1.0, t + s)],
+                    Color32::from_rgb(0xD0, 0x10, 0x10),
+                    Stroke::NONE,
+                ));
+            }
+        }
+
         // Frozen pane separators
         let (fr, fc) = self.sheet().freeze;
         if fr > 0 {
@@ -1042,6 +1092,17 @@ impl App {
             cp.rect_filled(fh.expand(1.0), 0.0, Color32::WHITE);
             cp.rect_filled(fh, 0.0, theme::ACCENT);
         }
+        // Move preview
+        if let Drag::Move(dr, dc) = self.drag {
+            if let Some(p) = ui.input(|i| i.pointer.interact_pos()) {
+                let r = lay.row_near(p.y).saturating_sub(dr);
+                let c = lay.col_near(p.x).saturating_sub(dc);
+                let t = Range::new(r, c, r + sel.rows() - 1, c + sel.cols() - 1);
+                let rr = self.range_rect(lay, t);
+                cp.rect_stroke(rr, 0.0, Stroke::new(2.0, Color32::from_gray(110)), StrokeKind::Middle);
+                ui.ctx().set_cursor_icon(CursorIcon::Move);
+            }
+        }
         // Fill preview
         if let Drag::Fill(src) = self.drag {
             if let Some(p) = ui.input(|i| i.pointer.interact_pos()) {
@@ -1092,6 +1153,26 @@ impl App {
 
         // In-cell editor
         self.paint_editor(ui, lay);
+
+        // Note popups (hovered cell, or all when "Show All Notes" is on)
+        if self.edit.is_none() && self.drag == Drag::None {
+            let shown_notes: Vec<(u32, u32)> =
+                if self.show_all_notes { notes.clone() } else { self.hover_cell.filter(|h| notes.contains(h)).into_iter().collect() };
+            let lp = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("cell_notes")));
+            for (r, c) in shown_notes {
+                let (Some((t, _)), Some((_, rx))) = (lay.row_span(r), lay.col_span(c)) else { continue };
+                let text = self.wb.sheets[si].notes.get(&(r, c)).cloned().unwrap_or_default();
+                let mut job = LayoutJob::single_section(text, TextFormat { font_id: theme::ui_font(12.0), color: Color32::BLACK, ..Default::default() });
+                job.wrap.max_width = 200.0;
+                let g = lp.layout_job(job);
+                let origin = Pos2::new(rx + 14.0, t - 4.0);
+                let bx = Rect::from_min_size(origin, g.size() + Vec2::new(12.0, 10.0));
+                lp.line_segment([Pos2::new(rx - 1.0, t + 1.0), bx.left_top() + Vec2::new(0.0, 6.0)], Stroke::new(1.0, Color32::from_gray(90)));
+                lp.rect_filled(bx, 0.0, Color32::from_rgb(0xFF, 0xFF, 0xE1));
+                lp.rect_stroke(bx, 0.0, Stroke::new(1.0, Color32::from_gray(120)), StrokeKind::Inside);
+                lp.galley(origin + Vec2::new(6.0, 5.0), g, Color32::BLACK);
+            }
+        }
 
         // Headers
         if self.show_headings {
@@ -1290,6 +1371,17 @@ impl App {
             }
             if ui.button("Clear Contents").clicked() {
                 self.clear(true, false);
+                ui.close();
+            }
+            ui.separator();
+            let (ar, ac) = self.active();
+            let has_note = self.sheet().notes.contains_key(&(ar, ac));
+            if ui.button(if has_note { "Edit Note" } else { "New Note" }).clicked() {
+                self.edit_note();
+                ui.close();
+            }
+            if has_note && ui.button("Delete Note").clicked() {
+                self.delete_notes_in_selection();
                 ui.close();
             }
             ui.separator();

@@ -956,6 +956,23 @@ impl App {
     }
 
     fn review_tab(&mut self, ui: &mut egui::Ui) {
+        self.group(ui, "Notes", |app, ui| {
+            let (r, c) = app.active();
+            let has = app.sheet().notes.contains_key(&(r, c));
+            let job = icon_job("🗒", false, if has { "Edit\nNote" } else { "New\nNote" }, 20.0, true, theme::TEXT);
+            if ui.add(egui::Button::new(job).min_size(Vec2::new(54.0, GROUP_H - 4.0))).on_hover_text("Shift+F2").clicked() {
+                app.edit_note();
+            }
+            ui.vertical(|ui| {
+                if ui.button("Delete Note").clicked() {
+                    app.delete_notes_in_selection();
+                }
+                let label = if app.show_all_notes { "✓ Show All Notes" } else { "Show All Notes" };
+                if ui.button(label).clicked() {
+                    app.show_all_notes = !app.show_all_notes;
+                }
+            });
+        });
         self.group(ui, "Proofing", |app, ui| {
             let job = icon_job("📊", false, "Workbook\nStatistics", 20.0, true, theme::TEXT);
             if ui.add(egui::Button::new(job).min_size(Vec2::new(66.0, GROUP_H - 4.0))).clicked() {

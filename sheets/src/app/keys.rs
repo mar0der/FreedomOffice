@@ -268,6 +268,7 @@ impl App {
                 }
             }
             Key::F2 if !m.shift => self.begin_edit(None, EditMode::Edit),
+            Key::F2 => self.edit_note(),
             Key::F3 if m.shift => self.dialog = Some(Dialog::insert_function()),
             Key::F3 if ctrl => self.dialog = Some(Dialog::NameManager { name: String::new(), refers: self.sel_abs_ref(), error: None }),
             Key::F5 => self.dialog = Some(Dialog::GoTo { text: String::new(), focus: true }),
@@ -450,6 +451,11 @@ impl App {
             }),
             Key::Backspace => ed!(|e: &mut super::Editor| e.backspace()),
             Key::Delete => ed!(|e: &mut super::Editor| e.delete()),
+            Key::F2 if m.shift => {
+                if self.commit_edit(false) {
+                    self.edit_note();
+                }
+            }
             Key::F2 => ed!(|e: &mut super::Editor| e.mode = if e.mode == EditMode::Enter { EditMode::Edit } else { EditMode::Enter }),
             Key::F4 => ed!(|e: &mut super::Editor| e.toggle_absolute()),
             Key::A if ctrl => ed!(|e: &mut super::Editor| e.select_all()),

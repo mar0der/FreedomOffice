@@ -66,6 +66,17 @@ pub fn read<R: Read + Seek>(src: R) -> Result<Workbook, String> {
             let ctx = SheetCtx { shared: &shared, xf: &xf, theme: &theme, date1904: info.date1904 };
             parse_sheet(&x, &ctx, &mut sheet);
         }
+        let srels = format!("{}_rels/{}.rels", dir_of(&path), file_of(&path));
+        if let Some(rx) = pkg.text(&srels) {
+            for r in parse_rels(&rx) {
+                if r.ty.ends_with("/comments") {
+                    let cp = resolve(&dir_of(&path), &r.target);
+                    if let Some(cx) = pkg.text(&cp) {
+                        parse_comments(&cx, &mut sheet);
+                    }
+                }
+            }
+        }
         wb.sheets.push(sheet);
     }
     if wb.sheets.is_empty() {
@@ -371,6 +382,27 @@ fn strip_future_prefixes(s: &str) -> String {
         return s.to_string();
     }
     s.replace("_xlfn.", "").replace("_xlws.", "").replace("_xlpm.", "")
+}
+
+// ---------------------------------------------------------------------------
+// Comments (notes)
+// ---------------------------------------------------------------------------
+
+fn parse_comments(xml: &str, sheet: &mut Sheet) {
+    let mut rd = Reader::from_str(xml);
+    loop {
+        match rd.read_event() {
+            Ok(Event::Start(e)) if local(&e) == "comment" => {
+                let at = attr(&e, "ref").and_then(|s| parse_ref(&s));
+                let text = read_rich_text(&mut rd, "comment");
+                if let Some(rc) = at {
+                    sheet.notes.insert(rc, text);
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

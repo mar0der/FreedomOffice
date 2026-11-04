@@ -39,6 +39,7 @@ pub enum Dialog {
     Stats,
     Shortcuts,
     PasteSpecial { mode: u8, transpose: bool },
+    Note { r: u32, c: u32, text: String, focus: bool },
 }
 
 impl Dialog {
@@ -615,6 +616,36 @@ impl App {
                             }
                         }
                         if ui.button("Close").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                            keep = false;
+                        }
+                    });
+                });
+            }
+            Dialog::Note { r, c, text, focus } => {
+                let (r, c) = (*r, *c);
+                let yellow = Color32::from_rgb(0xFF, 0xFF, 0xE1);
+                win(&format!("Note - {}", crate::model::cell_name(r, c))).show(ctx, |ui| {
+                    egui::Frame::new().fill(yellow).stroke(egui::Stroke::new(1.0, theme::BORDER)).show(ui, |ui| {
+                        let te = ui.add(egui::TextEdit::multiline(text).desired_width(300.0).desired_rows(6).frame(false).background_color(yellow));
+                        if *focus {
+                            te.request_focus();
+                            *focus = false;
+                        }
+                    });
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.add(egui::Button::new("OK").min_size(Vec2::new(76.0, 24.0)).fill(theme::ACCENT_LIGHT)).clicked() {
+                            let t = text.clone();
+                            self.set_note(r, c, Some(t));
+                            keep = false;
+                        }
+                        if ui.add(egui::Button::new("Delete Note").min_size(Vec2::new(90.0, 24.0))).clicked() {
+                            self.set_note(r, c, None);
+                            keep = false;
+                        }
+                        if ui.add(egui::Button::new("Cancel").min_size(Vec2::new(76.0, 24.0))).clicked()
+                            || ui.input(|i| i.key_pressed(egui::Key::Escape))
+                        {
                             keep = false;
                         }
                     });

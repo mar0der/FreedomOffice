@@ -354,7 +354,8 @@ impl App {
             text.push_str("\r\n");
         }
         ctx.copy_text(text.clone());
-        self.clip = Some(Clip { sheet: self.wb.active, range: sel, cells, text, cut });
+        let notes = sh.notes.iter().filter(|((r, c), _)| sel.contains(*r, *c)).map(|((r, c), t)| (r - sel.r1, c - sel.c1, t.clone())).collect();
+        self.clip = Some(Clip { sheet: self.wb.active, range: sel, cells, text, cut, notes });
     }
 
     fn normalize(s: &str) -> String {
@@ -445,13 +446,30 @@ impl App {
             for (dr0, dc0, cell) in taken {
                 dest.set(r0 + dr0, c0 + dc0, Some(cell));
             }
+            let src_rg = clip.range;
+            self.wb.sheets[src_sheet].notes.retain(|(r, c), _| !src_rg.contains(*r, *c));
+            for (dr0, dc0, t) in &clip.notes {
+                self.wb.sheets[si].notes.insert((r0 + dr0, c0 + dc0), t.clone());
+            }
             self.clip = None;
             self.select_range(target);
             self.changed();
             return;
         }
 
-        self.push_undo(&[Scope::Range(si, target)]);
+        if matches!(mode, PasteMode::All | PasteMode::Transpose) && !clip.notes.is_empty() {
+            self.push_undo(&[Scope::Sheet(si)]);
+            for ti in 0..tr {
+                for tj in 0..tc {
+                    for (dr, dc, t) in &clip.notes {
+                        let (dr, dc) = if mode == PasteMode::Transpose { (*dc, *dr) } else { (*dr, *dc) };
+                        self.wb.sheets[si].notes.insert((r0 + ti * h + dr, c0 + tj * w + dc), t.clone());
+                    }
+                }
+            }
+        } else {
+            self.push_undo(&[Scope::Range(si, target)]);
+        }
         for ti in 0..tr {
             for tj in 0..tc {
                 let br = r0 + ti * h;
@@ -515,6 +533,9 @@ impl App {
             let sh = &mut self.wb.sheets[si];
             sh.merges.retain(|m| !m.intersects(&sel));
         }
+        if contents && formats {
+            self.wb.sheets[si].notes.retain(|(r, c), _| !sel.contains(*r, *c));
+        }
         self.changed();
     }
 
@@ -554,6 +575,14 @@ impl App {
             sh.col_w = sh.col_w.drain().filter_map(|(c, w)| map(c).map(|nc| (nc, w))).collect();
             sh.hidden_cols = sh.hidden_cols.drain().filter_map(map).collect();
         }
+        sh.notes = sh
+            .notes
+            .drain()
+            .filter_map(|((r, c), t)| {
+                let k = if rows { map(r).map(|nr| (nr, c)) } else { map(c).map(|nc| (r, nc)) };
+                k.map(|k| (k, t))
+            })
+            .collect();
         let fix = |rg: Range| -> Option<Range> {
             let (a, b) = if rows { (rg.r1, rg.r2) } else { (rg.c1, rg.c2) };
             let (na, nb) = if n > 0 {
@@ -1742,6 +1771,61 @@ impl App {
         let style = self.wb.sheets[si].get(r, c).map(|x| x.style).unwrap_or(0);
         let cell = Cell { value: Value::Empty, formula: Some(Box::new(Formula::new(f))), style };
         self.wb.sheets[si].set(r, c, Some(cell));
+    }
+}
+
+impl App {
+    // ------------------------------------------------------------------
+    // Notes
+    // ------------------------------------------------------------------
+
+    pub fn edit_note(&mut self) {
+        self.commit_edit(false);
+        let (r, c) = self.active();
+        let text = self.sheet().notes.get(&(r, c)).cloned().unwrap_or_default();
+        self.dialog = Some(Dialog::Note { r, c, text, focus: true });
+    }
+
+    pub fn set_note(&mut self, r: u32, c: u32, text: Option<String>) {
+        let si = self.wb.active;
+        self.push_undo(&[Scope::Sheet(si)]);
+        match text {
+            Some(t) if !t.trim().is_empty() => {
+                self.wb.sheets[si].notes.insert((r, c), t);
+            }
+            _ => {
+                self.wb.sheets[si].notes.remove(&(r, c));
+            }
+        }
+        self.dirty = true;
+    }
+
+    pub fn delete_notes_in_selection(&mut self) {
+        let sel = self.sel();
+        let si = self.wb.active;
+        if !self.wb.sheets[si].notes.keys().any(|(r, c)| sel.contains(*r, *c)) {
+            return;
+        }
+        self.push_undo(&[Scope::Sheet(si)]);
+        self.wb.sheets[si].notes.retain(|(r, c), _| !sel.contains(*r, *c));
+        self.dirty = true;
+    }
+
+    // ------------------------------------------------------------------
+    // Drag-and-drop move/copy of the selection
+    // ------------------------------------------------------------------
+
+    pub fn drop_selection(&mut self, ctx: &egui::Context, r: u32, c: u32, copy: bool) {
+        let sel = self.sel();
+        if (r, c) == (sel.r1, sel.c1) {
+            return;
+        }
+        self.copy(ctx, !copy);
+        self.select(r, c, false);
+        self.paste_internal(PasteMode::All);
+        if copy {
+            self.clip = None;
+        }
     }
 }
 

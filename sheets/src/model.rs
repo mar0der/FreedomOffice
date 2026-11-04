@@ -402,6 +402,8 @@ pub struct Sheet {
     pub gridlines: bool,
     pub tab_color: Option<u32>,
     pub view: SheetView,
+    /// Cell notes (comments) keyed by (row, col).
+    pub notes: HashMap<(u32, u32), String>,
 }
 
 impl Sheet {
@@ -419,6 +421,7 @@ impl Sheet {
             gridlines: true,
             tab_color: None,
             view: SheetView::default(),
+            notes: HashMap::new(),
         }
     }
 
