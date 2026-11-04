@@ -41,6 +41,7 @@ pub enum Dialog {
     PasteSpecial { mode: u8, transpose: bool },
     Note { r: u32, c: u32, text: String, focus: bool },
     Link { r: u32, c: u32, text: String, address: String, focus: bool },
+    Recover { files: Vec<std::path::PathBuf> },
     CondFmt(Box<super::condfmt_ui::CfDialog>),
     Validation(Box<super::validation_ui::DvDialog>),
     DvAlert(Box<super::validation_ui::DvAlert>),
@@ -690,6 +691,61 @@ impl App {
                             keep = false;
                         }
                     });
+                });
+            }
+            Dialog::Recover { files } => {
+                win("Document Recovery").show(ctx, |ui| {
+                    ui.set_min_width(420.0);
+                    ui.label("FreedomOffice Sheets closed unexpectedly last time. These unsaved files were recovered:");
+                    ui.add_space(6.0);
+                    let mut remove = None;
+                    let mut open = None;
+                    for (i, f) in files.iter().enumerate() {
+                        let name = std::fs::read_to_string(f.with_extension("name")).unwrap_or_else(|_| "Book".into());
+                        let when = std::fs::metadata(f)
+                            .and_then(|m| m.modified())
+                            .ok()
+                            .map(|t| chrono::DateTime::<chrono::Local>::from(t).format("%Y-%m-%d %H:%M").to_string())
+                            .unwrap_or_default();
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(format!("{name} (Recovered)")).strong());
+                            ui.label(RichText::new(when).color(theme::TEXT_DIM));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("Delete").clicked() {
+                                    remove = Some(i);
+                                }
+                                if ui.button("Open").clicked() {
+                                    open = Some(i);
+                                }
+                            });
+                        });
+                    }
+                    if let Some(i) = remove {
+                        let f = files.remove(i);
+                        let _ = std::fs::remove_file(&f);
+                        let _ = std::fs::remove_file(f.with_extension("name"));
+                    }
+                    if let Some(i) = open {
+                        let f = files.remove(i);
+                        let name = std::fs::read_to_string(f.with_extension("name")).unwrap_or_else(|_| "Book1".into());
+                        match crate::io::load(&f) {
+                            Ok(mut wb) => {
+                                wb.path = None;
+                                wb.recalc();
+                                self.wb = wb;
+                                self.dirty = true;
+                                self.status = Some(format!("Recovered '{name}'. Save it to keep the changes."));
+                                let _ = std::fs::remove_file(&f);
+                                let _ = std::fs::remove_file(f.with_extension("name"));
+                            }
+                            Err(e) => self.status = Some(format!("Couldn't open the recovered file: {e}")),
+                        }
+                        keep = false;
+                    }
+                    ui.add_space(8.0);
+                    if files.is_empty() || ui.button("Close").clicked() {
+                        keep = false;
+                    }
                 });
             }
             Dialog::PasteSpecial { mode, transpose } => {

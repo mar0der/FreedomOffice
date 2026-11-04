@@ -168,6 +168,9 @@ pub struct App {
     pub print_selection: bool,
     pub last_press_pos: Option<egui::Pos2>,
     pub pending_link: Option<((u32, u32), String)>,
+    /// AutoRecover: where this session's recovery copy is written, and when it was last written.
+    pub recovery_path: Option<PathBuf>,
+    pub last_autosave: f64,
     pub chart: chart_view::ChartUi,
     pub cf: condfmt_ui::CfState,
     pub dv: validation_ui::DvState,
@@ -231,6 +234,8 @@ impl App {
             print_selection: false,
             last_press_pos: None,
             pending_link: None,
+            recovery_path: recovery_dir().map(|d| d.join(format!("Recovered-{}.xlsx", std::process::id()))),
+            last_autosave: 0.0,
             chart: Default::default(),
             cf: Default::default(),
             dv: Default::default(),
@@ -238,7 +243,55 @@ impl App {
         if let Some(p) = path {
             app.open_path(p);
         }
+        // Offer files left behind by a session that ended unexpectedly.
+        if let Some(dir) = recovery_dir() {
+            if let Ok(rd) = std::fs::read_dir(&dir) {
+                let files: Vec<PathBuf> = rd
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("xlsx")) && Some(p) != app.recovery_path.as_ref())
+                    .collect();
+                if !files.is_empty() {
+                    app.dialog = Some(dialogs::Dialog::Recover { files });
+                }
+            }
+        }
         app
+    }
+
+    /// Writes a recovery copy every few minutes while there are unsaved changes.
+    fn autosave(&mut self, ctx: &egui::Context) {
+        const INTERVAL: f64 = 120.0;
+        let now = ctx.input(|i| i.time);
+        if !self.dirty {
+            self.last_autosave = now;
+            return;
+        }
+        ctx.request_repaint_after(std::time::Duration::from_secs(30));
+        if now - self.last_autosave < INTERVAL || self.edit.is_some() {
+            return;
+        }
+        self.last_autosave = now;
+        let Some(path) = self.recovery_path.clone() else { return };
+        let mut wb = self.wb.clone();
+        // Remember where the original lives inside the recovery copy's document name.
+        let name = self.wb.file_name();
+        std::thread::spawn(move || {
+            if let Some(d) = path.parent() {
+                let _ = std::fs::create_dir_all(d);
+            }
+            wb.path = None;
+            if crate::io::save(&wb, &path).is_ok() {
+                let _ = std::fs::write(path.with_extension("name"), name);
+            }
+        });
+    }
+
+    pub fn remove_recovery(&self) {
+        if let Some(p) = &self.recovery_path {
+            let _ = std::fs::remove_file(p);
+            let _ = std::fs::remove_file(p.with_extension("name"));
+        }
     }
 
     // ------------------------------------------------------------------
@@ -709,6 +762,7 @@ impl App {
                 if ext == "xlsx" || ext == "xlsm" {
                     self.wb.path = Some(p.clone());
                     self.dirty = false;
+                    self.remove_recovery();
                 } else if self.wb.path.is_none() {
                     self.wb.path = Some(p.clone());
                     self.dirty = false;
@@ -752,6 +806,10 @@ fn is_native_format(p: &std::path::Path) -> bool {
     matches!(p.extension().map(|e| e.to_string_lossy().to_lowercase()).as_deref(), Some("xlsx") | Some("xlsm"))
 }
 
+fn recovery_dir() -> Option<PathBuf> {
+    std::env::var("LOCALAPPDATA").ok().map(|a| PathBuf::from(a).join("FreedomOffice").join("AutoRecover"))
+}
+
 fn recent_file() -> Option<PathBuf> {
     std::env::var("APPDATA").ok().map(|a| PathBuf::from(a).join("FreedomOffice").join("sheets-recent.txt"))
 }
@@ -791,6 +849,11 @@ fn set_caption_color(cc: &eframe::CreationContext<'_>) {
 }
 
 impl eframe::App for App {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Normal exit (after the save prompt): the recovery copy is no longer needed.
+        self.remove_recovery();
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.fonts.flush(ctx);
         self.edit_rect = None;
@@ -813,6 +876,7 @@ impl eframe::App for App {
 
         self.handle_keys(ctx);
         self.update_title(ctx);
+        self.autosave(ctx);
 
         if self.backstage.is_some() {
             self.backstage_ui(ctx);
