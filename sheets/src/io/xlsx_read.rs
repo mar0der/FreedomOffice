@@ -66,6 +66,7 @@ pub fn read<R: Read + Seek>(src: R) -> Result<Workbook, String> {
             active = wb.sheets.len();
         }
         let mut sheet = Sheet::new(&sh.name);
+        sheet.hidden = sh.hidden;
         if let Some(x) = pkg.text(&path) {
             let ctx = SheetCtx { shared: &shared, xf: &xf, theme: &theme, date1904: info.date1904 };
             parse_sheet(&x, &ctx, &mut sheet);
@@ -347,6 +348,7 @@ fn parse_f(s: &str) -> Option<f64> {
 struct SheetEntry {
     name: String,
     rid: String,
+    hidden: bool,
 }
 
 #[derive(Default)]
@@ -366,7 +368,8 @@ fn parse_workbook(xml: &str) -> WorkbookInfo {
                 "sheet" => {
                     let name = attr(&e, "name").unwrap_or_else(|| format!("Sheet{}", info.sheets.len() + 1));
                     let rid = attr(&e, "id").unwrap_or_default();
-                    info.sheets.push(SheetEntry { name, rid });
+                    let hidden = attr(&e, "state").is_some_and(|s| s != "visible");
+                    info.sheets.push(SheetEntry { name, rid, hidden });
                 }
                 "workbookView" => {
                     if let Some(t) = attr(&e, "activeTab").and_then(|v| v.parse().ok()) {

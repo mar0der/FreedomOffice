@@ -30,6 +30,8 @@ fn build(wb: &Workbook) -> Result<XWorkbook, XlsxError> {
         write_sheet(wb, sh, ws, &mut formats)?;
         if i == wb.active {
             ws.set_active(true);
+        } else if sh.hidden {
+            ws.set_hidden(true);
         }
     }
     for (name, text) in &wb.names {

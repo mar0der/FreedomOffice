@@ -889,16 +889,41 @@ impl App {
 
     pub fn autofit_rows(&mut self, rows: &[u32]) {
         self.push_undo(&[Scope::Sheet(self.wb.active)]);
+        self.fit_rows(rows);
+    }
+
+    /// Sets row heights to fit their content (wrapped text and line breaks included).
+    pub fn fit_rows(&mut self, rows: &[u32]) {
+        let ctx = self.ctx.clone();
         for &r in rows {
             let mut h: f32 = crate::model::DEFAULT_ROW_H;
-            let cells: Vec<Cell> = self.sheet().rows.get(&r).map(|row| row.values().cloned().collect()).unwrap_or_default();
-            for cell in cells {
-                let st = self.wb.style(cell.style);
-                let lines = match &cell.value {
+            let cells: Vec<(u32, Cell)> = self.sheet().rows.get(&r).map(|row| row.iter().map(|(c, x)| (*c, x.clone())).collect()).unwrap_or_default();
+            for (c, cell) in cells {
+                if self.sheet().merge_at(r, c).is_some_and(|m| m.rows() > 1) {
+                    continue;
+                }
+                let st = self.wb.style(cell.style).clone();
+                let line_h = st.font_size() * 96.0 / 72.0 * 1.25;
+                let mut lines = match &cell.value {
                     Value::Text(t) => t.lines().count().max(1),
                     _ => 1,
                 } as f32;
-                let line_h = st.font_size() * 96.0 / 72.0 * 1.25;
+                if st.wrap {
+                    if let (Some(ctx), Value::Text(t)) = (&ctx, &cell.value) {
+                        let z = self.zoom;
+                        self.zoom = 1.0;
+                        let font = self.cell_font(&st);
+                        self.zoom = z;
+                        let width = (self.sheet().col_width(c) - 6.0).max(4.0);
+                        let mut job = egui::text::LayoutJob::single_section(
+                            t.clone(),
+                            egui::TextFormat { font_id: font, ..Default::default() },
+                        );
+                        job.wrap.max_width = width;
+                        let rows_n = ctx.fonts_mut(|f| f.layout_job(job).rows.len()).max(1) as f32;
+                        lines = lines.max(rows_n);
+                    }
+                }
                 h = h.max(line_h * lines + 3.0);
             }
             let sh = self.sheet_mut();
@@ -997,6 +1022,12 @@ impl App {
     pub fn toggle_wrap(&mut self) {
         let v = !self.active_style().wrap;
         self.apply_style(move |s| s.wrap = v);
+        // Like the desktop app, rows grow (or shrink back) to fit wrapped text.
+        let sel = self.sel_clipped();
+        if sel.rows() <= 5000 {
+            let rows: Vec<u32> = (sel.r1..=sel.r2).collect();
+            self.fit_rows(&rows);
+        }
     }
     pub fn set_halign(&mut self, a: HAlign) {
         let cur = self.active_style().halign;
@@ -1794,6 +1825,44 @@ impl App {
         self.wb.sheets.insert(i + 1, copy);
         self.wb.active = i + 1;
         self.changed();
+    }
+
+    pub fn hide_sheet(&mut self, i: usize) {
+        let visible = self.wb.sheets.iter().filter(|s| !s.hidden).count();
+        if visible <= 1 {
+            self.dialog = Some(Dialog::Message { title: "Hide".into(), text: "A workbook must contain at least one visible worksheet.".into() });
+            return;
+        }
+        self.push_undo(&[Scope::All]);
+        self.wb.sheets[i].hidden = true;
+        if self.wb.active == i {
+            let next = (0..self.wb.sheets.len()).map(|k| (i + k) % self.wb.sheets.len()).find(|k| !self.wb.sheets[*k].hidden).unwrap_or(0);
+            self.wb.active = next;
+        }
+        self.dirty = true;
+    }
+
+    pub fn unhide_sheet(&mut self, i: usize) {
+        self.push_undo(&[Scope::All]);
+        self.wb.sheets[i].hidden = false;
+        self.wb.active = i;
+        self.dirty = true;
+    }
+
+    /// Next visible sheet in a direction (Ctrl+PgUp/PgDn).
+    pub fn next_visible_sheet(&self, forward: bool) -> usize {
+        let n = self.wb.sheets.len();
+        let mut i = self.wb.active;
+        loop {
+            let j = if forward { i + 1 } else { i.wrapping_sub(1) };
+            if j >= n {
+                return self.wb.active;
+            }
+            if !self.wb.sheets[j].hidden {
+                return j;
+            }
+            i = j;
+        }
     }
 
     pub fn switch_sheet(&mut self, i: usize) {

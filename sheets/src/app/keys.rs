@@ -266,9 +266,7 @@ impl App {
             Key::PageDown | Key::PageUp => {
                 let down = key == Key::PageDown;
                 if ctrl {
-                    let n = self.wb.sheets.len();
-                    let i = self.wb.active;
-                    let j = if down { (i + 1).min(n - 1) } else { i.saturating_sub(1) };
+                    let j = self.next_visible_sheet(down);
                     self.switch_sheet(j);
                 } else if m.alt {
                     self.page_horiz(down, m.shift);
@@ -485,9 +483,7 @@ impl App {
             Key::A if ctrl => ed!(|e: &mut super::Editor| e.select_all()),
             Key::Semicolon | Key::Colon if ctrl => self.insert_now(m.shift || key == Key::Colon),
             Key::PageDown | Key::PageUp if ctrl => {
-                let n = self.wb.sheets.len();
-                let i = self.wb.active;
-                let j = if key == Key::PageDown { (i + 1).min(n - 1) } else { i.saturating_sub(1) };
+                let j = self.next_visible_sheet(key == Key::PageDown);
                 self.switch_sheet(j);
             }
             Key::Z if ctrl => self.cancel_edit(),

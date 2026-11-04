@@ -406,6 +406,7 @@ pub struct Sheet {
     pub filter: Option<AutoFilter>,
     pub gridlines: bool,
     pub tab_color: Option<u32>,
+    pub hidden: bool,
     pub view: SheetView,
     /// Cell notes (comments) keyed by (row, col).
     pub notes: HashMap<(u32, u32), String>,
@@ -442,6 +443,7 @@ impl Sheet {
             filter: None,
             gridlines: true,
             tab_color: None,
+            hidden: false,
             view: SheetView::default(),
             notes: HashMap::new(),
             links: HashMap::new(),

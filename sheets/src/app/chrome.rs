@@ -235,6 +235,9 @@ impl App {
                     }
                     break;
                 }
+                if self.wb.sheets[i].hidden {
+                    continue;
+                }
                 let active = i == self.wb.active;
                 if let Some((ri, buf)) = &mut self.rename_tab {
                     if *ri == i {
@@ -304,6 +307,22 @@ impl App {
                         action = Some((i, 6));
                         ui.close();
                     }
+                    if ui.button("Hide").clicked() {
+                        action = Some((i, 7));
+                        ui.close();
+                    }
+                    let hidden: Vec<(usize, String)> =
+                        self.wb.sheets.iter().enumerate().filter(|(_, s)| s.hidden).map(|(k, s)| (k, s.name.clone())).collect();
+                    if !hidden.is_empty() {
+                        ui.menu_button("Unhide", |ui| {
+                            for (k, n) in hidden {
+                                if ui.button(n).clicked() {
+                                    action = Some((k, 8));
+                                    ui.close();
+                                }
+                            }
+                        });
+                    }
                     ui.menu_button("Tab Color", |ui| {
                         if let Some(c) = super::ribbon::color_grid(ui, true) {
                             self.push_undo(&[super::Scope::Sheet(i)]);
@@ -335,6 +354,8 @@ impl App {
                     4 => self.move_sheet(i, false),
                     5 => self.move_sheet(i, true),
                     6 => self.duplicate_sheet(i),
+                    7 => self.hide_sheet(i),
+                    8 => self.unhide_sheet(i),
                     _ => {}
                 }
             }
