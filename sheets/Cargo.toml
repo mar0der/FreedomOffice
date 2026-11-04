@@ -1,6 +1,6 @@
 [package]
 name = "freedom-sheets"
-version = "0.1.0"
+version = "26.45.1"
 edition = "2024"
 rust-version = "1.88"
 description = "FreedomOffice Sheets - a lightweight, open source spreadsheet application"

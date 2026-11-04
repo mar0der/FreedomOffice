@@ -738,7 +738,7 @@ dependencies = [
 
 [[package]]
 name = "freedom-sheets"
-version = "0.1.0"
+version = "26.45.1"
 dependencies = [
  "calamine",
  "chrono",
