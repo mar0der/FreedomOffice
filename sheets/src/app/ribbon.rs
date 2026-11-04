@@ -96,14 +96,33 @@ fn icon_job(icon: &str, is_icon: bool, label: &str, size: f32, vertical: bool, c
     }
     if vertical {
         job.halign = Align::Center;
-        job.wrap.max_width = 62.0;
     }
     job
 }
 
+/// Large ribbon button (icon over label) painted directly so multi-line labels stay centred.
+pub fn big_btn(ui: &mut egui::Ui, job: LayoutJob, min_w: f32, checked: bool) -> egui::Response {
+    let galley = ui.painter().layout_job(job);
+    let w = min_w.max(galley.rect.width() + 12.0);
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, GROUP_H - 4.0), Sense::click());
+    let p = ui.painter();
+    if !ui.is_enabled() {
+        // nothing
+    } else if resp.is_pointer_button_down_on() {
+        p.rect(rect, 3.0, theme::PRESSED, Stroke::new(1.0, Color32::from_gray(176)), egui::StrokeKind::Inside);
+    } else if checked {
+        p.rect(rect, 3.0, theme::CHECKED, Stroke::NONE, egui::StrokeKind::Inside);
+    } else if resp.hovered() {
+        p.rect(rect, 3.0, theme::HOVER, Stroke::new(1.0, Color32::from_gray(200)), egui::StrokeKind::Inside);
+    }
+    let pos = Pos2::new(rect.center().x - galley.rect.center().x, rect.top() + 6.0 - galley.rect.top());
+    p.galley(pos, galley, theme::TEXT);
+    resp
+}
+
 /// Large ribbon button that opens a dropdown menu.
 fn big_menu(ui: &mut egui::Ui, job: LayoutJob, add: impl FnOnce(&mut egui::Ui)) -> egui::Response {
-    let r = ui.add(egui::Button::new(job).min_size(Vec2::new(54.0, GROUP_H - 4.0)));
+    let r = big_btn(ui, job, 54.0, false);
     egui::Popup::menu(&r).show(add);
     r
 }
@@ -116,7 +135,7 @@ impl App {
 
     fn big(&self, ui: &mut egui::Ui, code: char, fallback: &'static str, label: &str, tip: &str) -> egui::Response {
         let job = self.ib(code, fallback, label, 22.0, true);
-        ui.add(egui::Button::new(job).min_size(Vec2::new(50.0, GROUP_H - 4.0))).on_hover_text(tip)
+        big_btn(ui, job, 50.0, false).on_hover_text(tip)
     }
 
     fn small(&self, ui: &mut egui::Ui, code: char, fallback: &'static str, label: &str, tip: &str, checked: bool) -> egui::Response {
@@ -137,8 +156,10 @@ impl App {
     }
 
     pub(super) fn group(&mut self, ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut Self, &mut egui::Ui)) {
+        let label_w = ui.painter().layout_no_wrap(label.to_string(), theme::ui_font(11.0), theme::TEXT_DIM).size().x;
         let resp = ui.vertical(|ui| {
             ui.set_height(GROUP_H + 18.0);
+            ui.set_min_width(label_w + 10.0);
             let w = ui.available_width();
             ui.allocate_ui_with_layout(Vec2::new(w, GROUP_H), egui::Layout::left_to_right(Align::Center), |ui| {
                 ui.set_height(GROUP_H);
@@ -516,7 +537,7 @@ impl App {
         self.group(ui, "Styles", |app, ui| {
             app.cf_ribbon_button(ui);
             let job = app.ib(ic::TABLE, "▤", "Cell\nStyles", 20.0, true);
-            ui.menu_button(job, |ui| {
+            big_menu(ui, job, |ui| {
                 ui.set_min_width(170.0);
                 type F = fn(&mut crate::model::Style);
                 let presets: [(&str, F); 10] = [
@@ -659,9 +680,9 @@ impl App {
                 });
             });
             let job = app.ib(ic::SORT, "⇅", "Sort &\nFilter", 20.0, true);
-            ui.menu_button(job, |ui| app.sort_menu(ui));
+            big_menu(ui, job, |ui| app.sort_menu(ui));
             let job = app.ib(ic::FIND, "🔍", "Find &\nSelect", 20.0, true);
-            ui.menu_button(job, |ui| {
+            big_menu(ui, job, |ui| {
                 ui.set_min_width(160.0);
                 if ui.button("Find... (Ctrl+F)").clicked() {
                     app.find.replace = false;
@@ -804,7 +825,7 @@ impl App {
         self.group(ui, "Charts", |app, ui| app.chart_insert_buttons(ui));
         self.group(ui, "Functions", |app, ui| {
             let job = icon_job("fx", false, "Function", 20.0, true, theme::TEXT);
-            if ui.add(egui::Button::new(job).min_size(Vec2::new(54.0, GROUP_H - 4.0))).on_hover_text("Insert Function (Shift+F3)").clicked() {
+            if big_btn(ui, job, 54.0, false).on_hover_text("Insert Function (Shift+F3)").clicked() {
                 app.dialog = Some(Dialog::insert_function());
             }
         });
@@ -881,7 +902,7 @@ impl App {
     fn formulas_tab(&mut self, ui: &mut egui::Ui) {
         self.group(ui, "Function Library", |app, ui| {
             let job = icon_job("fx", false, "Insert\nFunction", 20.0, true, theme::TEXT);
-            if ui.add(egui::Button::new(job).min_size(Vec2::new(54.0, GROUP_H - 4.0))).clicked() {
+            if big_btn(ui, job, 54.0, false).clicked() {
                 app.dialog = Some(Dialog::insert_function());
             }
             let job = icon_job("Σ", false, "AutoSum", 22.0, true, theme::TEXT);
@@ -917,7 +938,7 @@ impl App {
         });
         self.group(ui, "Defined Names", |app, ui| {
             let job = icon_job("🏷", false, "Name\nManager", 18.0, true, theme::TEXT);
-            if ui.add(egui::Button::new(job).min_size(Vec2::new(60.0, GROUP_H - 4.0))).on_hover_text("Name Manager (Ctrl+F3)").clicked() {
+            if big_btn(ui, job, 60.0, false).on_hover_text("Name Manager (Ctrl+F3)").clicked() {
                 app.dialog = Some(Dialog::NameManager { name: String::new(), refers: app.sel_abs_ref(), error: None });
             }
         });
@@ -929,7 +950,7 @@ impl App {
         self.group(ui, "Calculation", |app, ui| {
             let (c, ci) = app.icon(ic::CALC, "🖩");
             let job = icon_job(&c, ci, "Calculate\nNow", 20.0, true, theme::TEXT);
-            if ui.add(egui::Button::new(job).min_size(Vec2::new(60.0, GROUP_H - 4.0))).on_hover_text("Calculate Now (F9)").clicked() {
+            if big_btn(ui, job, 60.0, false).on_hover_text("Calculate Now (F9)").clicked() {
                 app.recalc_now();
             }
         });
@@ -955,11 +976,7 @@ impl App {
             }
             let on = app.sheet().filter.is_some();
             let job = app.ib(ic::FILTER, "⏷", "Filter", 22.0, true);
-            let mut b = egui::Button::new(job).min_size(Vec2::new(50.0, GROUP_H - 4.0));
-            if on {
-                b = b.fill(theme::CHECKED);
-            }
-            if ui.add(b).on_hover_text("Filter (Ctrl+Shift+L)").clicked() {
+            if big_btn(ui, job, 50.0, on).on_hover_text("Filter (Ctrl+Shift+L)").clicked() {
                 app.toggle_filter();
             }
             ui.vertical(|ui| {
@@ -973,11 +990,11 @@ impl App {
         });
         self.group(ui, "Data Tools", |app, ui| {
             let job = icon_job("⫼", false, "Text to\nColumns", 20.0, true, theme::TEXT);
-            if ui.add(egui::Button::new(job).min_size(Vec2::new(60.0, GROUP_H - 4.0))).clicked() {
+            if big_btn(ui, job, 60.0, false).clicked() {
                 app.dialog = Some(Dialog::TextToColumns { delim: 0, other: String::new() });
             }
             let job = icon_job("⧉", false, "Remove\nDuplicates", 20.0, true, theme::TEXT);
-            if ui.add(egui::Button::new(job).min_size(Vec2::new(66.0, GROUP_H - 4.0))).clicked() {
+            if big_btn(ui, job, 66.0, false).clicked() {
                 app.open_remove_duplicates();
             }
             app.dv_ribbon_button(ui);
@@ -989,7 +1006,7 @@ impl App {
             let (r, c) = app.active();
             let has = app.sheet().notes.contains_key(&(r, c));
             let job = icon_job("🗒", false, if has { "Edit\nNote" } else { "New\nNote" }, 20.0, true, theme::TEXT);
-            if ui.add(egui::Button::new(job).min_size(Vec2::new(54.0, GROUP_H - 4.0))).on_hover_text("Shift+F2").clicked() {
+            if big_btn(ui, job, 54.0, false).on_hover_text("Shift+F2").clicked() {
                 app.edit_note();
             }
             ui.vertical(|ui| {
@@ -1004,7 +1021,7 @@ impl App {
         });
         self.group(ui, "Proofing", |app, ui| {
             let job = icon_job("📊", false, "Workbook\nStatistics", 20.0, true, theme::TEXT);
-            if ui.add(egui::Button::new(job).min_size(Vec2::new(66.0, GROUP_H - 4.0))).clicked() {
+            if big_btn(ui, job, 66.0, false).clicked() {
                 app.dialog = Some(Dialog::Stats);
             }
         });
@@ -1027,17 +1044,17 @@ impl App {
                 app.dialog = Some(Dialog::Zoom { custom: format!("{}", (app.zoom * 100.0).round()) });
             }
             let job = icon_job("100", false, "100%", 16.0, true, theme::TEXT);
-            if ui.add(egui::Button::new(job).min_size(Vec2::new(50.0, GROUP_H - 4.0))).clicked() {
+            if big_btn(ui, job, 50.0, false).clicked() {
                 app.zoom = 1.0;
             }
             let job = icon_job("⛶", false, "Zoom to\nSelection", 20.0, true, theme::TEXT);
-            if ui.add(egui::Button::new(job).min_size(Vec2::new(62.0, GROUP_H - 4.0))).clicked() {
+            if big_btn(ui, job, 62.0, false).clicked() {
                 app.zoom_to_selection();
             }
         });
         self.group(ui, "Window", |app, ui| {
             let job = app.ib(ic::PIN, "❄", "Freeze\nPanes", 20.0, true);
-            ui.menu_button(job, |ui| {
+            big_menu(ui, job, |ui| {
                 ui.set_min_width(200.0);
                 let frozen = app.sheet().freeze != (0, 0);
                 if ui.button(if frozen { "Unfreeze Panes" } else { "Freeze Panes" }).clicked() {
@@ -1062,7 +1079,7 @@ impl App {
                 app.backstage = Some(Backstage::About);
             }
             let job = icon_job("⌨", false, "Keyboard\nShortcuts", 20.0, true, theme::TEXT);
-            if ui.add(egui::Button::new(job).min_size(Vec2::new(66.0, GROUP_H - 4.0))).clicked() {
+            if big_btn(ui, job, 66.0, false).clicked() {
                 app.dialog = Some(Dialog::Shortcuts);
             }
         });
