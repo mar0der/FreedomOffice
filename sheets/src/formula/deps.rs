@@ -330,9 +330,15 @@ fn collect(
             }
         }
         Expr::Neg(a) | Expr::Plus(a) | Expr::Percent(a) | Expr::Paren(a) => collect(a, wb, cur, out, vol, depth, names),
-        Expr::Bin(_, a, b) => {
-            collect(a, wb, cur, out, vol, depth, names);
-            collect(b, wb, cur, out, vol, depth, names);
+        Expr::Bin(..) => {
+            // Operator chains nest to the left: walk the spine iteratively (names expanded up
+            // to 16 levels would otherwise multiply the recursion depth).
+            let mut e = e;
+            while let Expr::Bin(_, a, b) = e {
+                collect(b, wb, cur, out, vol, depth, names);
+                e = a;
+            }
+            collect(e, wb, cur, out, vol, depth, names);
         }
         Expr::Func(name, args) => {
             if VOLATILE.contains(&name.as_str()) {

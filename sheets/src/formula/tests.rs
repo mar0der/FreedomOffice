@@ -649,3 +649,240 @@ fn fn_conditional_aggregates_with_dates() {
     // criteria arrays are lifted: one result per criterion
     assert_eq!(eval_array(&wb, 0, 9, 9, "=COUNTIF(B1:B5,{\">20\",\"<20\"})"), nums(&[&[3.0, 1.0]]));
 }
+
+// ---------------------------------------------------------------------------
+// Robustness: hostile arguments must give errors, never panics, hangs or huge allocations
+// ---------------------------------------------------------------------------
+
+#[test]
+fn error_literal_after_hash_with_multibyte_text() {
+    for src in ["=#Mañana", "=#üü", "=1+#ñ", "=#N/Añ", "=SUM(#Ü)"] {
+        assert_eq!(f(src), Value::Error(ErrorKind::Name), "{src}");
+        let mut wb = Workbook::new();
+        let cell = cell_from_input(&mut wb, src, 0);
+        assert!(cell.unwrap().formula.unwrap().ast.is_none(), "{src}");
+    }
+    assert_eq!(f("=#N/A"), NA);
+}
+
+#[test]
+fn text_functions_with_huge_or_negative_counts() {
+    assert_eq!(f("=MID(\"abc\",2,1E19)"), t("bc"));
+    assert_eq!(f("=MID(\"abc\",1E19,2)"), t(""));
+    assert_eq!(f("=MID(\"abc\",1E19,1E19)"), t(""));
+    is_err("=MID(\"abc\",-1E19,1)", ErrorKind::Value);
+    assert_eq!(f("=LEFT(\"abc\",1E19)&RIGHT(\"abc\",1E19)"), t("abcabc"));
+    is_err("=LEFT(\"abc\",-1E19)", ErrorKind::Value);
+    assert_eq!(f("=REPLACE(\"abc\",2,1E19,\"x\")"), t("ax"));
+    assert_eq!(f("=REPLACE(\"abc\",1E19,1E19,\"x\")"), t("abcx"));
+    assert_eq!(f("=REPT(\"\",1E19)"), t(""));
+    is_err("=REPT(\"ab\",1E19)", ErrorKind::Value);
+    is_err("=REPT(\"ab\",-1)", ErrorKind::Value);
+    is_err("=FIND(\"c\",\"abc\",1E19)", ErrorKind::Value);
+    is_err("=SEARCH(\"b\",\"abc\",-1E19)", ErrorKind::Value);
+    assert_eq!(f("=SEARCH(\"b?d\",\"abcd\")"), n(2.0));
+    assert_eq!(f("=SEARCH(\"c*\",\"abcd\")"), n(3.0));
+    assert_eq!(f("=SEARCH(\"b~\",\"ab~c\")"), n(2.0));
+    assert_eq!(f("=SEARCH(\"~*\",\"ab*c\")"), n(3.0));
+    is_err("=SEARCH(\"z*\",\"abcd\")", ErrorKind::Value);
+    is_err("=TEXTBEFORE(\"a-b\",\"-\",-1E19)", ErrorKind::NA);
+    is_err("=TEXTAFTER(\"a-b\",\"-\",1E19)", ErrorKind::NA);
+    assert_eq!(f("=TEXTAFTER(\"a-b-c\",\"-\",-1)"), t("c"));
+    assert_eq!(f("=SUBSTITUTE(\"abc\",\"b\",\"x\",1E19)"), t("abc"));
+    is_err("=SUBSTITUTE(REPT(\"a\",30000),\"a\",\"bb\")", ErrorKind::Value);
+    is_err("=FIXED(1,1E10)", ErrorKind::Value);
+    is_err("=TEXTJOIN(REPT(\"x\",30000),FALSE,{1,2,3})", ErrorKind::Value);
+    is_err("=REPT(\"x\",30000)&REPT(\"y\",30000)", ErrorKind::Value);
+    is_err("=TEXTSPLIT(REPT(\",\",3000)&REPT(\";\",3000),\",\",\";\")", ErrorKind::Calc);
+    assert_eq!(f("=LEN(REPT(\"ab\",16383))"), n(32766.0));
+}
+
+#[test]
+fn ragged_array_constants_are_rejected() {
+    is_err("=ABS({1,2;3})", ErrorKind::Name);
+    is_err("=TAKE({1;2,3},2,2)", ErrorKind::Name);
+    is_err("=CHOOSECOLS({1,2;3},2)", ErrorKind::Name);
+    assert_eq!(fa("=ABS({1,-2;-3,4})"), nums(&[&[1.0, 2.0], &[3.0, 4.0]]));
+}
+
+#[test]
+fn array_builders_are_capped() {
+    is_err("=WRAPROWS({1,2},1E9)", ErrorKind::Num);
+    is_err("=WRAPCOLS({1,2},1E19)", ErrorKind::Num);
+    assert_eq!(fa("=WRAPROWS({1,2},3)"), vec![vec![n(1.0), n(2.0), NA]]);
+    is_err("=SEQUENCE(4294967296,4294967296)", ErrorKind::Calc);
+    is_err("=SEQUENCE(1E19,1E19)", ErrorKind::Calc);
+    is_err("=SEQUENCE(-5)", ErrorKind::Calc);
+    is_err("=RANDARRAY(4294967296,4294967296)", ErrorKind::Calc);
+    is_err("=EXPAND({1},4611686018427387904,4)", ErrorKind::Num);
+    is_err("=EXPAND({1},1E19,1E19)", ErrorKind::Num);
+    is_err("=VSTACK(SEQUENCE(1000000),SEQUENCE(1,16384))", ErrorKind::Calc);
+    is_err("=CHOOSECOLS(SEQUENCE(1000,3),SEQUENCE(1,100000,1,0))", ErrorKind::Calc);
+    is_err("=SUM(SEQUENCE(1000000)*SEQUENCE(1,1000))", ErrorKind::Calc);
+    assert_eq!(f("=SUM(SEQUENCE(3)*SEQUENCE(1,2))"), n(18.0));
+}
+
+#[test]
+fn argument_driven_loops_are_bounded() {
+    is_err("=FACT(1E18)", ErrorKind::Num);
+    is_err("=FACT(171)", ErrorKind::Num);
+    near("=FACT(170)", 7.257415615307994e306, 1e294);
+    is_err("=WORKDAY(1,1E15)", ErrorKind::Num);
+    is_err("=WORKDAY(1,-1E19)", ErrorKind::Num);
+    is_err("=WORKDAY(10,-100)", ErrorKind::Num);
+    is_err("=WORKDAY(1E19,1)", ErrorKind::Num);
+    is_err("=WORKDAY.INTL(1,1E15)", ErrorKind::Num);
+    is_err("=WORKDAY.INTL(1,-1E19)", ErrorKind::Num);
+    is_err("=NETWORKDAYS(1,1E300)", ErrorKind::Num);
+    is_err("=NETWORKDAYS.INTL(-1E300,1E300)", ErrorKind::Num);
+    assert_eq!(f("=NETWORKDAYS(DATE(2024,1,1),DATE(2024,1,31),{45292,45293})"), n(21.0));
+    is_err("=CUMIPMT(0.01,1E15,1000,1,1E15,0)", ErrorKind::Num);
+    is_err("=CUMPRINC(0.01,1E300,1000,1,1E300,0)", ErrorKind::Num);
+    is_err("=DB(1000,100,1E15,1E15)", ErrorKind::Num);
+    is_err("=DDB(1000,100,1E15,1E15)", ErrorKind::Num);
+    is_err("=PERMUT(1E18,1E17)", ErrorKind::Num);
+    is_err("=COMBIN(1E18,5E17)", ErrorKind::Num);
+    is_err("=MULTINOMIAL(1E17,1E17)", ErrorKind::Num);
+    assert_eq!(f("=COMBIN(10,3)*PERMUT(5,2)"), n(2400.0));
+    is_err("=EDATE(1,1E19)", ErrorKind::Num);
+    is_err("=EOMONTH(1E19,1)", ErrorKind::Num);
+    is_err("=DATE(1E19,1,1)", ErrorKind::Num);
+    is_err("=DATE(2024,1E19,1)", ErrorKind::Num);
+    is_err("=YEAR(1E19)", ErrorKind::Num);
+    is_err("=WEEKDAY(-1E19)", ErrorKind::Num);
+    is_err("=WEEKNUM(1E19)", ErrorKind::Num);
+    is_err("=DATEDIF(0,1E19,\"D\")", ErrorKind::Num);
+    is_err("=YEARFRAC(0,1E19)", ErrorKind::Num);
+    is_err("=DAYS360(0,1E19)", ErrorKind::Num);
+    is_err("=ISOWEEKNUM(1E19)", ErrorKind::Num);
+    is_err("=1E999", ErrorKind::Name);
+}
+
+#[test]
+fn deep_nesting_is_rejected_by_the_parser() {
+    let deep_parens = format!("={}1{}", "(".repeat(10_000), ")".repeat(10_000));
+    let deep_plus = format!("=1{}{}", "+(1".repeat(10_000), ")".repeat(10_000));
+    let deep_funcs = format!("={}1{}", "ABS(".repeat(5_000), ")".repeat(5_000));
+    let deep_neg = format!("={}1", "-".repeat(100_000));
+    let long_chain = format!("=1{}", "+1".repeat(100_000));
+    let percents = format!("=1{}", "%".repeat(100_000));
+    for src in [&deep_parens, &deep_plus, &deep_funcs, &deep_neg, &long_chain, &percents] {
+        assert_eq!(f(src), Value::Error(ErrorKind::Name), "{}...", &src[..20]);
+        let mut wb = Workbook::new();
+        assert!(cell_from_input(&mut wb, src, 0).unwrap().formula.unwrap().ast.is_none());
+    }
+    // Ordinary nesting and long (but sane) operator chains still work (cells are computed on
+    // the big-stack recalculation thread).
+    let parens = format!("={}1{}", "(".repeat(150), ")".repeat(150));
+    let funcs = format!("={}-1{}", "ABS(".repeat(150), ")".repeat(150));
+    let chain = format!("=0{}", "+1".repeat(900));
+    let wb = book(&[("A1", &parens), ("A2", &funcs), ("A3", &chain)]);
+    assert_eq!((shown(&wb, "A1"), shown(&wb, "A2"), shown(&wb, "A3")), (n(1.0), n(1.0), n(900.0)));
+    assert_eq!(f(&chain), n(900.0));
+}
+
+#[test]
+fn main_thread_evaluation_is_stack_bounded() {
+    // Conditional formats / validation evaluate on the UI thread (about 1 MB of stack). A
+    // deeply nested formula and a self-referencing name must come back as values or errors.
+    let mut wb = Workbook::new();
+    wb.names.push(("loop".into(), "=loop+1".into()));
+    wb.names.push(("chain".into(), format!("=1{}", "+1".repeat(800))));
+    put(&mut wb, 0, "A1", "=A2+1");
+    put(&mut wb, 0, "A2", "=A1+1");
+    let nested = super::parse(&format!("{}1{}", "ABS(".repeat(199), ")".repeat(199))).unwrap();
+    let names = super::parse("loop+chain+A1").unwrap();
+    let wb = std::sync::Arc::new(wb);
+    let h = std::thread::Builder::new()
+        .stack_size(1 << 20)
+        .spawn(move || {
+            let a = super::eval_expr(&wb, 0, 5, 5, &nested);
+            let b = super::eval_expr(&wb, 0, 5, 5, &names);
+            let g = super::eval_grid(&wb, 0, 5, 5, &names);
+            (a, b, g.len())
+        })
+        .unwrap();
+    let (a, b, rows) = h.join().unwrap();
+    assert!(matches!(a, Value::Number(_) | Value::Error(_)), "{a:?}");
+    assert!(matches!(b, Value::Error(_)), "{b:?}");
+    assert_eq!(rows, 1);
+}
+
+#[test]
+fn offset_with_huge_sizes_is_a_ref_error() {
+    is_err("=ROWS(OFFSET(A1,0,0,1E19,1))", ErrorKind::Ref);
+    is_err("=ROWS(OFFSET(A1,0,0,1,1E19))", ErrorKind::Ref);
+    is_err("=ROWS(OFFSET(A1,1E19,0))", ErrorKind::Ref);
+    is_err("=ROWS(OFFSET(A1,-1E19,0))", ErrorKind::Ref);
+    is_err("=ROWS(OFFSET(A1,9.2E18,0,9.2E18,1))", ErrorKind::Ref);
+    is_err("=ROWS(OFFSET(A2,0,0,1048576,1))", ErrorKind::Ref);
+    assert_eq!(f("=ROWS(OFFSET(A1,0,0,1048576,1))"), n(1_048_576.0));
+    assert_eq!(f("=COLUMNS(OFFSET(B1,0,-1,1,16384))"), n(16_384.0));
+}
+
+#[test]
+fn conditional_aggregates_use_the_full_requested_shape() {
+    // Sheet2's data stops at row 10 (x x x x x y y y y y); Sheet1's sum column runs to row 100.
+    let mut wb = Workbook::empty_with(vec![Sheet::new("Sheet1"), Sheet::new("Sheet2")]);
+    for r in 1..=10 {
+        put(&mut wb, 1, &format!("A{r}"), if r <= 5 { "x" } else { "y" });
+    }
+    for r in 1..=100 {
+        put(&mut wb, 0, &format!("B{r}"), if r == 50 { "7" } else { "1" });
+    }
+    recalc(&mut wb);
+    let g = |src: &str| eval_formula(&wb, 0, 0, 5, src);
+    assert_eq!(g("=SUMIF(Sheet2!A1:A100,\"\",B1:B100)"), n(96.0));
+    assert_eq!(g("=SUMIF(Sheet2!A1:A100,\"x\",B1:B100)"), n(5.0));
+    assert_eq!(g("=AVERAGEIF(Sheet2!A1:A100,\"\",B1:B100)"), n(96.0 / 90.0));
+    assert_eq!(g("=SUMIFS(B1:B100,Sheet2!A1:A100,\"\")"), n(96.0));
+    assert_eq!(g("=SUMIFS(B:B,Sheet2!A:A,\"<>x\")"), n(101.0));
+    assert_eq!(g("=AVERAGEIFS(B1:B100,Sheet2!A1:A100,\"y\")"), n(1.0));
+    assert_eq!(g("=MAXIFS(B1:B100,Sheet2!A1:A100,\"\")"), n(7.0));
+    assert_eq!(g("=MINIFS(B1:B100,Sheet2!A1:A100,\"\",B1:B100,\">1\")"), n(7.0));
+    assert_eq!(g("=COUNTIFS(Sheet2!A1:A100,\"<>x\")"), n(95.0));
+    assert_eq!(g("=COUNTIFS(Sheet2!A1:A100,\"\")"), n(90.0));
+    assert_eq!(g("=COUNTIFS(Sheet2!A:A,\"\")"), n(1_048_576.0 - 10.0));
+    assert_eq!(g("=COUNTIFS(Sheet2!A1:A100,\"\",B1:B100,1)"), n(89.0));
+    assert_eq!(g("=COUNTIFS(Sheet2!A1:A100,\"y\",B1:B100,\"<>\")"), n(5.0));
+    assert_eq!(g("=COUNTIFS(Sheet2!A1:A100,\"\",C1:C100,\"\")"), n(90.0));
+    assert_eq!(g("=SUMPRODUCT(B1:B100,B1:B100)"), n(99.0 + 49.0));
+    assert_eq!(g("=SUMPRODUCT(B:B,Sheet2!C:C)"), n(0.0));
+    assert_eq!(g("=ROUND(CORREL(B1:B100,B1:B100),9)+ROUND(SLOPE(B:B,B:B),9)"), n(2.0));
+    // mismatched argument counts are still #VALUE!
+    assert_eq!(g("=COUNTIFS(Sheet2!A1:A100,\"\",B1:B100)"), Value::Error(ErrorKind::Value));
+    assert_eq!(g("=SUMIFS(B1:B100,Sheet2!A1:A100)"), Value::Error(ErrorKind::Value));
+}
+
+#[test]
+fn subtotal_ignores_nested_subtotals() {
+    let wb = book(&[
+        ("A1", "1"),
+        ("A2", "2"),
+        ("A3", "=SUBTOTAL(9,A1:A2)"),
+        ("A4", "4"),
+        ("A5", "=AGGREGATE(9,0,A4)"),
+        ("A6", "=SUBTOTAL(109,A1:A5)"),
+        ("A7", "=SUM(A1:A5)"),
+    ]);
+    assert_eq!(shown(&wb, "A3"), n(3.0));
+    assert_eq!(shown(&wb, "A6"), n(7.0));
+    assert_eq!(shown(&wb, "A7"), n(14.0));
+    assert_eq!(eval_formula(&wb, 0, 9, 9, "=SUBTOTAL(2,A1:A7)"), n(4.0));
+    assert_eq!(eval_formula(&wb, 0, 9, 9, "=AGGREGATE(9,0,A1:A7)"), n(21.0));
+}
+
+#[test]
+fn ranges_with_spills_are_walked_sparsely_in_order() {
+    let mut wb = book(&[("A1", "a"), ("A3", "c"), ("B1", "=SEQUENCE(3)"), ("D1048575", "100"), ("E1", "=SUM(A1:D1048575)")]);
+    assert_eq!(shown(&wb, "B3"), n(3.0));
+    assert_eq!(shown(&wb, "E1"), n(106.0));
+    let g = |wb: &Workbook, src: &str| eval_formula(wb, 0, 9, 9, src);
+    assert_eq!(g(&wb, "=TEXTJOIN(\",\",TRUE,A1:B3)"), t("a,1,2,c,3"));
+    assert_eq!(g(&wb, "=COUNT(A1:D1048575)"), n(4.0));
+    assert_eq!(g(&wb, "=COUNTA(A:B)"), n(5.0));
+    assert_eq!(g(&wb, "=MAX(B:B)+MIN(B2:B3)"), n(5.0));
+    // hidden rows are skipped for spilled values too
+    wb.sheets[0].hidden_rows.insert(1);
+    assert_eq!(g(&wb, "=SUBTOTAL(109,B1:B3)"), n(4.0));
+}

@@ -4,9 +4,9 @@ use std::cmp::Ordering;
 
 use std::rc::Rc;
 
-use super::eval::{boolean, compare, num, text, to_bool, to_num, to_text, values_equal, Evaluator, LookupCol, Res, EV};
+use super::eval::{boolean, compare, num, text, to_bool, to_num, to_text, values_equal, Evaluator, LookupCol, Res, EV, MAX_TEXT};
 use super::parser::{Expr, RefKind};
-use crate::model::{ErrorKind as E, Range, Value};
+use crate::model::{ErrorKind as E, Range, Value, MAX_COLS, MAX_ROWS};
 use crate::numfmt;
 
 /// (name, arguments, category)
@@ -363,6 +363,41 @@ pub(super) fn has_wild(s: &str) -> bool {
     s.contains(['*', '?', '~'])
 }
 
+/// `pattern*` for SEARCH: matches any text that starts with a match of `pattern`. A lone
+/// trailing `~` (a literal tilde) is written as `~~` so it does not escape the added `*`.
+fn search_prefix_pattern(p: &[char]) -> Vec<char> {
+    let mut out = Vec::with_capacity(p.len() + 2);
+    let mut i = 0;
+    while i < p.len() {
+        if p[i] == '~' {
+            out.push('~');
+            out.push(p.get(i + 1).copied().unwrap_or('~'));
+            i += 2;
+        } else {
+            out.push(p[i]);
+            i += 1;
+        }
+    }
+    out.push('*');
+    out
+}
+
+/// Latest date serial (9999-12-31).
+pub(super) const MAX_SERIAL: f64 = 2_958_465.0;
+
+/// Checks a date serial argument: Excel's dates run from 0 to 9999-12-31, others are #NUM!.
+pub(super) fn serial(x: f64) -> Result<f64, E> {
+    if (0.0..MAX_SERIAL + 1.0).contains(&x) { Ok(x) } else { Err(E::Num) }
+}
+
+/// Holiday serials as a set (whole days), so per-day lookups stay cheap.
+pub(super) fn holiday_set(days: impl IntoIterator<Item = f64>) -> std::collections::HashSet<i64> {
+    days.into_iter().filter(|d| d.is_finite()).map(|d| d.floor() as i64).collect()
+}
+
+/// Longest WORKDAY offset accepted (in working days), and NETWORKDAYS span (in days).
+pub(super) const WORKDAYS_MAX: f64 = 1_000_000.0;
+
 pub(super) fn text_match(pattern: &str, s: &str) -> bool {
     if has_wild(pattern) {
         let p: Vec<char> = pattern.chars().collect();
@@ -463,40 +498,73 @@ pub(super) fn get(g: &[Vec<Value>], r: usize, c: usize) -> Value {
     g.get(r).and_then(|row| row.get(c)).cloned().unwrap_or(Value::Empty)
 }
 
-/// Evaluates a range argument as a grid; for SUMIF-style "same shape as" ranges we
-/// re-anchor the second range at its top-left with the given dimensions.
-pub(super) fn grid_shaped(ev: &mut Evaluator, v: EV, rows: usize, cols: usize) -> Vec<Vec<Value>> {
-    match v {
-        EV::R(s, rg) => {
-            let rg2 = Range::new(rg.r1, rg.c1, rg.r1 + rows.max(1) as u32 - 1, rg.c1 + cols.max(1) as u32 - 1);
-            ev.grid(EV::R(s, rg2))
-        }
-        other => ev.grid(other),
+/// Grids of the *IF(S) range arguments over one logical shape: that of the first argument
+/// (the others are re-anchored at their top-left cell with the same size, like Excel). Only
+/// the leading block that holds data in any of them is materialised, so whole-column and
+/// cross-sheet ranges stay cheap without losing rows. Returns the grids, the block's
+/// (rows, cols) and the number of logical cells outside it (blank in every argument).
+pub(super) fn cond_grids(ev: &mut Evaluator, args: Vec<EV>) -> (Vec<Vec<Vec<Value>>>, usize, usize, f64) {
+    let dims = |v: &EV| match v {
+        EV::R(_, rg) => (rg.rows() as usize, rg.cols() as usize),
+        EV::A(g) => (g.len(), g.first().map_or(0, |r| r.len())),
+        EV::V(_) => (1, 1),
+    };
+    let (rows, cols) = args.first().map_or((0, 0), dims);
+    let (mut used_r, mut used_c) = (0, 0);
+    for v in &args {
+        let (r, c) = match v {
+            EV::R(s, rg) => match ev.extent(*s) {
+                Some((mr, mc)) if mr >= rg.r1 && mc >= rg.c1 => ((mr - rg.r1 + 1) as usize, (mc - rg.c1 + 1) as usize),
+                _ => (0, 0),
+            },
+            other => dims(other),
+        };
+        used_r = used_r.max(r.min(rows));
+        used_c = used_c.max(c.min(cols));
+    }
+    let grids = args
+        .into_iter()
+        .map(|v| match v {
+            EV::R(s, rg) if used_r > 0 && used_c > 0 => {
+                let r2 = (rg.r1 as usize + used_r - 1).min(MAX_ROWS as usize - 1) as u32;
+                let c2 = (rg.c1 as usize + used_c - 1).min(MAX_COLS as usize - 1) as u32;
+                ev.grid(EV::R(s, Range::new(rg.r1, rg.c1, r2, c2)))
+            }
+            EV::R(..) => Vec::new(),
+            other => ev.grid(other),
+        })
+        .collect();
+    let outside = rows as f64 * cols as f64 - used_r as f64 * used_c as f64;
+    (grids, used_r, used_c, outside)
+}
+
+/// Grids of arguments combined cell by cell where blank cells cannot change the result
+/// (SUMPRODUCT, paired statistics): ranges of one size are clipped together to their common
+/// data block instead of being materialised whole; anything else is materialised as is.
+pub(super) fn aligned_grids(ev: &mut Evaluator, vals: Vec<EV>) -> Vec<Vec<Vec<Value>>> {
+    let size = |v: &EV| match v {
+        EV::R(_, rg) => Some((rg.rows(), rg.cols())),
+        _ => None,
+    };
+    let first = vals.first().and_then(size);
+    if first.is_some() && vals.iter().all(|v| size(v) == first) {
+        cond_grids(ev, vals).0
+    } else {
+        vals.into_iter().map(|v| ev.grid(v)).collect()
     }
 }
 
-/// Evaluates (range, criteria) pairs starting at `start` into a mask over a grid shape.
-pub(super) fn criteria_mask(ev: &mut Evaluator, a: &[Expr], start: usize, rows: usize, cols: usize) -> Result<Vec<Vec<bool>>, E> {
-    let mut mask = vec![vec![true; cols]; rows];
-    let mut i = start;
-    while i + 1 < a.len() {
-        let rv = ev.eval(&a[i])?;
-        let g = grid_shaped(ev, rv, rows, cols);
-        let cv = ev.value(a, i + 1)?;
-        let crit = parse_criteria(&cv);
-        for (r, mrow) in mask.iter_mut().enumerate() {
-            for (c, m) in mrow.iter_mut().enumerate() {
-                if *m && !crit_match(&crit, &get(&g, r, c)) {
-                    *m = false;
-                }
-            }
-        }
-        i += 2;
-    }
-    if i != a.len() {
+/// (range, criteria) pairs of COUNTIFS/SUMIFS-style arguments from `start` on.
+fn criteria_pairs(ev: &mut Evaluator, a: &[Expr], start: usize) -> Result<(Vec<EV>, Vec<Criteria>), E> {
+    if start >= a.len() || (a.len() - start) % 2 != 0 {
         return Err(E::Value);
     }
-    Ok(mask)
+    let (mut ranges, mut crits) = (Vec::new(), Vec::new());
+    for i in (start..a.len()).step_by(2) {
+        ranges.push(ev.eval(&a[i])?);
+        crits.push(parse_criteria(&ev.value(a, i + 1)?));
+    }
+    Ok((ranges, crits))
 }
 
 /// Flattens a grid into a vector (row-major) and reports whether it was a column.
@@ -815,8 +883,8 @@ fn element(v: &EV, r: usize, c: usize) -> EV {
             Some((rr, cc)) => EV::R(*s, Range::cell(rg.r1 + rr as u32, rg.c1 + cc as u32)),
             None => EV::V(Value::Error(E::NA)),
         },
-        EV::A(g) => match pick(g.len(), g.first().map_or(0, |x| x.len())) {
-            Some((rr, cc)) => EV::V(g[rr][cc].clone()),
+        EV::A(g) => match pick(g.len(), g.first().map_or(0, |x| x.len())).and_then(|(rr, cc)| g.get(rr)?.get(cc)) {
+            Some(v) => EV::V(v.clone()),
             None => EV::V(Value::Error(E::NA)),
         },
         EV::V(x) => EV::V(x.clone()),
@@ -965,7 +1033,8 @@ fn dispatch(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
         "RADIANS" => num(ev.number(a, 0)?.to_radians()),
         "FACT" => {
             let x = ev.number(a, 0)?.floor();
-            if x < 0.0 {
+            // 171! overflows a double; larger arguments would also loop for ages.
+            if !(0.0..=170.0).contains(&x) {
                 return Err(E::Num);
             }
             num((1..=x as u64).fold(1.0, |acc, k| acc * k as f64))
@@ -989,10 +1058,12 @@ fn dispatch(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
             if x == 0.0 || acc == 0.0 { 0.0 } else { acc * x / gcd(acc, x) }
         })),
         "SUMPRODUCT" => {
-            let mut acc: Option<Vec<Vec<Value>>> = None;
+            let mut vals = Vec::with_capacity(n);
             for i in 0..n {
-                let v = ev.arg(a, i)?;
-                let g = ev.grid(v);
+                vals.push(ev.arg(a, i)?);
+            }
+            let mut acc: Option<Vec<Vec<Value>>> = None;
+            for g in aligned_grids(ev, vals) {
                 acc = Some(match acc {
                     None => g,
                     Some(prev) => {
@@ -1024,38 +1095,40 @@ fn dispatch(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
             let f = ev.number(a, 0)? as i64;
             let skip = f > 100;
             let f = f % 100;
-            let nums = ev.numbers(&a[1.min(n)..], skip)?;
+            // Cells that are themselves subtotals are ignored (no double counting).
+            let nums = ev.numbers_opts(&a[1.min(n)..], skip, true)?;
             subtotal(f, nums)
         }
         "SEQUENCE" => {
-            let rows = ev.number(a, 0)? as usize;
-            let cols = ev.number_or(a, 1, 1.0)? as usize;
+            // Validate as floats: huge counts must not wrap when cast or multiplied.
+            let rows = ev.number(a, 0)?.trunc();
+            let cols = ev.number_or(a, 1, 1.0)?.trunc();
             let start = ev.number_or(a, 2, 1.0)?;
             let step = ev.number_or(a, 3, 1.0)?;
-            if rows == 0 || cols == 0 || rows * cols > 1_000_000 {
+            if rows < 1.0 || cols < 1.0 || rows * cols > 1_000_000.0 {
                 return Err(E::Calc);
             }
+            let (rows, cols) = (rows as usize, cols as usize);
             Ok(EV::A((0..rows).map(|r| (0..cols).map(|c| Value::Number(start + step * (r * cols + c) as f64)).collect()).collect()))
         }
 
         // ----- Conditional aggregates -----
         "SUMIF" | "AVERAGEIF" => {
             need(a, 2, 3)?;
-            let rv = ev.arg(a, 0)?;
-            let g = ev.grid_clipped(rv);
-            let (rows, cols) = (g.len(), g.first().map_or(0, |r| r.len()));
+            let mut args = vec![ev.arg(a, 0)?];
             let crit = parse_criteria(&ev.value(a, 1)?);
-            let sg = if ev.has(a, 2) {
-                let sv = ev.arg(a, 2)?;
-                grid_shaped(ev, sv, rows, cols)
-            } else {
-                g.clone()
-            };
+            if ev.has(a, 2) {
+                args.push(ev.arg(a, 2)?);
+            }
+            // Cells outside the data block are blank in the sum range: they add nothing.
+            let (gs, rows, cols, _) = cond_grids(ev, args);
+            let g = &gs[0];
+            let sg = gs.get(1).unwrap_or(g);
             let (mut sum, mut cnt) = (0.0, 0.0);
             for r in 0..rows {
                 for c in 0..cols {
-                    if crit_match(&crit, &get(&g, r, c)) {
-                        match get(&sg, r, c) {
+                    if crit_match(&crit, &get(g, r, c)) {
+                        match get(sg, r, c) {
                             Value::Number(x) => {
                                 sum += x;
                                 cnt += 1.0;
@@ -1073,14 +1146,16 @@ fn dispatch(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
                 return Err(E::Value);
             }
             let sv = ev.arg(a, 0)?;
-            let sg = ev.grid_clipped(sv);
-            let (rows, cols) = (sg.len(), sg.first().map_or(0, |r| r.len()));
-            let mask = criteria_mask(ev, a, 1, rows, cols)?;
+            let (ranges, crits) = criteria_pairs(ev, a, 1)?;
+            let mut args = vec![sv];
+            args.extend(ranges);
+            // Cells outside the data block are blank in the sum range: they add nothing.
+            let (gs, rows, cols, _) = cond_grids(ev, args);
             let mut vals = Vec::new();
             for r in 0..rows {
                 for c in 0..cols {
-                    if mask[r][c] {
-                        match get(&sg, r, c) {
+                    if crits.iter().zip(&gs[1..]).all(|(cr, g)| crit_match(cr, &get(g, r, c))) {
+                        match get(&gs[0], r, c) {
                             Value::Number(x) => vals.push(x),
                             Value::Error(e) => return Err(e),
                             _ => {}
@@ -1115,11 +1190,15 @@ fn dispatch(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
             if n < 2 {
                 return Err(E::Value);
             }
-            let rv = ev.arg(a, 0)?;
-            let g = ev.grid_clipped(rv);
-            let (rows, cols) = (g.len(), g.first().map_or(0, |r| r.len()));
-            let mask = criteria_mask(ev, a, 0, rows, cols)?;
-            num(mask.iter().flatten().filter(|m| **m).count() as f64)
+            let (ranges, crits) = criteria_pairs(ev, a, 0)?;
+            let (gs, rows, cols, outside) = cond_grids(ev, ranges);
+            let hits = |r: usize, c: usize| crits.iter().zip(&gs).all(|(cr, g)| crit_match(cr, &get(g, r, c)));
+            let mut count = (0..rows).map(|r| (0..cols).filter(|&c| hits(r, c)).count()).sum::<usize>() as f64;
+            // Cells beyond every range's data are blank: count them when blanks match.
+            if crits.iter().all(|cr| crit_match(cr, &Value::Empty)) {
+                count += outside;
+            }
+            num(count)
         }
 
         // ----- Statistics -----
@@ -1212,9 +1291,9 @@ fn dispatch(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
         }
         "CORREL" => {
             let x = ev.arg(a, 0)?;
-            let gx: Vec<Value> = ev.grid(x).into_iter().flatten().collect();
             let y = ev.arg(a, 1)?;
-            let gy: Vec<Value> = ev.grid(y).into_iter().flatten().collect();
+            let mut gs = aligned_grids(ev, vec![x, y]).into_iter().map(|g| g.into_iter().flatten().collect::<Vec<Value>>());
+            let (gx, gy) = (gs.next().unwrap_or_default(), gs.next().unwrap_or_default());
             let pairs: Vec<(f64, f64)> = gx
                 .iter()
                 .zip(gy.iter())
@@ -1409,11 +1488,18 @@ fn dispatch(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
         "CONCAT" | "TEXTJOIN" => {
             let (start, delim, ignore) = if name == "TEXTJOIN" { (2, ev.string(a, 0)?, ev.boolean(a, 1)?) } else { (0, String::new(), false) };
             let mut parts = Vec::new();
+            // Characters of the result so far: stop at Excel's text limit (#VALUE!) rather than
+            // building huge strings (e.g. a long delimiter over a whole column).
+            let (dlen, mut total) = (delim.chars().count(), 0usize);
             for i in start..n {
                 let v = ev.arg(a, i)?;
                 ev.walk(v, false, &mut |val, _| {
                     let t = to_text(val)?;
                     if !(ignore && t.is_empty()) {
+                        total = total.saturating_add(t.chars().count() + if parts.is_empty() { 0 } else { dlen });
+                        if total > MAX_TEXT {
+                            return Err(E::Value);
+                        }
                         parts.push(t);
                     }
                     Ok(())
@@ -1437,8 +1523,9 @@ fn dispatch(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
             if st < 1.0 || k < 0.0 {
                 return Err(E::Value);
             }
-            let st = (st as usize - 1).min(s.len());
-            let end = (st + k as usize).min(s.len());
+            // `as usize` saturates for huge counts; clamp before adding so nothing overflows.
+            let st = ((st - 1.0) as usize).min(s.len());
+            let end = st.saturating_add(k as usize).min(s.len());
             text(s[st..end].iter().collect::<String>())
         }
         "LEN" => num(ev.string(a, 0)?.chars().count() as f64),
@@ -1473,23 +1560,28 @@ fn dispatch(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
                     None => text(s),
                 }
             } else {
+                // Refuse results past Excel's text limit before building them.
+                let (len, grow) = (s.chars().count(), new.chars().count().saturating_sub(old.chars().count()));
+                if len.saturating_add(s.matches(&old).count().saturating_mul(grow)) > MAX_TEXT.max(len) {
+                    return Err(E::Value);
+                }
                 text(s.replace(&old, &new))
             }
         }
         "REPLACE" => {
             let s: Vec<char> = ev.string(a, 0)?.chars().collect();
-            let st = (ev.number(a, 1)?.max(1.0) as usize - 1).min(s.len());
+            let st = ((ev.number(a, 1)?.max(1.0) - 1.0) as usize).min(s.len());
             let k = ev.number(a, 2)?.max(0.0) as usize;
             let new = ev.string(a, 3)?;
-            let end = (st + k).min(s.len());
+            let end = st.saturating_add(k).min(s.len());
             text(format!("{}{}{}", s[..st].iter().collect::<String>(), new, s[end..].iter().collect::<String>()))
         }
         "FIND" | "SEARCH" => {
             let f = ev.string(a, 0)?;
             let s = ev.string(a, 1)?;
-            let st = ev.number_or(a, 2, 1.0)?;
+            let st = ev.number_or(a, 2, 1.0)?.trunc();
             let sc: Vec<char> = s.chars().collect();
-            if st < 1.0 || st as usize > sc.len() + 1 {
+            if !(1.0..=sc.len() as f64 + 1.0).contains(&st) {
                 return Err(E::Value);
             }
             let st = st as usize - 1;
@@ -1508,22 +1600,23 @@ fn dispatch(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
                     None => Err(E::Value),
                 };
             }
+            // The pattern matches some sc[i..j] exactly when "pattern*" matches sc[i..]: one
+            // match per start position instead of one per (start, end) pair.
+            let prefix = search_prefix_pattern(&pc);
             for i in st..=sc.len() {
-                for j in i..=sc.len() {
-                    if wild_match(&pc, &sc[i..j]) {
-                        return num((i + 1) as f64);
-                    }
+                if wild_match(&prefix, &sc[i..]) {
+                    return num((i + 1) as f64);
                 }
             }
             Err(E::Value)
         }
         "REPT" => {
             let s = ev.string(a, 0)?;
-            let k = ev.number(a, 1)?;
-            if k < 0.0 || s.len() as f64 * k > 32767.0 {
+            let k = ev.number(a, 1)?.trunc();
+            if k < 0.0 || s.chars().count() as f64 * k > MAX_TEXT as f64 {
                 return Err(E::Value);
             }
-            text(s.repeat(k as usize))
+            text(if s.is_empty() { String::new() } else { s.repeat(k as usize) })
         }
         "EXACT" => boolean(ev.string(a, 0)? == ev.string(a, 1)?),
         "CHAR" | "UNICHAR" => {
@@ -1550,7 +1643,11 @@ fn dispatch(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
         }
         "FIXED" => {
             let x = ev.number(a, 0)?;
-            let d = ev.number_or(a, 1, 2.0)?.max(0.0) as usize;
+            let d = ev.number_or(a, 1, 2.0)?.trunc();
+            if d > 127.0 {
+                return Err(E::Value);
+            }
+            let d = d.max(0.0) as usize;
             let no_commas = ev.bool_or(a, 2, false)?;
             let fmt = format!("{}{}{}", if no_commas { "0" } else { "#,##0" }, if d > 0 { "." } else { "" }, "0".repeat(d));
             text(numfmt::format_value(&Value::Number(round_half_away(x, d as i32)), &fmt).text)
@@ -1558,12 +1655,13 @@ fn dispatch(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
         "TEXTBEFORE" | "TEXTAFTER" => {
             let s = ev.string(a, 0)?;
             let d = ev.string(a, 1)?;
-            let inst = ev.number_or(a, 2, 1.0)? as i64;
-            if d.is_empty() || inst == 0 {
+            let inst = ev.number_or(a, 2, 1.0)?.trunc();
+            if d.is_empty() || inst == 0.0 {
                 return Err(E::Value);
             }
             let idx: Vec<usize> = s.match_indices(&d).map(|(i, _)| i).collect();
-            let pick = if inst > 0 { idx.get(inst as usize - 1) } else { idx.len().checked_sub((-inst) as usize).and_then(|k| idx.get(k)) };
+            // Float -> usize casts saturate, so huge or very negative instances stay in range.
+            let pick = if inst > 0.0 { idx.get(inst as usize - 1) } else { idx.len().checked_sub((-inst) as usize).and_then(|k| idx.get(k)) };
             match pick {
                 Some(&i) => text(if name == "TEXTBEFORE" { s[..i].to_string() } else { s[i + d.len()..].to_string() }),
                 None => Err(E::NA),
@@ -1574,11 +1672,15 @@ fn dispatch(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
         "TODAY" => num(ev.now.floor()),
         "NOW" => num(ev.now),
         "DATE" => {
-            let y = ev.number(a, 0)?.trunc() as i64;
-            let m = ev.number(a, 1)?.trunc() as i64;
-            let d = ev.number(a, 2)?.trunc() as i64;
-            let s = numfmt::ymd_to_serial(y, m, d);
-            if s < 0.0 { Err(E::Num) } else { num(s) }
+            let y = ev.number(a, 0)?.trunc();
+            let m = ev.number(a, 1)?.trunc();
+            let d = ev.number(a, 2)?.trunc();
+            // Bound the parts before the integer date arithmetic (results past 9999 are #NUM!).
+            if !(0.0..=9999.0).contains(&y) || m.abs() > 1e6 || d.abs() > 1e8 {
+                return Err(E::Num);
+            }
+            let s = numfmt::ymd_to_serial(y as i64, m as i64, d as i64);
+            num(serial(s)?)
         }
         "TIME" => {
             let h = ev.number(a, 0)?;
@@ -1588,10 +1690,7 @@ fn dispatch(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
             if t < 0.0 { Err(E::Num) } else { num(t.fract()) }
         }
         "YEAR" | "MONTH" | "DAY" => {
-            let s = ev.number(a, 0)?;
-            if s < 0.0 {
-                return Err(E::Num);
-            }
+            let s = serial(ev.number(a, 0)?)?;
             let (y, m, d) = numfmt::serial_to_ymd(s);
             num(match name {
                 "YEAR" => y,
@@ -1617,7 +1716,7 @@ fn dispatch(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
             None => Err(E::Value),
         },
         "WEEKDAY" => {
-            let s = ev.number(a, 0)?;
+            let s = serial(ev.number(a, 0)?)?;
             let t = ev.number_or(a, 1, 1.0)? as i64;
             let w = numfmt::weekday(s); // 1=Sun
             num(match t {
@@ -1629,7 +1728,7 @@ fn dispatch(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
             } as f64)
         }
         "WEEKNUM" => {
-            let s = ev.number(a, 0)?.floor();
+            let s = serial(ev.number(a, 0)?)?.floor();
             let t = ev.number_or(a, 1, 1.0)? as i64;
             let (y, _, _) = numfmt::serial_to_ymd(s);
             let jan1 = numfmt::ymd_to_serial(y, 1, 1);
@@ -1638,14 +1737,18 @@ fn dispatch(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
             num(((s - jan1 + offset as f64) / 7.0).floor() + 1.0)
         }
         "EDATE" | "EOMONTH" => {
-            let s = ev.number(a, 0)?;
-            let m = ev.number(a, 1)?.trunc() as i64;
-            num(add_months(s, m, name == "EOMONTH"))
+            let s = serial(ev.number(a, 0)?)?;
+            let m = ev.number(a, 1)?.trunc();
+            // 120,000 months spans the whole date range; beyond is #NUM! (as is any result).
+            if m.abs() > 120_000.0 {
+                return Err(E::Num);
+            }
+            num(serial(add_months(s, m as i64, name == "EOMONTH"))?)
         }
         "DAYS" => num(ev.number(a, 0)?.floor() - ev.number(a, 1)?.floor()),
         "DATEDIF" => {
-            let s = ev.number(a, 0)?.floor();
-            let e = ev.number(a, 1)?.floor();
+            let s = serial(ev.number(a, 0)?)?.floor();
+            let e = serial(ev.number(a, 1)?)?.floor();
             let unit = ev.string(a, 2)?.to_uppercase();
             if s > e {
                 return Err(E::Num);
@@ -1677,16 +1780,16 @@ fn dispatch(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
             })
         }
         "NETWORKDAYS" | "WORKDAY" => {
-            let s = ev.number(a, 0)?.floor();
-            let mut holidays = Vec::new();
+            let s = serial(ev.number(a, 0)?)?.floor();
+            let mut holidays = Default::default();
             if ev.has(a, 2) {
-                holidays = ev.numbers(&a[2..3], false)?.into_iter().map(f64::floor).collect();
+                holidays = holiday_set(ev.numbers(&a[2..3], false)?);
             }
-            let is_off = |d: f64| is_weekend(d) || holidays.contains(&d);
+            let is_off = |d: f64| is_weekend(d) || holidays.contains(&(d as i64));
             if name == "NETWORKDAYS" {
-                let e = ev.number(a, 1)?.floor();
+                let e = serial(ev.number(a, 1)?)?.floor();
                 let (lo, hi, sign) = if s <= e { (s, e, 1.0) } else { (e, s, -1.0) };
-                if hi - lo > 1_000_000.0 {
+                if hi - lo > WORKDAYS_MAX {
                     return Err(E::Num);
                 }
                 let mut c = 0.0;
@@ -1699,14 +1802,20 @@ fn dispatch(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
                 }
                 num(c * sign)
             } else {
-                let days = ev.number(a, 1)?.trunc() as i64;
-                let step = if days >= 0 { 1.0 } else { -1.0 };
+                // Each step is bounded: at most WORKDAYS_MAX working days, and the walk stops
+                // once it leaves the date range.
+                let days = ev.number(a, 1)?.trunc();
+                if days.abs() > WORKDAYS_MAX {
+                    return Err(E::Num);
+                }
+                let step = if days >= 0.0 { 1.0 } else { -1.0 };
                 let mut left = days.abs();
                 let mut d = s;
-                while left > 0 {
+                while left > 0.0 {
                     d += step;
+                    serial(d)?;
                     if !is_off(d) {
-                        left -= 1;
+                        left -= 1.0;
                     }
                 }
                 num(d)
@@ -1885,21 +1994,19 @@ fn dispatch(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
         "OFFSET" => {
             need(a, 3, 5)?;
             let EV::R(s, rg) = ev.arg(a, 0)? else { return Err(E::Value) };
-            let dr = ev.number(a, 1)?.trunc() as i64;
-            let dc = ev.number(a, 2)?.trunc() as i64;
-            let h = if ev.has(a, 3) { ev.number(a, 3)?.trunc() as i64 } else { rg.rows() as i64 };
-            let w = if ev.has(a, 4) { ev.number(a, 4)?.trunc() as i64 } else { rg.cols() as i64 };
-            let r1 = rg.r1 as i64 + dr;
-            let c1 = rg.c1 as i64 + dc;
-            if r1 < 0 || c1 < 0 || h < 1 || w < 1 {
+            let dr = ev.number(a, 1)?.trunc();
+            let dc = ev.number(a, 2)?.trunc();
+            let h = if ev.has(a, 3) { ev.number(a, 3)?.trunc() } else { rg.rows() as f64 };
+            let w = if ev.has(a, 4) { ev.number(a, 4)?.trunc() } else { rg.cols() as f64 };
+            // Check the target against the sheet in floating point before any integer
+            // arithmetic, so huge offsets or sizes cannot overflow.
+            let r1 = rg.r1 as f64 + dr;
+            let c1 = rg.c1 as f64 + dc;
+            if r1 < 0.0 || c1 < 0.0 || h < 1.0 || w < 1.0 || r1 + h > MAX_ROWS as f64 || c1 + w > MAX_COLS as f64 {
                 return Err(E::Ref);
             }
-            let r2 = r1 + h - 1;
-            let c2 = c1 + w - 1;
-            if r2 >= crate::model::MAX_ROWS as i64 || c2 >= crate::model::MAX_COLS as i64 {
-                return Err(E::Ref);
-            }
-            Ok(EV::R(s, Range::new(r1 as u32, c1 as u32, r2 as u32, c2 as u32)))
+            let (r1, c1) = (r1 as u32, c1 as u32);
+            Ok(EV::R(s, Range::new(r1, c1, r1 + h as u32 - 1, c1 + w as u32 - 1)))
         }
         "INDIRECT" => {
             let t = ev.string(a, 0)?;
@@ -2012,7 +2119,7 @@ fn dispatch(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
                 EV::R(s, rg) => ev.lookup_col(s, if vertical { Range::new(rg.r1, rg.c1, rg.r2, rg.c1) } else { Range::new(rg.r1, rg.c1, rg.r1, rg.c2) }),
                 other => {
                     let lg = ev.grid(other);
-                    Rc::new(LookupCol::new(if vertical { lg.iter().map(|r| r.first().cloned().unwrap_or_default()).collect() } else { lg[0].clone() }))
+                    Rc::new(LookupCol::new(if vertical { lg.iter().map(|r| r.first().cloned().unwrap_or_default()).collect() } else { lg.first().cloned().unwrap_or_default() }))
                 }
             };
             let mode = ev.number_or(a, 4, 0.0)? as i64;
@@ -2021,6 +2128,10 @@ fn dispatch(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
             match hit {
                 Some(i) => match ev.arg(a, 2)? {
                     EV::R(s, rg) => {
+                        // A return range shorter than the hit position does not match in size.
+                        if i >= if vertical { rg.rows() } else { rg.cols() } as usize {
+                            return Err(E::Value);
+                        }
                         let i = i as u32;
                         Ok(EV::R(s, if vertical { Range::new(rg.r1 + i, rg.c1, rg.r1 + i, rg.c2) } else { Range::new(rg.r1, rg.c1 + i, rg.r2, rg.c1 + i) }))
                     }
