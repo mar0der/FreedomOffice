@@ -4,13 +4,17 @@
 use std::cmp::Ordering;
 use std::f64::consts::PI;
 
-use super::eval::{boolean, compare, num, text, to_num, to_text, Evaluator, Res, EV};
-use super::functions::{ipmt, need, percentile, pmt, round_half_away, stats, transpose};
+use super::eval::{boolean, compare, is_subtotal_cell, num, text, to_num, to_text, Evaluator, Res, ARRAY_MAX, EV};
+use super::functions::{aligned_grids, holiday_set, ipmt, need, percentile, pmt, round_half_away, serial, stats, transpose, WORKDAYS_MAX};
 use super::parser::{quote_sheet, Expr};
 use crate::model::{col_name, ErrorKind as E, Value, MAX_COLS, MAX_ROWS};
 use crate::numfmt;
 
 type G = Vec<Vec<Value>>;
+
+/// Most periods the depreciation / cumulative-payment functions step through (#NUM! beyond;
+/// a float loop counter past 2^53 would also never advance).
+const PERIODS_MAX: f64 = 1_000_000.0;
 
 fn arr(g: G) -> Res {
     Ok(EV::A(g))
@@ -55,8 +59,10 @@ fn value_or_error(ev: &mut Evaluator, a: &[Expr], i: usize, default: Value) -> V
 /// Numeric pairs of two equally sized arrays (both members numeric); errors propagate.
 fn paired(ev: &mut Evaluator, a: &[Expr], i: usize, j: usize) -> Result<Vec<(f64, f64)>, E> {
     need(a, j + 1, usize::MAX)?;
-    let x = flat(grid_arg(ev, a, i)?);
-    let y = flat(grid_arg(ev, a, j)?);
+    // Pairs with a blank member are skipped, so same-size ranges need only their data block.
+    let (xv, yv) = (ev.arg(a, i)?, ev.arg(a, j)?);
+    let mut gs = aligned_grids(ev, vec![xv, yv]).into_iter().map(flat);
+    let (x, y) = (gs.next().unwrap_or_default(), gs.next().unwrap_or_default());
     if x.len() != y.len() {
         return Err(E::NA);
     }
@@ -129,6 +135,11 @@ pub fn call(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
                 gs.push(if name == "HSTACK" { transpose(g) } else { g });
             }
             let w = gs.iter().map(|g| dims(g).1).max().unwrap_or(0);
+            // Padding to the widest piece multiplies sizes: refuse arrays too large to hold.
+            let h: usize = gs.iter().map(|g| g.len()).sum();
+            if h as u64 * w as u64 > ARRAY_MAX {
+                return Err(E::Calc);
+            }
             let mut out: G = Vec::new();
             for g in gs {
                 for mut row in g {
@@ -171,6 +182,9 @@ pub fn call(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
                     idx.push(j as usize);
                 }
             }
+            if idx.len() as u64 * if rows { w } else { h } as u64 > ARRAY_MAX {
+                return Err(E::Calc);
+            }
             arr(if rows { idx.iter().map(|&j| g[j].clone()).collect() } else { g.iter().map(|row| idx.iter().map(|&j| row[j].clone()).collect()).collect() })
         }
         "SORTBY" => sortby(ev, a),
@@ -199,7 +213,10 @@ pub fn call(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
                 return Err(E::Value);
             }
             let k = int_arg(ev, a, 1)?;
-            if k < 1 {
+            // Rows of WRAPROWS (columns of WRAPCOLS) are `k` long: at most a sheet's width
+            // (height). The result then has at most len + k cells.
+            let most = if name == "WRAPROWS" { MAX_COLS } else { MAX_ROWS } as i64;
+            if k < 1 || k > most {
                 return Err(E::Num);
             }
             let pad = value_or_error(ev, a, 2, Value::Error(E::NA));
@@ -222,7 +239,8 @@ pub fn call(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
             if rows < h as i64 || cols < w as i64 {
                 return Err(E::Value);
             }
-            if rows as u64 * cols as u64 > 1_048_576 {
+            // Bound each side before multiplying (huge counts must not wrap).
+            if rows > MAX_ROWS as i64 || cols > MAX_COLS as i64 || rows as u64 * cols as u64 > 1_048_576 {
                 return Err(E::Num);
             }
             let pad = value_or_error(ev, a, 3, Value::Error(E::NA));
@@ -243,7 +261,8 @@ pub fn call(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
             if rows < 1 || cols < 1 || lo > hi || (whole && (lo.fract() != 0.0 || hi.fract() != 0.0)) {
                 return Err(E::Value);
             }
-            if rows as u64 * cols as u64 > 1_048_576 {
+            // Bound each side before multiplying (huge counts must not wrap).
+            if rows > MAX_ROWS as i64 || cols > MAX_COLS as i64 || rows as u64 * cols as u64 > 1_048_576 {
                 return Err(E::Calc);
             }
             let mut out = Vec::with_capacity(rows as usize);
@@ -347,18 +366,15 @@ pub fn call(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
         // ----- date & time -----
         "YEARFRAC" => {
             need(a, 2, 3)?;
-            let s = ev.number(a, 0)?;
-            let e = ev.number(a, 1)?;
+            let s = serial(ev.number(a, 0)?)?;
+            let e = serial(ev.number(a, 1)?)?;
             let b = if ev.has(a, 2) { int_arg(ev, a, 2)? } else { 0 };
-            if s < 0.0 || e < 0.0 {
-                return Err(E::Num);
-            }
             num(yearfrac(s, e, b)?)
         }
         "DAYS360" => {
             need(a, 2, 3)?;
-            let s = ev.number(a, 0)?.floor();
-            let e = ev.number(a, 1)?.floor();
+            let s = serial(ev.number(a, 0)?)?.floor();
+            let e = serial(ev.number(a, 1)?)?.floor();
             let eu = ev.bool_or(a, 2, false)?;
             let (y1, m1, d1) = numfmt::serial_to_ymd(s);
             let (y2, m2, d2) = numfmt::serial_to_ymd(e);
@@ -372,10 +388,7 @@ pub fn call(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
         }
         "ISOWEEKNUM" => {
             need(a, 1, 1)?;
-            let d = ev.number(a, 0)?.floor();
-            if d < 0.0 {
-                return Err(E::Num);
-            }
+            let d = serial(ev.number(a, 0)?)?.floor();
             let iso = (numfmt::weekday(d) + 5) % 7 + 1; // Mon=1..Sun=7
             let thursday = d - iso as f64 + 4.0;
             let (y, _, _) = numfmt::serial_to_ymd(thursday);
@@ -383,7 +396,7 @@ pub fn call(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
         }
         "NETWORKDAYS.INTL" | "WORKDAY.INTL" => {
             need(a, 2, 4)?;
-            let s = ev.number(a, 0)?.floor();
+            let s = serial(ev.number(a, 0)?)?.floor();
             let wk = if ev.has(a, 2) { Some(ev.value(a, 2)?) } else { None };
             let mask = weekend_mask(wk)?;
             let mut holidays = Vec::new();
@@ -391,15 +404,16 @@ pub fn call(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
                 for v in flat(grid_arg(ev, a, 3)?) {
                     match v {
                         Value::Empty => {}
-                        v => holidays.push(to_num(&v)?.floor()),
+                        v => holidays.push(to_num(&v)?),
                     }
                 }
             }
-            let off = |d: f64| mask[((numfmt::weekday(d) + 5) % 7) as usize] || holidays.contains(&d);
+            let holidays = holiday_set(holidays);
+            let off = |d: f64| mask[((numfmt::weekday(d) + 5) % 7) as usize] || holidays.contains(&(d as i64));
             if name == "NETWORKDAYS.INTL" {
-                let e = ev.number(a, 1)?.floor();
+                let e = serial(ev.number(a, 1)?)?.floor();
                 let (lo, hi, sign) = if s <= e { (s, e, 1.0) } else { (e, s, -1.0) };
-                if hi - lo > 1_000_000.0 {
+                if hi - lo > WORKDAYS_MAX {
                     return Err(E::Num);
                 }
                 let mut c = 0.0;
@@ -412,20 +426,23 @@ pub fn call(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
                 }
                 num(c * sign)
             } else {
-                let days = ev.number(a, 1)?.trunc() as i64;
-                if days.abs() > 1_000_000 {
+                // Bounded walk: at most WORKDAYS_MAX working days, stopping if it leaves the
+                // date range (the weekend mask always leaves a working day).
+                let days = ev.number(a, 1)?.trunc();
+                if days.abs() > WORKDAYS_MAX {
                     return Err(E::Num);
                 }
-                let step = if days >= 0 { 1.0 } else { -1.0 };
+                let step = if days >= 0.0 { 1.0 } else { -1.0 };
                 let mut left = days.abs();
                 let mut d = s;
-                while left > 0 {
+                while left > 0.0 {
                     d += step;
+                    serial(d)?;
                     if !off(d) {
-                        left -= 1;
+                        left -= 1.0;
                     }
                 }
-                if d < 0.0 { Err(E::Num) } else { num(d) }
+                num(d)
             }
         }
 
@@ -526,7 +543,16 @@ pub fn call(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
                     if x < 0.0 || k < 0.0 || x < k {
                         return Err(E::Num);
                     }
-                    num((0..k as u64).fold(1.0, |acc, i| acc * (x - i as f64)))
+                    // Every factor is >= 1, so the product overflows within ~1000 steps for
+                    // any huge k: stop there instead of looping k times.
+                    let mut acc = 1.0;
+                    for i in 0..k as u64 {
+                        acc *= x - i as f64;
+                        if !acc.is_finite() {
+                            return Err(E::Num);
+                        }
+                    }
+                    num(acc)
                 }
             }
         }
@@ -806,7 +832,7 @@ pub fn call(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
             let s = ev.number(a, 3)?.trunc();
             let e = ev.number(a, 4)?.trunc();
             let t = ev.number(a, 5)?.trunc();
-            if r <= 0.0 || np <= 0.0 || pv <= 0.0 || s < 1.0 || e < s || e > np || !(t == 0.0 || t == 1.0) {
+            if r <= 0.0 || np <= 0.0 || pv <= 0.0 || s < 1.0 || e < s || e > np || !(t == 0.0 || t == 1.0) || e - s >= PERIODS_MAX {
                 return Err(E::Num);
             }
             let p = pmt(r, np, pv, 0.0, t);
@@ -846,7 +872,7 @@ pub fn call(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
             let (c, s, l) = (ev.number(a, 0)?, ev.number(a, 1)?, ev.number(a, 2)?.trunc());
             let p = ev.number(a, 3)?.trunc();
             let m = ev.number_or(a, 4, 12.0)?.trunc();
-            if c < 0.0 || s < 0.0 || l <= 0.0 || p <= 0.0 || !(1.0..=12.0).contains(&m) || p > l + if m < 12.0 { 1.0 } else { 0.0 } {
+            if c < 0.0 || s < 0.0 || l <= 0.0 || p <= 0.0 || !(1.0..=12.0).contains(&m) || p > l + if m < 12.0 { 1.0 } else { 0.0 } || p > PERIODS_MAX {
                 return Err(E::Num);
             }
             if c == 0.0 {
@@ -867,7 +893,7 @@ pub fn call(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
             need(a, 4, 5)?;
             let (c, s, l, p) = (ev.number(a, 0)?, ev.number(a, 1)?, ev.number(a, 2)?, ev.number(a, 3)?);
             let f = ev.number_or(a, 4, 2.0)?;
-            if c < 0.0 || s < 0.0 || l <= 0.0 || p <= 0.0 || p > l || f <= 0.0 {
+            if c < 0.0 || s < 0.0 || l <= 0.0 || p <= 0.0 || p > l || f <= 0.0 || p > PERIODS_MAX {
                 return Err(E::Num);
             }
             let (mut total, mut dep) = (0.0, 0.0);
@@ -1030,7 +1056,8 @@ fn textsplit(ev: &mut Evaluator, a: &[Expr]) -> Res {
         .filter(|r| !r.is_empty())
         .collect();
     let w = dims(&g).1;
-    if w == 0 {
+    // Padding every row to the widest one can square the text length: refuse huge results.
+    if w == 0 || g.len() as u64 * w as u64 > ARRAY_MAX {
         return Err(E::Calc);
     }
     for r in g.iter_mut() {
@@ -1123,11 +1150,7 @@ fn aggregate(ev: &mut Evaluator, a: &[Expr]) -> Res {
                         continue;
                     }
                     for (j, v) in row.into_iter().enumerate() {
-                        let nested = skip_nested
-                            && sh.get(r, rg.c1 + j as u32).and_then(|c| c.formula.as_ref()).is_some_and(|f| {
-                                let t = f.text.to_ascii_uppercase();
-                                t.contains("SUBTOTAL(") || t.contains("AGGREGATE(")
-                            });
+                        let nested = skip_nested && sh.get(r, rg.c1 + j as u32).is_some_and(is_subtotal_cell);
                         if !nested {
                             vals.push(v);
                         }
@@ -1368,8 +1391,13 @@ fn combin(n: f64, k: f64) -> Result<f64, E> {
     }
     let k = k.min(n - k);
     let mut r = 1.0;
+    // With k <= n/2 every factor is >= 1 and C(n, i) >= 2^i, so a huge k overflows within
+    // ~1000 steps: stop there instead of looping k times.
     for i in 0..k as u64 {
         r = r * (n - i as f64) / (i as f64 + 1.0);
+        if !r.is_finite() {
+            return Err(E::Num);
+        }
     }
     Ok(r.round())
 }

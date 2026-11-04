@@ -7,7 +7,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::rc::Rc;
 
 use super::parser::{BinOp, Expr, RefExpr, RefKind};
-use crate::model::{ErrorKind, Range, Spill, Value, Workbook, MAX_COLS, MAX_ROWS};
+use crate::model::{Cell, ErrorKind, Range, Spill, Value, Workbook, MAX_COLS, MAX_ROWS};
 
 /// Result of evaluating an expression: a scalar, a reference, or an in-memory array.
 #[derive(Clone, Debug)]
@@ -19,6 +19,12 @@ pub enum EV {
 
 pub type Res = Result<EV, ErrorKind>;
 pub type VRes = Result<Value, ErrorKind>;
+
+/// Longest text a formula may produce (characters), as in Excel.
+pub const MAX_TEXT: usize = 32_767;
+/// Largest in-memory array an operation may build (cells): four times the largest spill, the
+/// size the evaluator already materialises for range arguments.
+pub const ARRAY_MAX: u64 = 4 * SPILL_MAX;
 
 pub fn num(v: f64) -> Res {
     if v.is_finite() { Ok(EV::V(Value::Number(v))) } else { Err(ErrorKind::Num) }
@@ -37,6 +43,8 @@ pub fn boolean(b: bool) -> Res {
 pub fn to_num(v: &Value) -> Result<f64, ErrorKind> {
     match v {
         Value::Empty => Ok(0.0),
+        // Spreadsheets have no NaN/infinity; reject them so numeric arguments are always finite.
+        Value::Number(n) if !n.is_finite() => Err(ErrorKind::Num),
         Value::Number(n) => Ok(*n),
         Value::Bool(b) => Ok(if *b { 1.0 } else { 0.0 }),
         Value::Text(s) => {
@@ -45,7 +53,8 @@ pub fn to_num(v: &Value) -> Result<f64, ErrorKind> {
                 return Err(ErrorKind::Value);
             }
             match crate::numfmt::parse_input(t).0 {
-                Value::Number(n) => Ok(n),
+                Value::Number(n) if n.is_finite() => Ok(n),
+                Value::Number(_) => Err(ErrorKind::Num),
                 _ => Err(ErrorKind::Value),
             }
         }
@@ -140,6 +149,8 @@ fn binop_values(op: BinOp, a: &Value, b: &Value) -> Value {
             }
         }),
         BinOp::Concat => match (to_text(a), to_text(b)) {
+            // Excel's text limit; also stops chains of `A1&A1` from doubling without bound.
+            (Ok(x), Ok(y)) if x.chars().count() + y.chars().count() > MAX_TEXT => Value::Error(ErrorKind::Value),
             (Ok(x), Ok(y)) => Value::Text(x + &y),
             (Err(e), _) | (_, Err(e)) => Value::Error(e),
         },
@@ -652,6 +663,18 @@ impl<'a> Evaluator<'a> {
 
     /// Writes spilled values intersecting `rg` into `out` (indexed relative to rg).
     fn overlay_spills(&mut self, s: usize, rg: Range, out: &mut [Vec<Value>]) {
+        for (r, c, v) in self.spilled_cells(s, rg) {
+            let slot = &mut out[(r - rg.r1) as usize][(c - rg.c1) as usize];
+            if slot.is_empty() {
+                *slot = v;
+            }
+        }
+    }
+
+    /// Spilled (non-anchor) values inside `rg`, in row-major order; the first anchor wins
+    /// where stale spill areas overlap.
+    fn spilled_cells(&mut self, s: usize, rg: Range) -> Vec<(u32, u32, Value)> {
+        let mut out = Vec::new();
         let mut cands: Vec<(u32, u32)> = Vec::new();
         for (_, ents) in self.spill_cols[s].range(rg.c1..=rg.c2) {
             for &(r1, r2, a) in ents {
@@ -686,16 +709,25 @@ impl<'a> Evaluator<'a> {
                             None => continue,
                         }
                     };
-                    let slot = &mut out[(r - rg.r1) as usize][(c - rg.c1) as usize];
-                    if slot.is_empty() {
-                        *slot = v;
-                    }
+                    out.push((r, c, v));
                 }
             }
         }
+        // Stable sort: equal positions keep anchor order, then the first one is kept.
+        out.sort_by_key(|x| (x.0, x.1));
+        out.dedup_by_key(|x| (x.0, x.1));
+        out
     }
 
     pub fn eval(&mut self, e: &Expr) -> Res {
+        // Nested expressions recurse; stop before the stack runs out (the main thread's stack
+        // is small, and names can re-enter evaluation).
+        if matches!(e, Expr::Func(..) | Expr::Bin(..) | Expr::Neg(_) | Expr::Plus(_) | Expr::Percent(_) | Expr::Paren(_) | Expr::Array(_))
+            && self.too_deep()
+        {
+            self.circular = true;
+            return Err(ErrorKind::Calc);
+        }
         match e {
             Expr::Num(n) => Ok(EV::V(Value::Number(*n))),
             Expr::Str(s) => Ok(EV::V(Value::Text(s.clone()))),
@@ -723,21 +755,25 @@ impl<'a> Evaluator<'a> {
                 let v = self.eval(e)?;
                 self.map_unary(v, |x| binop_values(BinOp::Div, x, &Value::Number(100.0)))
             }
-            Expr::Bin(op, a, b) => {
+            Expr::Bin(op, a, b) if !matches!(**a, Expr::Bin(..)) => {
                 let a = self.eval(a)?;
                 let b = self.eval(b)?;
-                if self.is_multi(&a) || self.is_multi(&b) {
-                    let ga = self.grid(a);
-                    let gb = self.grid(b);
-                    Ok(EV::A(broadcast(&ga, &gb, |x, y| binop_values(*op, x, y))))
-                } else {
-                    let x = self.scalar(a)?;
-                    let y = self.scalar(b)?;
-                    match binop_values(*op, &x, &y) {
-                        Value::Error(e) => Err(e),
-                        v => Ok(EV::V(v)),
-                    }
+                self.binop(*op, a, b)
+            }
+            Expr::Bin(..) => {
+                // Operator chains (`A1+A2+...+An`) nest to the left: walk the spine iteratively.
+                let mut spine = Vec::new();
+                let mut cur = e;
+                while let Expr::Bin(op, a, b) = cur {
+                    spine.push((*op, &**b));
+                    cur = a;
                 }
+                let mut acc = self.eval(cur)?;
+                for (op, b) in spine.into_iter().rev() {
+                    let b = self.eval(b)?;
+                    acc = self.binop(op, acc, b)?;
+                }
+                Ok(acc)
             }
             Expr::Func(name, args) => super::functions::call(self, name, args),
             Expr::Array(rows) => {
@@ -754,6 +790,26 @@ impl<'a> Evaluator<'a> {
                     out.push(r);
                 }
                 Ok(EV::A(out))
+            }
+        }
+    }
+
+    fn binop(&mut self, op: BinOp, a: EV, b: EV) -> Res {
+        if self.is_multi(&a) || self.is_multi(&b) {
+            let ga = self.grid(a);
+            let gb = self.grid(b);
+            // A column against a row multiplies sizes: refuse arrays too large to hold.
+            let (rows, cols) = broadcast_dims(&ga, &gb);
+            if rows as u64 * cols as u64 > ARRAY_MAX {
+                return Err(ErrorKind::Calc);
+            }
+            Ok(EV::A(broadcast(&ga, &gb, |x, y| binop_values(op, x, y))))
+        } else {
+            let x = self.scalar(a)?;
+            let y = self.scalar(b)?;
+            match binop_values(op, &x, &y) {
+                Value::Error(e) => Err(e),
+                v => Ok(EV::V(v)),
             }
         }
     }
@@ -847,7 +903,16 @@ impl<'a> Evaluator<'a> {
     pub fn grid(&mut self, v: EV) -> Vec<Vec<Value>> {
         match v {
             EV::V(v) => vec![vec![v]],
-            EV::A(a) => a,
+            EV::A(mut a) => {
+                // Callers index grids as rectangles: pad any ragged rows.
+                let w = a.iter().map(|r| r.len()).max().unwrap_or(0);
+                if a.iter().any(|r| r.len() != w) {
+                    for r in a.iter_mut() {
+                        r.resize(w, Value::Error(ErrorKind::NA));
+                    }
+                }
+                a
+            }
             EV::R(s, rg) => {
                 let mut rg = self.clip(s, rg);
                 if rg.rows() as u64 * rg.cols() as u64 > 4 * SPILL_MAX {
@@ -900,6 +965,19 @@ impl<'a> Evaluator<'a> {
 
     /// Calls `f` for every value in the argument; `from_ref` is true for range/array members.
     pub fn walk(&mut self, v: EV, skip_hidden: bool, f: &mut dyn FnMut(&Value, bool) -> Result<(), ErrorKind>) -> Result<(), ErrorKind> {
+        self.walk_cells(v, skip_hidden, false, f)
+    }
+
+    /// Like `walk`; with `skip_nested`, cells holding SUBTOTAL/AGGREGATE formulas are left out.
+    /// Ranges are visited sparsely (populated and spilled cells only, row-major), so their
+    /// size does not matter.
+    pub fn walk_cells(
+        &mut self,
+        v: EV,
+        skip_hidden: bool,
+        skip_nested: bool,
+        f: &mut dyn FnMut(&Value, bool) -> Result<(), ErrorKind>,
+    ) -> Result<(), ErrorKind> {
         match v {
             EV::V(v) => f(&v, false),
             EV::A(a) => {
@@ -913,30 +991,36 @@ impl<'a> Evaluator<'a> {
             EV::R(s, rg) => {
                 let wb = self.wb;
                 let Some(sh) = wb.sheets.get(s) else { return Err(ErrorKind::Ref) };
-                if !self.has_spills(s, rg) {
-                    for (r, c, cell) in sh.iter_range(rg) {
-                        if skip_hidden && sh.hidden_rows.contains(&r) {
-                            continue;
-                        }
-                        if cell.formula.is_some() {
-                            let v = self.cell_value(s, r, c);
+                let hidden = |r: u32| skip_hidden && sh.hidden_rows.contains(&r);
+                let spilled = if self.has_spills(s, rg) { self.spilled_cells(s, rg) } else { Vec::new() };
+                let mut spilled = spilled.into_iter().peekable();
+                for (r, c, cell) in sh.iter_range(rg) {
+                    // Spilled values before this cell, then the one at it (shown only if empty).
+                    while let Some((sr, _, v)) = spilled.next_if(|x| (x.0, x.1) < (r, c)) {
+                        if !hidden(sr) {
                             f(&v, true)?;
-                        } else {
-                            f(&cell.value, true)?;
                         }
                     }
-                    return Ok(());
-                }
-                let rg = self.clip_extent(s, rg);
-                let g = self.grid_of(s, rg);
-                for (i, row) in g.iter().enumerate() {
-                    if skip_hidden && sh.hidden_rows.contains(&(rg.r1 + i as u32)) {
+                    let here = spilled.next_if(|x| (x.0, x.1) == (r, c)).map(|x| x.2);
+                    if hidden(r) {
                         continue;
                     }
-                    for v in row {
-                        if !v.is_empty() {
-                            f(v, true)?;
+                    if cell.formula.is_some() {
+                        if skip_nested && is_subtotal_cell(cell) {
+                            continue;
                         }
+                        let v = self.cell_value(s, r, c);
+                        f(&v, true)?;
+                    } else {
+                        match here {
+                            Some(v) if cell.value.is_empty() => f(&v, true)?,
+                            _ => f(&cell.value, true)?,
+                        }
+                    }
+                }
+                for (sr, _, v) in spilled {
+                    if !hidden(sr) {
+                        f(&v, true)?;
                     }
                 }
                 Ok(())
@@ -980,13 +1064,18 @@ impl<'a> Evaluator<'a> {
 
     /// Numbers from all arguments using SUM-style rules (text/logicals in ranges ignored).
     pub fn numbers(&mut self, args: &[Expr], skip_hidden: bool) -> Result<Vec<f64>, ErrorKind> {
+        self.numbers_opts(args, skip_hidden, false)
+    }
+
+    /// `numbers`, optionally leaving out cells that hold SUBTOTAL/AGGREGATE formulas.
+    pub fn numbers_opts(&mut self, args: &[Expr], skip_hidden: bool, skip_nested: bool) -> Result<Vec<f64>, ErrorKind> {
         let mut out = Vec::new();
         for e in args {
             if matches!(e, Expr::Missing) {
                 continue;
             }
             let v = self.eval(e)?;
-            self.walk(v, skip_hidden, &mut |v, from_ref| {
+            self.walk_cells(v, skip_hidden, skip_nested, &mut |v, from_ref| {
                 match v {
                     Value::Number(n) => out.push(*n),
                     Value::Error(e) => return Err(*e),
@@ -1001,13 +1090,28 @@ impl<'a> Evaluator<'a> {
     }
 }
 
-/// Element-wise operation with Excel's array broadcasting (single rows/columns expand,
-/// mismatched sizes pad with #N/A).
-pub fn broadcast(a: &[Vec<Value>], b: &[Vec<Value>], f: impl Fn(&Value, &Value) -> Value) -> Vec<Vec<Value>> {
+/// Whether a cell holds a SUBTOTAL or AGGREGATE formula; both functions ignore such cells in
+/// their ranges to avoid double counting, like Excel.
+pub fn is_subtotal_cell(cell: &Cell) -> bool {
+    cell.formula.as_ref().is_some_and(|f| {
+        let t = f.text.to_ascii_uppercase();
+        t.contains("SUBTOTAL(") || t.contains("AGGREGATE(")
+    })
+}
+
+/// Result size of `broadcast(a, b)`.
+pub fn broadcast_dims(a: &[Vec<Value>], b: &[Vec<Value>]) -> (usize, usize) {
     let rows = if a.len() == 1 { b.len() } else if b.len() == 1 { a.len() } else { a.len().max(b.len()) };
     let ca = a.first().map_or(0, |r| r.len());
     let cb = b.first().map_or(0, |r| r.len());
     let cols = if ca == 1 { cb } else if cb == 1 { ca } else { ca.max(cb) };
+    (rows, cols)
+}
+
+/// Element-wise operation with Excel's array broadcasting (single rows/columns expand,
+/// mismatched sizes pad with #N/A).
+pub fn broadcast(a: &[Vec<Value>], b: &[Vec<Value>], f: impl Fn(&Value, &Value) -> Value) -> Vec<Vec<Value>> {
+    let (rows, cols) = broadcast_dims(a, b);
     let get = |g: &[Vec<Value>], r: usize, c: usize| -> Value {
         let rr = if g.len() == 1 { 0 } else { r };
         let Some(row) = g.get(rr) else { return Value::Error(ErrorKind::NA) };

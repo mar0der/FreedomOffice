@@ -176,7 +176,8 @@ pub fn lex(src: &str) -> Result<Vec<Spanned>, String> {
                 let mut matched = None;
                 for e in ErrorKind::ALL {
                     let es = e.as_str();
-                    if src[start..].len() >= es.len() && src[start..start + es.len()].eq_ignore_ascii_case(es) {
+                    // `get` (not slicing): the source may hold a multi-byte char inside the window.
+                    if src.get(start..start + es.len()).is_some_and(|w| w.eq_ignore_ascii_case(es)) {
                         matched = Some(e);
                         break;
                     }
@@ -209,6 +210,9 @@ pub fn lex(src: &str) -> Result<Vec<Spanned>, String> {
                 }
                 let text = &src[pos(s0)..pos(i)];
                 let v: f64 = text.parse().map_err(|_| format!("bad number {text}"))?;
+                if !v.is_finite() {
+                    return Err(format!("bad number {text}"));
+                }
                 Tok::Num(v, text.to_string())
             }
             c if c.is_alphabetic() || c == '_' || c == '$' || c == '\\' => {
@@ -348,9 +352,21 @@ fn parse_row_part(s: &str) -> Option<(u32, bool)> {
 // Parser
 // ---------------------------------------------------------------------------
 
+/// Deepest bracket / function / prefix-operator nesting accepted (Excel allows 64 function levels).
+const MAX_NESTING: usize = 200;
+/// Deepest expression tree accepted (an operator chain such as `A1+A2+...` adds one level per
+/// operator). Every tree walk (evaluation, printing, reference transforms, dependency collection,
+/// clone, drop) recurses on the tree, so this bounds their stack use.
+const MAX_DEPTH: usize = 1000;
+const TOO_DEEP: &str = "formula is nested too deeply";
+
 struct Parser {
     toks: Vec<Tok>,
     i: usize,
+    /// Current recursion nesting (brackets, function arguments, prefix operators).
+    nest: usize,
+    /// Tree depth of the expression most recently returned by a production.
+    d: usize,
 }
 
 impl Parser {
@@ -369,97 +385,88 @@ impl Parser {
         matches!(self.peek(), Some(Tok::Op(o)) if *o == op)
     }
 
+    /// Records `d` as the depth of the expression being returned, rejecting overly deep trees.
+    fn set_depth(&mut self, d: usize) -> Result<(), String> {
+        if d > MAX_DEPTH {
+            return Err(TOO_DEEP.into());
+        }
+        self.d = d;
+        Ok(())
+    }
+
+    /// Builds `l op r`; `dl` is the depth of `l` (updated) and `self.d` that of `r`.
+    fn bin(&mut self, op: BinOp, l: Expr, dl: &mut usize, r: Expr) -> Result<Expr, String> {
+        *dl = 1 + (*dl).max(self.d);
+        if *dl > MAX_DEPTH {
+            return Err(TOO_DEEP.into());
+        }
+        Ok(Expr::Bin(op, Box::new(l), Box::new(r)))
+    }
+
+    /// Runs a nested production, bounding the parser's own recursion.
+    fn nested(&mut self, f: fn(&mut Self) -> Result<Expr, String>) -> Result<Expr, String> {
+        if self.nest >= MAX_NESTING {
+            return Err(TOO_DEEP.into());
+        }
+        self.nest += 1;
+        let r = f(self);
+        self.nest -= 1;
+        r
+    }
+
     fn expr(&mut self) -> Result<Expr, String> {
-        self.comparison()
+        self.nested(|p| p.binary(1))
     }
 
-    fn comparison(&mut self) -> Result<Expr, String> {
-        let mut l = self.concat()?;
-        loop {
-            let op = match self.peek() {
-                Some(Tok::Op("=")) => BinOp::Eq,
-                Some(Tok::Op("<>")) => BinOp::Ne,
-                Some(Tok::Op("<")) => BinOp::Lt,
-                Some(Tok::Op("<=")) => BinOp::Le,
-                Some(Tok::Op(">")) => BinOp::Gt,
-                Some(Tok::Op(">=")) => BinOp::Ge,
-                _ => return Ok(l),
-            };
-            self.i += 1;
-            let r = self.concat()?;
-            l = Expr::Bin(op, Box::new(l), Box::new(r));
-        }
-    }
-
-    fn concat(&mut self) -> Result<Expr, String> {
-        let mut l = self.additive()?;
-        while self.is_op("&") {
-            self.i += 1;
-            let r = self.additive()?;
-            l = Expr::Bin(BinOp::Concat, Box::new(l), Box::new(r));
-        }
-        Ok(l)
-    }
-
-    fn additive(&mut self) -> Result<Expr, String> {
-        let mut l = self.multiplicative()?;
-        loop {
-            let op = if self.is_op("+") {
-                BinOp::Add
-            } else if self.is_op("-") {
-                BinOp::Sub
-            } else {
-                return Ok(l);
-            };
-            self.i += 1;
-            let r = self.multiplicative()?;
-            l = Expr::Bin(op, Box::new(l), Box::new(r));
-        }
-    }
-
-    fn multiplicative(&mut self) -> Result<Expr, String> {
-        let mut l = self.power()?;
-        loop {
-            let op = if self.is_op("*") {
-                BinOp::Mul
-            } else if self.is_op("/") {
-                BinOp::Div
-            } else {
-                return Ok(l);
-            };
-            self.i += 1;
-            let r = self.power()?;
-            l = Expr::Bin(op, Box::new(l), Box::new(r));
-        }
-    }
-
-    fn power(&mut self) -> Result<Expr, String> {
+    /// Binary operators by precedence (comparison < & < +- < */ < ^, all left-associative).
+    /// Precedence climbing keeps the recursion per bracket level short (the main thread's
+    /// stack is small).
+    fn binary(&mut self, min: u8) -> Result<Expr, String> {
         let mut l = self.unary()?;
-        while self.is_op("^") {
+        let mut dl = self.d;
+        loop {
+            let (op, prec) = match self.peek() {
+                Some(Tok::Op("=")) => (BinOp::Eq, 1),
+                Some(Tok::Op("<>")) => (BinOp::Ne, 1),
+                Some(Tok::Op("<")) => (BinOp::Lt, 1),
+                Some(Tok::Op("<=")) => (BinOp::Le, 1),
+                Some(Tok::Op(">")) => (BinOp::Gt, 1),
+                Some(Tok::Op(">=")) => (BinOp::Ge, 1),
+                Some(Tok::Op("&")) => (BinOp::Concat, 2),
+                Some(Tok::Op("+")) => (BinOp::Add, 3),
+                Some(Tok::Op("-")) => (BinOp::Sub, 3),
+                Some(Tok::Op("*")) => (BinOp::Mul, 4),
+                Some(Tok::Op("/")) => (BinOp::Div, 4),
+                Some(Tok::Op("^")) => (BinOp::Pow, 5),
+                _ => break,
+            };
+            if prec < min {
+                break;
+            }
             self.i += 1;
-            let r = self.unary()?;
-            l = Expr::Bin(BinOp::Pow, Box::new(l), Box::new(r));
+            let r = self.binary(prec + 1)?;
+            l = self.bin(op, l, &mut dl, r)?;
         }
+        self.d = dl;
         Ok(l)
     }
 
     fn unary(&mut self) -> Result<Expr, String> {
-        if self.is_op("-") {
-            self.i += 1;
-            return Ok(Expr::Neg(Box::new(self.unary()?)));
-        }
-        if self.is_op("+") {
-            self.i += 1;
-            return Ok(Expr::Plus(Box::new(self.unary()?)));
-        }
-        if self.is_op("@") {
-            // Implicit intersection operator.
-            self.i += 1;
-            return Ok(Expr::Func("SINGLE".into(), vec![self.unary()?]));
+        let prefix = if self.is_op("-") || self.is_op("+") || self.is_op("@") { self.next() } else { None };
+        if let Some(Tok::Op(op)) = prefix {
+            let e = self.nested(Self::unary)?;
+            self.set_depth(self.d + 1)?;
+            return Ok(match op {
+                "-" => Expr::Neg(Box::new(e)),
+                "+" => Expr::Plus(Box::new(e)),
+                // Implicit intersection operator.
+                _ => Expr::Func("SINGLE".into(), vec![e]),
+            });
         }
         let mut e = self.primary()?;
         while self.is_op("%") {
             self.i += 1;
+            self.set_depth(self.d + 1)?;
             e = Expr::Percent(Box::new(e));
         }
         Ok(e)
@@ -545,6 +552,8 @@ impl Parser {
 
     fn primary(&mut self) -> Result<Expr, String> {
         let t = self.peek().cloned().ok_or("unexpected end of formula")?;
+        // Leaves (numbers, strings, references, names) have depth 1; compound branches override.
+        self.d = 1;
         match t {
             Tok::Num(v, _) => {
                 if let Ok(r) = self.try_ref(None) {
@@ -571,68 +580,17 @@ impl Parser {
                 if self.next() != Some(Tok::RParen) {
                     return Err("missing )".into());
                 }
+                self.set_depth(self.d + 1)?;
                 Ok(Expr::Paren(Box::new(e)))
             }
             Tok::LBrace => {
                 self.i += 1;
-                let mut rows = vec![vec![]];
-                loop {
-                    let neg = if self.is_op("-") {
-                        self.i += 1;
-                        true
-                    } else {
-                        false
-                    };
-                    let v = match self.next() {
-                        Some(Tok::Num(v, _)) => Expr::Num(if neg { -v } else { v }),
-                        Some(Tok::Str(s)) => Expr::Str(s),
-                        Some(Tok::Err(e)) => Expr::Err(e),
-                        Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("TRUE") => Expr::Bool(true),
-                        Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("FALSE") => Expr::Bool(false),
-                        _ => return Err("bad array constant".into()),
-                    };
-                    rows.last_mut().unwrap().push(v);
-                    match self.next() {
-                        Some(Tok::Comma) => {}
-                        Some(Tok::Semi) => rows.push(vec![]),
-                        Some(Tok::RBrace) => break,
-                        _ => return Err("bad array constant".into()),
-                    }
-                }
-                Ok(Expr::Array(rows))
+                self.array()
             }
             Tok::Ident(id) => {
                 if self.peek_at(1) == Some(&Tok::LParen) {
                     self.i += 2;
-                    let mut name = id.to_ascii_uppercase();
-                    for p in ["_XLFN._XLWS.", "_XLFN.", "_XLWS."] {
-                        if let Some(rest) = name.strip_prefix(p) {
-                            name = rest.to_string();
-                        }
-                    }
-                    let mut args = Vec::new();
-                    if self.peek() == Some(&Tok::RParen) {
-                        self.i += 1;
-                        return Ok(Expr::Func(name, args));
-                    }
-                    loop {
-                        if matches!(self.peek(), Some(Tok::Comma) | Some(Tok::RParen)) {
-                            args.push(Expr::Missing);
-                        } else {
-                            args.push(self.expr()?);
-                        }
-                        match self.next() {
-                            Some(Tok::Comma) => continue,
-                            Some(Tok::RParen) => break,
-                            _ => return Err(format!("missing ) in {name}")),
-                        }
-                    }
-                    if let (true, [Expr::Ref(r)]) = (name == "ANCHORARRAY", args.as_slice()) {
-                        if r.kind == RefKind::Cell {
-                            return Ok(Expr::Ref(RefExpr { kind: RefKind::Spill, ..r.clone() }));
-                        }
-                    }
-                    return Ok(Expr::Func(name, args));
+                    return self.call(&id);
                 }
                 if let Ok(r) = self.try_ref(None) {
                     return Ok(r);
@@ -649,6 +607,78 @@ impl Parser {
             Tok::Op(o) => Err(format!("unexpected operator {o}")),
             other => Err(format!("unexpected {other:?}")),
         }
+    }
+
+    /// Array constant after `{` (kept out of `primary` so its frame stays small).
+    #[inline(never)]
+    fn array(&mut self) -> Result<Expr, String> {
+        let mut rows = vec![vec![]];
+        loop {
+            let neg = if self.is_op("-") {
+                self.i += 1;
+                true
+            } else {
+                false
+            };
+            let v = match self.next() {
+                Some(Tok::Num(v, _)) => Expr::Num(if neg { -v } else { v }),
+                Some(Tok::Str(s)) => Expr::Str(s),
+                Some(Tok::Err(e)) => Expr::Err(e),
+                Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("TRUE") => Expr::Bool(true),
+                Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("FALSE") => Expr::Bool(false),
+                _ => return Err("bad array constant".into()),
+            };
+            rows.last_mut().unwrap().push(v);
+            match self.next() {
+                Some(Tok::Comma) => {}
+                Some(Tok::Semi) => rows.push(vec![]),
+                Some(Tok::RBrace) => break,
+                _ => return Err("bad array constant".into()),
+            }
+        }
+        // Every row must have the same number of columns (`{1,2;3}` is rejected, like Excel).
+        if rows.iter().any(|r| r.len() != rows[0].len()) {
+            return Err("array constant rows differ in length".into());
+        }
+        self.d = 2;
+        Ok(Expr::Array(rows))
+    }
+
+    /// Function call after `name(`.
+    fn call(&mut self, id: &str) -> Result<Expr, String> {
+        let mut name = id.to_ascii_uppercase();
+        for p in ["_XLFN._XLWS.", "_XLFN.", "_XLWS."] {
+            if let Some(rest) = name.strip_prefix(p) {
+                name = rest.to_string();
+            }
+        }
+        let mut args = Vec::new();
+        if self.peek() == Some(&Tok::RParen) {
+            self.i += 1;
+            return Ok(Expr::Func(name, args));
+        }
+        let mut deepest = 0;
+        loop {
+            if matches!(self.peek(), Some(Tok::Comma) | Some(Tok::RParen)) {
+                args.push(Expr::Missing);
+            } else {
+                args.push(self.expr()?);
+                deepest = deepest.max(self.d);
+            }
+            match self.next() {
+                Some(Tok::Comma) => continue,
+                Some(Tok::RParen) => break,
+                _ => return Err(format!("missing ) in {name}")),
+            }
+        }
+        if let (true, [Expr::Ref(r)]) = (name == "ANCHORARRAY", args.as_slice()) {
+            if r.kind == RefKind::Cell {
+                self.d = 1;
+                return Ok(Expr::Ref(RefExpr { kind: RefKind::Spill, ..r.clone() }));
+            }
+        }
+        self.set_depth(deepest + 1)?;
+        Ok(Expr::Func(name, args))
     }
 
     fn try_ref(&mut self, sheet: Option<String>) -> Result<Expr, String> {
@@ -678,7 +708,7 @@ pub fn parse(src: &str) -> Result<Expr, String> {
     if toks.is_empty() {
         return Err("empty formula".into());
     }
-    let mut p = Parser { toks, i: 0 };
+    let mut p = Parser { toks, i: 0, nest: 0, d: 0 };
     let e = p.expr()?;
     if p.i < p.toks.len() {
         return Err(format!("unexpected {:?}", p.toks[p.i]));
@@ -1003,6 +1033,30 @@ mod tests {
         assert_eq!(rt("_xlfn.ANCHORARRAY(B2)*2"), "B2#*2");
         let e = parse("SUM(A1#)+@B1:B3+LET(x,2,x*A1)").unwrap();
         assert_eq!(print_xlsx(&e), "SUM(ANCHORARRAY(A1))+SINGLE(B1:B3)+LET(_xlpm.x,2,_xlpm.x*A1)");
+    }
+
+    #[test]
+    fn precedence_and_limits() {
+        let b = |op, l, r| Expr::Bin(op, Box::new(l), Box::new(r));
+        let n = Expr::Num;
+        assert_eq!(
+            parse("1=2&3+4*5^6").unwrap(),
+            b(BinOp::Eq, n(1.0), b(BinOp::Concat, n(2.0), b(BinOp::Add, n(3.0), b(BinOp::Mul, n(4.0), b(BinOp::Pow, n(5.0), n(6.0))))))
+        );
+        assert_eq!(parse("1-2-3").unwrap(), b(BinOp::Sub, b(BinOp::Sub, n(1.0), n(2.0)), n(3.0)));
+        assert_eq!(parse("2^3^2").unwrap(), b(BinOp::Pow, b(BinOp::Pow, n(2.0), n(3.0)), n(2.0)));
+        assert_eq!(parse("-2^2").unwrap(), b(BinOp::Pow, Expr::Neg(Box::new(n(2.0))), n(2.0)));
+        assert_eq!(parse("1*2+3<4").unwrap(), b(BinOp::Lt, b(BinOp::Add, b(BinOp::Mul, n(1.0), n(2.0)), n(3.0)), n(4.0)));
+        // multi-byte text after '#', ragged arrays, non-finite numbers, deep nesting
+        for bad in ["#Mañana", "#üü", "1+#ñ", "{1,2;3}", "{1;2,3}", "1E999"] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+        assert!(parse(&format!("{}1{}", "(".repeat(MAX_NESTING), ")".repeat(MAX_NESTING))).is_err());
+        assert!(parse(&format!("{}1{}", "(".repeat(MAX_NESTING - 1), ")".repeat(MAX_NESTING - 1))).is_ok());
+        assert!(parse(&format!("1{}", "+1".repeat(MAX_DEPTH))).is_err());
+        assert!(parse(&format!("1{}", "+1".repeat(MAX_DEPTH - 1))).is_ok());
+        let chain = format!("A1{}", "+A1".repeat(500));
+        assert_eq!(rt(&chain), chain);
     }
 
     #[test]
