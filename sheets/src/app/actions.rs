@@ -9,7 +9,7 @@ use super::dialogs::Dialog;
 use super::{App, Clip, ClipCell, EditMode, Editor, Scope};
 use crate::formula::{self, Expr};
 use crate::model::{
-    cell_from_input, Border, BorderLine, Cell, Formula, HAlign, Range, Sheet, Style, VAlign, Value, MAX_COLS, MAX_ROWS,
+    cell_from_input, Border, BorderLine, Cell, HAlign, Range, Sheet, Style, VAlign, Value, MAX_COLS, MAX_ROWS,
 };
 use crate::numfmt;
 
@@ -52,14 +52,6 @@ const MONTHS_LONG: [&str; 12] = [
 ];
 const DAYS_SHORT: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 const DAYS_LONG: [&str; 7] = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
-
-fn reprint(cell: &mut Cell) {
-    if let Some(f) = &mut cell.formula {
-        if let Some(ast) = &f.ast {
-            f.text = formula::print(ast);
-        }
-    }
-}
 
 fn shift_cell(cell: &mut Cell, dr: i64, dc: i64) {
     if dr == 0 && dc == 0 {
@@ -1963,16 +1955,6 @@ impl App {
         self.wb.recalc();
     }
 
-    pub fn update_cell_formula_text(cell: &mut Cell) {
-        reprint(cell);
-    }
-
-    pub fn set_formula_cell(&mut self, r: u32, c: u32, f: &str) {
-        let si = self.wb.active;
-        let style = self.wb.sheets[si].get(r, c).map(|x| x.style).unwrap_or(0);
-        let cell = Cell { value: Value::Empty, formula: Some(Box::new(Formula::new(f))), style };
-        self.wb.sheets[si].set(r, c, Some(cell));
-    }
 }
 
 impl App {

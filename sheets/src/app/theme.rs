@@ -94,7 +94,6 @@ pub mod ic {
     pub const UNDO: char = '\u{E7A7}';
     pub const REDO: char = '\u{E7A6}';
     pub const SAVE: char = '\u{E74E}';
-    pub const SAVE_AS: char = '\u{E792}';
     pub const OPEN: char = '\u{E8E5}';
     pub const FOLDER: char = '\u{E8B7}';
     pub const NEW: char = '\u{E8A5}';
@@ -116,9 +115,6 @@ pub mod ic {
     pub const ACCEPT: char = '\u{E8FB}';
     pub const TABLE: char = '\u{E80A}';
     pub const SETTINGS: char = '\u{E713}';
-    pub const HIDE: char = '\u{ED1A}';
-    pub const VIEW: char = '\u{E890}';
-    pub const EXIT: char = '\u{E7E8}';
 }
 
 // ---------------------------------------------------------------------------
@@ -208,7 +204,7 @@ impl FontManager {
     pub fn new(ctx: &egui::Context) -> Self {
         let mut defs = FontDefinitions::default();
         let mut ui_fallbacks = Vec::new();
-        let mut add = |defs: &mut FontDefinitions, key: &str, file: &str| -> bool {
+        let add = |defs: &mut FontDefinitions, key: &str, file: &str| -> bool {
             match read_font(file) {
                 Some(b) => {
                     defs.font_data.insert(key.to_string(), Arc::new(FontData::from_owned(b)));

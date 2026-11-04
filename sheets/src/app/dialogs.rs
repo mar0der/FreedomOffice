@@ -1135,7 +1135,7 @@ fn border_tab(ui: &mut egui::Ui, fc: &mut FormatCells) {
     ui.add_space(6.0);
     let l = fc.line;
     let b = &mut fc.style.border;
-    let mut toggle = |ui: &mut egui::Ui, name: &str, v: &mut BorderLine| {
+    let toggle = |ui: &mut egui::Ui, name: &str, v: &mut BorderLine| {
         let mut on = *v != BorderLine::None;
         if ui.checkbox(&mut on, name).changed() {
             *v = if on { l } else { BorderLine::None };

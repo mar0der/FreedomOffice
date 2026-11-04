@@ -251,7 +251,7 @@ pub fn render(wb: &Workbook, sheet: usize, area: Option<Range>, setup: PageSetup
     let mut offsets: Vec<usize> = Vec::new();
     let n_pages = contents.len();
     // object numbers: 1 catalog, 2 pages, 3-6 fonts, then (page, content) pairs
-    let mut obj = |pdf: &mut Vec<u8>, offsets: &mut Vec<usize>, body: &[u8]| {
+    let obj = |pdf: &mut Vec<u8>, offsets: &mut Vec<usize>, body: &[u8]| {
         offsets.push(pdf.len());
         let id = offsets.len();
         pdf.extend(format!("{id} 0 obj\n").bytes());

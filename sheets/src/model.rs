@@ -262,17 +262,6 @@ pub enum BorderLine {
     Dotted,
 }
 
-impl BorderLine {
-    pub fn width(self) -> f32 {
-        match self {
-            BorderLine::None => 0.0,
-            BorderLine::Thin | BorderLine::Dashed | BorderLine::Dotted => 1.0,
-            BorderLine::Medium => 2.0,
-            BorderLine::Thick | BorderLine::Double => 3.0,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub struct Border {
     pub left: BorderLine,
