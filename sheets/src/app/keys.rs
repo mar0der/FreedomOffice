@@ -110,7 +110,7 @@ impl App {
                 },
                 Event::Text(t) => {
                     let m = ctx.input(|i| i.modifiers);
-                    if (m.ctrl || m.command) && !m.alt {
+                    if ((m.ctrl || m.command) && !m.alt) || (m.alt && !m.ctrl) {
                         continue;
                     }
                     if t.chars().any(|c| c.is_control()) {
