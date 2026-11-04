@@ -431,14 +431,42 @@ impl App {
         }
         let (r, c) = self.active();
         let si = self.wb.active;
-        let Some(v) = validation::at(self.sheet(), r, c) else { return };
-        if v.allow != Allow::List {
+        let items = match validation::at(self.sheet(), r, c) {
+            Some(v) if v.allow == Allow::List => v.list_items(&self.wb, si, r, c),
+            _ => self.pick_list(r, c),
+        };
+        if items.is_empty() {
             return;
         }
-        let items = v.list_items(&self.wb, si, r, c);
         let cur = crate::numfmt::value_to_text(self.sheet().value(r, c));
         let hover = items.iter().position(|(t, _)| t.eq_ignore_ascii_case(&cur)).unwrap_or(0);
         self.dv.popup = Some(DropList { si, r, c, items, hover, fresh: true, scroll: true });
+    }
+
+    /// "Pick From Drop-down List": distinct text entries above/below in the same column.
+    fn pick_list(&self, r: u32, c: u32) -> Vec<(String, Value)> {
+        let sh = self.sheet();
+        let mut seen: Vec<String> = Vec::new();
+        for dir in [-1i64, 1] {
+            let mut k = r as i64 + dir;
+            while k >= 0 && k < crate::model::MAX_ROWS as i64 {
+                match sh.value(k as u32, c) {
+                    Value::Empty => break,
+                    Value::Text(t) => {
+                        if !seen.iter().any(|x| x.eq_ignore_ascii_case(t)) {
+                            seen.push(t.clone());
+                        }
+                    }
+                    _ => {}
+                }
+                k += dir;
+                if seen.len() > 5000 {
+                    break;
+                }
+            }
+        }
+        seen.sort_by_key(|a| a.to_lowercase());
+        seen.into_iter().map(|t| (t.clone(), Value::Text(t))).collect()
     }
 
     fn dv_pick(&mut self, si: usize, r: u32, c: u32, text: &str, v: Value) {
