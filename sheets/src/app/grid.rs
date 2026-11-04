@@ -1020,9 +1020,24 @@ impl App {
                         for d in (0..10).rev() {
                             let s = format!("{:.*}", d, n);
                             let w = painter.layout_no_wrap(s.clone(), font.clone(), color).size().x;
-                            if w <= avail && (n.abs() >= 1.0 || d > 0) {
+                            if w <= avail && (n.abs() >= 1.0 || d > 0) && s.trim_start_matches('-').trim_start_matches(['0', '.']).len() > 0 {
                                 t = s;
                                 break;
+                            }
+                        }
+                        // then scientific notation with fewer mantissa digits (General's fallback)
+                        if t.is_empty() {
+                            for m in (0..=5).rev() {
+                                let raw = format!("{:.*E}", m, n);
+                                let (mant, exp) = raw.split_once('E').unwrap_or((&raw, "0"));
+                                let mant = if mant.contains('.') { mant.trim_end_matches('0').trim_end_matches('.') } else { mant };
+                                let e: i32 = exp.parse().unwrap_or(0);
+                                let s = format!("{}E{}{:02}", mant, if e < 0 { '-' } else { '+' }, e.abs());
+                                let w = painter.layout_no_wrap(s.clone(), font.clone(), color).size().x;
+                                if w <= avail {
+                                    t = s;
+                                    break;
+                                }
                             }
                         }
                     }
