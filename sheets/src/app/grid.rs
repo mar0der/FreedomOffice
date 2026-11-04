@@ -268,7 +268,14 @@ impl App {
                 i.pointer.primary_down(),
                 i.pointer.interact_pos(),
                 i.pointer.button_double_clicked(egui::PointerButton::Primary),
-                i.modifiers,
+                // Prefer the modifiers recorded with the click itself (robust to fast key-up).
+                i.events
+                    .iter()
+                    .find_map(|e| match e {
+                        egui::Event::PointerButton { pressed: true, modifiers, .. } => Some(*modifiers),
+                        _ => None,
+                    })
+                    .unwrap_or(i.modifiers),
                 i.raw_scroll_delta,
                 i.pointer.secondary_pressed(),
             )
@@ -331,8 +338,11 @@ impl App {
             }
         }
 
+        // egui reports double-clicks by timing only; require both clicks on the same spot.
+        let dbl = dbl && !mods.shift && !mods.ctrl && self.last_press_pos.is_some_and(|p| p.distance(pos) < 6.0);
         if pressed && hovered {
             self.on_press(lay, pos, mods, dbl);
+            self.last_press_pos = Some(pos);
         } else if dbl && hovered {
             self.on_double_click(lay, pos);
         }
