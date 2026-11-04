@@ -2239,6 +2239,69 @@ impl App {
     }
 }
 
+impl App {
+    /// Selects ranges as a multi-area selection (first range active).
+    fn select_areas(&mut self, areas: Vec<Range>) {
+        if let Some(first) = areas.first().copied() {
+            self.select_range(first);
+            self.sheet_mut().view.extra = areas[1..].to_vec();
+        }
+    }
+
+    /// Ctrl+[ : select the cells the active formula refers to.
+    pub fn select_precedents(&mut self) {
+        let (r, c) = self.active();
+        let Some(mut ast) = self.sheet().get(r, c).and_then(|x| x.formula.as_ref()).and_then(|f| f.ast.clone()) else {
+            self.status = Some("The active cell has no formula.".into());
+            return;
+        };
+        let mut refs: Vec<(Option<String>, Range)> = Vec::new();
+        formula::map_refs(&mut ast, &mut |rf| {
+            refs.push((rf.sheet.clone(), Range::new(rf.a.row, rf.a.col, rf.b.row, rf.b.col)));
+            true
+        });
+        if refs.is_empty() {
+            self.status = Some("No precedents found.".into());
+            return;
+        }
+        let cur = self.wb.active;
+        let sheet_of = |s: &Option<String>| s.as_ref().and_then(|n| self.wb.sheet_index(n)).unwrap_or(cur);
+        let target = sheet_of(&refs[0].0);
+        let areas: Vec<Range> = refs.iter().filter(|(s, _)| sheet_of(s) == target).map(|(_, rg)| *rg).collect();
+        self.wb.active = target;
+        self.select_areas(areas);
+    }
+
+    /// Ctrl+] : select the formulas on this sheet that refer to the active cell.
+    pub fn select_dependents(&mut self) {
+        let si = self.wb.active;
+        let (r, c) = self.active();
+        let name = self.sheet().name.clone();
+        let mut hits: Vec<Range> = Vec::new();
+        for (rr, row) in &self.wb.sheets[si].rows {
+            for (cc, cell) in row {
+                let Some(mut ast) = cell.formula.as_ref().and_then(|f| f.ast.clone()) else { continue };
+                let mut found = false;
+                formula::map_refs(&mut ast, &mut |rf| {
+                    let here = rf.sheet.as_ref().is_none_or(|s| s.eq_ignore_ascii_case(&name));
+                    if here && Range::new(rf.a.row, rf.a.col, rf.b.row, rf.b.col).contains(r, c) {
+                        found = true;
+                    }
+                    true
+                });
+                if found {
+                    hits.push(Range::cell(*rr, *cc));
+                }
+            }
+        }
+        if hits.is_empty() {
+            self.status = Some("No dependents found.".into());
+            return;
+        }
+        self.select_areas(hits);
+    }
+}
+
 fn replace_ci(text: &str, what: &str, with: &str) -> String {
     if what.is_empty() {
         return text.to_string();

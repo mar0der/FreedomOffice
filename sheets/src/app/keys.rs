@@ -363,6 +363,8 @@ impl App {
             }
             Key::G => self.dialog = Some(Dialog::GoTo { text: String::new(), focus: true }),
             Key::D => self.fill_down(),
+            Key::OpenBracket => self.select_precedents(),
+            Key::CloseBracket => self.select_dependents(),
             Key::R => self.fill_right(),
             Key::L if shift => self.toggle_filter(),
             Key::T | Key::L => self.format_as_table(0x4472C4, 1),
