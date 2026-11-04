@@ -3,11 +3,13 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
 mod app;
+mod condfmt;
 mod formula;
 mod icon;
 mod io;
 mod model;
 mod numfmt;
+mod validation;
 
 use eframe::egui;
 

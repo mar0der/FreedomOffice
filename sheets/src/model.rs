@@ -402,6 +402,9 @@ pub struct Sheet {
     pub gridlines: bool,
     pub tab_color: Option<u32>,
     pub view: SheetView,
+    /// Conditional formatting rules, highest priority first.
+    pub cond_formats: Vec<crate::condfmt::CondFormat>,
+    pub validations: Vec<crate::validation::Validation>,
 }
 
 impl Sheet {
@@ -419,6 +422,8 @@ impl Sheet {
             gridlines: true,
             tab_color: None,
             view: SheetView::default(),
+            cond_formats: Vec::new(),
+            validations: Vec::new(),
         }
     }
 

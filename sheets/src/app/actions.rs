@@ -78,6 +78,7 @@ impl App {
     /// Applies all formula transforms across the workbook.
     pub fn transform_formulas(&mut self, mut f: impl FnMut(&mut Expr, usize)) {
         for (si, sh) in self.wb.sheets.iter_mut().enumerate() {
+            crate::condfmt::map_sheet_formulas(sh, &mut |e| f(e, si));
             for row in sh.rows.values_mut() {
                 for cell in row.values_mut() {
                     if let Some(fm) = &mut cell.formula {
@@ -587,6 +588,7 @@ impl App {
         self.push_undo(&[Scope::All]);
         let si = self.wb.active;
         Self::shift_sheet(&mut self.wb.sheets[si], rows, at, n);
+        crate::condfmt::shift_sheet_rules(&mut self.wb.sheets[si], rows, at, n);
         let name = self.wb.sheets[si].name.clone();
         self.transform_formulas(|e, fsi| formula::shift_for_structure(e, &name, fsi == si, rows, at, n));
         self.clip = None;

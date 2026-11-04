@@ -2,12 +2,14 @@
 
 mod actions;
 mod chrome;
+mod condfmt_ui;
 mod dialogs;
 mod editor;
 mod grid;
 mod keys;
 mod ribbon;
 mod theme;
+mod validation_ui;
 
 use std::path::PathBuf;
 
@@ -146,6 +148,8 @@ pub struct App {
     pub stats_cache: Option<((usize, Range, u64), Option<(f64, usize, usize, f64)>)>,
     pub last_font_color: u32,
     pub last_fill: u32,
+    pub cf: condfmt_ui::CfState,
+    pub dv: validation_ui::DvState,
 }
 
 const MAX_UNDO: usize = 100;
@@ -196,6 +200,8 @@ impl App {
             stats_cache: None,
             last_font_color: 0xFF0000,
             last_fill: 0xFFFF00,
+            cf: Default::default(),
+            dv: Default::default(),
         };
         if let Some(p) = path {
             app.open_path(p);
@@ -429,6 +435,7 @@ impl App {
     pub fn changed(&mut self) {
         self.generation += 1;
         self.wb.recalc();
+        self.cf.invalidate();
         self.dirty = true;
         if self.wb.circular {
             self.status = Some("Circular reference warning: one or more formulas refer to their own cell.".into());
@@ -486,6 +493,10 @@ impl App {
                     return false;
                 }
             }
+        }
+        if !self.dv_check_entry(&e, &text, fill_selection) {
+            self.edit = Some(e);
+            return false;
         }
         let targets: Vec<(u32, u32)> = if fill_selection {
             let sel = self.sel();
@@ -583,6 +594,8 @@ impl App {
         self.dirty = false;
         self.backstage = None;
         self.filter_popup = None;
+        self.cf = Default::default();
+        self.dv = Default::default();
     }
 
     pub fn open_path(&mut self, p: PathBuf) {
