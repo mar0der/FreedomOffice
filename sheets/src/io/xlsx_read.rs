@@ -1064,6 +1064,15 @@ fn parse_sheet(xml: &str, ctx: &SheetCtx, sheet: &mut Sheet) {
     clear_array_results(sheet);
 }
 
+/// A formula from a file; `ANCHORARRAY(A1)` / `SINGLE(x)` are shown as `A1#` / `@x` like Excel.
+fn file_formula(text: &str) -> Formula {
+    let f = Formula::new(text);
+    match f.ast {
+        Some(ast) if text.contains("ANCHORARRAY(") || text.contains("SINGLE(") => Formula::from_ast(ast),
+        _ => f,
+    }
+}
+
 /// Array formulas are saved with their results as plain cells inside the formula's range;
 /// drop those so the formula spills them again (they are kept as recalculation hints).
 fn clear_array_results(sheet: &mut Sheet) {
@@ -1122,7 +1131,7 @@ fn finish_cell(cb: CellBuf, ctx: &SheetCtx, shared_f: &mut HashMap<String, Share
                 if !text.is_empty() {
                     let text = strip_future_prefixes(text);
                     let ast = formula::parse(&text).ok();
-                    f = Some(Formula::new(&text));
+                    f = Some(file_formula(&text));
                     shared_f.insert(si, SharedMaster { row: cb.row, col: cb.col, ast, text });
                 } else if let Some(m) = shared_f.get(&si) {
                     f = Some(match &m.ast {
@@ -1141,7 +1150,7 @@ fn finish_cell(cb: CellBuf, ctx: &SheetCtx, shared_f: &mut HashMap<String, Share
                 if let Some(rg) = cb.f_ref.as_deref().and_then(Range::parse).filter(|rg| !rg.is_single() && rg.r1 == cb.row && rg.c1 == cb.col) {
                     sheet.spill.anchors.insert((cb.row, cb.col), (rg, false));
                 }
-                f = Some(Formula::new(&text));
+                f = Some(file_formula(&text));
             }
             _ => {
                 if !text.is_empty() {
@@ -1149,7 +1158,7 @@ fn finish_cell(cb: CellBuf, ctx: &SheetCtx, shared_f: &mut HashMap<String, Share
                     // A formula that is just an error literal is how errors are stored on save.
                     match ErrorKind::parse(&text) {
                         Some(e) if !text.contains('(') => value = Value::Error(e),
-                        _ => f = Some(Formula::new(&text)),
+                        _ => f = Some(file_formula(&text)),
                     }
                 }
             }

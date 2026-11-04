@@ -16,6 +16,6 @@ pub use eval::{eval_formula, recalc, recalc_ranges};
 pub use eval::{eval_array, recalc_cells};
 pub use functions::{function_names, signature};
 pub use parser::{
-    lex, map_refs, move_refs, parse, parse_cell_part, print, quote_sheet, ref_str, rename_sheet, shift_for_structure,
+    lex, map_refs, move_refs, parse, parse_cell_part, print, print_xlsx, quote_sheet, ref_str, rename_sheet, shift_for_structure,
     shift_relative, Expr, RefExpr, RefKind, Spanned, Tok,
 };

@@ -80,6 +80,29 @@ mod tests {
     }
 
     #[test]
+    fn xlsx_dynamic_arrays() {
+        let mut wb = Workbook::new();
+        wb.sheets[0].set(0, 0, Some(fcell("SEQUENCE(3)", Value::Empty)));
+        wb.sheets[0].set(0, 1, Some(fcell("SUM(A1#)+@C1:C2", Value::Empty)));
+        wb.sheets[0].set(0, 2, Some(fcell("LET(x,2,x*10)", Value::Empty)));
+        wb.recalc();
+        assert_eq!(wb.sheets[0].display_value(2, 0), &Value::Number(3.0));
+        assert_eq!(wb.sheets[0].value(0, 1), &Value::Number(26.0));
+        let path = temp("dynamic_arrays.xlsx");
+        save(&wb, &path).unwrap();
+        let mut back = load(&path).unwrap();
+        let s = &back.sheets[0];
+        assert_eq!(s.get(0, 1).unwrap().formula.as_ref().unwrap().text, "SUM(A1#)+@C1:C2");
+        assert_eq!(s.get(0, 2).unwrap().formula.as_ref().unwrap().text, "LET(x,2,x*10)");
+        // cached spill results are dropped so the formula can spill again
+        assert!(s.get(1, 0).is_none() && s.get(2, 0).is_none());
+        back.recalc();
+        assert_eq!(back.sheets[0].display_value(2, 0), &Value::Number(3.0));
+        assert_eq!(back.sheets[0].value(0, 1), &Value::Number(26.0));
+        assert_eq!(back.sheets[0].value(0, 2), &Value::Number(20.0));
+    }
+
+    #[test]
     fn xlsx_round_trip() {
         let mut wb = Workbook::empty_with(vec![Sheet::new("Data"), Sheet::new("My Sheet")]);
         let fancy = wb.intern_style(Style {

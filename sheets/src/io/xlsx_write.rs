@@ -127,7 +127,7 @@ fn write_cell(ws: &mut Worksheet, r: u32, c: u16, cell: &Cell, fmt: &Format, spi
         // Normalized text (upper-case function names) so Excel and the future-function
         // escaping in rust_xlsxwriter both recognise it.
         let text = match &f.ast {
-            Some(ast) => formula::print(ast),
+            Some(ast) => formula::print_xlsx(ast),
             None => f.text.clone(),
         };
         let xf = XFormula::new(&text).set_result(result_text(&cell.value));
