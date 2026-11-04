@@ -643,6 +643,9 @@ fn fn_conditional_aggregates_with_dates() {
     assert_eq!(g("=COUNTIF(A:A,DATE(2024,1,15))"), n(1.0));
     assert_eq!(g("=SUMIF(A1:A5,\"1/20/2024\",B1:B5)"), n(30.0));
     assert_eq!(g("=COUNTIFS(A1:A5,\">\"&A2,B1:B5,\"<50\")"), n(2.0));
+    assert_eq!(g("=COUNTIF(A1:A10,\"\")"), n(5.0));
+    assert_eq!(g("=COUNTIF(A1:A10,\"<>\")"), n(5.0));
+    assert_eq!(g("=SUMIF($A$1:$A$100000,\">=1/20/2024\",$B$1:$B$100000)"), n(120.0));
     // criteria arrays are lifted: one result per criterion
     assert_eq!(eval_array(&wb, 0, 9, 9, "=COUNTIF(B1:B5,{\">20\",\"<20\"})"), nums(&[&[3.0, 1.0]]));
 }

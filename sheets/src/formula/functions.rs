@@ -1042,7 +1042,7 @@ fn dispatch(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
         "SUMIF" | "AVERAGEIF" => {
             need(a, 2, 3)?;
             let rv = ev.arg(a, 0)?;
-            let g = ev.grid(rv);
+            let g = ev.grid_clipped(rv);
             let (rows, cols) = (g.len(), g.first().map_or(0, |r| r.len()));
             let crit = parse_criteria(&ev.value(a, 1)?);
             let sg = if ev.has(a, 2) {
@@ -1073,7 +1073,7 @@ fn dispatch(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
                 return Err(E::Value);
             }
             let sv = ev.arg(a, 0)?;
-            let sg = ev.grid(sv);
+            let sg = ev.grid_clipped(sv);
             let (rows, cols) = (sg.len(), sg.first().map_or(0, |r| r.len()));
             let mask = criteria_mask(ev, a, 1, rows, cols)?;
             let mut vals = Vec::new();
@@ -1100,16 +1100,23 @@ fn dispatch(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
         "COUNTIF" => {
             need(a, 2, 2)?;
             let rv = ev.arg(a, 0)?;
-            let g = ev.grid(rv);
+            let area = match &rv {
+                EV::R(_, rg) => rg.rows() as f64 * rg.cols() as f64,
+                _ => 0.0,
+            };
+            let g = ev.grid_clipped(rv);
             let crit = parse_criteria(&ev.value(a, 1)?);
-            num(g.iter().flatten().filter(|v| crit_match(&crit, v)).count() as f64)
+            let seen = g.iter().map(|r| r.len()).sum::<usize>() as f64;
+            // Cells beyond the used area are blank.
+            let blanks = if crit_match(&crit, &Value::Empty) { (area - seen).max(0.0) } else { 0.0 };
+            num(g.iter().flatten().filter(|v| crit_match(&crit, v)).count() as f64 + blanks)
         }
         "COUNTIFS" => {
             if n < 2 {
                 return Err(E::Value);
             }
             let rv = ev.arg(a, 0)?;
-            let g = ev.grid(rv);
+            let g = ev.grid_clipped(rv);
             let (rows, cols) = (g.len(), g.first().map_or(0, |r| r.len()));
             let mask = criteria_mask(ev, a, 0, rows, cols)?;
             num(mask.iter().flatten().filter(|m| **m).count() as f64)

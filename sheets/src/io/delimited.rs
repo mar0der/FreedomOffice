@@ -137,7 +137,7 @@ pub fn write(wb: &Workbook, path: &Path, delim: u8) -> Result<(), String> {
 pub fn to_text(wb: &Workbook, delim: u8) -> String {
     let sh = &wb.sheets[wb.active.min(wb.sheets.len().saturating_sub(1))];
     let mut out = String::from("\u{feff}");
-    let Some((max_r, max_c)) = sh.extent() else {
+    let Some((max_r, max_c)) = sh.extent_with_spills() else {
         return out;
     };
     let d = delim as char;
@@ -147,8 +147,11 @@ pub fn to_text(wb: &Workbook, delim: u8) -> String {
             if c > 0 {
                 out.push(d);
             }
-            if let Some(cell) = row.and_then(|row| row.get(&c)) {
-                let text = numfmt::format_value(&cell.value, &wb.style(cell.style).num_fmt).text;
+            // Spilled dynamic-array values are exported like ordinary values.
+            let cell = row.and_then(|row| row.get(&c));
+            let value = sh.display_value(r, c);
+            if cell.is_some() || !value.is_empty() {
+                let text = numfmt::format_value(value, &wb.style(cell.map_or(0, |c| c.style)).num_fmt).text;
                 push_field(&mut out, &text, d);
             }
         }

@@ -100,6 +100,8 @@ mod tests {
         assert_eq!(back.sheets[0].display_value(2, 0), &Value::Number(3.0));
         assert_eq!(back.sheets[0].value(0, 1), &Value::Number(26.0));
         assert_eq!(back.sheets[0].value(0, 2), &Value::Number(20.0));
+        let csv = super::delimited::to_text(&back, b',');
+        assert_eq!(csv.trim_start_matches('\u{feff}').split("\r\n").take(3).collect::<Vec<_>>(), ["1,26,20", "2,,", "3,,"]);
     }
 
     #[test]

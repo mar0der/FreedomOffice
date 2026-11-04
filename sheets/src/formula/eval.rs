@@ -858,6 +858,18 @@ impl<'a> Evaluator<'a> {
         }
     }
 
+    /// Like `grid`, but ranges are clipped to the used area: for aggregates whose result does
+    /// not depend on trailing blank cells (keeps `SUMIF($A$1:$A$100000,...)` cheap).
+    pub fn grid_clipped(&mut self, v: EV) -> Vec<Vec<Value>> {
+        match v {
+            EV::R(s, rg) => {
+                let rg = self.clip_extent(s, rg);
+                self.grid_of(s, rg)
+            }
+            other => self.grid(other),
+        }
+    }
+
     fn grid_of(&mut self, s: usize, rg: Range) -> Vec<Vec<Value>> {
         let mut out = vec![vec![Value::Empty; rg.cols() as usize]; rg.rows() as usize];
         let wb = self.wb;

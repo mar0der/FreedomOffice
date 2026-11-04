@@ -501,8 +501,10 @@ impl App {
         if formats {
             let sh = &mut self.wb.sheets[si];
             sh.merges.retain(|m| !m.intersects(&sel));
+            self.changed();
+        } else {
+            self.changed_ranges(si, &[sel]);
         }
-        self.changed();
     }
 
     // ------------------------------------------------------------------
