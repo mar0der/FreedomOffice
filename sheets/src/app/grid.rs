@@ -1031,6 +1031,44 @@ impl App {
                 }
             }
             it.clip = clip;
+            if it.style.rotation != 0 {
+                let tp = painter.with_clip_rect(it.rect.intersect(lay.cells));
+                if it.style.rotation == 255 {
+                    let stacked: String = it.shown.text.chars().map(|c| c.to_string()).collect::<Vec<_>>().join("\n");
+                    let mut job = LayoutJob::single_section(stacked, fmt.clone());
+                    job.halign = egui::Align::Center;
+                    let g = painter.layout_job(job);
+                    let y = match it.style.valign {
+                        VAlign::Top => it.rect.top() + 1.0,
+                        VAlign::Center => it.rect.center().y - g.size().y / 2.0,
+                        VAlign::Bottom => it.rect.bottom() - g.size().y - 1.0,
+                    };
+                    tp.galley(Pos2::new(it.rect.center().x.round(), y.round()), g, color);
+                } else {
+                    let r = it.style.rotation as f32;
+                    let deg = if r <= 90.0 { -r } else { r - 90.0 };
+                    let a = deg.to_radians();
+                    let (s, c) = a.sin_cos();
+                    let rot = |v: Vec2| Vec2::new(v.x * c - v.y * s, v.x * s + v.y * c);
+                    let pts = [rot(Vec2::ZERO), rot(Vec2::new(gs.x, 0.0)), rot(Vec2::new(0.0, gs.y)), rot(gs)];
+                    let minx = pts.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
+                    let maxx = pts.iter().map(|p| p.x).fold(f32::NEG_INFINITY, f32::max);
+                    let miny = pts.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
+                    let maxy = pts.iter().map(|p| p.y).fold(f32::NEG_INFINITY, f32::max);
+                    let px = match it.shown.align {
+                        HAlign::Left | HAlign::General => it.rect.left() + pad - minx,
+                        HAlign::Right => it.rect.right() - pad - maxx,
+                        HAlign::Center => it.rect.center().x - (minx + maxx) / 2.0,
+                    };
+                    let py = match it.style.valign {
+                        VAlign::Top => it.rect.top() + 1.0 - miny,
+                        VAlign::Center => it.rect.center().y - (miny + maxy) / 2.0,
+                        VAlign::Bottom => it.rect.bottom() - 1.0 - maxy,
+                    };
+                    tp.add(egui::epaint::TextShape::new(Pos2::new(px, py), galley, color).with_angle(a));
+                }
+                continue;
+            }
             let x = match it.shown.align {
                 HAlign::Left | HAlign::General => it.rect.left() + pad + indent,
                 HAlign::Right => it.rect.right() - pad - gs.x - indent,

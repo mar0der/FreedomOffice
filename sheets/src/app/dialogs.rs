@@ -797,6 +797,9 @@ impl App {
                             if o.indent != n.indent {
                                 s.indent = n.indent;
                             }
+                            if o.rotation != n.rotation {
+                                s.rotation = n.rotation;
+                            }
                             if o.border != n.border {
                                 s.border = n.border;
                             }
@@ -952,6 +955,21 @@ fn alignment_tab(ui: &mut egui::Ui, fc: &mut FormatCells) {
     ui.add_space(8.0);
     ui.label(RichText::new("Text control").strong());
     ui.checkbox(&mut fc.style.wrap, "Wrap text");
+    ui.add_space(8.0);
+    ui.label(RichText::new("Orientation").strong());
+    let mut vertical = fc.style.rotation == 255;
+    if ui.checkbox(&mut vertical, "Vertical text").changed() {
+        fc.style.rotation = if vertical { 255 } else { 0 };
+    }
+    if !vertical {
+        let r = fc.style.rotation as i32;
+        let mut deg = if r <= 90 { r } else { -(r - 90) };
+        ui.horizontal(|ui| {
+            if ui.add(egui::DragValue::new(&mut deg).range(-90..=90).suffix(" Degrees")).changed() {
+                fc.style.rotation = if deg >= 0 { deg as u8 } else { (90 - deg) as u8 };
+            }
+        });
+    }
 }
 
 fn font_tab(ui: &mut egui::Ui, fc: &mut FormatCells) {

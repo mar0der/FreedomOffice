@@ -298,6 +298,9 @@ pub struct Style {
     pub valign: VAlign,
     pub wrap: bool,
     pub indent: u8,
+    /// Text rotation in xlsx terms: 0 none, 1-90 counterclockwise degrees,
+    /// 91-180 = clockwise (value - 90) degrees, 255 = vertical stacked text.
+    pub rotation: u8,
     /// Number format code; empty = "General".
     pub num_fmt: String,
     pub border: Border,

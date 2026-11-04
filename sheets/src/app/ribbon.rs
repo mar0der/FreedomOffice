@@ -398,7 +398,31 @@ impl App {
                             app.set_valign(v);
                         }
                     }
-                    ui.add_space(4.0);
+                    ui.add_space(2.0);
+                    ui.menu_button(RichText::new("ab↗").size(13.0), |ui| {
+                        ui.set_min_width(190.0);
+                        for (label, rot) in [
+                            ("Angle Counterclockwise", 45u8),
+                            ("Angle Clockwise", 135),
+                            ("Vertical Text", 255),
+                            ("Rotate Text Up", 90),
+                            ("Rotate Text Down", 180),
+                            ("No Rotation", 0),
+                        ] {
+                            if ui.button(label).clicked() {
+                                app.apply_style(move |s| s.rotation = rot);
+                                ui.close();
+                            }
+                        }
+                        ui.separator();
+                        if ui.button("Format Cell Alignment").clicked() {
+                            app.open_format_cells(1);
+                            ui.close();
+                        }
+                    })
+                    .response
+                    .on_hover_text("Orientation");
+                    ui.add_space(2.0);
                     if Self::text_btn(ui, "↵ Wrap Text", "Wrap Text", st.wrap, 90.0).clicked() {
                         app.toggle_wrap();
                     }

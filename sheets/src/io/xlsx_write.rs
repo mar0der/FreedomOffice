@@ -223,6 +223,12 @@ fn to_format(s: &Style) -> Format {
     if s.indent > 0 {
         f = f.set_indent(s.indent);
     }
+    match s.rotation {
+        0 => {}
+        r @ 1..=90 => f = f.set_rotation(r as i16),
+        r @ 91..=180 => f = f.set_rotation(-((r - 90) as i16)),
+        _ => f = f.set_rotation(270),
+    }
     if !s.num_fmt.is_empty() && !s.num_fmt.eq_ignore_ascii_case("general") {
         f = f.set_num_format(&s.num_fmt);
     }

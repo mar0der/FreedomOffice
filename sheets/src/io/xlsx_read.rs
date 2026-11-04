@@ -832,6 +832,7 @@ fn parse_styles(xml: &str, theme: &Theme, wb: &mut Workbook) -> XfMap {
                                                 }
                                                 "wrapText" => st.wrap = v == "1" || v == "true",
                                                 "indent" => st.indent = v.parse::<u32>().unwrap_or(0).min(250) as u8,
+                                                "textRotation" => st.rotation = v.parse::<u32>().unwrap_or(0).min(255) as u8,
                                                 _ => {}
                                             }
                                         }
