@@ -306,6 +306,10 @@ impl App {
 
         let Some(pos) = pos else { return };
 
+        if self.chart_pointer(ui, lay, pos, hovered, pressed, down) {
+            return;
+        }
+
         // Cursor icon
         if hovered && self.drag == Drag::None {
             ui.ctx().set_cursor_icon(self.hover_cursor(lay, pos));
@@ -1088,6 +1092,8 @@ impl App {
                 }
             }
         }
+
+        self.paint_charts(ui, lay);
 
         // In-cell editor
         self.paint_editor(ui, lay);

@@ -1,6 +1,7 @@
 //! Application shell: state, undo, editing and the frame loop.
 
 mod actions;
+mod chart_view;
 mod chrome;
 mod dialogs;
 mod editor;
@@ -27,6 +28,8 @@ pub enum RibbonTab {
     Review,
     View,
     Help,
+    /// Contextual tab shown while a chart is selected.
+    ChartDesign,
 }
 
 #[derive(Clone)]
@@ -146,6 +149,7 @@ pub struct App {
     pub stats_cache: Option<((usize, Range, u64), Option<(f64, usize, usize, f64)>)>,
     pub last_font_color: u32,
     pub last_fill: u32,
+    pub chart: chart_view::ChartUi,
 }
 
 const MAX_UNDO: usize = 100;
@@ -196,6 +200,7 @@ impl App {
             stats_cache: None,
             last_font_color: 0xFF0000,
             last_fill: 0xFFFF00,
+            chart: Default::default(),
         };
         if let Some(p) = path {
             app.open_path(p);

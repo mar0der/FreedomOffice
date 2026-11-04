@@ -589,6 +589,7 @@ impl App {
         Self::shift_sheet(&mut self.wb.sheets[si], rows, at, n);
         let name = self.wb.sheets[si].name.clone();
         self.transform_formulas(|e, fsi| formula::shift_for_structure(e, &name, fsi == si, rows, at, n));
+        crate::chart::shift_for_structure(&mut self.wb, si, rows, at, n);
         self.clip = None;
         self.changed();
     }
@@ -1639,6 +1640,7 @@ impl App {
         self.wb.sheets[i].name = new.to_string();
         let newn = new.to_string();
         self.transform_formulas(|e, _| formula::rename_sheet(e, &old, &newn));
+        crate::chart::rename_sheet(&mut self.wb, &old, &newn);
         self.changed();
         Ok(())
     }
