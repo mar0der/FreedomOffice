@@ -577,7 +577,13 @@ impl App {
                         self.backstage = None;
                         self.confirm_then(Pending::New);
                     }
-                    ui.add_space(24.0);
+                    ui.add_space(16.0);
+                    let browse = egui::Button::new(RichText::new("📂  Open — Browse for a workbook...").size(14.0)).min_size(Vec2::new(260.0, 34.0));
+                    if ui.add(browse).on_hover_text("Ctrl+O").clicked() {
+                        self.backstage = None;
+                        self.confirm_then(Pending::Open(None));
+                    }
+                    ui.add_space(20.0);
                     self.recent_list(ui);
                 }
                 Backstage::Open => {

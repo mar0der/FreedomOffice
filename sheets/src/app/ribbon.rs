@@ -216,6 +216,10 @@ impl App {
             let (u, ui_) = self.icon(ic::UNDO, "↶");
             let (rd, ri) = self.icon(ic::REDO, "↷");
             let mk = |g: String, i: bool| if i { RichText::new(g).font(theme::icon_font(13.0)) } else { RichText::new(g).size(14.0) };
+            let (o, oi) = self.icon(ic::OPEN, "📂");
+            if ui.add(egui::Button::new(mk(o, oi)).frame(false).min_size(Vec2::new(26.0, 26.0))).on_hover_text("Open (Ctrl+O)").clicked() {
+                self.confirm_then(super::Pending::Open(None));
+            }
             if ui.add(egui::Button::new(mk(s, si)).frame(false).min_size(Vec2::new(26.0, 26.0))).on_hover_text("Save (Ctrl+S)").clicked() {
                 self.save();
             }
