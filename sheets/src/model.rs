@@ -381,6 +381,8 @@ pub struct SheetView {
     pub sel: Range,
     pub top: u32,
     pub left: u32,
+    /// Additional areas of a Ctrl+click multi-area selection.
+    pub extra: Vec<Range>,
 }
 
 #[derive(Clone, Debug, Default)]

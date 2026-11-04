@@ -171,6 +171,8 @@ pub struct App {
     /// AutoRecover: where this session's recovery copy is written, and when it was last written.
     pub recovery_path: Option<PathBuf>,
     pub last_autosave: f64,
+    /// Last repeatable command (F4 / Ctrl+Y).
+    pub last_action: Option<actions::Repeat>,
     pub chart: chart_view::ChartUi,
     pub cf: condfmt_ui::CfState,
     pub dv: validation_ui::DvState,
@@ -236,6 +238,7 @@ impl App {
             pending_link: None,
             recovery_path: recovery_dir().map(|d| d.join(format!("Recovered-{}.xlsx", std::process::id()))),
             last_autosave: 0.0,
+            last_action: None,
             chart: Default::default(),
             cf: Default::default(),
             dv: Default::default(),
@@ -343,6 +346,7 @@ impl App {
             v.active = v.anchor;
             self.scroll_into_view(r, c);
         } else {
+            self.sheet_mut().view.extra.clear();
             let (r, c) = match self.sheet().merge_at(r, c) {
                 Some(m) => (m.r1, m.c1),
                 None => (r, c),
@@ -358,6 +362,7 @@ impl App {
 
     pub fn select_range(&mut self, rg: Range) {
         let v = &mut self.sheet_mut().view;
+        v.extra.clear();
         v.sel = rg;
         v.active = (rg.r1, rg.c1);
         v.anchor = (rg.r1, rg.c1);

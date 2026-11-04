@@ -13,6 +13,16 @@ use crate::model::{
 };
 use crate::numfmt;
 
+/// A command that F4 / Ctrl+Y can repeat.
+#[derive(Clone)]
+pub enum Repeat {
+    Style(std::rc::Rc<dyn Fn(&mut Style)>),
+    InsertRows,
+    InsertCols,
+    DeleteRows,
+    DeleteCols,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PasteMode {
     All,
@@ -73,6 +83,32 @@ impl App {
         let sel = self.sel();
         let (er, ec) = self.sheet().extent().unwrap_or((0, 0));
         Range { r1: sel.r1, c1: sel.c1, r2: sel.r2.min(er.max(sel.r1)), c2: sel.c2.min(ec.max(sel.c1)) }
+    }
+
+    /// All selected areas (Ctrl+click multi-selection), active area last.
+    pub fn areas(&self) -> Vec<Range> {
+        let v = &self.sheet().view;
+        let mut out: Vec<Range> = v.extra.clone();
+        out.push(v.sel);
+        out
+    }
+
+    /// An area clipped to the used part of the sheet (for whole rows/columns).
+    pub fn clip_area(&self, a: Range) -> Range {
+        let (er, ec) = self.sheet().extent().unwrap_or((0, 0));
+        Range { r1: a.r1, c1: a.c1, r2: a.r2.min(er.max(a.r1)), c2: a.c2.min(ec.max(a.c1)) }
+    }
+
+    /// F4 / Ctrl+Y: repeats the last formatting or insert/delete command.
+    pub fn repeat_last(&mut self) {
+        match self.last_action.clone() {
+            Some(Repeat::Style(f)) => self.apply_style_rc(f),
+            Some(Repeat::InsertRows) => self.insert_rows(),
+            Some(Repeat::InsertCols) => self.insert_cols(),
+            Some(Repeat::DeleteRows) => self.delete_rows(),
+            Some(Repeat::DeleteCols) => self.delete_cols(),
+            None => {}
+        }
     }
 
     /// Applies all formula transforms across the workbook.
@@ -513,6 +549,18 @@ impl App {
     // ------------------------------------------------------------------
 
     pub fn clear(&mut self, contents: bool, formats: bool) {
+        let areas = self.areas();
+        if areas.len() > 1 {
+            // Multi-area: clear each area (one undo step per area keeps this simple and exact).
+            let saved = self.sheet().view.clone();
+            for a in areas {
+                self.sheet_mut().view.sel = a;
+                self.sheet_mut().view.extra.clear();
+                self.clear(contents, formats);
+            }
+            self.sheet_mut().view = saved;
+            return;
+        }
         let sel = self.sel_clipped();
         let si = self.wb.active;
         self.push_undo(&[Scope::Range(si, sel)]);
@@ -620,18 +668,22 @@ impl App {
     }
 
     pub fn insert_rows(&mut self) {
+        self.last_action = Some(Repeat::InsertRows);
         let sel = self.sel();
         self.structure(true, sel.r1, sel.rows() as i64);
     }
     pub fn insert_cols(&mut self) {
+        self.last_action = Some(Repeat::InsertCols);
         let sel = self.sel();
         self.structure(false, sel.c1, sel.cols() as i64);
     }
     pub fn delete_rows(&mut self) {
+        self.last_action = Some(Repeat::DeleteRows);
         let sel = self.sel();
         self.structure(true, sel.r1, -(sel.rows() as i64));
     }
     pub fn delete_cols(&mut self) {
+        self.last_action = Some(Repeat::DeleteCols);
         let sel = self.sel();
         self.structure(false, sel.c1, -(sel.cols() as i64));
     }
@@ -877,18 +929,29 @@ impl App {
     // ------------------------------------------------------------------
 
     /// Applies a style change to every cell of the selection.
-    pub fn apply_style(&mut self, f: impl Fn(&mut Style)) {
+    pub fn apply_style(&mut self, f: impl Fn(&mut Style) + 'static) {
+        self.apply_style_rc(std::rc::Rc::new(f));
+    }
+
+    pub fn apply_style_rc(&mut self, f: std::rc::Rc<dyn Fn(&mut Style)>) {
         self.commit_edit(false);
-        let sel = self.sel();
+        self.last_action = Some(Repeat::Style(f.clone()));
         let si = self.wb.active;
-        let clipped = self.sel_clipped();
-        let dense = clipped.rows() as u64 * clipped.cols() as u64 <= 250_000;
-        self.push_undo(&[Scope::Range(si, clipped)]);
-        let coords: Vec<(u32, u32)> = if dense {
-            (clipped.r1..=clipped.r2).flat_map(|r| (clipped.c1..=clipped.c2).map(move |c| (r, c))).collect()
-        } else {
-            self.wb.sheets[si].iter_range(sel).map(|(r, c, _)| (r, c)).collect()
-        };
+        let areas = self.areas();
+        let scopes: Vec<Scope> = areas.iter().map(|a| Scope::Range(si, self.clip_area(*a))).collect();
+        self.push_undo(&scopes);
+        let mut coords: Vec<(u32, u32)> = Vec::new();
+        for a in areas {
+            let clipped = self.clip_area(a);
+            let dense = clipped.rows() as u64 * clipped.cols() as u64 <= 250_000;
+            if dense {
+                coords.extend((clipped.r1..=clipped.r2).flat_map(|r| (clipped.c1..=clipped.c2).map(move |c| (r, c))));
+            } else {
+                coords.extend(self.wb.sheets[si].iter_range(a).map(|(r, c, _)| (r, c)));
+            }
+        }
+        coords.sort_unstable();
+        coords.dedup();
         let mut cache: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
         for (r, c) in coords {
             let old = self.wb.sheets[si].get(r, c).map(|c| c.style).unwrap_or(0);
@@ -917,31 +980,31 @@ impl App {
 
     pub fn toggle_bold(&mut self) {
         let v = !self.active_style().bold;
-        self.apply_style(|s| s.bold = v);
+        self.apply_style(move |s| s.bold = v);
     }
     pub fn toggle_italic(&mut self) {
         let v = !self.active_style().italic;
-        self.apply_style(|s| s.italic = v);
+        self.apply_style(move |s| s.italic = v);
     }
     pub fn toggle_underline(&mut self) {
         let v = !self.active_style().underline;
-        self.apply_style(|s| s.underline = v);
+        self.apply_style(move |s| s.underline = v);
     }
     pub fn toggle_strike(&mut self) {
         let v = !self.active_style().strike;
-        self.apply_style(|s| s.strike = v);
+        self.apply_style(move |s| s.strike = v);
     }
     pub fn toggle_wrap(&mut self) {
         let v = !self.active_style().wrap;
-        self.apply_style(|s| s.wrap = v);
+        self.apply_style(move |s| s.wrap = v);
     }
     pub fn set_halign(&mut self, a: HAlign) {
         let cur = self.active_style().halign;
         let a = if cur == a { HAlign::General } else { a };
-        self.apply_style(|s| s.halign = a);
+        self.apply_style(move |s| s.halign = a);
     }
     pub fn set_valign(&mut self, a: VAlign) {
-        self.apply_style(|s| s.valign = a);
+        self.apply_style(move |s| s.valign = a);
     }
     pub fn set_num_fmt(&mut self, f: &str) {
         let f = f.to_string();
@@ -955,10 +1018,10 @@ impl App {
         } else {
             SIZES.iter().rev().copied().find(|s| *s < cur).unwrap_or((cur - 1.0).max(1.0))
         };
-        self.apply_style(|s| s.set_font_size(next));
+        self.apply_style(move |s| s.set_font_size(next));
     }
     pub fn indent(&mut self, more: bool) {
-        self.apply_style(|s| {
+        self.apply_style(move |s| {
             s.indent = if more { (s.indent + 1).min(15) } else { s.indent.saturating_sub(1) };
             if s.halign == HAlign::General || s.halign == HAlign::Center {
                 s.halign = HAlign::Left;

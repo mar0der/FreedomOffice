@@ -606,7 +606,14 @@ impl App {
                 self.begin_edit(None, EditMode::Edit);
                 return;
             }
-            self.select(r, c, mods.shift);
+            if mods.ctrl && !mods.shift {
+                let prev = self.areas();
+                self.select(r, c, false);
+                let v = &mut self.sheet_mut().view;
+                v.extra = prev.into_iter().filter(|a| !a.contains(r, c)).collect();
+            } else {
+                self.select(r, c, mods.shift);
+            }
             self.drag = Drag::Cells;
             if !mods.shift {
                 if let Some(t) = self.sheet().links.get(&(r, c)).cloned() {
@@ -1217,6 +1224,11 @@ impl App {
             } else {
                 cp.rect_stroke(r, 0.0, Stroke::new(1.0, blue), StrokeKind::Middle);
             }
+        }
+        for a in self.sheet().view.extra.clone() {
+            let r = self.range_rect(lay, a);
+            cp.rect_filled(r, 0.0, theme::sel_fill());
+            cp.rect_stroke(r.shrink(0.5), 0.0, Stroke::new(1.0, theme::ACCENT), StrokeKind::Middle);
         }
         let sel_stroke = Stroke::new(2.0, theme::ACCENT);
         cp.rect_stroke(sel_rect.expand(0.0), 0.0, sel_stroke, StrokeKind::Middle);

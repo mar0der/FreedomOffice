@@ -281,6 +281,11 @@ impl App {
             Key::F3 if m.shift => self.dialog = Some(Dialog::insert_function()),
             Key::F3 if ctrl => self.dialog = Some(Dialog::NameManager { name: String::new(), refers: self.sel_abs_ref(), error: None }),
             Key::F5 => self.dialog = Some(Dialog::GoTo { text: String::new(), focus: true }),
+            Key::F4 if !ctrl => self.repeat_last(),
+            Key::Backspace if ctrl => {
+                let (r, c) = self.active();
+                self.scroll_into_view(r, c);
+            }
             Key::F9 => self.recalc_now(),
             Key::F11 if m.shift => self.add_sheet(),
             Key::F12 if ctrl => self.confirm_then(Pending::Open(None)),
@@ -323,7 +328,13 @@ impl App {
         let shift = m.shift;
         match key {
             Key::Z => self.undo(),
-            Key::Y => self.redo(),
+            Key::Y => {
+                if self.can_redo() {
+                    self.redo()
+                } else {
+                    self.repeat_last()
+                }
+            }
             Key::B => self.toggle_bold(),
             Key::I => self.toggle_italic(),
             Key::U => self.toggle_underline(),
