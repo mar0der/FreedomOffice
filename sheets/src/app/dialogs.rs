@@ -522,7 +522,7 @@ impl App {
                     });
                     ui.horizontal(|ui| {
                         ui.label("Or select a category:");
-                        let cats = ["Most Recently Used", "All", "Financial", "Date & Time", "Math & Trig", "Statistical", "Lookup & Reference", "Text", "Logical", "Information"];
+                        let cats = ["Most Recently Used", "All", "Financial", "Date & Time", "Math & Trig", "Statistical", "Lookup & Reference", "Text", "Logical", "Information", "Engineering"];
                         egui::ComboBox::from_id_salt("fcat").width(200.0).selected_text(category.as_str()).show_ui(ui, |ui| {
                             for c in cats {
                                 ui.selectable_value(category, c.to_string(), c);

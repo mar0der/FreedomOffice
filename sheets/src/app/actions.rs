@@ -183,8 +183,8 @@ impl App {
             v.active
         };
         let sh = self.sheet();
-        let (er, ec) = sh.extent().unwrap_or((0, 0));
-        let pop = |r: i64, c: i64| r >= 0 && c >= 0 && r < MAX_ROWS as i64 && c < MAX_COLS as i64 && sh.is_populated(r as u32, c as u32);
+        let (er, ec) = sh.extent_with_spills().unwrap_or((0, 0));
+        let pop =|r: i64, c: i64| r >= 0 && c >= 0 && r < MAX_ROWS as i64 && c < MAX_COLS as i64 && sh.is_populated(r as u32, c as u32);
         let (mut cr, mut cc) = (r as i64, c as i64);
         let max_r = MAX_ROWS as i64 - 1;
         let max_c = MAX_COLS as i64 - 1;
@@ -394,7 +394,7 @@ impl App {
             }
         }
         self.select_range(target);
-        self.changed();
+        self.changed_ranges(si, &[target]);
     }
 
     pub fn paste_internal(&mut self, mode: PasteMode) {
@@ -505,7 +505,7 @@ impl App {
             }
         }
         self.select_range(target);
-        self.changed();
+        self.changed_ranges(si, &[target]);
     }
 
     // ------------------------------------------------------------------
@@ -533,12 +533,14 @@ impl App {
         if formats {
             let sh = &mut self.wb.sheets[si];
             sh.merges.retain(|m| !m.intersects(&sel));
+            self.changed();
+        } else {
+            self.changed_ranges(si, &[sel]);
         }
         if contents && formats {
             self.wb.sheets[si].notes.retain(|(r, c), _| !sel.contains(*r, *c));
             self.wb.sheets[si].links.retain(|(r, c), _| !sel.contains(*r, *c));
         }
-        self.changed();
     }
 
     // ------------------------------------------------------------------

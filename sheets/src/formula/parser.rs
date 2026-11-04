@@ -8,6 +8,8 @@ pub enum RefKind {
     Area,
     Cols,
     Rows,
+    /// Spill-range operator on an anchor cell: `A1#`.
+    Spill,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -179,9 +181,18 @@ pub fn lex(src: &str) -> Result<Vec<Spanned>, String> {
                         break;
                     }
                 }
-                let e = matched.ok_or("unknown error literal")?;
-                i += e.as_str().chars().count();
-                Tok::Err(e)
+                match matched {
+                    Some(e) => {
+                        i += e.as_str().chars().count();
+                        Tok::Err(e)
+                    }
+                    // `A1#`: spill-range operator directly after a cell reference.
+                    None if out.last().is_some_and(|t: &Spanned| t.end == start && matches!(t.tok, Tok::Ident(_))) => {
+                        i += 1;
+                        Tok::Op("#")
+                    }
+                    None => return Err("unknown error literal".into()),
+                }
             }
             '0'..='9' | '.' if c != '.' || at(i + 1).is_ascii_digit() => {
                 let s0 = i;
@@ -216,9 +227,10 @@ pub fn lex(src: &str) -> Result<Vec<Spanned>, String> {
                     Tok::Ident(text)
                 }
             }
-            '+' | '-' | '*' | '/' | '^' | '&' | '%' | '=' => {
+            '+' | '-' | '*' | '/' | '^' | '&' | '%' | '=' | '@' => {
                 i += 1;
                 Tok::Op(match c {
+                    '@' => "@",
                     '+' => "+",
                     '-' => "-",
                     '*' => "*",
@@ -440,6 +452,11 @@ impl Parser {
             self.i += 1;
             return Ok(Expr::Plus(Box::new(self.unary()?)));
         }
+        if self.is_op("@") {
+            // Implicit intersection operator.
+            self.i += 1;
+            return Ok(Expr::Func("SINGLE".into(), vec![self.unary()?]));
+        }
         let mut e = self.primary()?;
         while self.is_op("%") {
             self.i += 1;
@@ -461,6 +478,10 @@ impl Parser {
                                 return Ok(Expr::Ref(RefExpr { sheet, kind: RefKind::Area, a, b }));
                             }
                         }
+                    }
+                    if self.is_op("#") {
+                        self.i += 1;
+                        return Ok(Expr::Ref(RefExpr { sheet, kind: RefKind::Spill, a, b: a }));
                     }
                     return Ok(Expr::Ref(RefExpr { sheet, kind: RefKind::Cell, a, b: a }));
                 }
@@ -606,6 +627,11 @@ impl Parser {
                             _ => return Err(format!("missing ) in {name}")),
                         }
                     }
+                    if let (true, [Expr::Ref(r)]) = (name == "ANCHORARRAY", args.as_slice()) {
+                        if r.kind == RefKind::Cell {
+                            return Ok(Expr::Ref(RefExpr { kind: RefKind::Spill, ..r.clone() }));
+                        }
+                    }
                     return Ok(Expr::Func(name, args));
                 }
                 if let Ok(r) = self.try_ref(None) {
@@ -680,6 +706,7 @@ pub fn ref_str(r: &RefExpr) -> String {
     let prefix = r.sheet.as_ref().map(|s| format!("{}!", quote_sheet(s))).unwrap_or_default();
     let body = match r.kind {
         RefKind::Cell => part_str(&r.a),
+        RefKind::Spill => format!("{}#", part_str(&r.a)),
         RefKind::Area => format!("{}:{}", part_str(&r.a), part_str(&r.b)),
         RefKind::Cols => format!(
             "{}{}:{}{}",
@@ -705,11 +732,20 @@ pub fn num_str(v: f64) -> String {
 
 pub fn print(e: &Expr) -> String {
     let mut s = String::new();
-    write_expr(e, &mut s);
+    write_expr(e, &mut s, &mut None);
     s
 }
 
-fn write_expr(e: &Expr, out: &mut String) {
+/// Prints a formula as stored in .xlsx files: `A1#` as `ANCHORARRAY(A1)`, `@x` as
+/// `SINGLE(x)` and LET parameters with the `_xlpm.` prefix.
+pub fn print_xlsx(e: &Expr) -> String {
+    let mut s = String::new();
+    write_expr(e, &mut s, &mut Some(Vec::new()));
+    s
+}
+
+/// `xlsx` holds the LET parameter names in scope when printing for files.
+fn write_expr(e: &Expr, out: &mut String, xlsx: &mut Option<Vec<String>>) {
     match e {
         Expr::Num(v) => out.push_str(&num_str(*v)),
         Expr::Str(s) => {
@@ -719,35 +755,60 @@ fn write_expr(e: &Expr, out: &mut String) {
         }
         Expr::Bool(b) => out.push_str(if *b { "TRUE" } else { "FALSE" }),
         Expr::Err(e) => out.push_str(e.as_str()),
+        Expr::Ref(r) if r.kind == RefKind::Spill && xlsx.is_some() => {
+            let cell = RefExpr { kind: RefKind::Cell, ..r.clone() };
+            out.push_str(&format!("ANCHORARRAY({})", ref_str(&cell)));
+        }
         Expr::Ref(r) => out.push_str(&ref_str(r)),
-        Expr::Name(n) => out.push_str(n),
+        Expr::Name(n) => {
+            if xlsx.as_ref().is_some_and(|lets| lets.iter().any(|l| l.eq_ignore_ascii_case(n))) {
+                out.push_str("_xlpm.");
+            }
+            out.push_str(n)
+        }
         Expr::Neg(e) => {
             out.push('-');
-            write_expr(e, out);
+            write_expr(e, out, xlsx);
         }
         Expr::Plus(e) => {
             out.push('+');
-            write_expr(e, out);
+            write_expr(e, out, xlsx);
         }
         Expr::Percent(e) => {
-            write_expr(e, out);
+            write_expr(e, out, xlsx);
             out.push('%');
         }
         Expr::Bin(op, a, b) => {
-            write_expr(a, out);
+            write_expr(a, out, xlsx);
             out.push_str(op.as_str());
-            write_expr(b, out);
+            write_expr(b, out, xlsx);
+        }
+        Expr::Func(name, args) if name == "SINGLE" && args.len() == 1 && xlsx.is_none() => {
+            out.push('@');
+            write_expr(&args[0], out, xlsx);
         }
         Expr::Func(name, args) => {
+            let lets = match xlsx {
+                Some(l) if name == "LET" => {
+                    let names: Vec<String> = args.iter().step_by(2).filter_map(|a| if let Expr::Name(n) = a { Some(n.clone()) } else { None }).collect();
+                    let k = names.len();
+                    l.extend(names);
+                    k
+                }
+                _ => 0,
+            };
             out.push_str(name);
             out.push('(');
             for (i, a) in args.iter().enumerate() {
                 if i > 0 {
                     out.push(',');
                 }
-                write_expr(a, out);
+                write_expr(a, out, xlsx);
             }
             out.push(')');
+            if let Some(l) = xlsx {
+                l.truncate(l.len() - lets);
+            }
         }
         Expr::Array(rows) => {
             out.push('{');
@@ -759,14 +820,14 @@ fn write_expr(e: &Expr, out: &mut String) {
                     if ci > 0 {
                         out.push(',');
                     }
-                    write_expr(v, out);
+                    write_expr(v, out, xlsx);
                 }
             }
             out.push('}');
         }
         Expr::Paren(e) => {
             out.push('(');
-            write_expr(e, out);
+            write_expr(e, out, xlsx);
             out.push(')');
         }
         Expr::Missing => {}
@@ -935,6 +996,13 @@ mod tests {
         assert_eq!(rt("LOG10(100)"), "LOG10(100)");
         assert_eq!(rt("IF(A1,,2)"), "IF(A1,,2)");
         assert_eq!(rt("myName*2"), "myName*2");
+        assert_eq!(rt("SUM(A1#)+Sheet2!$B$3#"), "SUM(A1#)+Sheet2!$B$3#");
+        assert_eq!(rt("@A1:A10*2"), "@A1:A10*2");
+        assert_eq!(rt("_xlfn.SINGLE(A1:A3)"), "@A1:A3");
+        assert!(parse("#").is_err());
+        assert_eq!(rt("_xlfn.ANCHORARRAY(B2)*2"), "B2#*2");
+        let e = parse("SUM(A1#)+@B1:B3+LET(x,2,x*A1)").unwrap();
+        assert_eq!(print_xlsx(&e), "SUM(ANCHORARRAY(A1))+SINGLE(B1:B3)+LET(_xlpm.x,2,_xlpm.x*A1)");
     }
 
     #[test]

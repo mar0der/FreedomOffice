@@ -474,6 +474,18 @@ impl App {
         }
     }
 
+    /// Like `changed`, after only the contents of these cells changed: recalculates just
+    /// their dependents (falls back to a full recalculation when needed).
+    pub fn changed_ranges(&mut self, sheet: usize, ranges: &[Range]) {
+        let edited: Vec<(usize, Range)> = ranges.iter().map(|r| (sheet, *r)).collect();
+        crate::formula::recalc_ranges(&mut self.wb, &edited);
+        self.generation += 1;
+        self.dirty = true;
+        if self.wb.circular {
+            self.status = Some("Circular reference warning: one or more formulas refer to their own cell.".into());
+        }
+    }
+
     // ------------------------------------------------------------------
     // Editing
     // ------------------------------------------------------------------
@@ -577,7 +589,7 @@ impl App {
                 sh.row_h.insert(e.row, need);
             }
         }
-        self.changed();
+        self.changed_ranges(e.sheet, &[rg]);
         true
     }
 

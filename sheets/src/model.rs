@@ -413,6 +413,17 @@ pub struct Sheet {
     /// Conditional formatting rules, highest priority first.
     pub cond_formats: Vec<crate::condfmt::CondFormat>,
     pub validations: Vec<crate::validation::Validation>,
+    /// Dynamic-array spill overlay, rebuilt by recalculation.
+    pub spill: Spill,
+}
+
+/// Values spilled by dynamic-array formulas. Spilled cells are not stored as real cells.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Spill {
+    /// Spilled (non-anchor) cells: position -> (anchor, value).
+    pub cells: HashMap<(u32, u32), ((u32, u32), Value)>,
+    /// Anchor -> (intended spill range, blocked). Blocked anchors show #SPILL!.
+    pub anchors: HashMap<(u32, u32), (Range, bool)>,
 }
 
 impl Sheet {
@@ -435,6 +446,7 @@ impl Sheet {
             charts: Vec::new(),
             cond_formats: Vec::new(),
             validations: Vec::new(),
+            spill: Spill::default(),
         }
     }
 
@@ -522,7 +534,37 @@ impl Sheet {
     }
 
     pub fn is_populated(&self, r: u32, c: u32) -> bool {
-        self.get(r, c).is_some_and(|c| !c.value.is_empty() || c.formula.is_some())
+        self.get(r, c).is_some_and(|c| !c.value.is_empty() || c.formula.is_some()) || self.spill.cells.contains_key(&(r, c))
+    }
+
+    /// The value shown in a cell: its own value, or the value spilled into it.
+    pub fn display_value(&self, r: u32, c: u32) -> &Value {
+        match self.get(r, c) {
+            Some(cell) if !cell.value.is_empty() || cell.formula.is_some() => &cell.value,
+            _ => self.spill.cells.get(&(r, c)).map(|(_, v)| v).unwrap_or(self.value(r, c)),
+        }
+    }
+
+    /// Anchor of the dynamic array spilling into (r, c), if any.
+    pub fn spill_anchor_of(&self, r: u32, c: u32) -> Option<(u32, u32)> {
+        self.spill.cells.get(&(r, c)).map(|(a, _)| *a)
+    }
+
+    /// Spill range of an anchor cell (also returned for a blocked #SPILL! anchor).
+    pub fn spill_range(&self, r: u32, c: u32) -> Option<(Range, bool)> {
+        self.spill.anchors.get(&(r, c)).copied()
+    }
+
+    /// (max_row, max_col) of populated cells including spilled values.
+    pub fn extent_with_spills(&self) -> Option<(u32, u32)> {
+        let mut out = self.extent();
+        for (rg, blocked) in self.spill.anchors.values() {
+            if !blocked {
+                let (r, c) = out.unwrap_or((0, 0));
+                out = Some((r.max(rg.r2), c.max(rg.c2)));
+            }
+        }
+        out
     }
 }
 
@@ -540,6 +582,8 @@ pub struct Workbook {
     pub active: usize,
     pub path: Option<PathBuf>,
     pub circular: bool,
+    /// Dependency graph for incremental recalculation (rebuilt on demand).
+    pub calc: formula::CalcState,
 }
 
 impl Default for Workbook {
@@ -562,6 +606,7 @@ impl Workbook {
             active: 0,
             path: None,
             circular: false,
+            calc: Default::default(),
         };
         wb.intern_style(Style::default());
         wb

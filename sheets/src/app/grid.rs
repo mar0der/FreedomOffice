@@ -928,7 +928,8 @@ impl App {
                 }
                 let sh = &self.wb.sheets[si];
                 let ov = cf.eval(&self.wb, si, anchor.0, anchor.1);
-                let Some(cell) = sh.get(anchor.0, anchor.1) else {
+                let cell = sh.get(anchor.0, anchor.1);
+                if cell.is_none() && sh.spill_anchor_of(anchor.0, anchor.1).is_none() {
                     // Conditional formats can also mark empty cells (e.g. "Blanks").
                     if let Some(o) = ov {
                         let mut style = Style::default();
@@ -937,8 +938,8 @@ impl App {
                         items.push(Item { rect, clip: rect, fill: style.fill.map(rgb), style, shown, cf: Some(o) });
                     }
                     continue;
-                };
-                let mut style = self.wb.style(cell.style).clone();
+                }
+                let mut style = self.wb.style(cell.map_or(0, |c| c.style)).clone();
                 if let Some(o) = &ov {
                     super::condfmt_ui::apply_override(&mut style, o);
                 }
@@ -949,7 +950,7 @@ impl App {
                     }
                     continue;
                 }
-                let mut s = shown(&cell.value, &style, cell.formula.as_ref().map(|f| f.text.as_str()), show_formulas);
+                let mut s = shown(sh.display_value(anchor.0, anchor.1), &style, cell.and_then(|c| c.formula.as_ref()).map(|f| f.text.as_str()), show_formulas);
                 if ov.as_ref().is_some_and(|o| o.color.is_some()) {
                     s.color = None;
                 }
@@ -1175,12 +1176,14 @@ impl App {
                     super::condfmt_ui::paint_data_bar(&cp, act, &bar);
                 }
                 // redraw active cell text above the white-out
-                if let Some(cell) = self.wb.sheets[si].get(ar, ac) {
-                    let mut style = self.wb.style(cell.style).clone();
+                let sh = &self.wb.sheets[si];
+                let cell = sh.get(ar, ac);
+                if cell.is_some() || sh.spill_anchor_of(ar, ac).is_some() {
+                    let mut style = self.wb.style(cell.map_or(0, |c| c.style)).clone();
                     if let Some(o) = &act_cf {
                         super::condfmt_ui::apply_override(&mut style, o);
                     }
-                    let mut s = shown(&cell.value, &style, cell.formula.as_ref().map(|f| f.text.as_str()), show_formulas);
+                    let mut s = shown(sh.display_value(ar, ac), &style, cell.and_then(|c| c.formula.as_ref()).map(|f| f.text.as_str()), show_formulas);
                     if act_cf.as_ref().is_some_and(|o| o.color.is_some()) {
                         s.color = None;
                     }
@@ -1201,6 +1204,18 @@ impl App {
                         painter.with_clip_rect(act.intersect(lay.cells)).galley(Pos2::new(x.round(), y.round()), g, color);
                     }
                 }
+            }
+        }
+        // Spill range of the active cell's dynamic array (dashed when blocked by #SPILL!).
+        let sh = self.sheet();
+        let spill_anchor = if sh.spill_range(ar, ac).is_some() { Some((ar, ac)) } else { sh.spill_anchor_of(ar, ac) };
+        if let Some((rg, blocked)) = spill_anchor.and_then(|(r, c)| sh.spill_range(r, c)) {
+            let r = self.range_rect(lay, rg).shrink(0.5);
+            let blue = Color32::from_rgb(91, 155, 213);
+            if blocked {
+                dashed_rect(&cp, r, blue, 0.0);
+            } else {
+                cp.rect_stroke(r, 0.0, Stroke::new(1.0, blue), StrokeKind::Middle);
             }
         }
         let sel_stroke = Stroke::new(2.0, theme::ACCENT);

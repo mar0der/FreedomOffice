@@ -929,6 +929,7 @@ struct CellBuf {
     f_text: Option<String>,
     f_type: String,
     f_si: Option<String>,
+    f_ref: Option<String>,
 }
 
 struct SharedMaster {
@@ -1009,6 +1010,7 @@ fn parse_sheet(xml: &str, ctx: &SheetCtx, sheet: &mut Sheet) {
                                                 match k.as_str() {
                                                     "t" => cb.f_type = v,
                                                     "si" => cb.f_si = Some(v),
+                                                    "ref" => cb.f_ref = Some(v),
                                                     _ => {}
                                                 }
                                             }
@@ -1023,6 +1025,7 @@ fn parse_sheet(xml: &str, ctx: &SheetCtx, sheet: &mut Sheet) {
                                                 match k.as_str() {
                                                     "t" => cb.f_type = v,
                                                     "si" => cb.f_si = Some(v),
+                                                    "ref" => cb.f_ref = Some(v),
                                                     _ => {}
                                                 }
                                             }
@@ -1123,6 +1126,31 @@ fn parse_sheet(xml: &str, ctx: &SheetCtx, sheet: &mut Sheet) {
             _ => {}
         }
     }
+    clear_array_results(sheet);
+}
+
+/// A formula from a file; `ANCHORARRAY(A1)` / `SINGLE(x)` are shown as `A1#` / `@x` like Excel.
+fn file_formula(text: &str) -> Formula {
+    let f = Formula::new(text);
+    match f.ast {
+        Some(ast) if text.contains("ANCHORARRAY(") || text.contains("SINGLE(") => Formula::from_ast(ast),
+        _ => f,
+    }
+}
+
+/// Array formulas are saved with their results as plain cells inside the formula's range;
+/// drop those so the formula spills them again (they are kept as recalculation hints).
+fn clear_array_results(sheet: &mut Sheet) {
+    let anchors: Vec<((u32, u32), Range)> = sheet.spill.anchors.iter().map(|(a, (rg, _))| (*a, *rg)).collect();
+    for (a, rg) in anchors {
+        let keys: Vec<(u32, u32)> = sheet.iter_range(rg).filter(|(r, c, cell)| (*r, *c) != a && cell.formula.is_none()).map(|(r, c, _)| (r, c)).collect();
+        for (r, c) in keys {
+            if let Some(cell) = sheet.get_mut(r, c) {
+                cell.value = Value::Empty;
+            }
+            sheet.tidy(r, c);
+        }
+    }
 }
 
 fn finish_cell(cb: CellBuf, ctx: &SheetCtx, shared_f: &mut HashMap<String, SharedMaster>, sheet: &mut Sheet) {
@@ -1168,7 +1196,7 @@ fn finish_cell(cb: CellBuf, ctx: &SheetCtx, shared_f: &mut HashMap<String, Share
                 if !text.is_empty() {
                     let text = strip_future_prefixes(text);
                     let ast = formula::parse(&text).ok();
-                    f = Some(Formula::new(&text));
+                    f = Some(file_formula(&text));
                     shared_f.insert(si, SharedMaster { row: cb.row, col: cb.col, ast, text });
                 } else if let Some(m) = shared_f.get(&si) {
                     f = Some(match &m.ast {
@@ -1182,13 +1210,20 @@ fn finish_cell(cb: CellBuf, ctx: &SheetCtx, shared_f: &mut HashMap<String, Share
                 }
             }
             "dataTable" => {}
+            "array" if !text.is_empty() => {
+                let text = strip_future_prefixes(text);
+                if let Some(rg) = cb.f_ref.as_deref().and_then(Range::parse).filter(|rg| !rg.is_single() && rg.r1 == cb.row && rg.c1 == cb.col) {
+                    sheet.spill.anchors.insert((cb.row, cb.col), (rg, false));
+                }
+                f = Some(file_formula(&text));
+            }
             _ => {
                 if !text.is_empty() {
                     let text = strip_future_prefixes(text);
                     // A formula that is just an error literal is how errors are stored on save.
                     match ErrorKind::parse(&text) {
                         Some(e) if !text.contains('(') => value = Value::Error(e),
-                        _ => f = Some(Formula::new(&text)),
+                        _ => f = Some(file_formula(&text)),
                     }
                 }
             }
