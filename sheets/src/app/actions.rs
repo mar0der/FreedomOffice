@@ -1919,6 +1919,55 @@ impl App {
     }
 }
 
+impl App {
+    /// Format as Table: banded rows, styled header and AutoFilter on the current region.
+    /// `kind`: 0 = Light, 1 = Medium, 2 = Dark.
+    pub fn format_as_table(&mut self, accent: u32, kind: u8) {
+        self.commit_edit(false);
+        let rg = if self.sel().is_single() { self.current_region() } else { self.sel_clipped() };
+        if rg.rows() < 2 {
+            self.status = Some("Select a range with a header row and data to format as a table.".into());
+            return;
+        }
+        let si = self.wb.active;
+        self.push_undo(&[Scope::Sheet(si)]);
+        let tint = super::theme::tint;
+        let (head_fill, head_color, band, bottom) = match kind {
+            0 => (None, Some(accent), Some(tint(accent, 0.8)), BorderLine::Thin),
+            1 => (Some(accent), Some(0xFFFFFF), Some(tint(accent, 0.8)), BorderLine::None),
+            _ => (Some(0x000000), Some(0xFFFFFF), Some(tint(accent, -0.25)), BorderLine::Medium),
+        };
+        let dark = kind == 2;
+        for r in rg.r1..=rg.r2 {
+            for c in rg.c1..=rg.c2 {
+                let old = self.wb.sheets[si].get(r, c).map(|x| x.style).unwrap_or(0);
+                let mut st = self.wb.style(old).clone();
+                if r == rg.r1 {
+                    st.bold = true;
+                    st.fill = head_fill;
+                    st.color = head_color;
+                    st.border.bottom = bottom;
+                } else {
+                    let banded = (r - rg.r1) % 2 == 1;
+                    st.fill = if banded { band } else if dark { Some(tint(accent, -0.5)) } else { None };
+                    if dark {
+                        st.color = Some(0xFFFFFF);
+                    }
+                    if kind == 0 && r == rg.r2 {
+                        st.border.bottom = BorderLine::Thin;
+                    }
+                }
+                let id = self.wb.intern_style(st);
+                self.wb.sheets[si].cell_mut(r, c).style = id;
+                self.wb.sheets[si].tidy(r, c);
+            }
+        }
+        self.wb.sheets[si].filter = Some(crate::model::AutoFilter { range: rg, excluded: Default::default() });
+        self.select_range(Range::new(rg.r1, rg.c1, rg.r2, rg.c2));
+        self.dirty = true;
+    }
+}
+
 fn replace_ci(text: &str, what: &str, with: &str) -> String {
     if what.is_empty() {
         return text.to_string();

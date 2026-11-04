@@ -352,6 +352,7 @@ impl App {
             Key::D => self.fill_down(),
             Key::R => self.fill_right(),
             Key::L if shift => self.toggle_filter(),
+            Key::T | Key::L => self.format_as_table(0x4472C4, 1),
             Key::P => {
                 self.commit_edit(false);
                 self.backstage = Some(super::chrome::Backstage::Print);

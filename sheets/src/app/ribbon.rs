@@ -536,6 +536,41 @@ impl App {
         });
         self.group(ui, "Styles", |app, ui| {
             app.cf_ribbon_button(ui);
+            let job = icon_job("▦", false, "Format as\nTable", 20.0, true, theme::TEXT);
+            big_menu(ui, job, |ui| {
+                ui.set_min_width(330.0);
+                for (kind, title) in [(0u8, "Light"), (1, "Medium"), (2, "Dark")] {
+                    ui.label(RichText::new(title).size(11.0).color(theme::TEXT_DIM));
+                    ui.horizontal(|ui| {
+                        for accent in [0x4472C4u32, 0xED7D31, 0xA5A5A5, 0xFFC000, 0x5B9BD5, 0x70AD47] {
+                            let (rect, resp) = ui.allocate_exact_size(Vec2::new(48.0, 34.0), Sense::click());
+                            let p = ui.painter();
+                            let rh = rect.height() / 4.0;
+                            for i in 0..4 {
+                                let row = Rect::from_min_size(Pos2::new(rect.left(), rect.top() + i as f32 * rh), Vec2::new(rect.width(), rh));
+                                let fill = match (kind, i) {
+                                    (0, 0) => Color32::WHITE,
+                                    (1, 0) => rgb(accent),
+                                    (2, 0) => Color32::BLACK,
+                                    (2, k) if k % 2 == 1 => rgb(theme::tint(accent, -0.25)),
+                                    (2, _) => rgb(theme::tint(accent, -0.5)),
+                                    (_, k) if k % 2 == 1 => rgb(theme::tint(accent, 0.8)),
+                                    _ => Color32::WHITE,
+                                };
+                                p.rect_filled(row, 0.0, fill);
+                            }
+                            if kind == 0 {
+                                p.line_segment([Pos2::new(rect.left(), rect.top() + rh), Pos2::new(rect.right(), rect.top() + rh)], Stroke::new(1.0, rgb(accent)));
+                            }
+                            p.rect_stroke(rect, 0.0, Stroke::new(if resp.hovered() { 2.0 } else { 1.0 }, if resp.hovered() { theme::ACCENT } else { Color32::from_gray(200) }), egui::StrokeKind::Inside);
+                            if resp.clicked() {
+                                app.format_as_table(accent, kind);
+                                ui.close();
+                            }
+                        }
+                    });
+                }
+            });
             let job = app.ib(ic::TABLE, "▤", "Cell\nStyles", 20.0, true);
             big_menu(ui, job, |ui| {
                 ui.set_min_width(170.0);
