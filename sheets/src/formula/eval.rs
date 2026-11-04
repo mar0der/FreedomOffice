@@ -1375,7 +1375,8 @@ fn dirty_set(wb: &Workbook, calc: &mut super::deps::CalcState, edited: &[(usize,
     dirty
 }
 
-/// Evaluates a standalone formula in the context of a cell (used by tests and the Function dialog).
+/// Evaluates a standalone formula in the context of a cell (used by tests).
+#[cfg(test)]
 pub fn eval_formula(wb: &Workbook, sheet: usize, r: u32, c: u32, src: &str) -> Value {
     let Ok(e) = super::parse(src.trim_start_matches('=')) else { return Value::Error(ErrorKind::Name) };
     let mut ev = Evaluator::new(wb, Mode::Stored);

@@ -11,11 +11,11 @@ mod bench;
 mod tests;
 
 pub use deps::CalcState;
-pub use eval::{compare, eval_expr, eval_formula, eval_grid, recalc, recalc_ranges};
+pub use eval::{compare, eval_expr, eval_grid, recalc, recalc_ranges};
 #[cfg(test)]
-pub use eval::{eval_array, recalc_cells};
+pub use eval::{eval_array, eval_formula, recalc_cells};
 pub use functions::{function_names, signature};
 pub use parser::{
-    lex, map_refs, move_refs, parse, parse_cell_part, print, print_xlsx, quote_sheet, ref_str, rename_sheet, shift_for_structure,
-    shift_relative, Expr, RefExpr, RefKind, Spanned, Tok,
+    lex, map_refs, move_refs, parse, parse_cell_part, print, print_xlsx, quote_sheet, rename_sheet, shift_for_structure,
+    shift_relative, Expr, Tok,
 };
