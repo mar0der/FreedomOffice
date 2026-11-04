@@ -919,6 +919,124 @@ impl App {
     }
 
     fn page_layout_tab(&mut self, ui: &mut egui::Ui) {
+        use crate::page::{Margins, Paper, Scaling};
+        let metric = crate::page::metric_locale();
+        let ps = self.sheet().page.clone();
+        self.group(ui, "Page Setup", |app, ui| {
+            let job = icon_job("▭", false, "Margins", 20.0, true, theme::TEXT);
+            big_menu(ui, job, |ui| {
+                ui.set_min_width(300.0);
+                for (name, m) in [("Normal", Margins::NORMAL), ("Wide", Margins::WIDE), ("Narrow", Margins::NARROW)] {
+                    let u = |v: f32| if metric { format!("{:.2} cm", v * 2.54) } else { format!("{v:.2}\"") };
+                    let tick = if ps.margins == m { "  ✓" } else { "" };
+                    let label = format!("{name}{tick}\nTop: {}  Bottom: {}\nLeft: {}  Right: {}", u(m.top), u(m.bottom), u(m.left), u(m.right));
+                    if ui.button(label).clicked() {
+                        app.set_page(|p| p.margins = m);
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                if ui.button("Custom Margins...").clicked() {
+                    app.open_page_setup(1);
+                    ui.close();
+                }
+            });
+            let job = icon_job("⟲", false, "Orientation", 20.0, true, theme::TEXT);
+            big_menu(ui, job, |ui| {
+                ui.set_min_width(150.0);
+                if ui.selectable_label(!ps.landscape, "Portrait").clicked() {
+                    app.set_page(|p| p.landscape = false);
+                    ui.close();
+                }
+                if ui.selectable_label(ps.landscape, "Landscape").clicked() {
+                    app.set_page(|p| p.landscape = true);
+                    ui.close();
+                }
+            });
+            let job = icon_job("🗋", false, "Size", 20.0, true, theme::TEXT);
+            big_menu(ui, job, |ui| {
+                ui.set_min_width(240.0);
+                for p in Paper::ALL {
+                    if ui.selectable_label(ps.paper == p, format!("{}\n{}", p.name(), p.caption(metric))).clicked() {
+                        app.set_page(|x| x.paper = p);
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                if ui.button("More Paper Sizes...").clicked() {
+                    app.open_page_setup(0);
+                    ui.close();
+                }
+            });
+            let job = icon_job("▣", false, "Print\nArea", 20.0, true, theme::TEXT);
+            big_menu(ui, job, |ui| {
+                ui.set_min_width(170.0);
+                if ui.button("Set Print Area").clicked() {
+                    app.set_print_area();
+                    ui.close();
+                }
+                if ui.add_enabled(ps.print_area.is_some(), egui::Button::new("Clear Print Area")).clicked() {
+                    app.clear_print_area();
+                    ui.close();
+                }
+            });
+            let job = icon_job("⤓", false, "Breaks", 20.0, true, theme::TEXT);
+            big_menu(ui, job, |ui| {
+                ui.set_min_width(190.0);
+                if ui.button("Insert Page Break").clicked() {
+                    app.insert_page_break();
+                    ui.close();
+                }
+                if ui.button("Remove Page Break").clicked() {
+                    app.remove_page_break();
+                    ui.close();
+                }
+                if ui.button("Reset All Page Breaks").clicked() {
+                    app.reset_page_breaks();
+                    ui.close();
+                }
+            });
+            let job = icon_job("☰", false, "Print\nTitles", 20.0, true, theme::TEXT);
+            if big_btn(ui, job, 50.0, false).on_hover_text("Rows and columns to repeat on every printed page").clicked() {
+                app.open_page_setup(3);
+            }
+            if ui.small_button("⇲").on_hover_text("Page Setup").clicked() {
+                app.open_page_setup(0);
+            }
+        });
+        self.group(ui, "Scale to Fit", |app, ui| {
+            let (wide, tall) = match ps.scaling {
+                Scaling::Fit { wide, tall } => (wide, tall),
+                Scaling::Percent(_) => (0, 0),
+            };
+            let label = |n: u16| if n == 0 { "Automatic".to_string() } else if n == 1 { "1 page".into() } else { format!("{n} pages") };
+            ui.vertical(|ui| {
+                for (title, cur, is_w) in [("Width:", wide, true), ("Height:", tall, false)] {
+                    ui.horizontal(|ui| {
+                        ui.add_sized([44.0, 18.0], egui::Label::new(title));
+                        egui::ComboBox::from_id_salt(("fit", is_w)).width(92.0).selected_text(label(cur)).show_ui(ui, |ui| {
+                            for n in [0u16, 1, 2, 3, 4, 5, 6, 7, 8, 9] {
+                                if ui.selectable_label(cur == n, label(n)).clicked() {
+                                    let (w, t) = if is_w { (n, tall) } else { (wide, n) };
+                                    app.set_page(|p| p.scaling = if w == 0 && t == 0 { Scaling::Percent(100) } else { Scaling::Fit { wide: w, tall: t } });
+                                }
+                            }
+                        });
+                    });
+                }
+                ui.horizontal(|ui| {
+                    ui.add_sized([44.0, 18.0], egui::Label::new("Scale:"));
+                    let mut pct = match ps.scaling {
+                        Scaling::Percent(p) => p,
+                        Scaling::Fit { .. } => 100,
+                    };
+                    let enabled = matches!(ps.scaling, Scaling::Percent(_));
+                    if ui.add_enabled(enabled, egui::DragValue::new(&mut pct).range(10..=400).suffix(" %")).changed() {
+                        app.set_page(|p| p.scaling = Scaling::Percent(pct));
+                    }
+                });
+            });
+        });
         self.group(ui, "Sheet Options", |app, ui| {
             ui.vertical(|ui| {
                 ui.label(RichText::new("Gridlines").strong());
@@ -927,11 +1045,19 @@ impl App {
                     app.sheet_mut().gridlines = g;
                     app.dirty = true;
                 }
+                let mut gp = ps.gridlines;
+                if ui.checkbox(&mut gp, "Print").changed() {
+                    app.set_page(|p| p.gridlines = gp);
+                }
             });
             ui.add_space(8.0);
             ui.vertical(|ui| {
                 ui.label(RichText::new("Headings").strong());
                 ui.checkbox(&mut app.show_headings, "View");
+                let mut hp = ps.headings;
+                if ui.checkbox(&mut hp, "Print").changed() {
+                    app.set_page(|p| p.headings = hp);
+                }
             });
         });
         self.group(ui, "Sheet", |app, ui| {

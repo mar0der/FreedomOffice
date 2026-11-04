@@ -649,7 +649,6 @@ impl CfFrame {
     }
 
     /// Builds a frame computing statistics directly.
-    #[cfg(test)]
     pub fn uncached(sheet: &Sheet) -> Self {
         Self::new(sheet, |_, rule| Rc::new(compute_stats(sheet, rule)))
     }

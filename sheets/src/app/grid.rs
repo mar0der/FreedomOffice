@@ -1175,6 +1175,9 @@ impl App {
             }
         }
 
+        // Page breaks (after Print Preview / Page Setup, like the desktop app)
+        self.paint_page_breaks(&cp, lay);
+
         // Frozen pane separators
         let (fr, fc) = self.sheet().freeze;
         if fr > 0 {

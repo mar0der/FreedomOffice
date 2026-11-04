@@ -42,6 +42,7 @@ pub enum Dialog {
     Note { r: u32, c: u32, text: String, focus: bool },
     Link { r: u32, c: u32, text: String, address: String, focus: bool },
     Recover { files: Vec<std::path::PathBuf> },
+    PageSetup(Box<super::print_ui::PageSetupDlg>),
     CondFmt(Box<super::condfmt_ui::CfDialog>),
     Validation(Box<super::validation_ui::DvDialog>),
     DvAlert(Box<super::validation_ui::DvAlert>),
@@ -692,6 +693,9 @@ impl App {
                         }
                     });
                 });
+            }
+            Dialog::PageSetup(dlg) => {
+                keep = self.page_setup_dialog(ctx, dlg);
             }
             Dialog::Recover { files } => {
                 win("Document Recovery").show(ctx, |ui| {

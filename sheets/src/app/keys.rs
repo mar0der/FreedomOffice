@@ -278,6 +278,10 @@ impl App {
                     self.page(down, m.shift);
                 }
             }
+            Key::F2 if ctrl => {
+                self.commit_edit(false);
+                self.backstage = Some(super::chrome::Backstage::Print);
+            }
             Key::F2 if !m.shift => self.begin_edit(None, EditMode::Edit),
             Key::F2 => self.edit_note(),
             Key::F3 if m.shift => self.dialog = Some(Dialog::insert_function()),

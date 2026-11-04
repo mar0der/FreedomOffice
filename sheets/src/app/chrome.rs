@@ -13,6 +13,7 @@ pub enum Backstage {
     Open,
     SaveAs,
     Print,
+    Export,
     About,
 }
 
@@ -539,6 +540,9 @@ impl App {
                 if item(ui, "Print", page == Backstage::Print) {
                     self.backstage = Some(Backstage::Print);
                 }
+                if item(ui, "Export", page == Backstage::Export) {
+                    self.backstage = Some(Backstage::Export);
+                }
                 if item(ui, "Close", false) {
                     self.backstage = None;
                     self.confirm_then(Pending::New);
@@ -613,6 +617,18 @@ impl App {
                     }
                 }
                 Backstage::Print => self.print_page_ui(ui),
+                Backstage::Export => {
+                    ui.label(RichText::new("Export").size(28.0));
+                    ui.add_space(14.0);
+                    ui.label(RichText::new("Create PDF Document").size(16.0).strong());
+                    ui.label("Preserves layout, formatting and fonts. Content can't be easily changed. Uses the print settings (File > Print).");
+                    ui.add_space(10.0);
+                    let btn = egui::Button::new(RichText::new("Create PDF").size(15.0)).min_size(Vec2::new(140.0, 44.0));
+                    if ui.add(btn).clicked() {
+                        let ctx = ui.ctx().clone();
+                        self.export_pdf(&ctx);
+                    }
+                }
                 Backstage::About => {
                     ui.label(RichText::new("FreedomOffice Sheets").size(28.0).color(theme::ACCENT_DARK));
                     ui.add_space(6.0);

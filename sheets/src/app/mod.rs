@@ -164,6 +164,10 @@ pub struct App {
     pub hover_cell: Option<(u32, u32)>,
     pub show_all_notes: bool,
     pub print: print_ui::PrintState,
+    /// Counts workbook edits (cache key for print layout and page breaks).
+    pub edits: u64,
+    /// Native window handle (for printer dialogs).
+    pub hwnd: isize,
     pub last_press_pos: Option<egui::Pos2>,
     pub pending_link: Option<((u32, u32), String)>,
     /// AutoRecover: where this session's recovery copy is written, and when it was last written.
@@ -185,7 +189,9 @@ impl App {
         theme::apply_style(&cc.egui_ctx);
         let fonts = FontManager::new(&cc.egui_ctx);
         #[cfg(windows)]
-        set_caption_color(cc);
+        let hwnd = set_caption_color(cc);
+        #[cfg(not(windows))]
+        let hwnd = 0;
         let mut app = App {
             wb: Workbook::new(),
             fonts,
@@ -231,6 +237,8 @@ impl App {
             hover_cell: None,
             show_all_notes: false,
             print: Default::default(),
+            edits: 0,
+            hwnd,
             last_press_pos: None,
             pending_link: None,
             recovery_path: recovery_dir().map(|d| d.join(format!("Recovered-{}.xlsx", std::process::id()))),
@@ -471,6 +479,7 @@ impl App {
 
     /// Records the current state of the given scopes before a change.
     pub fn push_undo(&mut self, scopes: &[Scope]) {
+        self.edits += 1;
         let snaps = scopes.iter().map(|s| self.snapshot(*s)).collect();
         let view = (self.wb.active, self.sheet().view.clone());
         self.undo.push(UndoEntry { snaps, view });
@@ -522,6 +531,7 @@ impl App {
     /// Call after any workbook mutation.
     pub fn changed(&mut self) {
         self.generation += 1;
+        self.edits += 1;
         self.wb.recalc();
         self.cf.invalidate();
         self.dirty = true;
@@ -848,10 +858,10 @@ fn save_recent(v: &[PathBuf]) {
 }
 
 #[cfg(windows)]
-fn set_caption_color(cc: &eframe::CreationContext<'_>) {
+fn set_caption_color(cc: &eframe::CreationContext<'_>) -> isize {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
-    let Ok(h) = cc.window_handle() else { return };
+    let Ok(h) = cc.window_handle() else { return 0 };
     if let RawWindowHandle::Win32(w) = h.as_raw() {
         let hwnd = w.hwnd.get() as windows_sys::Win32::Foundation::HWND;
         // COLORREF is 0x00BBGGRR
@@ -861,7 +871,9 @@ fn set_caption_color(cc: &eframe::CreationContext<'_>) {
             DwmSetWindowAttribute(hwnd, 35, &caption as *const u32 as *const _, 4);
             DwmSetWindowAttribute(hwnd, 36, &text as *const u32 as *const _, 4);
         }
+        return hwnd as isize;
     }
+    0
 }
 
 impl eframe::App for App {
@@ -892,6 +904,7 @@ impl eframe::App for App {
 
         self.handle_keys(ctx);
         self.update_title(ctx);
+        self.poll_print();
         self.autosave(ctx);
 
         if self.backstage.is_some() {

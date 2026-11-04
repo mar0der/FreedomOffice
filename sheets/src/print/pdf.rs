@@ -255,3 +255,64 @@ mod tests {
         assert!(pdf.trim_end().ends_with("%%EOF"));
     }
 }
+
+#[cfg(test)]
+mod sample {
+    use crate::model::{cell_from_input, BorderLine, Workbook};
+    use crate::page::{HeaderFooter, Scaling};
+    use crate::print::{layout, LayoutOptions, PrintWhat};
+
+    /// Writes a sample multi-page PDF to the temp dir for visual inspection.
+    #[test]
+    #[ignore]
+    fn print_sample_pdf() {
+        let mut wb = Workbook::new();
+        let head = ["Region", "Product", "Units", "Price", "Revenue", "Notes"];
+        for (c, h) in head.iter().enumerate() {
+            let cell = cell_from_input(&mut wb, h, 0);
+            wb.sheets[0].set(0, c as u32, cell);
+        }
+        for r in 1..90u32 {
+            let vals = [
+                ["North", "South", "East", "West"][r as usize % 4].to_string(),
+                format!("Item {r}"),
+                format!("{}", r * 7 % 50 + 1),
+                format!("{:.2}", (r as f64) * 1.37),
+                format!("=C{}*D{}", r + 1, r + 1),
+                if r % 9 == 0 { "A longer note that overflows into the next empty cells".into() } else { String::new() },
+            ];
+            for (c, v) in vals.iter().enumerate() {
+                let cell = cell_from_input(&mut wb, v, 0);
+                wb.sheets[0].set(r, c as u32, cell);
+            }
+        }
+        let mut st = wb.style(0).clone();
+        st.bold = true;
+        st.fill = Some(0x4472C4);
+        st.color = Some(0xFFFFFF);
+        st.border.bottom = BorderLine::Medium;
+        let hdr = wb.intern_style(st);
+        for c in 0..6 {
+            wb.sheets[0].cell_mut(0, c).style = hdr;
+        }
+        let mut money = wb.style(0).clone();
+        money.num_fmt = "\"$\"#,##0.00".into();
+        let m = wb.intern_style(money);
+        for r in 1..90 {
+            wb.sheets[0].cell_mut(r, 4).style = m;
+        }
+        wb.recalc();
+        let p = &mut wb.sheets[0].page;
+        p.title_rows = Some((0, 0));
+        p.gridlines = true;
+        p.headings = true;
+        p.scaling = Scaling::Fit { wide: 1, tall: 0 };
+        p.header = HeaderFooter { left: "&A".into(), center: "Sales report".into(), right: "&D".into() };
+        p.footer = HeaderFooter::center("Page &P of &N");
+        let o = LayoutOptions { what: PrintWhat::ActiveSheet, selection: None, ignore_print_area: false, file_name: "Sales.xlsx", file_path: "" };
+        let pages = layout(&wb, &o, &|_, _, _| Vec::new());
+        let path = std::env::temp_dir().join("freedom_print_sample.pdf");
+        super::export(&pages, &path).unwrap();
+        println!("{} pages -> {}", pages.len(), path.display());
+    }
+}
