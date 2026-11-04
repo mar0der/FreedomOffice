@@ -136,7 +136,7 @@ impl App {
         ui.add(b).on_hover_text(tip)
     }
 
-    fn group(&mut self, ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut Self, &mut egui::Ui)) {
+    pub(super) fn group(&mut self, ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut Self, &mut egui::Ui)) {
         let resp = ui.vertical(|ui| {
             ui.set_height(GROUP_H + 18.0);
             let w = ui.available_width();
@@ -250,6 +250,7 @@ impl App {
                     self.ribbon_collapsed = !self.ribbon_collapsed;
                 }
             }
+            self.chart_tab_button(ui);
         });
         let _ = strip;
         if self.ribbon_collapsed {
@@ -274,6 +275,7 @@ impl App {
                         RibbonTab::Review => self.review_tab(ui),
                         RibbonTab::View => self.view_tab(ui),
                         RibbonTab::Help => self.help_tab(ui),
+                        RibbonTab::ChartDesign => self.chart_design_tab(ui),
                     }
                 });
             });
@@ -774,6 +776,7 @@ impl App {
                 app.add_sheet();
             }
         });
+        self.group(ui, "Charts", |app, ui| app.chart_insert_buttons(ui));
         self.group(ui, "Functions", |app, ui| {
             let job = icon_job("fx", false, "Function", 20.0, true, theme::TEXT);
             if ui.add(egui::Button::new(job).min_size(Vec2::new(54.0, GROUP_H - 4.0))).on_hover_text("Insert Function (Shift+F3)").clicked() {

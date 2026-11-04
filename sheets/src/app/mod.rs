@@ -1,6 +1,7 @@
 //! Application shell: state, undo, editing and the frame loop.
 
 mod actions;
+mod chart_view;
 mod chrome;
 mod dialogs;
 mod editor;
@@ -28,6 +29,8 @@ pub enum RibbonTab {
     Review,
     View,
     Help,
+    /// Contextual tab shown while a chart is selected.
+    ChartDesign,
 }
 
 #[derive(Clone)]
@@ -161,6 +164,7 @@ pub struct App {
     pub show_all_notes: bool,
     pub page_setup: crate::pdf::PageSetup,
     pub print_selection: bool,
+    pub chart: chart_view::ChartUi,
 }
 
 const MAX_UNDO: usize = 100;
@@ -219,6 +223,7 @@ impl App {
             show_all_notes: false,
             page_setup: crate::pdf::PageSetup::default(),
             print_selection: false,
+            chart: Default::default(),
         };
         if let Some(p) = path {
             app.open_path(p);

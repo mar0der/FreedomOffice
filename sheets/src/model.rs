@@ -404,6 +404,7 @@ pub struct Sheet {
     pub view: SheetView,
     /// Cell notes (comments) keyed by (row, col).
     pub notes: HashMap<(u32, u32), String>,
+    pub charts: Vec<crate::chart::Chart>,
 }
 
 impl Sheet {
@@ -422,6 +423,7 @@ impl Sheet {
             tab_color: None,
             view: SheetView::default(),
             notes: HashMap::new(),
+            charts: Vec::new(),
         }
     }
 

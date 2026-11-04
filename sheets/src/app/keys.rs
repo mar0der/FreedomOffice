@@ -72,6 +72,9 @@ impl App {
             }
             return;
         }
+        if self.chart_keys(ctx) {
+            return;
+        }
         let events = ctx.input(|i| i.events.clone());
         for ev in events {
             if self.dialog.is_some() || self.backstage.is_some() {
