@@ -369,3 +369,57 @@ mod extras_roundtrip {
         assert_eq!(rot, Some(90));
     }
 }
+
+#[cfg(test)]
+mod sweep {
+    /// Loads every spreadsheet under $SWEEP_DIRS (';'-separated) and reports panics/errors.
+    #[test]
+    #[ignore]
+    fn load_everything() {
+        let dirs = std::env::var("SWEEP_DIRS").unwrap_or_default();
+        let mut files = Vec::new();
+        fn walk(d: &std::path::Path, out: &mut Vec<std::path::PathBuf>, depth: u32) {
+            let Ok(rd) = std::fs::read_dir(d) else { return };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() && depth < 3 {
+                    walk(&p, out, depth + 1);
+                } else if let Some(x) = p.extension().map(|x| x.to_string_lossy().to_lowercase()) {
+                    if ["xlsx", "xlsm", "xls", "xlsb", "ods", "csv"].contains(&x.as_str()) {
+                        out.push(p);
+                    }
+                }
+            }
+        }
+        for d in dirs.split(';').filter(|d| !d.is_empty()) {
+            walk(std::path::Path::new(d), &mut files, 0);
+        }
+        let (mut ok, mut err, mut panics) = (0, 0, 0);
+        for f in &files {
+            let t = std::time::Instant::now();
+            let r = std::panic::catch_unwind(|| {
+                let mut wb = super::load(f)?;
+                wb.recalc();
+                let tmp = std::env::temp_dir().join("freedom_sweep_roundtrip.xlsx");
+                super::save(&wb, &tmp)?;
+                super::load(&tmp).map(|_| ())
+            });
+            match r {
+                Ok(Ok(())) => ok += 1,
+                Ok(Err(e)) => {
+                    err += 1;
+                    println!("ERR   {} : {e}", f.display());
+                }
+                Err(_) => {
+                    panics += 1;
+                    println!("PANIC {}", f.display());
+                }
+            }
+            let ms = t.elapsed().as_millis();
+            if ms > 3000 {
+                println!("SLOW  {} : {ms} ms", f.display());
+            }
+        }
+        println!("files={} ok={ok} err={err} panics={panics}", files.len());
+    }
+}
