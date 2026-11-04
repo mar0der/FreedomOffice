@@ -262,6 +262,84 @@ mod tests {
     }
 
     #[test]
+    fn xlsx_page_setup_round_trip() {
+        use crate::page::{HeaderFooter, Margins, Paper, Scaling};
+        let mut wb = Workbook::empty_with(vec![Sheet::new("Plain"), Sheet::new("My Sheet")]);
+        wb.sheets[1].set(0, 0, Some(Cell { value: Value::Number(1.0), ..Default::default() }));
+        {
+            let p = &mut wb.sheets[1].page;
+            p.landscape = true;
+            p.paper = Paper::A3;
+            p.margins = Margins { top: 1.25, bottom: 0.5, left: 0.4, right: 0.6, header: 0.2, footer: 0.35 };
+            p.scaling = Scaling::Fit { wide: 1, tall: 0 };
+            p.center_h = true;
+            p.center_v = true;
+            p.gridlines = true;
+            p.headings = true;
+            p.black_white = true;
+            p.print_area = Some(Range::new(0, 0, 19, 3));
+            p.title_rows = Some((0, 1));
+            p.title_cols = Some((0, 0));
+            p.header = HeaderFooter { left: "&A".into(), center: "Report && Co".into(), right: "&D &T".into() };
+            p.footer = HeaderFooter::center("Page &P of &N");
+            p.first_page = Some(5);
+            p.over_then_down = true;
+            p.row_breaks.extend([10, 25]);
+            p.col_breaks.insert(4);
+        }
+        let path = temp("page_setup.xlsx");
+        save(&wb, &path).unwrap();
+        let back = load(&path).unwrap();
+        assert_eq!(back.sheets[1].page, wb.sheets[1].page);
+        assert_eq!(back.sheets[0].page, wb.sheets[0].page);
+
+        // Percentage scaling.
+        wb.sheets[1].page.scaling = Scaling::Percent(75);
+        save(&wb, &path).unwrap();
+        assert_eq!(load(&path).unwrap().sheets[1].page.scaling, Scaling::Percent(75));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn xlsx_print_titles_quoted_sheet() {
+        let ct = r#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/></Types>"#;
+        let rels = r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#;
+        let wbx = r#"<?xml version="1.0"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="First" sheetId="1" r:id="rId1"/><sheet name="Q1, 'Sales'!" sheetId="2" r:id="rId2"/></sheets><definedNames><definedName name="_xlnm.Print_Area" localSheetId="1">'Q1, ''Sales''!'!$B$2:$F$30,'Q1, ''Sales''!'!$H$1:$H$2</definedName><definedName name="_xlnm.Print_Titles" localSheetId="1">'Q1, ''Sales''!'!$A:$B,'Q1, ''Sales''!'!$1:$3</definedName></definedNames></workbook>"#;
+        let wbrels = r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/></Relationships>"#;
+        let empty = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData/></worksheet>"#;
+        let sheet2 = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetPr><pageSetUpPr fitToPage="1"/></sheetPr><sheetData/><printOptions gridLines="1"/><pageMargins left="0.25" right="0.25" top="0.75" bottom="0.75" header="0.3" footer="0.3"/><pageSetup paperSize="5" fitToHeight="0" orientation="landscape" firstPageNumber="3" useFirstPageNumber="1"/><headerFooter><oddHeader>&amp;CTitle</oddHeader><oddFooter>&amp;RPage &amp;P</oddFooter></headerFooter><rowBreaks count="2" manualBreakCount="1"><brk id="12" max="16383" man="1"/><brk id="40" max="16383"/></rowBreaks></worksheet>"#;
+        let path = temp("print_titles.xlsx");
+        write_zip(
+            &path,
+            &[
+                ("[Content_Types].xml", ct),
+                ("_rels/.rels", rels),
+                ("xl/workbook.xml", wbx),
+                ("xl/_rels/workbook.xml.rels", wbrels),
+                ("xl/worksheets/sheet1.xml", empty),
+                ("xl/worksheets/sheet2.xml", sheet2),
+            ],
+        );
+        let wb = load(&path).unwrap();
+        assert_eq!(wb.sheets[0].page, crate::page::PageSetup::default());
+        let p = &wb.sheets[1].page;
+        assert_eq!(wb.sheets[1].name, "Q1, 'Sales'!");
+        assert_eq!(p.print_area, Some(Range::new(1, 1, 29, 5)));
+        assert_eq!(p.title_rows, Some((0, 2)));
+        assert_eq!(p.title_cols, Some((0, 1)));
+        assert!(p.landscape && p.gridlines);
+        assert_eq!(p.paper, crate::page::Paper::Legal);
+        assert_eq!(p.scaling, crate::page::Scaling::Fit { wide: 1, tall: 0 });
+        assert_eq!(p.margins.left, 0.25);
+        assert_eq!(p.first_page, Some(3));
+        assert_eq!(p.header.center, "Title");
+        assert_eq!(p.footer.right, "Page &P");
+        assert_eq!(p.row_breaks.iter().copied().collect::<Vec<_>>(), [12]);
+        assert!(wb.names.is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn csv_semicolon_newline_and_injection() {
         let path = temp("data.csv");
         std::fs::write(&path, "\u{feff}name;amount;note\r\n\"multi\nline\";1,5;=1+2\r\nb;12;\"x;y\"\r\n").unwrap();
