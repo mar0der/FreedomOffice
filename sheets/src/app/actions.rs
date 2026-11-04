@@ -631,6 +631,11 @@ impl App {
             sh.col_w = sh.col_w.drain().filter_map(|(c, w)| map(c).map(|nc| (nc, w))).collect();
             sh.hidden_cols = sh.hidden_cols.drain().filter_map(map).collect();
         }
+        if rows {
+            sh.row_levels = sh.row_levels.drain().filter_map(|(r, l)| map(r).map(|nr| (nr, l))).collect();
+        } else {
+            sh.col_levels = sh.col_levels.drain().filter_map(|(c, l)| map(c).map(|nc| (nc, l))).collect();
+        }
         sh.links = sh
             .links
             .drain()
@@ -2169,6 +2174,87 @@ fn match_ci_at(hay: &str, start: usize, needle: &[char]) -> Option<usize> {
         end = start + j + ch.len_utf8();
     }
     (k == needle.len()).then_some(end)
+}
+
+impl App {
+    // ------------------------------------------------------------------
+    // Outline (Group / Ungroup)
+    // ------------------------------------------------------------------
+
+    /// Group (or ungroup) the selected rows or columns. Whole-column selections act on columns.
+    pub fn outline_group_cmd(&mut self, ungroup: bool) {
+        self.commit_edit(false);
+        let sel = self.sel();
+        let cols = sel.is_full_cols() && !sel.is_full_rows();
+        let (a, b) = if cols {
+            (sel.c1, sel.c2)
+        } else if sel.is_full_rows() {
+            (sel.r1, sel.r2)
+        } else {
+            (sel.r1, sel.r2)
+        };
+        if b - a > 100_000 {
+            return;
+        }
+        let si = self.wb.active;
+        self.push_undo(&[Scope::Sheet(si)]);
+        let sh = &mut self.wb.sheets[si];
+        let map = if cols { &mut sh.col_levels } else { &mut sh.row_levels };
+        for i in a..=b {
+            let l = map.entry(i).or_insert(0);
+            if ungroup {
+                *l = l.saturating_sub(1);
+            } else if *l < 7 {
+                *l += 1;
+            }
+        }
+        map.retain(|_, l| *l > 0);
+        if ungroup {
+            // ungrouped rows/columns become visible again
+            for i in a..=b {
+                if cols {
+                    sh.hidden_cols.remove(&i);
+                } else {
+                    sh.hidden_rows.remove(&i);
+                }
+            }
+        }
+        self.changed();
+    }
+
+    /// Expands or collapses one outline group.
+    pub fn toggle_outline(&mut self, cols: bool, a: u32, b: u32) {
+        let si = self.wb.active;
+        self.push_undo(&[Scope::Sheet(si)]);
+        let sh = &mut self.wb.sheets[si];
+        let hidden = if cols { &mut sh.hidden_cols } else { &mut sh.hidden_rows };
+        let collapsed = (a..=b).all(|i| hidden.contains(&i));
+        for i in a..=b {
+            if collapsed {
+                hidden.remove(&i);
+            } else {
+                hidden.insert(i);
+            }
+        }
+        self.changed();
+    }
+
+    /// Outline level buttons (1, 2, 3...): show only groups above `level`.
+    pub fn show_outline_level(&mut self, cols: bool, level: u8) {
+        let si = self.wb.active;
+        self.push_undo(&[Scope::Sheet(si)]);
+        let sh = &mut self.wb.sheets[si];
+        let levels: Vec<(u32, u8)> = if cols { sh.col_levels.iter().map(|(k, v)| (*k, *v)).collect() } else { sh.row_levels.iter().map(|(k, v)| (*k, *v)).collect() };
+        let hidden = if cols { &mut sh.hidden_cols } else { &mut sh.hidden_rows };
+        for (i, l) in levels {
+            if l >= level {
+                hidden.insert(i);
+            } else {
+                hidden.remove(&i);
+            }
+        }
+        self.changed();
+    }
 }
 
 fn replace_ci(text: &str, what: &str, with: &str) -> String {

@@ -135,6 +135,8 @@ pub const KEYTIPS: &[(&str, &str)] = &[
     ("AY", "Reapply Filter"),
     ("AE", "Text to Columns..."),
     ("AM", "Remove Duplicates..."),
+    ("AGG", "Group"),
+    ("AUU", "Ungroup"),
     // Page layout
     ("PVG", "View Gridlines"),
     ("PVH", "View Headings"),
@@ -309,6 +311,8 @@ impl App {
             "AY" => self.apply_filter(),
             "AE" => self.dialog = Some(Dialog::TextToColumns { delim: 0, other: String::new() }),
             "AM" => self.open_remove_duplicates(),
+            "AGG" => self.outline_group_cmd(false),
+            "AUU" => self.outline_group_cmd(true),
             "HFDF" => {
                 self.find.replace = false;
                 self.find.focus = true;

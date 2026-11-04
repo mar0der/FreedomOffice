@@ -412,6 +412,9 @@ pub struct Sheet {
     pub notes: HashMap<(u32, u32), String>,
     /// Hyperlinks: URL, or "#Sheet!A1" for a place in this workbook.
     pub links: HashMap<(u32, u32), String>,
+    /// Outline (group) levels 1..=7 for rows and columns.
+    pub row_levels: HashMap<u32, u8>,
+    pub col_levels: HashMap<u32, u8>,
     pub charts: Vec<crate::chart::Chart>,
     /// Conditional formatting rules, highest priority first.
     pub cond_formats: Vec<crate::condfmt::CondFormat>,
@@ -447,6 +450,8 @@ impl Sheet {
             view: SheetView::default(),
             notes: HashMap::new(),
             links: HashMap::new(),
+            row_levels: HashMap::new(),
+            col_levels: HashMap::new(),
             charts: Vec::new(),
             cond_formats: Vec::new(),
             validations: Vec::new(),
@@ -524,6 +529,20 @@ impl Sheet {
     }
     pub fn row_height(&self, r: u32) -> f32 {
         if self.hidden_rows.contains(&r) { 0.0 } else { self.raw_row_height(r) }
+    }
+
+    /// Maximal runs of consecutive indices whose outline level is at least `level`.
+    pub fn outline_runs(levels: &HashMap<u32, u8>, level: u8) -> Vec<(u32, u32)> {
+        let mut keys: Vec<u32> = levels.iter().filter(|(_, l)| **l >= level).map(|(k, _)| *k).collect();
+        keys.sort_unstable();
+        let mut out: Vec<(u32, u32)> = Vec::new();
+        for k in keys {
+            match out.last_mut() {
+                Some((_, b)) if *b + 1 == k => *b = k,
+                _ => out.push((k, k)),
+            }
+        }
+        out
     }
 
     pub fn merge_at(&self, r: u32, c: u32) -> Option<Range> {

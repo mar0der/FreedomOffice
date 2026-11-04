@@ -1046,6 +1046,20 @@ impl App {
             }
             app.dv_ribbon_button(ui);
         });
+        self.outline_group(ui);
+    }
+
+    fn outline_group(&mut self, ui: &mut egui::Ui) {
+        self.group(ui, "Outline", |app, ui| {
+            let job = icon_job("⊞", false, "Group", 20.0, true, theme::TEXT);
+            if big_btn(ui, job, 50.0, false).on_hover_text("Group rows or columns (Alt+Shift+Right)").clicked() {
+                app.outline_group_cmd(false);
+            }
+            let job = icon_job("⊟", false, "Ungroup", 20.0, true, theme::TEXT);
+            if big_btn(ui, job, 54.0, false).on_hover_text("Ungroup (Alt+Shift+Left)").clicked() {
+                app.outline_group_cmd(true);
+            }
+        });
     }
 
     fn review_tab(&mut self, ui: &mut egui::Ui) {

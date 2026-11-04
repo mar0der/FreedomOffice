@@ -960,6 +960,7 @@ fn parse_sheet(xml: &str, ctx: &SheetCtx, sheet: &mut Sheet) {
                         let mut r = next_row;
                         let mut ht = None;
                         let mut hidden = false;
+                        let mut outline = 0u8;
                         for (k, v) in attrs(e) {
                             match k.as_str() {
                                 "r" => {
@@ -971,6 +972,7 @@ fn parse_sheet(xml: &str, ctx: &SheetCtx, sheet: &mut Sheet) {
                                 }
                                 "ht" => ht = parse_f(&v),
                                 "hidden" => hidden = v == "1" || v == "true",
+                                "outlineLevel" => outline = v.parse::<u8>().unwrap_or(0).min(7),
                                 _ => {}
                             }
                         }
@@ -982,6 +984,9 @@ fn parse_sheet(xml: &str, ctx: &SheetCtx, sheet: &mut Sheet) {
                         }
                         if hidden {
                             sheet.hidden_rows.insert(r);
+                        }
+                        if outline > 0 {
+                            sheet.row_levels.insert(r, outline);
                         }
                         row = r;
                         next_row = r + 1;
@@ -1073,7 +1078,11 @@ fn parse_sheet(xml: &str, ctx: &SheetCtx, sheet: &mut Sheet) {
                         let max = attr(e, "max").and_then(|v| v.parse::<u32>().ok()).unwrap_or(min).clamp(min, MAX_COLS);
                         let hidden = attr_bool(e, "hidden").unwrap_or(false);
                         let px = attr(e, "width").and_then(|v| parse_f(&v)).map(width_to_px);
+                        let outline = attr(e, "outlineLevel").and_then(|v| v.parse::<u8>().ok()).unwrap_or(0).min(7);
                         for c in (min - 1)..max {
+                            if outline > 0 {
+                                sheet.col_levels.insert(c, outline);
+                            }
                             if hidden {
                                 sheet.hidden_cols.insert(c);
                             }

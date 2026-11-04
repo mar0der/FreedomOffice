@@ -227,6 +227,10 @@ impl App {
         let sel = self.sel();
         match key {
             Key::ArrowUp | Key::ArrowDown | Key::ArrowLeft | Key::ArrowRight => {
+                if m.alt && m.shift && matches!(key, Key::ArrowRight | Key::ArrowLeft) {
+                    self.outline_group_cmd(key == Key::ArrowLeft);
+                    return;
+                }
                 if m.alt {
                     if key == Key::ArrowDown {
                         self.dv_open_dropdown();

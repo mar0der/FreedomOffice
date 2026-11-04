@@ -10,6 +10,7 @@ use crate::model::{col_name, BorderLine, HAlign, Range, Style, VAlign, Value, MA
 use crate::numfmt;
 
 pub const SCROLLBAR: f32 = 14.0;
+const OUTLINE_STEP: f32 = 14.0;
 
 #[derive(Clone, Debug)]
 pub struct Layout {
@@ -231,7 +232,14 @@ impl App {
     }
 
     pub fn grid_ui(&mut self, ui: &mut egui::Ui) {
-        let rect = ui.available_rect_before_wrap();
+        let full = ui.available_rect_before_wrap();
+        let (rl, cl) = {
+            let sh = self.sheet();
+            (sh.row_levels.values().copied().max().unwrap_or(0), sh.col_levels.values().copied().max().unwrap_or(0))
+        };
+        let gw = if rl > 0 { 6.0 + OUTLINE_STEP * (rl as f32 + 1.0) } else { 0.0 };
+        let gh = if cl > 0 { 6.0 + OUTLINE_STEP * (cl as f32 + 1.0) } else { 0.0 };
+        let rect = Rect::from_min_max(full.min + Vec2::new(gw, gh), full.max);
         let id = egui::Id::new("grid");
         let resp = ui.interact(rect, id, Sense::click_and_drag());
         if resp.clicked() || resp.drag_started() || resp.secondary_clicked() {
@@ -253,6 +261,9 @@ impl App {
         let lay = self.compute_layout(rect);
         self.layout = Some(lay.clone());
         self.paint_grid(ui, &lay);
+        if gw > 0.0 || gh > 0.0 {
+            self.outline_ui(ui, full, &lay, rl, cl);
+        }
         self.context_menu(&resp);
     }
 
@@ -1612,6 +1623,95 @@ impl App {
                 }
             }
         });
+    }
+}
+
+impl App {
+    /// Outline gutters (row groups on the left, column groups on top) with +/- and level buttons.
+    fn outline_ui(&mut self, ui: &mut egui::Ui, full: Rect, lay: &Layout, rl: u8, cl: u8) {
+        let p = ui.painter();
+        let left = Rect::from_min_max(Pos2::new(full.left(), lay.rect.top()), Pos2::new(lay.rect.left(), full.bottom()));
+        let top = Rect::from_min_max(Pos2::new(lay.rect.left(), full.top()), Pos2::new(full.right(), lay.rect.top()));
+        let corner = Rect::from_min_max(full.min, Pos2::new(lay.rect.left(), lay.rect.top()));
+        for r in [left, top, corner] {
+            if r.width() > 0.0 && r.height() > 0.0 {
+                p.rect_filled(r, 0.0, theme::CHROME);
+            }
+        }
+        let line = Stroke::new(1.0, Color32::from_gray(110));
+        let font = theme::ui_font(10.0);
+        // (button rect, action) where action = (cols, kind, a, b, level); kind 0 = toggle group, 1 = level button
+        let mut buttons: Vec<(Rect, bool, u8, u32, u32, u8)> = Vec::new();
+        let button = |p: &egui::Painter, r: Rect, text: &str| {
+            p.rect_filled(r, 1.0, Color32::WHITE);
+            p.rect_stroke(r, 1.0, Stroke::new(1.0, Color32::from_gray(120)), StrokeKind::Inside);
+            p.text(r.center(), Align2::CENTER_CENTER, text, font.clone(), theme::TEXT);
+        };
+        let sh = self.sheet();
+        if rl > 0 {
+            let lp = p.with_clip_rect(Rect::from_min_max(Pos2::new(left.left(), lay.cells.top()), left.max));
+            for level in 1..=rl {
+                let x = left.left() + 3.0 + (level - 1) as f32 * OUTLINE_STEP + 7.0;
+                for (a, b) in crate::model::Sheet::outline_runs(&sh.row_levels, level) {
+                    let vis: Vec<&(u32, f32, f32)> = lay.rows.iter().filter(|(r, _, _)| *r >= a && *r <= b).collect();
+                    if let (Some(f), Some(l)) = (vis.first(), vis.last()) {
+                        lp.line_segment([Pos2::new(x, f.1 + 2.0), Pos2::new(x, l.1 + l.2)], line);
+                    }
+                    let collapsed = (a..=b).all(|r| sh.hidden_rows.contains(&r));
+                    if let Some(&(_, y, h)) = lay.rows.iter().find(|(r, _, _)| *r == b + 1) {
+                        let br = Rect::from_center_size(Pos2::new(x, y + h / 2.0), Vec2::splat(11.0));
+                        if !collapsed {
+                            lp.line_segment([Pos2::new(x, y), br.center_top()], line);
+                        }
+                        button(&lp, br, if collapsed { "+" } else { "−" });
+                        buttons.push((br, false, 0, a, b, level));
+                    }
+                }
+            }
+            for k in 1..=rl + 1 {
+                let br = Rect::from_min_size(Pos2::new(left.left() + 3.0 + (k - 1) as f32 * OUTLINE_STEP + 1.0, lay.rect.top() + (lay.hh - 12.0) / 2.0), Vec2::splat(12.0));
+                button(p, br, &k.to_string());
+                buttons.push((br, false, 1, 0, 0, k));
+            }
+        }
+        if cl > 0 {
+            let tp = p.with_clip_rect(Rect::from_min_max(Pos2::new(lay.cells.left(), top.top()), top.max));
+            for level in 1..=cl {
+                let y = top.top() + 3.0 + (level - 1) as f32 * OUTLINE_STEP + 7.0;
+                for (a, b) in crate::model::Sheet::outline_runs(&sh.col_levels, level) {
+                    let vis: Vec<&(u32, f32, f32)> = lay.cols.iter().filter(|(c, _, _)| *c >= a && *c <= b).collect();
+                    if let (Some(f), Some(l)) = (vis.first(), vis.last()) {
+                        tp.line_segment([Pos2::new(f.1 + 2.0, y), Pos2::new(l.1 + l.2, y)], line);
+                    }
+                    let collapsed = (a..=b).all(|c| sh.hidden_cols.contains(&c));
+                    if let Some(&(_, x, w)) = lay.cols.iter().find(|(c, _, _)| *c == b + 1) {
+                        let br = Rect::from_center_size(Pos2::new(x + w / 2.0, y), Vec2::splat(11.0));
+                        if !collapsed {
+                            tp.line_segment([Pos2::new(x, y), br.left_center()], line);
+                        }
+                        button(&tp, br, if collapsed { "+" } else { "−" });
+                        buttons.push((br, true, 0, a, b, level));
+                    }
+                }
+            }
+            for k in 1..=cl + 1 {
+                let br = Rect::from_min_size(Pos2::new(lay.rect.left() + (lay.hw - 12.0).max(0.0) / 2.0, top.top() + 3.0 + (k - 1) as f32 * OUTLINE_STEP + 1.0), Vec2::splat(12.0));
+                button(p, br, &k.to_string());
+                buttons.push((br, true, 1, 0, 0, k));
+            }
+        }
+        let clicked = ui.input(|i| if i.pointer.primary_clicked() { i.pointer.interact_pos() } else { None });
+        if let Some(pos) = clicked {
+            if !lay.rect.contains(pos) {
+                if let Some(&(_, cols, kind, a, b, level)) = buttons.iter().find(|(r, ..)| r.expand(2.0).contains(pos)) {
+                    if kind == 0 {
+                        self.toggle_outline(cols, a, b);
+                    } else {
+                        self.show_outline_level(cols, level);
+                    }
+                }
+            }
+        }
     }
 }
 

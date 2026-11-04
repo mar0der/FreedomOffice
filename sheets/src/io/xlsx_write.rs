@@ -47,6 +47,18 @@ fn format_for<'a>(wb: &Workbook, formats: &'a mut HashMap<u32, Format>, id: u32)
 }
 
 fn write_sheet(wb: &Workbook, sh: &Sheet, ws: &mut Worksheet, formats: &mut HashMap<u32, Format>) -> Result<(), XlsxError> {
+    for level in 1..=7u8 {
+        for (a, b) in Sheet::outline_runs(&sh.row_levels, level) {
+            if b < MAX_ROWS {
+                let _ = ws.group_rows(a, b);
+            }
+        }
+        for (a, b) in Sheet::outline_runs(&sh.col_levels, level) {
+            if b < MAX_COLS {
+                let _ = ws.group_columns(a as u16, b as u16);
+            }
+        }
+    }
     let mut cols: Vec<_> = sh.col_w.iter().filter(|(c, _)| **c < MAX_COLS).collect();
     cols.sort_by_key(|(c, _)| **c);
     for (&c, &w) in cols {
