@@ -331,7 +331,13 @@ impl App {
                     app.copy(&ctx, false);
                 }
                 let fp = app.format_painter.is_some();
-                if app.small(ui, ic::BRUSH, "🖌", "", "Format Painter", fp).clicked() {
+                let r = app.small(ui, ic::BRUSH, "🖌", "", "Format Painter (double-click to keep it on)", fp);
+                if r.double_clicked() {
+                    app.start_format_painter();
+                    if let Some(p) = &mut app.format_painter {
+                        p.3 = true;
+                    }
+                } else if r.clicked() {
                     if fp { app.format_painter = None } else { app.start_format_painter() }
                 }
             });

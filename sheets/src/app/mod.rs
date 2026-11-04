@@ -173,6 +173,8 @@ pub struct App {
     pub last_autosave: f64,
     /// Last repeatable command (F4 / Ctrl+Y).
     pub last_action: Option<actions::Repeat>,
+    /// Sheet tab being dragged to a new position.
+    pub tab_drag: Option<usize>,
     pub chart: chart_view::ChartUi,
     pub cf: condfmt_ui::CfState,
     pub dv: validation_ui::DvState,
@@ -239,6 +241,7 @@ impl App {
             recovery_path: recovery_dir().map(|d| d.join(format!("Recovered-{}.xlsx", std::process::id()))),
             last_autosave: 0.0,
             last_action: None,
+            tab_drag: None,
             chart: Default::default(),
             cf: Default::default(),
             dv: Default::default(),

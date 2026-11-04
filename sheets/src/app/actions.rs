@@ -1842,6 +1842,21 @@ impl App {
         self.dirty = true;
     }
 
+    /// Moves sheet `src` so it lands before position `dst` (0..=len).
+    pub fn move_sheet_to(&mut self, src: usize, dst: usize) {
+        let n = self.wb.sheets.len();
+        if src >= n || dst > n || dst == src || dst == src + 1 {
+            return;
+        }
+        self.push_undo(&[Scope::All]);
+        let active_name = self.wb.sheets[self.wb.active].name.clone();
+        let sh = self.wb.sheets.remove(src);
+        let at = if dst > src { dst - 1 } else { dst };
+        self.wb.sheets.insert(at, sh);
+        self.wb.active = self.wb.sheet_index(&active_name).unwrap_or(at);
+        self.dirty = true;
+    }
+
     pub fn duplicate_sheet(&mut self, i: usize) {
         self.push_undo(&[Scope::All]);
         let mut copy = self.wb.sheets[i].clone();

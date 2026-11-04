@@ -231,6 +231,7 @@ impl App {
             let font = theme::ui_font(12.5);
             let bold = theme::ui_bold(12.5);
             let mut action: Option<(usize, u8)> = None;
+            let mut tab_rects: Vec<(usize, Rect)> = Vec::new();
             for i in self.tab_scroll..self.wb.sheets.len() {
                 if ui.available_width() < 60.0 {
                     if self.wb.active >= i {
@@ -262,6 +263,10 @@ impl App {
                 let galley = ui.painter().layout_no_wrap(name.clone(), if active { bold.clone() } else { font.clone() }, theme::TEXT);
                 let w = galley.size().x + 26.0;
                 let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 26.0), Sense::click_and_drag());
+                tab_rects.push((i, rect));
+                if resp.drag_started() {
+                    self.tab_drag = Some(i);
+                }
                 let p = ui.painter();
                 if active {
                     p.rect_filled(rect.shrink2(Vec2::new(0.0, 1.0)), 0.0, Color32::WHITE);
@@ -341,6 +346,36 @@ impl App {
             let txt = if pi { RichText::new(plus).font(theme::icon_font(12.0)) } else { RichText::new(plus).size(16.0) };
             if ui.add(egui::Button::new(txt).frame(false).min_size(Vec2::new(26.0, 24.0))).on_hover_text("New sheet (Shift+F11)").clicked() {
                 self.add_sheet();
+            }
+            // Drag a tab to reorder sheets (a small marker shows the drop position).
+            if let Some(src) = self.tab_drag {
+                let pointer = ui.input(|i| i.pointer.interact_pos());
+                let released = ui.input(|i| i.pointer.primary_released());
+                let target = pointer.and_then(|p| {
+                    tab_rects
+                        .iter()
+                        .find(|(_, r)| p.x < r.center().x)
+                        .map(|(k, r)| (*k, r.left()))
+                        .or_else(|| tab_rects.last().map(|(k, r)| (*k + 1, r.right())))
+                });
+                if let Some((dst, x)) = target {
+                    if dst != src && dst != src + 1 {
+                        let y = full.top() + 3.0;
+                        ui.painter().add(egui::Shape::convex_polygon(
+                            vec![Pos2::new(x - 5.0, y), Pos2::new(x + 5.0, y), Pos2::new(x, y + 6.0)],
+                            theme::ACCENT_DARK,
+                            Stroke::NONE,
+                        ));
+                    }
+                    if released {
+                        self.tab_drag = None;
+                        if dst != src && dst != src + 1 {
+                            self.move_sheet_to(src, dst);
+                        }
+                    }
+                } else if released {
+                    self.tab_drag = None;
+                }
             }
             if let Some((i, a)) = action {
                 match a {
