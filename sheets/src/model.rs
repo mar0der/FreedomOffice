@@ -396,6 +396,8 @@ pub struct Sheet {
     pub gridlines: bool,
     pub tab_color: Option<u32>,
     pub hidden: bool,
+    /// Page setup used for printing.
+    pub page: crate::page::PageSetup,
     pub view: SheetView,
     /// Cell notes (comments) keyed by (row, col).
     pub notes: HashMap<(u32, u32), String>,
@@ -436,6 +438,7 @@ impl Sheet {
             gridlines: true,
             tab_color: None,
             hidden: false,
+            page: crate::page::PageSetup::default(),
             view: SheetView::default(),
             notes: HashMap::new(),
             links: HashMap::new(),

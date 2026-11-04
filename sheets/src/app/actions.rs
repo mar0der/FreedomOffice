@@ -636,6 +636,7 @@ impl App {
                 k.map(|k| (k, t))
             })
             .collect();
+        sh.page.shift(rows, at, n);
         sh.notes = sh
             .notes
             .drain()

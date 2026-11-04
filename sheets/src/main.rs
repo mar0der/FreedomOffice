@@ -10,7 +10,8 @@ mod icon;
 mod io;
 mod model;
 mod numfmt;
-mod pdf;
+mod page;
+mod print;
 mod validation;
 
 use eframe::egui;

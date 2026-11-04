@@ -23,7 +23,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 raw-window-handle = "0.6"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Graphics_Printing", "Win32_Storage_Xps", "Win32_Globalization", "Win32_UI_WindowsAndMessaging"] }
 
 [build-dependencies]
 embed-resource = "3"

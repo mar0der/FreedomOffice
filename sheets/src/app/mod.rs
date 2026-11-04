@@ -9,6 +9,7 @@ mod editor;
 mod grid;
 mod keys;
 mod keytips;
+mod print_ui;
 mod ribbon;
 mod theme;
 mod validation_ui;
@@ -162,8 +163,7 @@ pub struct App {
     prev_alt: bool,
     pub hover_cell: Option<(u32, u32)>,
     pub show_all_notes: bool,
-    pub page_setup: crate::pdf::PageSetup,
-    pub print_selection: bool,
+    pub print: print_ui::PrintState,
     pub last_press_pos: Option<egui::Pos2>,
     pub pending_link: Option<((u32, u32), String)>,
     /// AutoRecover: where this session's recovery copy is written, and when it was last written.
@@ -230,8 +230,7 @@ impl App {
             prev_alt: false,
             hover_cell: None,
             show_all_notes: false,
-            page_setup: crate::pdf::PageSetup::default(),
-            print_selection: false,
+            print: Default::default(),
             last_press_pos: None,
             pending_link: None,
             recovery_path: recovery_dir().map(|d| d.join(format!("Recovered-{}.xlsx", std::process::id()))),
