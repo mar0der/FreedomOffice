@@ -2,7 +2,9 @@
 
 use std::cmp::Ordering;
 
-use super::eval::{boolean, compare, num, text, to_bool, to_num, to_text, values_equal, Evaluator, Res, EV};
+use std::rc::Rc;
+
+use super::eval::{boolean, compare, num, text, to_bool, to_num, to_text, values_equal, Evaluator, LookupCol, Res, EV};
 use super::parser::{Expr, RefKind};
 use crate::model::{ErrorKind as E, Range, Value};
 use crate::numfmt;
@@ -203,11 +205,11 @@ pub fn signature(name: &str) -> Option<&'static str> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn need(a: &[Expr], min: usize, max: usize) -> Result<(), E> {
+pub(super) fn need(a: &[Expr], min: usize, max: usize) -> Result<(), E> {
     if a.len() < min || a.len() > max { Err(E::Value) } else { Ok(()) }
 }
 
-fn round_half_away(x: f64, digits: i32) -> f64 {
+pub(super) fn round_half_away(x: f64, digits: i32) -> f64 {
     let p = 10f64.powi(digits);
     let y = x * p;
     let frac = y.abs().fract();
@@ -250,11 +252,11 @@ fn wild_match(p: &[char], s: &[char]) -> bool {
     pi == p.len()
 }
 
-fn has_wild(s: &str) -> bool {
+pub(super) fn has_wild(s: &str) -> bool {
     s.contains(['*', '?', '~'])
 }
 
-fn text_match(pattern: &str, s: &str) -> bool {
+pub(super) fn text_match(pattern: &str, s: &str) -> bool {
     if has_wild(pattern) {
         let p: Vec<char> = pattern.chars().collect();
         let sc: Vec<char> = s.chars().collect();
@@ -265,7 +267,7 @@ fn text_match(pattern: &str, s: &str) -> bool {
 }
 
 #[derive(Debug)]
-enum CritOp {
+pub(super) enum CritOp {
     Eq,
     Ne,
     Lt,
@@ -274,12 +276,12 @@ enum CritOp {
     Ge,
 }
 
-struct Criteria {
+pub(super) struct Criteria {
     op: CritOp,
     val: Value,
 }
 
-fn parse_criteria(v: &Value) -> Criteria {
+pub(super) fn parse_criteria(v: &Value) -> Criteria {
     match v {
         Value::Text(s) => {
             let (op, rest) = if let Some(r) = s.strip_prefix(">=") {
@@ -299,16 +301,12 @@ fn parse_criteria(v: &Value) -> Criteria {
             };
             let val = if rest.is_empty() {
                 Value::Empty
-            } else if let Some(n) = numfmt::parse_number(rest) {
-                Value::Number(n)
-            } else if rest.eq_ignore_ascii_case("TRUE") {
-                Value::Bool(true)
-            } else if rest.eq_ignore_ascii_case("FALSE") {
-                Value::Bool(false)
-            } else if let Some((n, _)) = numfmt::parse_date(rest) {
-                Value::Number(n)
             } else {
-                Value::Text(rest.to_string())
+                // Numbers, dates ("1/15/2024", "2024-01-15"), date-times, times, percents, logicals.
+                match numfmt::parse_input(rest).0 {
+                    v @ (Value::Number(_) | Value::Bool(_)) => v,
+                    _ => Value::Text(rest.to_string()),
+                }
             };
             Criteria { op, val }
         }
@@ -316,7 +314,7 @@ fn parse_criteria(v: &Value) -> Criteria {
     }
 }
 
-fn crit_match(c: &Criteria, v: &Value) -> bool {
+pub(super) fn crit_match(c: &Criteria, v: &Value) -> bool {
     match (&c.op, &c.val) {
         (CritOp::Eq, Value::Empty) => matches!(v, Value::Empty) || matches!(v, Value::Text(s) if s.is_empty()),
         (CritOp::Ne, Value::Empty) => !(matches!(v, Value::Empty) || matches!(v, Value::Text(s) if s.is_empty())),
@@ -330,7 +328,7 @@ fn crit_match(c: &Criteria, v: &Value) -> bool {
         },
         (CritOp::Eq, Value::Number(n)) => match v {
             Value::Number(x) => x == n,
-            Value::Text(s) => numfmt::parse_number(s) == Some(*n),
+            Value::Text(s) => numfmt::parse_input(s).0 == Value::Number(*n),
             _ => false,
         },
         (CritOp::Ne, Value::Number(n)) => !matches!(v, Value::Number(x) if x == n),
@@ -354,13 +352,13 @@ fn crit_match(c: &Criteria, v: &Value) -> bool {
     }
 }
 
-fn get(g: &[Vec<Value>], r: usize, c: usize) -> Value {
+pub(super) fn get(g: &[Vec<Value>], r: usize, c: usize) -> Value {
     g.get(r).and_then(|row| row.get(c)).cloned().unwrap_or(Value::Empty)
 }
 
 /// Evaluates a range argument as a grid; for SUMIF-style "same shape as" ranges we
 /// re-anchor the second range at its top-left with the given dimensions.
-fn grid_shaped(ev: &mut Evaluator, v: EV, rows: usize, cols: usize) -> Vec<Vec<Value>> {
+pub(super) fn grid_shaped(ev: &mut Evaluator, v: EV, rows: usize, cols: usize) -> Vec<Vec<Value>> {
     match v {
         EV::R(s, rg) => {
             let rg2 = Range::new(rg.r1, rg.c1, rg.r1 + rows.max(1) as u32 - 1, rg.c1 + cols.max(1) as u32 - 1);
@@ -371,7 +369,7 @@ fn grid_shaped(ev: &mut Evaluator, v: EV, rows: usize, cols: usize) -> Vec<Vec<V
 }
 
 /// Evaluates (range, criteria) pairs starting at `start` into a mask over a grid shape.
-fn criteria_mask(ev: &mut Evaluator, a: &[Expr], start: usize, rows: usize, cols: usize) -> Result<Vec<Vec<bool>>, E> {
+pub(super) fn criteria_mask(ev: &mut Evaluator, a: &[Expr], start: usize, rows: usize, cols: usize) -> Result<Vec<Vec<bool>>, E> {
     let mut mask = vec![vec![true; cols]; rows];
     let mut i = start;
     while i + 1 < a.len() {
@@ -395,7 +393,7 @@ fn criteria_mask(ev: &mut Evaluator, a: &[Expr], start: usize, rows: usize, cols
 }
 
 /// Flattens a grid into a vector (row-major) and reports whether it was a column.
-fn vector(g: Vec<Vec<Value>>) -> Vec<Value> {
+pub(super) fn vector(g: Vec<Vec<Value>>) -> Vec<Value> {
     if g.len() == 1 {
         g.into_iter().next().unwrap()
     } else {
@@ -403,7 +401,7 @@ fn vector(g: Vec<Vec<Value>>) -> Vec<Value> {
     }
 }
 
-fn lookup_exact(vals: &[Value], key: &Value, wildcard: bool, reverse: bool) -> Option<usize> {
+pub(super) fn lookup_exact(vals: &[Value], key: &Value, wildcard: bool, reverse: bool) -> Option<usize> {
     let idx: Box<dyn Iterator<Item = usize>> = if reverse { Box::new((0..vals.len()).rev()) } else { Box::new(0..vals.len()) };
     for i in idx {
         let v = &vals[i];
@@ -422,7 +420,7 @@ fn lookup_exact(vals: &[Value], key: &Value, wildcard: bool, reverse: bool) -> O
 }
 
 /// Largest value <= key (sorted ascending assumption, linear scan like a binary search would see).
-fn lookup_approx(vals: &[Value], key: &Value) -> Option<usize> {
+pub(super) fn lookup_approx(vals: &[Value], key: &Value) -> Option<usize> {
     let mut best = None;
     for (i, v) in vals.iter().enumerate() {
         if v.is_empty() || std::mem::discriminant(v) != std::mem::discriminant(key) {
@@ -437,7 +435,7 @@ fn lookup_approx(vals: &[Value], key: &Value) -> Option<usize> {
     best
 }
 
-fn lookup_mode(vals: &[Value], key: &Value, mode: i64, reverse: bool) -> Option<usize> {
+pub(super) fn lookup_mode(vals: &[Value], key: &Value, mode: i64, reverse: bool) -> Option<usize> {
     if let Some(i) = lookup_exact(vals, key, mode == 2, reverse) {
         return Some(i);
     }
@@ -464,7 +462,7 @@ fn lookup_mode(vals: &[Value], key: &Value, mode: i64, reverse: bool) -> Option<
     None
 }
 
-fn stats(v: &[f64], sample: bool) -> Result<f64, E> {
+pub(super) fn stats(v: &[f64], sample: bool) -> Result<f64, E> {
     let n = v.len() as f64;
     if n < if sample { 2.0 } else { 1.0 } {
         return Err(E::Div0);
@@ -474,7 +472,7 @@ fn stats(v: &[f64], sample: bool) -> Result<f64, E> {
     Ok(ss / if sample { n - 1.0 } else { n })
 }
 
-fn percentile(mut v: Vec<f64>, k: f64) -> Result<f64, E> {
+pub(super) fn percentile(mut v: Vec<f64>, k: f64) -> Result<f64, E> {
     if v.is_empty() || !(0.0..=1.0).contains(&k) {
         return Err(E::Num);
     }
@@ -485,7 +483,7 @@ fn percentile(mut v: Vec<f64>, k: f64) -> Result<f64, E> {
     Ok(v[lo] + (v[hi] - v[lo]) * (pos - lo as f64))
 }
 
-fn gcd(a: f64, b: f64) -> f64 {
+pub(super) fn gcd(a: f64, b: f64) -> f64 {
     let (mut a, mut b) = (a.abs().floor(), b.abs().floor());
     while b > 0.0 {
         let t = a % b;
@@ -495,7 +493,7 @@ fn gcd(a: f64, b: f64) -> f64 {
     a
 }
 
-fn add_months(serial: f64, months: i64, eom: bool) -> f64 {
+pub(super) fn add_months(serial: f64, months: i64, eom: bool) -> f64 {
     let (y, m, d) = numfmt::serial_to_ymd(serial);
     let total = y * 12 + (m - 1) + months;
     let (ny, nm) = (total.div_euclid(12), total.rem_euclid(12) + 1);
@@ -504,7 +502,7 @@ fn add_months(serial: f64, months: i64, eom: bool) -> f64 {
     numfmt::ymd_to_serial(ny, nm, nd)
 }
 
-fn pmt(rate: f64, nper: f64, pv: f64, fv: f64, typ: f64) -> f64 {
+pub(super) fn pmt(rate: f64, nper: f64, pv: f64, fv: f64, typ: f64) -> f64 {
     if rate == 0.0 {
         return -(pv + fv) / nper;
     }
@@ -512,7 +510,7 @@ fn pmt(rate: f64, nper: f64, pv: f64, fv: f64, typ: f64) -> f64 {
     -(rate * (pv * p + fv)) / ((1.0 + rate * typ) * (p - 1.0))
 }
 
-fn fv(rate: f64, nper: f64, pmt: f64, pv: f64, typ: f64) -> f64 {
+pub(super) fn fv(rate: f64, nper: f64, pmt: f64, pv: f64, typ: f64) -> f64 {
     if rate == 0.0 {
         return -(pv + pmt * nper);
     }
@@ -520,7 +518,7 @@ fn fv(rate: f64, nper: f64, pmt: f64, pv: f64, typ: f64) -> f64 {
     -(pv * p + pmt * (1.0 + rate * typ) * (p - 1.0) / rate)
 }
 
-fn ipmt(rate: f64, per: f64, nper: f64, pv: f64, fvv: f64, typ: f64) -> f64 {
+pub(super) fn ipmt(rate: f64, per: f64, nper: f64, pv: f64, fvv: f64, typ: f64) -> f64 {
     let p = pmt(rate, nper, pv, fvv, typ);
     let i = fv(rate, per - 1.0, p, pv, typ) * rate;
     if typ == 1.0 {
@@ -530,12 +528,12 @@ fn ipmt(rate: f64, per: f64, nper: f64, pv: f64, fvv: f64, typ: f64) -> f64 {
     }
 }
 
-fn is_weekend(serial: f64) -> bool {
+pub(super) fn is_weekend(serial: f64) -> bool {
     let w = numfmt::weekday(serial);
     w == 1 || w == 7
 }
 
-fn sort_grid(mut g: Vec<Vec<Value>>, col: usize, desc: bool) -> Vec<Vec<Value>> {
+pub(super) fn sort_grid(mut g: Vec<Vec<Value>>, col: usize, desc: bool) -> Vec<Vec<Value>> {
     g.sort_by(|a, b| {
         let o = compare(&a.get(col).cloned().unwrap_or_default(), &b.get(col).cloned().unwrap_or_default());
         if desc { o.reverse() } else { o }
@@ -543,7 +541,7 @@ fn sort_grid(mut g: Vec<Vec<Value>>, col: usize, desc: bool) -> Vec<Vec<Value>> 
     g
 }
 
-fn transpose(g: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
+pub(super) fn transpose(g: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
     let cols = g.first().map_or(0, |r| r.len());
     (0..cols).map(|c| g.iter().map(|r| r.get(c).cloned().unwrap_or_default()).collect()).collect()
 }
@@ -556,7 +554,186 @@ fn is_ref(e: &Expr) -> bool {
 // Dispatcher
 // ---------------------------------------------------------------------------
 
+/// Scalar functions whose arguments are evaluated element-wise over arrays ("lifting").
+#[derive(Clone, Copy)]
+enum Lift {
+    All,
+    First,
+    At(usize),
+    /// Criteria arguments: start index, then every second one.
+    Pairs(usize),
+}
+
+impl Lift {
+    fn lifts(self, i: usize) -> bool {
+        match self {
+            Lift::All => true,
+            Lift::First => i == 0,
+            Lift::At(k) => i == k,
+            Lift::Pairs(k) => i >= k && (i - k) % 2 == 0,
+        }
+    }
+}
+
+/// Functions taking only scalar arguments (sorted).
+const LIFT_ALL: &[&str] = &[
+    "ABS", "ACOS", "ADDRESS", "ARABIC", "ASIN", "ATAN", "ATAN2", "BASE", "BIN2DEC", "CEILING", "CEILING.MATH", "CHAR", "CLEAN",
+    "CODE", "COMBIN", "COMBINA", "CONVERT", "COS", "DATE", "DATEDIF", "DATEVALUE", "DAY", "DAYS", "DAYS360", "DEC2BIN", "DEC2HEX",
+    "DEC2OCT", "DECIMAL", "DEGREES", "DOLLAR", "EDATE", "EFFECT", "EOMONTH", "EVEN", "EXACT", "EXP", "FACT", "FIND", "FIXED",
+    "FLOOR", "FLOOR.MATH", "HEX2DEC", "HOUR", "HYPERLINK", "IF", "IFERROR", "IFNA", "INT", "ISBLANK", "ISERR", "ISERROR",
+    "ISEVEN", "ISLOGICAL", "ISNA", "ISNONTEXT", "ISNUMBER", "ISODD", "ISOWEEKNUM", "ISTEXT", "LEFT", "LEN", "LN", "LOG",
+    "LOG10", "LOWER", "MID", "MINUTE", "MOD", "MONTH", "MROUND", "N", "NOMINAL", "NORM.DIST", "NORM.INV", "NORM.S.DIST",
+    "NORM.S.INV", "NOT", "NUMBERVALUE", "OCT2DEC", "ODD", "PERMUT", "POWER", "PROPER", "QUOTIENT", "RADIANS", "REPLACE",
+    "REPT", "RIGHT", "ROMAN", "ROUND", "ROUNDDOWN", "ROUNDUP", "SEARCH", "SECOND", "SIGN", "SIN", "SQRT", "STANDARDIZE",
+    "SUBSTITUTE", "T", "T.DIST", "T.INV", "TAN", "TEXT", "TEXTAFTER", "TEXTBEFORE", "TIME", "TIMEVALUE", "TRIM", "TRUNC",
+    "UNICHAR", "UNICODE", "UPPER", "VALUE", "WEEKDAY", "WEEKNUM", "YEAR", "YEARFRAC",
+];
+
+/// Functions that always return a single value regardless of their arguments (sorted).
+const SCALAR_ONLY: &[&str] = &[
+    "AGGREGATE", "AND", "AVERAGE", "AVERAGEA", "COLUMNS", "CONCAT", "CONCATENATE", "CORREL", "COUNT", "COUNTA", "COUNTBLANK",
+    "FORMULATEXT", "ISFORMULA", "ISREF", "LARGE", "MAX", "MAXA", "MEDIAN", "MIN", "MINA", "NOW", "NPV", "OR", "PI", "PRODUCT",
+    "RAND", "ROWS", "SHEET", "SHEETS", "SMALL", "STDEV", "STDEV.P", "STDEV.S", "SUBTOTAL", "SUM", "SUMPRODUCT", "SUMSQ",
+    "TEXTJOIN", "TODAY", "VAR", "VAR.P", "VAR.S", "XOR",
+];
+
+fn lift_spec(name: &str) -> Option<Lift> {
+    match name {
+        "VLOOKUP" | "HLOOKUP" | "MATCH" | "XMATCH" => Some(Lift::First),
+        "COUNTIF" | "SUMIF" | "AVERAGEIF" => Some(Lift::At(1)),
+        "COUNTIFS" => Some(Lift::Pairs(1)),
+        "SUMIFS" | "AVERAGEIFS" | "MAXIFS" | "MINIFS" => Some(Lift::Pairs(2)),
+        _ if LIFT_ALL.binary_search(&name).is_ok() => Some(Lift::All),
+        _ => None,
+    }
+}
+
+/// Conservative static check: could this expression evaluate to more than one cell?
+fn maybe_multi(e: &Expr) -> bool {
+    match e {
+        Expr::Ref(r) => r.kind != RefKind::Cell,
+        Expr::Array(rows) => rows.len() > 1 || rows.first().is_some_and(|r| r.len() > 1),
+        Expr::Name(_) => true,
+        Expr::Neg(a) | Expr::Plus(a) | Expr::Percent(a) | Expr::Paren(a) => maybe_multi(a),
+        Expr::Bin(_, a, b) => maybe_multi(a) || maybe_multi(b),
+        Expr::Func(n, args) => {
+            if n == "SINGLE" || SCALAR_ONLY.binary_search(&n.as_str()).is_ok() {
+                false
+            } else if let Some(spec) = lift_spec(n) {
+                args.iter().enumerate().any(|(i, a)| spec.lifts(i) && maybe_multi(a))
+            } else {
+                true
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Calls a worksheet function, evaluating scalar arguments element-wise when given arrays.
 pub fn call(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
+    if let Some(spec) = lift_spec(name) {
+        let trigger = if matches!(name, "IF" | "IFERROR" | "IFNA") {
+            a.first().is_some_and(maybe_multi)
+        } else {
+            a.iter().enumerate().any(|(i, e)| spec.lifts(i) && maybe_multi(e))
+        };
+        if trigger {
+            return lift(ev, name, a, spec);
+        }
+    }
+    dispatch(ev, name, a)
+}
+
+fn lift(ev: &mut Evaluator, name: &str, a: &[Expr], spec: Lift) -> Res {
+    let idx: Vec<usize> = (0..a.len()).filter(|&i| spec.lifts(i) && maybe_multi(&a[i])).collect();
+    let mut vals = Vec::with_capacity(idx.len());
+    for &i in &idx {
+        let v = match ev.eval(&a[i]) {
+            Ok(EV::R(s, rg)) => EV::R(s, ev.clip(s, rg)),
+            Ok(v) => v,
+            Err(e) => EV::V(Value::Error(e)),
+        };
+        vals.push(v);
+    }
+    let names: Vec<String> = idx.iter().map(|i| format!("\u{1}{i}")).collect();
+    let mut args = a.to_vec();
+    for (k, &i) in idx.iter().enumerate() {
+        args[i] = Expr::Name(names[k].clone());
+    }
+    if !vals.iter().any(|v| ev.is_multi(v)) {
+        for (k, v) in vals.into_iter().enumerate() {
+            ev.bind(names[k].clone(), v);
+        }
+        let r = dispatch(ev, name, &args);
+        ev.unbind(idx.len());
+        return r;
+    }
+    let dims = |v: &EV| match v {
+        EV::R(_, rg) => (rg.rows() as usize, rg.cols() as usize),
+        EV::A(g) => (g.len(), g.first().map_or(0, |r| r.len())),
+        EV::V(_) => (1, 1),
+    };
+    let rows = vals.iter().map(|v| dims(v).0).max().unwrap_or(1);
+    let cols = vals.iter().map(|v| dims(v).1).max().unwrap_or(1);
+    if rows as u64 * cols as u64 > 1_048_576 {
+        return Err(E::Calc);
+    }
+    let mut out = vec![vec![Value::Empty; cols]; rows];
+    for (r, row) in out.iter_mut().enumerate() {
+        for (c, slot) in row.iter_mut().enumerate() {
+            for (k, v) in vals.iter().enumerate() {
+                ev.bind(names[k].clone(), element(v, r, c));
+            }
+            let res = dispatch(ev, name, &args);
+            ev.unbind(idx.len());
+            *slot = match res {
+                Err(e) => Value::Error(e),
+                Ok(EV::V(v)) => v,
+                Ok(other) => ev.scalar(other).unwrap_or_else(Value::Error),
+            };
+        }
+    }
+    Ok(EV::A(out))
+}
+
+/// Element (r, c) of an argument under array broadcasting.
+fn element(v: &EV, r: usize, c: usize) -> EV {
+    let pick = |h: usize, w: usize| -> Option<(usize, usize)> {
+        let rr = if h == 1 { 0 } else { r };
+        let cc = if w == 1 { 0 } else { c };
+        (rr < h && cc < w).then_some((rr, cc))
+    };
+    match v {
+        EV::R(s, rg) => match pick(rg.rows() as usize, rg.cols() as usize) {
+            Some((rr, cc)) => EV::R(*s, Range::cell(rg.r1 + rr as u32, rg.c1 + cc as u32)),
+            None => EV::V(Value::Error(E::NA)),
+        },
+        EV::A(g) => match pick(g.len(), g.first().map_or(0, |x| x.len())) {
+            Some((rr, cc)) => EV::V(g[rr][cc].clone()),
+            None => EV::V(Value::Error(E::NA)),
+        },
+        EV::V(x) => EV::V(x.clone()),
+    }
+}
+
+/// Lookup vector for a range or array argument.
+fn lookup_vector(ev: &mut Evaluator, v: EV) -> Rc<LookupCol> {
+    match v {
+        EV::R(s, rg) if rg.rows() == 1 || rg.cols() == 1 => ev.lookup_col(s, rg),
+        other => Rc::new(LookupCol::new(vector(ev.grid(other)))),
+    }
+}
+
+/// Exact match position (optionally with wildcards), first or last occurrence.
+fn find_exact(col: &LookupCol, key: &Value, wildcard: bool, reverse: bool) -> Option<usize> {
+    if (wildcard && matches!(key, Value::Text(k) if has_wild(k))) || col.vals.len() < 8 {
+        lookup_exact(&col.vals, key, wildcard, reverse)
+    } else {
+        col.find(key, reverse)
+    }
+}
+
+fn dispatch(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
     let n = a.len();
     match name {
         // ----- Math -----
@@ -842,10 +1019,10 @@ pub fn call(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
                 let x = ev.arg(a, i)?;
                 ev.walk(x, false, &mut |val, _| {
                     match val {
-                        Value::Number(x) => v.push(x),
-                        Value::Bool(b) => v.push(if b { 1.0 } else { 0.0 }),
+                        Value::Number(x) => v.push(*x),
+                        Value::Bool(b) => v.push(if *b { 1.0 } else { 0.0 }),
                         Value::Text(_) => v.push(0.0),
-                        Value::Error(e) => return Err(e),
+                        Value::Error(e) => return Err(*e),
                         Value::Empty => {}
                     }
                     Ok(())
@@ -951,7 +1128,7 @@ pub fn call(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
                     match val {
                         Value::Number(_) => c += 1.0,
                         Value::Bool(_) if !from_ref => c += 1.0,
-                        Value::Text(s) if !from_ref && numfmt::parse_number(&s).is_some() => c += 1.0,
+                        Value::Text(s) if !from_ref && numfmt::parse_number(s).is_some() => c += 1.0,
                         _ => {}
                     }
                     Ok(())
@@ -984,7 +1161,7 @@ pub fn call(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
             };
             let mut filled = 0.0;
             ev.walk(v, false, &mut |val, _| {
-                if !val.is_empty() && !matches!(&val, Value::Text(s) if s.is_empty()) {
+                if !val.is_empty() && !matches!(val, Value::Text(s) if s.is_empty()) {
                     filled += 1.0;
                 }
                 Ok(())
@@ -1036,10 +1213,10 @@ pub fn call(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
                 let v = ev.arg(a, i)?;
                 ev.walk(v, false, &mut |val, from_ref| {
                     match val {
-                        Value::Bool(b) => vals.push(b),
-                        Value::Number(x) => vals.push(x != 0.0),
-                        Value::Error(e) => return Err(e),
-                        Value::Text(s) if !from_ref => vals.push(to_bool(&Value::Text(s))?),
+                        Value::Bool(b) => vals.push(*b),
+                        Value::Number(x) => vals.push(*x != 0.0),
+                        Value::Error(e) => return Err(*e),
+                        Value::Text(_) if !from_ref => vals.push(to_bool(val)?),
                         _ => {}
                     }
                     Ok(())
@@ -1121,7 +1298,7 @@ pub fn call(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
             for i in start..n {
                 let v = ev.arg(a, i)?;
                 ev.walk(v, false, &mut |val, _| {
-                    let t = to_text(&val)?;
+                    let t = to_text(val)?;
                     if !(ignore && t.is_empty()) {
                         parts.push(t);
                     }
@@ -1537,6 +1714,14 @@ pub fn call(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
                 return num(if name == "ROW" { r + 1 } else { c + 1 } as f64);
             }
             match ev.arg(a, 0)? {
+                EV::R(s, rg) if !rg.is_single() => {
+                    let rg = ev.clip(s, rg);
+                    Ok(EV::A(if name == "ROW" {
+                        (rg.r1..=rg.r2).map(|r| vec![Value::Number(r as f64 + 1.0)]).collect()
+                    } else {
+                        vec![(rg.c1..=rg.c2).map(|c| Value::Number(c as f64 + 1.0)).collect()]
+                    }))
+                }
                 EV::R(_, rg) => num(if name == "ROW" { rg.r1 + 1 } else { rg.c1 + 1 } as f64),
                 _ => Err(E::Value),
             }
@@ -1617,6 +1802,24 @@ pub fn call(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
             need(a, 3, 4)?;
             let key = ev.value(a, 0)?;
             let tv = ev.arg(a, 1)?;
+            if let EV::R(s, rg) = tv {
+                let vert = name == "VLOOKUP";
+                let idx = ev.number(a, 2)?.trunc() as i64;
+                if idx < 1 {
+                    return Err(E::Value);
+                }
+                if idx > (if vert { rg.cols() } else { rg.rows() }) as i64 {
+                    return Err(E::Ref);
+                }
+                let approx = ev.bool_or(a, 3, true)?;
+                let keys = if vert { Range::new(rg.r1, rg.c1, rg.r2, rg.c1) } else { Range::new(rg.r1, rg.c1, rg.r1, rg.c2) };
+                let col = ev.lookup_col(s, keys);
+                let hit = if approx { lookup_approx(&col.vals, &key) } else { find_exact(&col, &key, true, false) };
+                let i = hit.ok_or(E::NA)? as u32;
+                let off = idx as u32 - 1;
+                let (r, c) = if vert { (rg.r1 + i, rg.c1 + off) } else { (rg.r1 + off, rg.c1 + i) };
+                return Ok(EV::V(ev.cell_value(s, r, c)));
+            }
             let full = match &tv {
                 EV::R(_, rg) => Some(*rg),
                 _ => None,
@@ -1648,11 +1851,12 @@ pub fn call(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
             need(a, 2, 3)?;
             let key = ev.value(a, 0)?;
             let v = ev.arg(a, 1)?;
-            let vals = vector(ev.grid(v));
+            let col = lookup_vector(ev, v);
+            let vals = &col.vals;
             let t = ev.number_or(a, 2, 1.0)? as i64;
             let hit = match t {
-                0 => lookup_exact(&vals, &key, true, false),
-                1 => lookup_approx(&vals, &key),
+                0 => find_exact(&col, &key, true, false),
+                1 => lookup_approx(vals, &key),
                 _ => {
                     let mut best = None;
                     for (i, v) in vals.iter().enumerate() {
@@ -1673,21 +1877,34 @@ pub fn call(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
         "XMATCH" => {
             let key = ev.value(a, 0)?;
             let v = ev.arg(a, 1)?;
-            let vals = vector(ev.grid(v));
+            let col = lookup_vector(ev, v);
             let mode = ev.number_or(a, 2, 0.0)? as i64;
             let rev = ev.number_or(a, 3, 1.0)? < 0.0;
-            lookup_mode(&vals, &key, mode, rev).map(|i| EV::V(Value::Number(i as f64 + 1.0))).ok_or(E::NA)
+            find_exact(&col, &key, mode == 2, rev)
+                .or_else(|| lookup_mode(&col.vals, &key, mode, rev))
+                .map(|i| EV::V(Value::Number(i as f64 + 1.0)))
+                .ok_or(E::NA)
         }
         "XLOOKUP" => {
             need(a, 3, 6)?;
             let key = ev.value(a, 0)?;
             let lv = ev.arg(a, 1)?;
-            let lg = ev.grid(lv);
-            let vertical = lg.len() > 1 || lg.first().map_or(0, |r| r.len()) == 1;
-            let vals: Vec<Value> = if vertical { lg.iter().map(|r| r.first().cloned().unwrap_or_default()).collect() } else { lg[0].clone() };
+            let vertical = match &lv {
+                EV::R(_, rg) => rg.rows() > 1 || rg.cols() == 1,
+                EV::A(g) => g.len() > 1 || g.first().map_or(0, |r| r.len()) == 1,
+                EV::V(_) => true,
+            };
+            let col = match lv {
+                EV::R(s, rg) => ev.lookup_col(s, if vertical { Range::new(rg.r1, rg.c1, rg.r2, rg.c1) } else { Range::new(rg.r1, rg.c1, rg.r1, rg.c2) }),
+                other => {
+                    let lg = ev.grid(other);
+                    Rc::new(LookupCol::new(if vertical { lg.iter().map(|r| r.first().cloned().unwrap_or_default()).collect() } else { lg[0].clone() }))
+                }
+            };
             let mode = ev.number_or(a, 4, 0.0)? as i64;
             let rev = ev.number_or(a, 5, 1.0)? < 0.0;
-            match lookup_mode(&vals, &key, mode, rev) {
+            let hit = if mode == 0 || mode == 2 { find_exact(&col, &key, mode == 2, rev) } else { lookup_mode(&col.vals, &key, mode, rev) };
+            match hit {
                 Some(i) => match ev.arg(a, 2)? {
                     EV::R(s, rg) => {
                         let i = i as u32;
@@ -1761,9 +1978,17 @@ pub fn call(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
                 Ok(EV::A(out))
             }
         }
+        "SINGLE" => match ev.arg(a, 0)? {
+            EV::R(s, rg) if !rg.is_single() => match ev.implicit(s, rg)? {
+                Value::Error(e) => Err(e),
+                v => Ok(EV::V(v)),
+            },
+            EV::A(g) => Ok(EV::V(g.into_iter().next().and_then(|r| r.into_iter().next()).unwrap_or_default())),
+            other => Ok(other),
+        },
         _ => {
             let _ = is_ref;
-            Err(E::Name)
+            super::ext::call(ev, name, a)
         }
     }
 }

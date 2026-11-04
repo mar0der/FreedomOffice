@@ -849,8 +849,11 @@ impl App {
                     cp.rect_filled(rect.shrink(0.5), 0.0, Color32::WHITE);
                 }
                 let sh = &self.wb.sheets[si];
-                let Some(cell) = sh.get(anchor.0, anchor.1) else { continue };
-                let style = self.wb.style(cell.style).clone();
+                let cell = sh.get(anchor.0, anchor.1);
+                if cell.is_none() && sh.spill_anchor_of(anchor.0, anchor.1).is_none() {
+                    continue;
+                }
+                let style = self.wb.style(cell.map_or(0, |c| c.style)).clone();
                 let fill = style.fill.map(rgb);
                 if editing == Some(anchor) {
                     if let Some(f) = fill {
@@ -858,7 +861,7 @@ impl App {
                     }
                     continue;
                 }
-                let s = shown(&cell.value, &style, cell.formula.as_ref().map(|f| f.text.as_str()), show_formulas);
+                let s = shown(sh.display_value(anchor.0, anchor.1), &style, cell.and_then(|c| c.formula.as_ref()).map(|f| f.text.as_str()), show_formulas);
                 items.push(Item { rect, clip: rect, style, shown: s, fill });
             }
         }
@@ -1013,9 +1016,11 @@ impl App {
             if editing.is_none() {
                 cp.rect_filled(act.shrink(0.5), 0.0, fill.gamma_multiply(1.0));
                 // redraw active cell text above the white-out
-                if let Some(cell) = self.wb.sheets[si].get(ar, ac) {
-                    let style = self.wb.style(cell.style).clone();
-                    let s = shown(&cell.value, &style, cell.formula.as_ref().map(|f| f.text.as_str()), show_formulas);
+                let sh = &self.wb.sheets[si];
+                let cell = sh.get(ar, ac);
+                if cell.is_some() || sh.spill_anchor_of(ar, ac).is_some() {
+                    let style = self.wb.style(cell.map_or(0, |c| c.style)).clone();
+                    let s = shown(sh.display_value(ar, ac), &style, cell.and_then(|c| c.formula.as_ref()).map(|f| f.text.as_str()), show_formulas);
                     if !s.text.is_empty() {
                         let font = self.cell_font(&style);
                         let color = s.color.or(style.color.map(rgb)).unwrap_or(Color32::BLACK);
@@ -1033,6 +1038,18 @@ impl App {
                         painter.with_clip_rect(act.intersect(lay.cells)).galley(Pos2::new(x.round(), y.round()), g, color);
                     }
                 }
+            }
+        }
+        // Spill range of the active cell's dynamic array (dashed when blocked by #SPILL!).
+        let sh = self.sheet();
+        let spill_anchor = if sh.spill_range(ar, ac).is_some() { Some((ar, ac)) } else { sh.spill_anchor_of(ar, ac) };
+        if let Some((rg, blocked)) = spill_anchor.and_then(|(r, c)| sh.spill_range(r, c)) {
+            let r = self.range_rect(lay, rg).shrink(0.5);
+            let blue = Color32::from_rgb(91, 155, 213);
+            if blocked {
+                dashed_rect(&cp, r, blue, 0.0);
+            } else {
+                cp.rect_stroke(r, 0.0, Stroke::new(1.0, blue), StrokeKind::Middle);
             }
         }
         let sel_stroke = Stroke::new(2.0, theme::ACCENT);

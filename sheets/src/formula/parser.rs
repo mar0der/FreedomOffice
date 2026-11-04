@@ -8,6 +8,8 @@ pub enum RefKind {
     Area,
     Cols,
     Rows,
+    /// Spill-range operator on an anchor cell: `A1#`.
+    Spill,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -179,9 +181,18 @@ pub fn lex(src: &str) -> Result<Vec<Spanned>, String> {
                         break;
                     }
                 }
-                let e = matched.ok_or("unknown error literal")?;
-                i += e.as_str().chars().count();
-                Tok::Err(e)
+                match matched {
+                    Some(e) => {
+                        i += e.as_str().chars().count();
+                        Tok::Err(e)
+                    }
+                    // `A1#`: spill-range operator directly after a cell reference.
+                    None if out.last().is_some_and(|t: &Spanned| t.end == start && matches!(t.tok, Tok::Ident(_))) => {
+                        i += 1;
+                        Tok::Op("#")
+                    }
+                    None => return Err("unknown error literal".into()),
+                }
             }
             '0'..='9' | '.' if c != '.' || at(i + 1).is_ascii_digit() => {
                 let s0 = i;
@@ -216,9 +227,10 @@ pub fn lex(src: &str) -> Result<Vec<Spanned>, String> {
                     Tok::Ident(text)
                 }
             }
-            '+' | '-' | '*' | '/' | '^' | '&' | '%' | '=' => {
+            '+' | '-' | '*' | '/' | '^' | '&' | '%' | '=' | '@' => {
                 i += 1;
                 Tok::Op(match c {
+                    '@' => "@",
                     '+' => "+",
                     '-' => "-",
                     '*' => "*",
@@ -440,6 +452,11 @@ impl Parser {
             self.i += 1;
             return Ok(Expr::Plus(Box::new(self.unary()?)));
         }
+        if self.is_op("@") {
+            // Implicit intersection operator.
+            self.i += 1;
+            return Ok(Expr::Func("SINGLE".into(), vec![self.unary()?]));
+        }
         let mut e = self.primary()?;
         while self.is_op("%") {
             self.i += 1;
@@ -461,6 +478,10 @@ impl Parser {
                                 return Ok(Expr::Ref(RefExpr { sheet, kind: RefKind::Area, a, b }));
                             }
                         }
+                    }
+                    if self.is_op("#") {
+                        self.i += 1;
+                        return Ok(Expr::Ref(RefExpr { sheet, kind: RefKind::Spill, a, b: a }));
                     }
                     return Ok(Expr::Ref(RefExpr { sheet, kind: RefKind::Cell, a, b: a }));
                 }
@@ -680,6 +701,7 @@ pub fn ref_str(r: &RefExpr) -> String {
     let prefix = r.sheet.as_ref().map(|s| format!("{}!", quote_sheet(s))).unwrap_or_default();
     let body = match r.kind {
         RefKind::Cell => part_str(&r.a),
+        RefKind::Spill => format!("{}#", part_str(&r.a)),
         RefKind::Area => format!("{}:{}", part_str(&r.a), part_str(&r.b)),
         RefKind::Cols => format!(
             "{}{}:{}{}",
@@ -737,6 +759,10 @@ fn write_expr(e: &Expr, out: &mut String) {
             write_expr(a, out);
             out.push_str(op.as_str());
             write_expr(b, out);
+        }
+        Expr::Func(name, args) if name == "SINGLE" && args.len() == 1 => {
+            out.push('@');
+            write_expr(&args[0], out);
         }
         Expr::Func(name, args) => {
             out.push_str(name);
@@ -935,6 +961,10 @@ mod tests {
         assert_eq!(rt("LOG10(100)"), "LOG10(100)");
         assert_eq!(rt("IF(A1,,2)"), "IF(A1,,2)");
         assert_eq!(rt("myName*2"), "myName*2");
+        assert_eq!(rt("SUM(A1#)+Sheet2!$B$3#"), "SUM(A1#)+Sheet2!$B$3#");
+        assert_eq!(rt("@A1:A10*2"), "@A1:A10*2");
+        assert_eq!(rt("_xlfn.SINGLE(A1:A3)"), "@A1:A3");
+        assert!(parse("#").is_err());
     }
 
     #[test]

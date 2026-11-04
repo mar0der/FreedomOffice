@@ -133,10 +133,16 @@ impl App {
             }
             None => {
                 let (r, c) = self.active();
-                let t = self.sheet().get(r, c).map(|c| c.input_text()).unwrap_or_default();
+                // A spilled cell shows its anchor's formula in grey.
+                let sh = self.sheet();
+                let own = sh.get(r, c).filter(|x| !x.value.is_empty() || x.formula.is_some());
+                let (t, color) = match own.is_none().then(|| sh.spill_anchor_of(r, c)).flatten().and_then(|(ar, ac)| sh.get(ar, ac)) {
+                    Some(anchor) => (anchor.input_text(), Color32::from_gray(150)),
+                    None => (sh.get(r, c).map(|c| c.input_text()).unwrap_or_default(), Color32::BLACK),
+                };
                 let first = t.lines().next().unwrap_or("").to_string();
                 let more = t.lines().count() > 1;
-                painter.layout_no_wrap(if more { format!("{first} …") } else { first }, font.clone(), Color32::BLACK)
+                painter.layout_no_wrap(if more { format!("{first} …") } else { first }, font.clone(), color)
             }
         };
         if let Some(e) = &self.edit {

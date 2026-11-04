@@ -876,6 +876,7 @@ struct CellBuf {
     f_text: Option<String>,
     f_type: String,
     f_si: Option<String>,
+    f_ref: Option<String>,
 }
 
 struct SharedMaster {
@@ -956,6 +957,7 @@ fn parse_sheet(xml: &str, ctx: &SheetCtx, sheet: &mut Sheet) {
                                                 match k.as_str() {
                                                     "t" => cb.f_type = v,
                                                     "si" => cb.f_si = Some(v),
+                                                    "ref" => cb.f_ref = Some(v),
                                                     _ => {}
                                                 }
                                             }
@@ -970,6 +972,7 @@ fn parse_sheet(xml: &str, ctx: &SheetCtx, sheet: &mut Sheet) {
                                                 match k.as_str() {
                                                     "t" => cb.f_type = v,
                                                     "si" => cb.f_si = Some(v),
+                                                    "ref" => cb.f_ref = Some(v),
                                                     _ => {}
                                                 }
                                             }
@@ -1058,6 +1061,22 @@ fn parse_sheet(xml: &str, ctx: &SheetCtx, sheet: &mut Sheet) {
             _ => {}
         }
     }
+    clear_array_results(sheet);
+}
+
+/// Array formulas are saved with their results as plain cells inside the formula's range;
+/// drop those so the formula spills them again (they are kept as recalculation hints).
+fn clear_array_results(sheet: &mut Sheet) {
+    let anchors: Vec<((u32, u32), Range)> = sheet.spill.anchors.iter().map(|(a, (rg, _))| (*a, *rg)).collect();
+    for (a, rg) in anchors {
+        let keys: Vec<(u32, u32)> = sheet.iter_range(rg).filter(|(r, c, cell)| (*r, *c) != a && cell.formula.is_none()).map(|(r, c, _)| (r, c)).collect();
+        for (r, c) in keys {
+            if let Some(cell) = sheet.get_mut(r, c) {
+                cell.value = Value::Empty;
+            }
+            sheet.tidy(r, c);
+        }
+    }
 }
 
 fn finish_cell(cb: CellBuf, ctx: &SheetCtx, shared_f: &mut HashMap<String, SharedMaster>, sheet: &mut Sheet) {
@@ -1117,6 +1136,13 @@ fn finish_cell(cb: CellBuf, ctx: &SheetCtx, shared_f: &mut HashMap<String, Share
                 }
             }
             "dataTable" => {}
+            "array" if !text.is_empty() => {
+                let text = strip_future_prefixes(text);
+                if let Some(rg) = cb.f_ref.as_deref().and_then(Range::parse).filter(|rg| !rg.is_single() && rg.r1 == cb.row && rg.c1 == cb.col) {
+                    sheet.spill.anchors.insert((cb.row, cb.col), (rg, false));
+                }
+                f = Some(Formula::new(&text));
+            }
             _ => {
                 if !text.is_empty() {
                     let text = strip_future_prefixes(text);

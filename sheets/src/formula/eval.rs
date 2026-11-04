@@ -1,10 +1,13 @@
 //! Formula evaluator and workbook recalculation.
 
+use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hasher};
+use std::rc::Rc;
 
-use super::parser::{BinOp, Expr, RefExpr};
-use crate::model::{ErrorKind, Range, Value, Workbook};
+use super::parser::{BinOp, Expr, RefExpr, RefKind};
+use crate::model::{ErrorKind, Range, Spill, Value, Workbook, MAX_COLS, MAX_ROWS};
 
 /// Result of evaluating an expression: a scalar, a reference, or an in-memory array.
 #[derive(Clone, Debug)]
@@ -157,41 +160,220 @@ fn binop_values(op: BinOp, a: &Value, b: &Value) -> Value {
 }
 
 // ---------------------------------------------------------------------------
+// Fast hashing for cell keys
+// ---------------------------------------------------------------------------
+
+/// FxHash-style hasher: much faster than SipHash for small integer keys.
+#[derive(Default, Clone, Copy)]
+pub struct FxHasher {
+    hash: u64,
+}
+
+const FX_SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+
+impl FxHasher {
+    #[inline]
+    fn add(&mut self, w: u64) {
+        self.hash = (self.hash.rotate_left(5) ^ w).wrapping_mul(FX_SEED);
+    }
+}
+
+impl Hasher for FxHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut b = [0u8; 8];
+            b[..chunk.len()].copy_from_slice(chunk);
+            self.add(u64::from_le_bytes(b));
+        }
+    }
+    #[inline]
+    fn write_u8(&mut self, i: u8) {
+        self.add(i as u64);
+    }
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.add(i as u64);
+    }
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.add(i);
+    }
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.add(i as u64);
+    }
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+}
+
+pub type FxBuild = BuildHasherDefault<FxHasher>;
+pub type FxMap<K, V> = HashMap<K, V, FxBuild>;
+pub type FxSet<K> = HashSet<K, FxBuild>;
+
+// ---------------------------------------------------------------------------
 // Evaluator
 // ---------------------------------------------------------------------------
 
-type Key = (usize, u32, u32);
+pub type Key = (usize, u32, u32);
+
+/// Largest dynamic array that may spill (cells).
+const SPILL_MAX: u64 = 1_048_576;
+
+/// Which formula cells are (re)computed; all others report their stored value.
+pub enum Mode {
+    /// Full recalculation: every formula is evaluated.
+    All,
+    /// Incremental: only these cells are evaluated.
+    Dirty(FxSet<Key>),
+    /// Use stored values for every formula (ad-hoc evaluation after a recalc).
+    #[allow(dead_code)]
+    Stored,
+}
+
+/// A dynamic-array result of an anchor cell evaluated in this pass.
+pub struct SpillRes {
+    pub range: Range,
+    pub blocked: bool,
+    pub vals: Vec<Vec<Value>>,
+}
+
+/// Normalised exact-match key for lookup indexes.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum LKey {
+    Num(u64),
+    Text(String),
+    Bool(bool),
+}
+
+fn lkey(v: &Value) -> Option<LKey> {
+    match v {
+        Value::Number(n) => Some(LKey::Num((n + 0.0).to_bits())),
+        Value::Text(s) => Some(LKey::Text(s.to_lowercase())),
+        Value::Bool(b) => Some(LKey::Bool(*b)),
+        _ => None,
+    }
+}
+
+/// A lookup vector (first column/row of a lookup range) with lazily built hash indexes.
+pub struct LookupCol {
+    pub vals: Vec<Value>,
+    first: RefCell<Option<FxMap<LKey, usize>>>,
+    last: RefCell<Option<FxMap<LKey, usize>>>,
+}
+
+impl LookupCol {
+    pub fn new(vals: Vec<Value>) -> Self {
+        LookupCol { vals, first: RefCell::new(None), last: RefCell::new(None) }
+    }
+
+    /// Exact (case-insensitive) match without wildcards; first or last occurrence.
+    pub fn find(&self, key: &Value, reverse: bool) -> Option<usize> {
+        let k = lkey(key)?;
+        let cell = if reverse { &self.last } else { &self.first };
+        let mut idx = cell.borrow_mut();
+        let map = idx.get_or_insert_with(|| {
+            let mut m = FxMap::with_capacity_and_hasher(self.vals.len(), Default::default());
+            for (i, v) in self.vals.iter().enumerate() {
+                if let Some(k) = lkey(v) {
+                    if reverse {
+                        m.insert(k, i);
+                    } else {
+                        m.entry(k).or_insert(i);
+                    }
+                }
+            }
+            m
+        });
+        map.get(&k).copied()
+    }
+}
 
 pub struct Evaluator<'a> {
     pub wb: &'a Workbook,
-    results: HashMap<Key, Value>,
-    stack: HashSet<Key>,
+    mode: Mode,
+    results: FxMap<Key, Value>,
+    stack: FxSet<Key>,
     pub circular: bool,
     /// (sheet, row, col) of the formula being evaluated.
     pub cur: Key,
     depth: usize,
-    names: HashMap<String, Option<Expr>>,
+    name_depth: u32,
+    names: FxMap<String, Option<Rc<Expr>>>,
+    /// LET variables and lifted-argument bindings (innermost last).
+    scopes: Vec<(String, EV)>,
     rng: u64,
     pub now: f64,
+    /// Dynamic arrays computed in this pass, by anchor.
+    pub spills: FxMap<Key, SpillRes>,
+    /// Cells claimed by spills of this pass -> anchor.
+    claimed: FxMap<Key, (u32, u32)>,
+    /// Per sheet: column -> (r1, r2, anchor) of known spill ranges (previous + this pass).
+    spill_cols: Vec<BTreeMap<u32, Vec<(u32, u32, (u32, u32))>>>,
+    extents: Vec<Option<Option<(u32, u32)>>>,
+    lookups: FxMap<(usize, Range), Rc<LookupCol>>,
+    stack_base: usize,
+    stack_budget: usize,
+}
+
+#[inline(never)]
+fn stack_pos() -> usize {
+    let marker = 0u8;
+    std::hint::black_box(&marker) as *const u8 as usize
 }
 
 impl<'a> Evaluator<'a> {
-    pub fn new(wb: &'a Workbook) -> Self {
+    pub fn new(wb: &'a Workbook, mode: Mode) -> Self {
         let seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0x9E3779B97F4A7C15);
+        let spill_cols = wb
+            .sheets
+            .iter()
+            .map(|sh| {
+                let mut m: BTreeMap<u32, Vec<(u32, u32, (u32, u32))>> = BTreeMap::new();
+                for (a, (rg, blocked)) in &sh.spill.anchors {
+                    if !blocked {
+                        for c in rg.c1..=rg.c2 {
+                            m.entry(c).or_default().push((rg.r1, rg.r2, *a));
+                        }
+                    }
+                }
+                m
+            })
+            .collect();
+        let cap = match &mode {
+            Mode::Dirty(d) => d.len(),
+            _ => 0,
+        };
         Evaluator {
             wb,
-            results: HashMap::new(),
-            stack: HashSet::new(),
+            mode,
+            results: FxMap::with_capacity_and_hasher(cap, Default::default()),
+            stack: FxSet::default(),
             circular: false,
             cur: (wb.active, 0, 0),
             depth: 0,
-            names: HashMap::new(),
+            name_depth: 0,
+            names: FxMap::default(),
+            scopes: Vec::new(),
             rng: seed | 1,
             now: crate::numfmt::now_serial(),
+            spills: FxMap::default(),
+            claimed: FxMap::default(),
+            spill_cols,
+            extents: vec![None; wb.sheets.len()],
+            lookups: FxMap::default(),
+            stack_base: stack_pos(),
+            stack_budget: 512 * 1024,
         }
+    }
+
+    fn reserve(&mut self, n: usize) {
+        self.results.reserve(n);
     }
 
     pub fn random(&mut self) -> f64 {
@@ -204,38 +386,183 @@ impl<'a> Evaluator<'a> {
         (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64
     }
 
-    /// Value of a cell, evaluating its formula on demand.
+    #[inline]
+    fn is_dirty(&self, key: &Key) -> bool {
+        match &self.mode {
+            Mode::All => true,
+            Mode::Dirty(d) => d.contains(key),
+            Mode::Stored => false,
+        }
+    }
+
+    fn too_deep(&self) -> bool {
+        self.depth > 1_000_000 || stack_pos().abs_diff(self.stack_base) > self.stack_budget
+    }
+
+    /// Value of a cell, evaluating its formula on demand; empty cells report spilled values.
     pub fn cell_value(&mut self, s: usize, r: u32, c: u32) -> Value {
         let wb = self.wb;
-        let Some(cell) = wb.sheets.get(s).and_then(|sh| sh.get(r, c)) else { return Value::Empty };
-        let Some(f) = &cell.formula else { return cell.value.clone() };
-        let key = (s, r, c);
-        if let Some(v) = self.results.get(&key) {
-            return v.clone();
+        let Some(sh) = wb.sheets.get(s) else { return Value::Empty };
+        match sh.get(r, c) {
+            Some(cell) if cell.formula.is_some() => {
+                let key = (s, r, c);
+                if !self.is_dirty(&key) {
+                    return cell.value.clone();
+                }
+                if let Some(v) = self.results.get(&key) {
+                    return v.clone();
+                }
+                self.eval_cell(key, cell.formula.as_ref().and_then(|f| f.ast.as_ref()))
+            }
+            Some(cell) if !cell.value.is_empty() => cell.value.clone(),
+            _ => self.spilled_value(s, r, c),
         }
-        if self.stack.contains(&key) || self.depth > 100_000 {
+    }
+
+    fn eval_cell(&mut self, key: Key, ast: Option<&Expr>) -> Value {
+        if self.stack.contains(&key) || self.too_deep() {
             self.circular = true;
             return Value::Number(0.0);
         }
         self.stack.insert(key);
         let prev = self.cur;
+        let scopes = std::mem::take(&mut self.scopes);
         self.cur = key;
         self.depth += 1;
-        let v = match &f.ast {
+        let v = match ast {
             Some(e) => {
                 let r = self.eval(e);
-                self.top_value(r)
+                self.finish_cell(key, r)
             }
             None => Value::Error(ErrorKind::Name),
         };
         self.depth -= 1;
         self.cur = prev;
+        self.scopes = scopes;
         self.stack.remove(&key);
         self.results.insert(key, v.clone());
         v
     }
 
-    /// Converts a formula result into the value stored in its cell.
+    /// Value of an empty cell: whatever a dynamic array spills into it.
+    fn spilled_value(&mut self, s: usize, r: u32, c: u32) -> Value {
+        if let Some(v) = self.claimed_value(s, r, c) {
+            return v;
+        }
+        let wb = self.wb;
+        let Some((a, v)) = wb.sheets[s].spill.cells.get(&(r, c)) else { return Value::Empty };
+        let akey = (s, a.0, a.1);
+        if !self.is_dirty(&akey) {
+            return v.clone();
+        }
+        self.cell_value(s, a.0, a.1);
+        self.claimed_value(s, r, c).unwrap_or(Value::Empty)
+    }
+
+    fn claimed_value(&self, s: usize, r: u32, c: u32) -> Option<Value> {
+        let a = self.claimed.get(&(s, r, c))?;
+        let sp = self.spills.get(&(s, a.0, a.1))?;
+        sp.vals.get((r - sp.range.r1) as usize)?.get((c - sp.range.c1) as usize).cloned()
+    }
+
+    /// Converts a formula result into the value stored in its cell, spilling arrays.
+    fn finish_cell(&mut self, key: Key, r: Res) -> Value {
+        match r {
+            Ok(EV::A(a)) if a.len() > 1 || a.first().is_some_and(|row| row.len() > 1) => self.spill(key, a),
+            Ok(EV::R(s, rg)) if !rg.is_single() => {
+                let rg = self.clip(s, rg);
+                if rg.rows() as u64 * rg.cols() as u64 > SPILL_MAX {
+                    return self.spill_blocked_result(key, rg);
+                }
+                let g = self.grid(EV::R(s, rg));
+                self.spill(key, g)
+            }
+            other => self.top_value(other),
+        }
+    }
+
+    fn spill_blocked_result(&mut self, key: Key, rg: Range) -> Value {
+        let (_, r, c) = key;
+        let range = Range::new(r, c, (r + rg.rows() - 1).min(MAX_ROWS - 1), (c + rg.cols() - 1).min(MAX_COLS - 1));
+        self.spills.insert(key, SpillRes { range, blocked: true, vals: Vec::new() });
+        Value::Error(ErrorKind::Spill)
+    }
+
+    fn spill(&mut self, key: Key, mut a: Vec<Vec<Value>>) -> Value {
+        let (s, r, c) = key;
+        let h = a.len();
+        let w = a.iter().map(|row| row.len()).max().unwrap_or(0);
+        if h == 0 || w == 0 {
+            return Value::Error(ErrorKind::Calc);
+        }
+        for row in a.iter_mut() {
+            row.resize(w, Value::Error(ErrorKind::NA));
+            for v in row.iter_mut() {
+                if v.is_empty() {
+                    *v = Value::Number(0.0);
+                }
+            }
+        }
+        if h == 1 && w == 1 {
+            return a[0][0].clone();
+        }
+        let (r2, c2) = (r as u64 + h as u64 - 1, c as u64 + w as u64 - 1);
+        let range = Range::new(r, c, r2.min(MAX_ROWS as u64 - 1) as u32, c2.min(MAX_COLS as u64 - 1) as u32);
+        if r2 >= MAX_ROWS as u64 || c2 >= MAX_COLS as u64 || (h as u64 * w as u64) > SPILL_MAX || self.is_blocked(s, (r, c), range) {
+            self.spills.insert(key, SpillRes { range, blocked: true, vals: Vec::new() });
+            return Value::Error(ErrorKind::Spill);
+        }
+        for rr in range.r1..=range.r2 {
+            for cc in range.c1..=range.c2 {
+                if (rr, cc) != (r, c) {
+                    self.claimed.insert((s, rr, cc), (r, c));
+                }
+            }
+        }
+        for cc in range.c1..=range.c2 {
+            self.spill_cols[s].entry(cc).or_default().push((range.r1, range.r2, (r, c)));
+        }
+        if let Some(Some(e)) = &mut self.extents[s] {
+            *e = (e.0.max(range.r2), e.1.max(range.c2));
+        } else if let Some(None) = self.extents[s] {
+            self.extents[s] = Some(Some((range.r2, range.c2)));
+        }
+        let first = a[0][0].clone();
+        self.spills.insert(key, SpillRes { range, blocked: false, vals: a });
+        first
+    }
+
+    /// Whether a spill range is obstructed by data, merged cells or another spill.
+    fn is_blocked(&self, s: usize, anchor: (u32, u32), rg: Range) -> bool {
+        let sh = &self.wb.sheets[s];
+        if sh.iter_range(rg).any(|(r, c, cell)| (r, c) != anchor && (!cell.value.is_empty() || cell.formula.is_some())) {
+            return true;
+        }
+        if sh.merges.iter().any(|m| m.intersects(&rg)) {
+            return true;
+        }
+        let check_old = !matches!(self.mode, Mode::All) && !sh.spill.cells.is_empty();
+        for r in rg.r1..=rg.r2 {
+            for c in rg.c1..=rg.c2 {
+                if (r, c) == anchor {
+                    continue;
+                }
+                if self.claimed.get(&(s, r, c)).is_some_and(|a| *a != anchor) {
+                    return true;
+                }
+                if check_old {
+                    if let Some((a, _)) = sh.spill.cells.get(&(r, c)) {
+                        if *a != anchor && !self.is_dirty(&(s, a.0, a.1)) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Converts a formula result into a single value (ad-hoc evaluation; no spilling).
     pub fn top_value(&mut self, r: Res) -> Value {
         match r {
             Err(e) => Value::Error(e),
@@ -259,7 +586,8 @@ impl<'a> Evaluator<'a> {
         }
     }
 
-    fn implicit(&mut self, s: usize, rg: Range) -> VRes {
+    /// Implicit intersection of a multi-cell range with the current cell's row/column.
+    pub fn implicit(&mut self, s: usize, rg: Range) -> VRes {
         let (_, r, c) = self.cur;
         if rg.c1 == rg.c2 && rg.r1 <= r && r <= rg.r2 {
             return Ok(self.cell_value(s, r, rg.c1));
@@ -278,11 +606,92 @@ impl<'a> Evaluator<'a> {
         Ok((s, Range::new(r.a.row, r.a.col, r.b.row, r.b.col)))
     }
 
-    /// Clips a range to the populated area of its sheet (whole-column refs etc).
-    pub fn clip(&self, s: usize, rg: Range) -> Range {
-        match self.wb.sheets.get(s).and_then(|sh| sh.extent()) {
+    /// (max_row, max_col) of a sheet including spilled values.
+    pub fn extent(&mut self, s: usize) -> Option<(u32, u32)> {
+        if s >= self.extents.len() {
+            return None;
+        }
+        if let Some(e) = self.extents[s] {
+            return e;
+        }
+        let e = self.wb.sheets[s].extent_with_spills();
+        self.extents[s] = Some(e);
+        e
+    }
+
+    /// Clips a range to the populated area of its sheet.
+    pub fn clip_extent(&mut self, s: usize, rg: Range) -> Range {
+        match self.extent(s) {
             Some((mr, mc)) => Range { r1: rg.r1, c1: rg.c1, r2: rg.r2.min(mr.max(rg.r1)), c2: rg.c2.min(mc.max(rg.c1)) },
             None => Range { r1: rg.r1, c1: rg.c1, r2: rg.r1, c2: rg.c1 },
+        }
+    }
+
+    /// Clips whole-column / whole-row references to the populated area.
+    pub fn clip(&mut self, s: usize, rg: Range) -> Range {
+        if rg.is_full_cols() || rg.is_full_rows() { self.clip_extent(s, rg) } else { rg }
+    }
+
+    /// Current spill range of an anchor cell, if it spills.
+    pub fn spill_range_of(&mut self, s: usize, r: u32, c: u32) -> Option<Range> {
+        let wb = self.wb;
+        let sh = wb.sheets.get(s)?;
+        sh.get(r, c)?.formula.as_ref()?;
+        let key = (s, r, c);
+        if self.is_dirty(&key) {
+            self.cell_value(s, r, c);
+            self.spills.get(&key).filter(|sp| !sp.blocked).map(|sp| sp.range)
+        } else {
+            sh.spill.anchors.get(&(r, c)).filter(|(_, b)| !b).map(|(rg, _)| *rg)
+        }
+    }
+
+    fn has_spills(&self, s: usize, rg: Range) -> bool {
+        self.spill_cols.get(s).is_some_and(|m| m.range(rg.c1..=rg.c2).next().is_some())
+    }
+
+    /// Writes spilled values intersecting `rg` into `out` (indexed relative to rg).
+    fn overlay_spills(&mut self, s: usize, rg: Range, out: &mut [Vec<Value>]) {
+        let mut cands: Vec<(u32, u32)> = Vec::new();
+        for (_, ents) in self.spill_cols[s].range(rg.c1..=rg.c2) {
+            for &(r1, r2, a) in ents {
+                if r1 <= rg.r2 && r2 >= rg.r1 {
+                    cands.push(a);
+                }
+            }
+        }
+        cands.sort_unstable();
+        cands.dedup();
+        let wb = self.wb;
+        let sh = &wb.sheets[s];
+        for a in cands {
+            let key = (s, a.0, a.1);
+            let Some(sr) = self.spill_range_of(s, a.0, a.1) else { continue };
+            if !sr.intersects(&rg) {
+                continue;
+            }
+            let i = Range { r1: sr.r1.max(rg.r1), c1: sr.c1.max(rg.c1), r2: sr.r2.min(rg.r2), c2: sr.c2.min(rg.c2) };
+            let fresh = self.is_dirty(&key);
+            for r in i.r1..=i.r2 {
+                for c in i.c1..=i.c2 {
+                    if (r, c) == a {
+                        continue;
+                    }
+                    let v = if fresh {
+                        let sp = &self.spills[&key];
+                        sp.vals[(r - sp.range.r1) as usize][(c - sp.range.c1) as usize].clone()
+                    } else {
+                        match sh.spill.cells.get(&(r, c)) {
+                            Some((_, v)) => v.clone(),
+                            None => continue,
+                        }
+                    };
+                    let slot = &mut out[(r - rg.r1) as usize][(c - rg.c1) as usize];
+                    if slot.is_empty() {
+                        *slot = v;
+                    }
+                }
+            }
         }
     }
 
@@ -295,6 +704,12 @@ impl<'a> Evaluator<'a> {
             Expr::Missing => Ok(EV::V(Value::Empty)),
             Expr::Ref(r) => {
                 let (s, rg) = self.resolve_ref(r)?;
+                if r.kind == RefKind::Spill {
+                    return match self.spill_range_of(s, rg.r1, rg.c1) {
+                        Some(sr) => Ok(EV::R(s, sr)),
+                        None => Err(ErrorKind::Ref),
+                    };
+                }
                 Ok(EV::R(s, rg))
             }
             Expr::Name(n) => self.eval_name(n),
@@ -326,9 +741,9 @@ impl<'a> Evaluator<'a> {
             }
             Expr::Func(name, args) => super::functions::call(self, name, args),
             Expr::Array(rows) => {
-                let mut out = Vec::new();
+                let mut out = Vec::with_capacity(rows.len());
                 for row in rows {
-                    let mut r = Vec::new();
+                    let mut r = Vec::with_capacity(row.len());
                     for e in row {
                         r.push(match self.eval(e) {
                             Ok(EV::V(v)) => v,
@@ -343,25 +758,46 @@ impl<'a> Evaluator<'a> {
         }
     }
 
+    /// Binds a LET variable / lifted argument for the duration of a call.
+    pub fn bind(&mut self, name: String, v: EV) {
+        self.scopes.push((name, v));
+    }
+
+    pub fn unbind(&mut self, n: usize) {
+        let keep = self.scopes.len().saturating_sub(n);
+        self.scopes.truncate(keep);
+    }
+
     fn eval_name(&mut self, n: &str) -> Res {
-        let key = n.to_ascii_uppercase();
-        if !self.names.contains_key(&key) {
-            let parsed = self
-                .wb
-                .names
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case(n))
-                .and_then(|(_, f)| super::parse(f.trim_start_matches('=')).ok());
-            self.names.insert(key.clone(), parsed);
+        if let Some((_, v)) = self.scopes.iter().rev().find(|(k, _)| k.eq_ignore_ascii_case(n)) {
+            return match v {
+                EV::V(Value::Error(e)) => Err(*e),
+                v => Ok(v.clone()),
+            };
         }
-        match self.names.get(&key).cloned().flatten() {
+        let key = n.to_ascii_uppercase();
+        let parsed = match self.names.get(&key) {
+            Some(p) => p.clone(),
+            None => {
+                let p = self
+                    .wb
+                    .names
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(n))
+                    .and_then(|(_, f)| super::parse(f.trim_start_matches('=')).ok())
+                    .map(Rc::new);
+                self.names.insert(key, p.clone());
+                p
+            }
+        };
+        match parsed {
             Some(e) => {
-                if self.depth > 200 {
+                if self.name_depth > 200 || self.too_deep() {
                     return Err(ErrorKind::Name);
                 }
-                self.depth += 1;
+                self.name_depth += 1;
                 let r = self.eval(&e);
-                self.depth -= 1;
+                self.name_depth -= 1;
                 r
             }
             None => Err(ErrorKind::Name),
@@ -399,7 +835,7 @@ impl<'a> Evaluator<'a> {
                     self.implicit(s, rg)?
                 }
             }
-            EV::A(a) => a.first().and_then(|r| r.first()).cloned().unwrap_or(Value::Empty),
+            EV::A(a) => a.into_iter().next().and_then(|r| r.into_iter().next()).unwrap_or(Value::Empty),
         };
         match v {
             Value::Error(e) => Err(e),
@@ -413,26 +849,49 @@ impl<'a> Evaluator<'a> {
             EV::V(v) => vec![vec![v]],
             EV::A(a) => a,
             EV::R(s, rg) => {
-                let rg = self.clip(s, rg);
-                let mut out = vec![vec![Value::Empty; rg.cols() as usize]; rg.rows() as usize];
-                let wb = self.wb;
-                if let Some(sh) = wb.sheets.get(s) {
-                    for (r, c, cell) in sh.iter_range(rg) {
-                        let v = if cell.formula.is_some() { self.cell_value(s, r, c) } else { cell.value.clone() };
-                        out[(r - rg.r1) as usize][(c - rg.c1) as usize] = v;
-                    }
+                let mut rg = self.clip(s, rg);
+                if rg.rows() as u64 * rg.cols() as u64 > 4 * SPILL_MAX {
+                    rg = self.clip_extent(s, rg);
                 }
-                out
+                self.grid_of(s, rg)
             }
         }
     }
 
+    fn grid_of(&mut self, s: usize, rg: Range) -> Vec<Vec<Value>> {
+        let mut out = vec![vec![Value::Empty; rg.cols() as usize]; rg.rows() as usize];
+        let wb = self.wb;
+        if let Some(sh) = wb.sheets.get(s) {
+            for (r, c, cell) in sh.iter_range(rg) {
+                let v = if cell.formula.is_some() { self.cell_value(s, r, c) } else { cell.value.clone() };
+                out[(r - rg.r1) as usize][(c - rg.c1) as usize] = v;
+            }
+            if self.has_spills(s, rg) {
+                self.overlay_spills(s, rg, &mut out);
+            }
+        }
+        out
+    }
+
+    /// Values of a one-dimensional lookup range (cached per pass, with hash indexes).
+    pub fn lookup_col(&mut self, s: usize, rg: Range) -> Rc<LookupCol> {
+        let rg = self.clip_extent(s, rg);
+        if let Some(c) = self.lookups.get(&(s, rg)) {
+            return c.clone();
+        }
+        let g = self.grid_of(s, rg);
+        let vals: Vec<Value> = if rg.rows() == 1 { g.into_iter().next().unwrap_or_default() } else { g.into_iter().map(|r| r.into_iter().next().unwrap_or_default()).collect() };
+        let col = Rc::new(LookupCol::new(vals));
+        self.lookups.insert((s, rg), col.clone());
+        col
+    }
+
     /// Calls `f` for every value in the argument; `from_ref` is true for range/array members.
-    pub fn walk(&mut self, v: EV, skip_hidden: bool, f: &mut dyn FnMut(Value, bool) -> Result<(), ErrorKind>) -> Result<(), ErrorKind> {
+    pub fn walk(&mut self, v: EV, skip_hidden: bool, f: &mut dyn FnMut(&Value, bool) -> Result<(), ErrorKind>) -> Result<(), ErrorKind> {
         match v {
-            EV::V(v) => f(v, false),
+            EV::V(v) => f(&v, false),
             EV::A(a) => {
-                for row in a {
+                for row in &a {
                     for v in row {
                         f(v, true)?;
                     }
@@ -442,12 +901,31 @@ impl<'a> Evaluator<'a> {
             EV::R(s, rg) => {
                 let wb = self.wb;
                 let Some(sh) = wb.sheets.get(s) else { return Err(ErrorKind::Ref) };
-                for (r, c, cell) in sh.iter_range(rg) {
-                    if skip_hidden && sh.hidden_rows.contains(&r) {
+                if !self.has_spills(s, rg) {
+                    for (r, c, cell) in sh.iter_range(rg) {
+                        if skip_hidden && sh.hidden_rows.contains(&r) {
+                            continue;
+                        }
+                        if cell.formula.is_some() {
+                            let v = self.cell_value(s, r, c);
+                            f(&v, true)?;
+                        } else {
+                            f(&cell.value, true)?;
+                        }
+                    }
+                    return Ok(());
+                }
+                let rg = self.clip_extent(s, rg);
+                let g = self.grid_of(s, rg);
+                for (i, row) in g.iter().enumerate() {
+                    if skip_hidden && sh.hidden_rows.contains(&(rg.r1 + i as u32)) {
                         continue;
                     }
-                    let v = if cell.formula.is_some() { self.cell_value(s, r, c) } else { cell.value.clone() };
-                    f(v, true)?;
+                    for v in row {
+                        if !v.is_empty() {
+                            f(v, true)?;
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -498,10 +976,10 @@ impl<'a> Evaluator<'a> {
             let v = self.eval(e)?;
             self.walk(v, skip_hidden, &mut |v, from_ref| {
                 match v {
-                    Value::Number(n) => out.push(n),
-                    Value::Error(e) => return Err(e),
-                    Value::Bool(b) if !from_ref => out.push(if b { 1.0 } else { 0.0 }),
-                    Value::Text(s) if !from_ref => out.push(to_num(&Value::Text(s))?),
+                    Value::Number(n) => out.push(*n),
+                    Value::Error(e) => return Err(*e),
+                    Value::Bool(b) if !from_ref => out.push(if *b { 1.0 } else { 0.0 }),
+                    Value::Text(s) if !from_ref => out.push(to_num(&Value::Text(s.clone()))?),
                     _ => {}
                 }
                 Ok(())
@@ -511,22 +989,116 @@ impl<'a> Evaluator<'a> {
     }
 }
 
+/// Element-wise operation with Excel's array broadcasting (single rows/columns expand,
+/// mismatched sizes pad with #N/A).
 pub fn broadcast(a: &[Vec<Value>], b: &[Vec<Value>], f: impl Fn(&Value, &Value) -> Value) -> Vec<Vec<Value>> {
-    let rows = if a.len() == 1 { b.len() } else if b.len() == 1 { a.len() } else { a.len().min(b.len()) };
+    let rows = if a.len() == 1 { b.len() } else if b.len() == 1 { a.len() } else { a.len().max(b.len()) };
     let ca = a.first().map_or(0, |r| r.len());
     let cb = b.first().map_or(0, |r| r.len());
-    let cols = if ca == 1 { cb } else if cb == 1 { ca } else { ca.min(cb) };
+    let cols = if ca == 1 { cb } else if cb == 1 { ca } else { ca.max(cb) };
     let get = |g: &[Vec<Value>], r: usize, c: usize| -> Value {
         let rr = if g.len() == 1 { 0 } else { r };
-        let row = &g[rr];
+        let Some(row) = g.get(rr) else { return Value::Error(ErrorKind::NA) };
         let cc = if row.len() == 1 { 0 } else { c };
         row.get(cc).cloned().unwrap_or(Value::Error(ErrorKind::NA))
     };
     (0..rows).map(|r| (0..cols).map(|c| f(&get(a, r, c), &get(b, r, c))).collect()).collect()
 }
 
-/// Recalculates every formula in the workbook.
+// ---------------------------------------------------------------------------
+// Recalculation drivers
+// ---------------------------------------------------------------------------
+
+/// Stack reserved for recalculation threads (address space only; committed on use).
+const BIG_STACK: usize = 1 << 30;
+const STACK_MARGIN: usize = 8 << 20;
+/// Edits larger than this many cells recalculate everything.
+const INCREMENTAL_MAX_CELLS: u64 = 50_000;
+
+struct PassOut {
+    results: Vec<(Key, Value)>,
+    spills: FxMap<Key, SpillRes>,
+    circular: bool,
+}
+
+/// Runs `f` on a thread with a large stack so deep reference chains cannot overflow.
+fn on_big_stack<R: Send, F: FnOnce(usize) -> R + Send>(f: F) -> R {
+    let slot = std::sync::Mutex::new(Some(f));
+    let take = || slot.lock().ok().and_then(|mut g| g.take());
+    std::thread::scope(|sc| {
+        let spawned = std::thread::Builder::new()
+            .name("recalc".into())
+            .stack_size(BIG_STACK)
+            .spawn_scoped(sc, || take().map(|f| f(BIG_STACK - STACK_MARGIN)));
+        let out = match spawned {
+            Ok(h) => match h.join() {
+                Ok(r) => r,
+                Err(e) => std::panic::resume_unwind(e),
+            },
+            Err(_) => None,
+        };
+        match out {
+            Some(r) => r,
+            None => (take().expect("recalc closure"))(512 * 1024),
+        }
+    })
+}
+
+fn run_pass(wb: &Workbook, mode: Mode, targets: &[Key]) -> PassOut {
+    on_big_stack(|budget| {
+        let mut ev = Evaluator::new(wb, mode);
+        ev.stack_base = stack_pos();
+        ev.stack_budget = budget;
+        ev.reserve(targets.len());
+        for &(s, r, c) in targets {
+            ev.cell_value(s, r, c);
+        }
+        PassOut { results: ev.results.into_iter().collect(), spills: ev.spills, circular: ev.circular }
+    })
+}
+
+fn write_results(wb: &mut Workbook, results: Vec<(Key, Value)>) {
+    for ((s, r, c), v) in results {
+        if let Some(cell) = wb.sheets[s].get_mut(r, c) {
+            if cell.formula.is_some() {
+                cell.value = v;
+            }
+        }
+    }
+}
+
+fn add_spill(sp: &mut Spill, anchor: (u32, u32), res: SpillRes) {
+    sp.anchors.insert(anchor, (res.range, res.blocked));
+    if res.blocked {
+        return;
+    }
+    for (i, row) in res.vals.into_iter().enumerate() {
+        for (j, v) in row.into_iter().enumerate() {
+            let pos = (res.range.r1 + i as u32, res.range.c1 + j as u32);
+            if pos != anchor {
+                sp.cells.insert(pos, (anchor, v));
+            }
+        }
+    }
+}
+
+fn remove_spill(sp: &mut Spill, anchor: (u32, u32)) {
+    if let Some((rg, blocked)) = sp.anchors.remove(&anchor) {
+        if !blocked {
+            for r in rg.r1..=rg.r2 {
+                for c in rg.c1..=rg.c2 {
+                    if sp.cells.get(&(r, c)).is_some_and(|(a, _)| *a == anchor) {
+                        sp.cells.remove(&(r, c));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Recalculates every formula in the workbook (loads, structural changes).
 pub fn recalc(wb: &mut Workbook) {
+    wb.calc.invalidate();
     let mut targets = Vec::new();
     for (si, s) in wb.sheets.iter().enumerate() {
         for (r, row) in &s.rows {
@@ -537,26 +1109,173 @@ pub fn recalc(wb: &mut Workbook) {
             }
         }
     }
-    let (results, circular) = {
-        let mut ev = Evaluator::new(wb);
-        for &(s, r, c) in &targets {
-            ev.cell_value(s, r, c);
+    let had_spills = wb.sheets.iter().any(|s| !s.spill.anchors.is_empty());
+    if targets.is_empty() && !had_spills {
+        wb.circular = false;
+        return;
+    }
+    for _pass in 0..4 {
+        let out = run_pass(wb, Mode::All, &targets);
+        write_results(wb, out.results);
+        let mut fresh: Vec<Spill> = wb.sheets.iter().map(|_| Spill::default()).collect();
+        for ((s, r, c), res) in out.spills {
+            add_spill(&mut fresh[s], (r, c), res);
         }
-        (ev.results, ev.circular)
-    };
-    for ((s, r, c), v) in results {
-        if let Some(cell) = wb.sheets[s].get_mut(r, c) {
-            cell.value = v;
+        let mut stable = true;
+        for (sh, sp) in wb.sheets.iter_mut().zip(fresh) {
+            if sh.spill.anchors != sp.anchors {
+                stable = false;
+            }
+            sh.spill = sp;
+        }
+        wb.circular = out.circular;
+        if stable {
+            break;
         }
     }
-    wb.circular = circular;
+}
+
+/// Recalculates only what depends on the given cells (contents edited in place).
+#[cfg(test)]
+pub fn recalc_cells(wb: &mut Workbook, cells: &[(usize, u32, u32)]) {
+    let ranges: Vec<(usize, Range)> = cells.iter().map(|&(s, r, c)| (s, Range::cell(r, c))).collect();
+    recalc_ranges(wb, &ranges);
+}
+
+/// Recalculates only what depends on the given ranges, whose cell contents were edited.
+/// Falls back to a full recalculation whenever the incremental state cannot be trusted.
+pub fn recalc_ranges(wb: &mut Workbook, edited: &[(usize, Range)]) {
+    let area: u64 = edited.iter().map(|(_, rg)| rg.rows() as u64 * rg.cols() as u64).sum();
+    if wb.circular || area > INCREMENTAL_MAX_CELLS || edited.iter().any(|(s, _)| *s >= wb.sheets.len()) {
+        recalc(wb);
+        return;
+    }
+    let mut calc = std::mem::take(&mut wb.calc);
+    if calc.is_valid_for(wb) {
+        calc.update(wb, edited);
+    } else {
+        calc.build(wb);
+    }
+    let mut regions: Vec<(usize, Range)> = Vec::new();
+    let mut converged = false;
+    for round in 0..4 {
+        let first = round == 0;
+        let dirty = dirty_set(wb, &mut calc, if first { edited } else { &[] }, &regions, first);
+        let mut targets: Vec<Key> = dirty.iter().copied().collect();
+        targets.sort_unstable();
+        let out = run_pass(wb, Mode::Dirty(dirty), &targets);
+        write_results(wb, out.results);
+        wb.circular = out.circular;
+        // Apply spill changes of the anchors evaluated in this round.
+        regions.clear();
+        let mut new_spills: Vec<Vec<((u32, u32), SpillRes)>> = wb.sheets.iter().map(|_| Vec::new()).collect();
+        for ((s, r, c), res) in out.spills {
+            new_spills[s].push(((r, c), res));
+        }
+        for (s, news) in new_spills.into_iter().enumerate() {
+            let sp = &mut wb.sheets[s].spill;
+            let evaluated: Vec<(u32, u32)> = targets.iter().filter(|k| k.0 == s).map(|k| (k.1, k.2)).collect();
+            let mut olds = Vec::new();
+            for a in &evaluated {
+                if let Some(o) = sp.anchors.get(a).copied() {
+                    olds.push((*a, o));
+                }
+            }
+            for (a, o) in &olds {
+                let now = news.iter().find(|(na, _)| na == a).map(|(_, r)| (r.range, r.blocked));
+                if now != Some(*o) {
+                    regions.push((s, o.0));
+                }
+                remove_spill(sp, *a);
+            }
+            for (a, res) in news {
+                if olds.iter().find(|(oa, _)| *oa == a).map(|(_, o)| *o) != Some((res.range, res.blocked)) {
+                    regions.push((s, res.range));
+                }
+                add_spill(sp, a, res);
+            }
+        }
+        if regions.is_empty() || wb.circular {
+            converged = true;
+            break;
+        }
+    }
+    wb.calc = calc;
+    if !converged {
+        recalc(wb);
+    }
+}
+
+/// Formula cells to recompute after `edited` cells changed and `regions` changed spill values.
+fn dirty_set(wb: &Workbook, calc: &mut super::deps::CalcState, edited: &[(usize, Range)], regions: &[(usize, Range)], volatile: bool) -> FxSet<Key> {
+    let mut dirty: FxSet<Key> = FxSet::default();
+    let mut queue: Vec<(usize, Range)> = Vec::new();
+    for &(s, rg) in edited {
+        let sh = &wb.sheets[s];
+        for r in rg.r1..=rg.r2 {
+            for c in rg.c1..=rg.c2 {
+                dirty.insert((s, r, c));
+            }
+        }
+        for (a, (srg, blocked)) in &sh.spill.anchors {
+            if rg.contains(a.0, a.1) {
+                if !blocked {
+                    queue.push((s, *srg));
+                }
+            }
+        }
+        queue.push((s, rg));
+    }
+    for &(s, rg) in edited.iter().chain(regions) {
+        // Anchors whose (possibly blocked) spill area overlaps a change must re-spill.
+        for (a, (srg, blocked)) in &wb.sheets[s].spill.anchors {
+            if srg.intersects(&rg) && dirty.insert((s, a.0, a.1)) {
+                queue.push((s, Range::cell(a.0, a.1)));
+                if !blocked {
+                    queue.push((s, *srg));
+                }
+            }
+        }
+        queue.push((s, rg));
+    }
+    if volatile {
+        for k in calc.volatile() {
+            if dirty.insert(*k) {
+                queue.push((k.0, Range::cell(k.1, k.2)));
+            }
+        }
+    }
+    while let Some((s, rg)) = queue.pop() {
+        calc.dependents(s, rg, &mut |k| {
+            if dirty.insert(k) {
+                queue.push((k.0, Range::cell(k.1, k.2)));
+                if let Some((srg, false)) = wb.sheets[k.0].spill.anchors.get(&(k.1, k.2)) {
+                    queue.push((k.0, *srg));
+                }
+            }
+        });
+    }
+    calc.end_propagation();
+    dirty
 }
 
 /// Evaluates a standalone formula in the context of a cell (used by tests and the Function dialog).
 pub fn eval_formula(wb: &Workbook, sheet: usize, r: u32, c: u32, src: &str) -> Value {
     let Ok(e) = super::parse(src.trim_start_matches('=')) else { return Value::Error(ErrorKind::Name) };
-    let mut ev = Evaluator::new(wb);
+    let mut ev = Evaluator::new(wb, Mode::Stored);
     ev.cur = (sheet, r, c);
     let res = ev.eval(&e);
     ev.top_value(res)
+}
+
+/// Evaluates a standalone formula and returns its full (array) result.
+#[cfg(test)]
+pub fn eval_array(wb: &Workbook, sheet: usize, r: u32, c: u32, src: &str) -> Vec<Vec<Value>> {
+    let Ok(e) = super::parse(src.trim_start_matches('=')) else { return vec![vec![Value::Error(ErrorKind::Name)]] };
+    let mut ev = Evaluator::new(wb, Mode::Stored);
+    ev.cur = (sheet, r, c);
+    match ev.eval(&e) {
+        Err(e) => vec![vec![Value::Error(e)]],
+        Ok(v) => ev.grid(v),
+    }
 }

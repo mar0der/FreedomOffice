@@ -82,7 +82,15 @@ fn write_sheet(wb: &Workbook, sh: &Sheet, ws: &mut Worksheet, formats: &mut Hash
                 continue;
             }
             let fmt = format_for(wb, formats, cell.style);
-            write_cell(ws, r, c as u16, cell, fmt)?;
+            let spill = sh.spill_range(r, c).filter(|(_, blocked)| !blocked).map(|(rg, _)| rg);
+            write_cell(ws, r, c as u16, cell, fmt, spill)?;
+        }
+    }
+    // Cached values of dynamic-array spills (not stored as real cells).
+    for (&(r, c), (_, v)) in &sh.spill.cells {
+        if sh.get(r, c).is_none() && c < MAX_COLS {
+            let fmt = format_for(wb, formats, 0);
+            write_cell(ws, r, c as u16, &Cell { value: v.clone(), formula: None, style: 0 }, fmt, None)?;
         }
     }
 
@@ -114,7 +122,7 @@ fn result_text(v: &Value) -> String {
     }
 }
 
-fn write_cell(ws: &mut Worksheet, r: u32, c: u16, cell: &Cell, fmt: &Format) -> Result<(), XlsxError> {
+fn write_cell(ws: &mut Worksheet, r: u32, c: u16, cell: &Cell, fmt: &Format, spill: Option<Range>) -> Result<(), XlsxError> {
     if let Some(f) = &cell.formula {
         // Normalized text (upper-case function names) so Excel and the future-function
         // escaping in rust_xlsxwriter both recognise it.
@@ -123,7 +131,10 @@ fn write_cell(ws: &mut Worksheet, r: u32, c: u16, cell: &Cell, fmt: &Format) -> 
             None => f.text.clone(),
         };
         let xf = XFormula::new(&text).set_result(result_text(&cell.value));
-        ws.write_formula_with_format(r, c, xf, fmt)?;
+        match spill {
+            Some(rg) => ws.write_dynamic_array_formula_with_format(rg.r1, rg.c1 as u16, rg.r2, rg.c2 as u16, xf, fmt)?,
+            None => ws.write_formula_with_format(r, c, xf, fmt)?,
+        };
         return Ok(());
     }
     match &cell.value {
