@@ -343,7 +343,10 @@ impl App {
             Key::D => self.fill_down(),
             Key::R => self.fill_right(),
             Key::L if shift => self.toggle_filter(),
-            Key::P => self.status = Some("Printing isn't available yet. Save as PDF from another app, or copy the range.".into()),
+            Key::P => {
+                self.commit_edit(false);
+                self.backstage = Some(super::chrome::Backstage::Print);
+            }
             Key::K => {}
             Key::Semicolon | Key::Colon => self.insert_now(shift || key == Key::Colon),
             Key::Backtick if shift => self.set_num_fmt("General"),

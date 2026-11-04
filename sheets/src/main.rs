@@ -8,6 +8,7 @@ mod icon;
 mod io;
 mod model;
 mod numfmt;
+mod pdf;
 
 use eframe::egui;
 

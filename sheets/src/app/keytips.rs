@@ -12,6 +12,10 @@ use crate::model::{HAlign, VAlign};
 /// (sequence, description). Sequences follow the familiar ribbon access keys.
 pub const KEYTIPS: &[(&str, &str)] = &[
     ("F", "File"),
+    ("FP", "Print"),
+    ("FA", "Save As"),
+    ("FO", "Open"),
+    ("FN", "New"),
     ("H", "Home"),
     ("N", "Insert"),
     ("P", "Page Layout"),
@@ -186,6 +190,10 @@ impl App {
                 self.tab = t;
                 self.ribbon_collapsed = false;
             }
+            if s == "F" {
+                self.commit_edit(false);
+                self.backstage = Some(Backstage::Home);
+            }
         }
         let exact = KEYTIPS.iter().any(|(k, _)| *k == s);
         let longer = KEYTIPS.iter().any(|(k, _)| k.len() > s.len() && k.starts_with(&s));
@@ -203,7 +211,12 @@ impl App {
     fn run_keytip(&mut self, ctx: &egui::Context, s: &str) {
         self.commit_edit(false);
         match s {
-            "F" => self.backstage = Some(Backstage::Home),
+            "FP" => self.backstage = Some(Backstage::Print),
+            "FA" => {
+                self.save_as();
+            }
+            "FO" => self.confirm_then(Pending::Open(None)),
+            "FN" => self.confirm_then(Pending::New),
             "HVP" => self.paste_internal(PasteMode::All),
             "HVV" => self.paste_internal(PasteMode::Values),
             "HVF" => self.paste_internal(PasteMode::Formulas),

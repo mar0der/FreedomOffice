@@ -159,6 +159,8 @@ pub struct App {
     prev_alt: bool,
     pub hover_cell: Option<(u32, u32)>,
     pub show_all_notes: bool,
+    pub page_setup: crate::pdf::PageSetup,
+    pub print_selection: bool,
 }
 
 const MAX_UNDO: usize = 100;
@@ -215,6 +217,8 @@ impl App {
             prev_alt: false,
             hover_cell: None,
             show_all_notes: false,
+            page_setup: crate::pdf::PageSetup::default(),
+            print_selection: false,
         };
         if let Some(p) = path {
             app.open_path(p);
