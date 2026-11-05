@@ -5,7 +5,7 @@
 pub mod engine;
 pub mod style;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -881,6 +881,20 @@ pub fn unique_name(wb: &Workbook) -> String {
         .map(|i| format!("PivotTable{i}"))
         .find(|n| !wb.sheets.iter().any(|s| s.pivots.iter().any(|p| p.name.eq_ignore_ascii_case(n))))
         .unwrap()
+}
+
+/// Keeps report sources pointing at a renamed sheet.
+pub fn rename_sheet(wb: &mut Workbook, old: &str, new: &str) {
+    for sh in wb.sheets.iter_mut() {
+        for p in sh.pivots.iter_mut() {
+            if let Some(i) = p.source.rfind('!') {
+                let name = p.source[..i].trim_matches('\'').replace("''", "'");
+                if name.eq_ignore_ascii_case(old) {
+                    p.source = format!("{}{}", crate::formula::quote_sheet(new), &p.source[i..]);
+                }
+            }
+        }
+    }
 }
 
 /// Moves the reports of a sheet when rows (`rows`) or columns are inserted (n > 0) or deleted

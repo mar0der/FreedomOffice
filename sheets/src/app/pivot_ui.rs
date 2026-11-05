@@ -1371,6 +1371,28 @@ impl App {
         Ok(())
     }
 
+    /// Sort A to Z / Z to A inside a report: a label sorts its field, a value sorts the
+    /// innermost row field by that value. Returns true when the active cell is in a report.
+    pub fn pivot_sort(&mut self, desc: bool) -> bool {
+        let Some((si, pi)) = self.active_pivot() else { return false };
+        let order = if desc { pivot::SortOrder::Desc } else { pivot::SortOrder::Asc };
+        if let Some(d) = self.active_data().filter(|_| matches!(self.wb.sheets[si].pivots[pi].out.role(self.active().0, self.active().1), Role::Value(..))) {
+            let pt = &self.wb.sheets[si].pivots[pi];
+            if let Some(&f) = pt.rows.iter().rev().find(|f| **f != VALUES) {
+                self.pivot_edit(si, pi, |p| {
+                    p.fields[f].sort = order;
+                    p.fields[f].sort_by = Some(d);
+                });
+            }
+        } else if let Some(f) = self.active_field() {
+            self.pivot_edit(si, pi, |p| {
+                p.fields[f].sort = order;
+                p.fields[f].sort_by = None;
+            });
+        }
+        true
+    }
+
     /// Select > Entire PivotTable / Values / Labels.
     pub(super) fn select_pivot_part(&mut self, part: u8) {
         let Some((si, pi)) = self.active_pivot() else { return };
@@ -1389,5 +1411,122 @@ impl App {
         let Some((si, pi)) = self.active_pivot() else { return };
         self.pivots.pending = None;
         self.pivot_edit(si, pi, |pt| if filters_only { pt.clear_filters() } else { pt.clear() });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(ctx: &egui::Context, app: &mut App) {
+        let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 1000.0))), ..Default::default() };
+        let _ = ctx.run(input, |ctx| {
+            egui::TopBottomPanel::top("ribbon").show(ctx, |ui| app.ribbon_ui(ui));
+            app.pivot_field_pane(ctx);
+            egui::CentralPanel::default().show(ctx, |ui| app.grid_ui(ui));
+            app.pivot_dialogs(ctx);
+            app.dialogs_ui(ctx);
+        });
+    }
+
+    /// Creates a report through the commands the UI uses, draws every tab, pane, popup and
+    /// dialog, and checks Show Details, GETPIVOTDATA pointing, protection, refresh and undo.
+    #[test]
+    fn pivot_ui_smoke() {
+        let ctx = egui::Context::default();
+        let mut app = App::with_context(&ctx, 0, None);
+        app.wb = crate::pivot::tests::sample(true);
+        app.select(1, 1, false);
+        app.open_create_pivot();
+        let Some(PDialog::Create { source, .. }) = &app.pivots.dialog else { panic!("no dialog") };
+        assert_eq!(source, "Sheet1!$A$1:$E$8");
+        let source = source.clone();
+        app.pivots.dialog = None;
+        app.create_pivot(&source, true, "").unwrap();
+        assert_eq!(app.wb.sheets.len(), 2);
+        assert_eq!(app.wb.active, 0);
+        assert_eq!(app.tab, RibbonTab::PivotAnalyze);
+        let (si, pi) = app.active_pivot().unwrap();
+        assert!(app.sheet().pivots[pi].out.placeholder);
+        frame(&ctx, &mut app);
+        app.pane_edit(si, pi, |p| p.add_field(0, Area::Rows, None));
+        app.pane_edit(si, pi, |p| p.add_field(1, Area::Columns, None));
+        app.pane_edit(si, pi, |p| p.add_field(3, Area::Values, None));
+        app.pane_edit(si, pi, |p| p.add_field(4, Area::Filters, None));
+        let pt = app.sheet().pivots[pi].clone();
+        assert_eq!(pt.out.range.r1, 2);
+        assert_eq!(app.sheet().value(2, 0), &Value::Text("Sum of Sales".into()));
+        // Defer Layout Update keeps the report until Update.
+        app.pivots.defer = true;
+        app.pane_edit(si, pi, |p| p.add_field(2, Area::Rows, None));
+        assert_eq!(app.sheet().pivots[pi].rows.len(), 1);
+        app.apply_pending();
+        assert_eq!(app.sheet().pivots[pi].rows.len(), 2);
+        app.pivots.defer = false;
+        app.undo();
+        assert_eq!(app.sheet().pivots[pi].rows.len(), 1);
+        for (k, tab) in [RibbonTab::PivotAnalyze, RibbonTab::PivotDesign, RibbonTab::PivotAnalyze, RibbonTab::PivotDesign, RibbonTab::Insert, RibbonTab::Home].into_iter().enumerate() {
+            let rg = app.sheet().pivots[pi].out.range;
+            app.select(rg.r1 + 2, rg.c1 + 1, false);
+            app.tab = tab;
+            match k {
+                0 => app.open_field_settings(),
+                1 => app.open_pivot_options(),
+                2 => app.open_move_pivot(),
+                3 => app.open_change_source(),
+                4 => {
+                    app.select(rg.r1 + 2, rg.c1, false);
+                    app.open_field_settings();
+                }
+                _ => {
+                    let pos = Pos2::new(100.0, 200.0);
+                    app.open_item_popup(si, pi, 0, vec![0], false, pos);
+                }
+            }
+            frame(&ctx, &mut app);
+            frame(&ctx, &mut app);
+            app.pivots.dialog = None;
+        }
+        app.select(rg_value(&app, pi).0, rg_value(&app, pi).1, false);
+        app.open_group_dialog();
+        frame(&ctx, &mut app);
+        app.pivots.dialog = None;
+        // Report cells can't be typed over.
+        let (vr, vc) = rg_value(&app, pi);
+        assert!(app.locked_block(Range::cell(vr, vc)));
+        app.dialog = None;
+        // GETPIVOTDATA when a value is clicked while typing a formula.
+        app.select(0, 8, false);
+        app.begin_edit(Some("=".into()), super::super::EditMode::Enter);
+        let t = app.pivot_point_text(vr, vc).unwrap();
+        assert!(t.starts_with("GETPIVOTDATA(\"Sales\",$A$3,\"Region\",\"East\""), "{t}");
+        app.cancel_edit();
+        // Double-clicking a value shows its records on a new sheet.
+        let sheets = app.wb.sheets.len();
+        assert!(app.pivot_double_click(vr, vc));
+        assert_eq!(app.wb.sheets.len(), sheets + 1);
+        assert_eq!(app.sheet().tables.len(), 1);
+        assert_eq!(app.sheet().value(0, 0), &Value::Text("Region".into()));
+        app.undo();
+        assert_eq!(app.wb.sheets.len(), sheets);
+        // Collapse an item with its button, then refresh after a source change.
+        let li = app.sheet().pivots[pi].out.row_at[0];
+        app.toggle_item(si, pi, true, li);
+        let src = app.wb.sheet_index("Sheet1").unwrap();
+        app.wb.sheets[src].set(1, 3, Some(Cell { value: Value::Number(1000.0), ..Default::default() }));
+        app.select(vr, vc, false);
+        app.pivot_refresh_active();
+        let total = app.sheet().pivots[pi].out.range;
+        assert_eq!(app.sheet().value(total.r2, total.c2), &Value::Number(1610.0));
+        app.pivot_refresh_all();
+        app.clear_pivot(false);
+        assert!(app.sheet().pivots[pi].out.placeholder);
+        frame(&ctx, &mut app);
+    }
+
+    /// First value cell of a report.
+    fn rg_value(app: &App, pi: usize) -> (u32, u32) {
+        let o = &app.sheet().pivots[pi].out;
+        (o.range.r1 + o.header_rows, o.range.c1 + o.label_cols)
     }
 }

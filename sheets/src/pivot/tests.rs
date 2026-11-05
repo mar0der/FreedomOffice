@@ -605,3 +605,17 @@ fn print_pivot_file() {
         }
     }
 }
+
+#[test]
+fn sheet_rename_and_row_insert_follow_reports() {
+    let mut wb = rich_workbook();
+    super::rename_sheet(&mut wb, "Sheet1", "My Data");
+    assert_eq!(wb.sheets[1].pivots[0].source, "'My Data'!$A$1:$E$8");
+    wb.sheets[0].name = "My Data".into();
+    assert!(engine::refresh(&mut wb, 1, 0).is_ok());
+    let before = wb.sheets[1].pivots[0].out.full;
+    super::shift_for_structure(&mut wb.sheets[1], true, 0, 2);
+    let p = &wb.sheets[1].pivots[0];
+    assert_eq!((p.out.full.r1, p.out.full.r2), (before.r1 + 2, before.r2 + 2));
+    assert_eq!(p.anchor.0, p.out.range.r1);
+}

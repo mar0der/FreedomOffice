@@ -1446,6 +1446,7 @@ impl App {
         let newn = new.to_string();
         self.transform_formulas(|e, _| formula::rename_sheet(e, &old, &newn));
         crate::chart::rename_sheet(&mut self.wb, &old, &newn);
+        crate::pivot::rename_sheet(&mut self.wb, &old, &newn);
         self.changed();
         Ok(())
     }
