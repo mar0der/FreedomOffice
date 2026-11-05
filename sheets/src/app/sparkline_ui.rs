@@ -4,7 +4,8 @@ use eframe::egui::{self, Align2, Color32, Pos2, Rect, RichText, Sense, Stroke, V
 
 use super::dialogs::Dialog;
 use super::grid::Layout;
-use super::ribbon::{big_btn, color_grid, icon_job};
+use super::chart_view::big_button;
+use super::ribbon::color_grid;
 use super::theme::{self, rgb};
 use super::whatif_ui::{buttons, ref_box, window, Seen, WhatIfDlg};
 use super::{App, RibbonTab, Scope};
@@ -146,6 +147,15 @@ fn paint_one(p: &egui::Painter, r: Rect, g: &SparklineGroup, vals: &[Option<f64>
     }
 }
 
+/// Ribbon icon for a sparkline type.
+fn paint_kind(p: &egui::Painter, r: Rect, kind: SparkKind) {
+    let g = SparklineGroup::new(kind, Vec::new());
+    let vals = [Some(2.0), Some(-1.0), Some(3.0), Some(1.5), Some(-2.0), Some(4.0)];
+    let inner = r.shrink2(Vec2::new(r.width() * 0.15, r.height() * 0.25));
+    p.rect_stroke(r.shrink(2.0), 2.0, Stroke::new(1.0, theme::icon_line()), egui::StrokeKind::Inside);
+    paint_one(p, inner, &SparklineGroup { negative: true, ..g }, &vals, (-2.0, 4.0), 1.2);
+}
+
 impl App {
     /// Draws the sparklines of the visible cells (called from the grid painter).
     pub(super) fn paint_sparklines(&self, p: &egui::Painter, lay: &Layout) {
@@ -172,13 +182,12 @@ impl App {
 
     /// Insert > Sparklines group.
     pub(super) fn sparkline_insert_buttons(&mut self, ui: &mut egui::Ui) {
-        for (kind, glyph, tip) in [
-            (SparkKind::Line, "📈", "Insert a line chart within a single cell."),
-            (SparkKind::Column, "▮▯▮", "Insert a column chart within a single cell."),
-            (SparkKind::WinLoss, "▀▄▀", "Insert a win/loss chart within a single cell."),
+        for (kind, tip) in [
+            (SparkKind::Line, "Insert a line chart within a single cell."),
+            (SparkKind::Column, "Insert a column chart within a single cell."),
+            (SparkKind::WinLoss, "Insert a win/loss chart within a single cell."),
         ] {
-            let job = icon_job(glyph, false, kind.label(), 16.0, true, theme::text());
-            if big_btn(ui, job, 50.0, false).on_hover_text(format!("{} Sparkline\n{tip}", kind.label())).clicked() {
+            if big_button(ui, kind.label(), &format!("{} Sparkline\n{tip}", kind.label()), |p, r| paint_kind(p, r, kind)).clicked() {
                 self.open_create_sparklines(kind);
             }
         }
@@ -354,8 +363,10 @@ impl App {
         let Some((gi, ii)) = self.active_sparkline() else { return };
         let g = self.sheet().sparklines[gi].clone();
         self.group(ui, "Sparkline", |app, ui| {
-            let job = icon_job("✎", false, "Edit\nData", 20.0, true, theme::text());
-            let r = big_btn(ui, job, 50.0, false).on_hover_text("Edit Data\nEdit the location and data source of the sparklines.");
+            let r = big_button(ui, "Edit\nData", "Edit Data\nEdit the location and data source of the sparklines.", |p, r| {
+                paint_kind(p, r, SparkKind::Line);
+                p.line_segment([r.right_bottom() + Vec2::new(-3.0, -1.0), r.right_bottom() + Vec2::new(-9.0, -7.0)], Stroke::new(2.0, theme::accent()));
+            });
             egui::Popup::menu(&r).show(|ui| {
                 ui.set_min_width(230.0);
                 if ui.button("Edit Group Location & Data...").clicked() {
@@ -374,9 +385,12 @@ impl App {
             });
         });
         self.group(ui, "Type", |app, ui| {
-            for (kind, glyph) in [(SparkKind::Line, "📈"), (SparkKind::Column, "▮▯▮"), (SparkKind::WinLoss, "▀▄▀")] {
-                let job = icon_job(glyph, false, kind.label(), 16.0, true, theme::text());
-                if big_btn(ui, job, 48.0, g.kind == kind).clicked() {
+            for kind in [SparkKind::Line, SparkKind::Column, SparkKind::WinLoss] {
+                let r = big_button(ui, kind.label(), &format!("Change the sparkline group to a {} sparkline.", kind.label()), |p, r| paint_kind(p, r, kind));
+                if g.kind == kind {
+                    ui.painter().rect_stroke(r.rect, 3.0, Stroke::new(1.0, theme::accent()), egui::StrokeKind::Inside);
+                }
+                if r.clicked() {
                     app.edit_group(|x| x.kind = kind);
                 }
             }
@@ -453,8 +467,11 @@ impl App {
             });
         });
         self.group(ui, "Group", |app, ui| {
-            let job = icon_job("⊥", false, "Axis", 18.0, true, theme::text());
-            let r = big_btn(ui, job, 44.0, false).on_hover_text("Axis\nChange the scaling and visibility of the sparkline axes.");
+            let r = big_button(ui, "Axis", "Axis\nChange the scaling and visibility of the sparkline axes.", |p, r| {
+                let st = Stroke::new(1.5, theme::text());
+                p.line_segment([r.left_bottom() + Vec2::new(3.0, -3.0), r.right_bottom() + Vec2::new(-3.0, -3.0)], st);
+                p.line_segment([r.left_bottom() + Vec2::new(3.0, -3.0), r.left_top() + Vec2::new(3.0, 3.0)], st);
+            });
             egui::Popup::menu(&r).show(|ui| {
                 ui.set_min_width(260.0);
                 ui.label(RichText::new("Horizontal Axis Options").strong());
@@ -500,7 +517,7 @@ impl App {
                 if ui.button("⊟ Ungroup").on_hover_text("Ungroup the selected sparklines.").clicked() {
                     app.ungroup_sparklines();
                 }
-                ui.menu_button("✖ Clear", |ui| {
+                ui.menu_button("Clear", |ui| {
                     if ui.button("Clear Selected Sparklines").clicked() {
                         app.clear_sparklines(false);
                         ui.close();

@@ -829,7 +829,7 @@ pub(super) fn subtype_tile(ui: &mut egui::Ui, st: &Subtype, selected: bool) -> e
     resp.on_hover_text(st.name)
 }
 
-fn big_button(ui: &mut egui::Ui, label: &str, tip: &str, icon: impl FnOnce(&Painter, Rect)) -> egui::Response {
+pub(super) fn big_button(ui: &mut egui::Ui, label: &str, tip: &str, icon: impl FnOnce(&Painter, Rect)) -> egui::Response {
     let font = theme::ui_font(12.0);
     let w = label.lines().map(|l| ui.painter().layout_no_wrap(l.to_string(), font.clone(), theme::text()).size().x).fold(0.0, f32::max);
     let (rect, resp) = ui.allocate_exact_size(Vec2::new((w + 10.0).max(48.0), BTN_H), Sense::click());

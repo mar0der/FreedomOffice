@@ -2,7 +2,7 @@
 //! analysis tools. Reference boxes work like Excel's: while one has been focused last,
 //! selecting cells on the sheet types their address into it.
 
-use eframe::egui::{self, Align2, RichText, Stroke, Vec2};
+use eframe::egui::{self, Align2, Rect, RichText, Stroke, Vec2};
 
 use super::dialogs::Dialog;
 use super::theme;
@@ -87,6 +87,22 @@ pub(super) fn buttons(ui: &mut egui::Ui, labels: &[&str]) -> Option<usize> {
         }
     });
     out
+}
+
+/// Ribbon icon of the analysis tools: a small grid with a symbol on the highlighted cell.
+fn paint_tool(p: &egui::Painter, r: Rect, sym: &str) {
+    let g = r.shrink2(Vec2::new(r.width() * 0.18, r.height() * 0.18));
+    let line = Stroke::new(1.0, theme::icon_line());
+    p.rect_stroke(g, 1.0, line, egui::StrokeKind::Inside);
+    for k in 1..3 {
+        let x = g.left() + g.width() * k as f32 / 3.0;
+        let y = g.top() + g.height() * k as f32 / 3.0;
+        p.line_segment([egui::pos2(x, g.top()), egui::pos2(x, g.bottom())], line);
+        p.line_segment([egui::pos2(g.left(), y), egui::pos2(g.right(), y)], line);
+    }
+    let cell = Rect::from_min_size(egui::pos2(g.left() + g.width() * 2.0 / 3.0, g.top() + g.height() * 2.0 / 3.0), g.size() / 3.0);
+    p.rect_filled(cell.shrink(0.5), 0.0, theme::accent());
+    p.text(r.left_top() + Vec2::new(r.width() * 0.32, r.height() * 0.3), Align2::CENTER_CENTER, sym, theme::ui_bold(14.0), theme::accent_dark());
 }
 
 fn keys(ui: &egui::Ui) -> (bool, bool) {
@@ -201,8 +217,7 @@ impl App {
     /// Data > Forecast group: What-If Analysis.
     pub(super) fn forecast_group(&mut self, ui: &mut egui::Ui) {
         self.group(ui, "Forecast", |app, ui| {
-            let job = super::ribbon::icon_job("❓", false, "What-If\nAnalysis", 20.0, true, theme::text());
-            let r = super::ribbon::big_btn(ui, job, 60.0, false).on_hover_text("What-If Analysis\nTry out various values for the formulas in the sheet.");
+            let r = super::chart_view::big_button(ui, "What-If\nAnalysis", "What-If Analysis\nTry out various values for the formulas in the sheet.", |p, r| paint_tool(p, r, "?"));
             egui::Popup::menu(&r).show(|ui| {
                 ui.set_min_width(180.0);
                 if ui.button("Scenario Manager...").clicked() {
@@ -224,8 +239,7 @@ impl App {
     /// Data > Analyze group: Solver.
     pub(super) fn analyze_group(&mut self, ui: &mut egui::Ui) {
         self.group(ui, "Analyze", |app, ui| {
-            let job = super::ribbon::icon_job("?→", false, "Solver", 18.0, true, theme::text());
-            if super::ribbon::big_btn(ui, job, 50.0, false).on_hover_text("Solver\nFind the best values for the variable cells of a model.").clicked() {
+            if super::chart_view::big_button(ui, "Solver", "Solver\nFind the best values for the variable cells of a model.", |p, r| paint_tool(p, r, "=")).clicked() {
                 app.open_solver();
             }
         });
