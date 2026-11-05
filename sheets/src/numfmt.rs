@@ -310,7 +310,15 @@ pub fn parse_input(text: &str) -> (Value, Option<&'static str>) {
         return (Value::Error(e), None);
     }
     if let Some(n) = parse_number(t) {
-        return (Value::Number(n), if t.contains(',') { Some("#,##0.##") } else { None });
+        // Thousands separators imply a comma format: two decimals when decimals were typed.
+        let fmt = if !t.contains(',') {
+            None
+        } else if t.contains('.') {
+            Some("#,##0.00")
+        } else {
+            Some("#,##0")
+        };
+        return (Value::Number(n), fmt);
     }
     if let Some(p) = t.strip_suffix('%') {
         if let Some(n) = parse_number(p) {
@@ -934,5 +942,14 @@ mod tests {
         assert_eq!(parse_input("'123").0, Value::Text("123".into()));
         assert_eq!(parse_input("hello").0, Value::Text("hello".into()));
         assert_eq!(parse_input("1,2").0, Value::Text("1,2".into()));
+    }
+
+    #[test]
+    fn thousands_input_implies_comma_format() {
+        assert_eq!(parse_input("1,000"), (Value::Number(1000.0), Some("#,##0")));
+        assert_eq!(parse_input("1,000.5"), (Value::Number(1000.5), Some("#,##0.00")));
+        assert_eq!(parse_input("1000").1, None);
+        assert_eq!(format_value(&Value::Number(1000.0), parse_input("1,000").1.unwrap()).text, "1,000");
+        assert_eq!(format_value(&Value::Number(1000.5), parse_input("1,000.5").1.unwrap()).text, "1,000.50");
     }
 }
