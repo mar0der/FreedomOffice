@@ -388,16 +388,16 @@ impl App {
         let sel = self.tab == RibbonTab::ChartDesign && !self.ribbon_collapsed;
         let font = if sel { theme::ui_bold(13.0) } else { theme::ui_font(13.0) };
         let name = "Chart Design";
-        let g = ui.painter().layout_no_wrap(name.to_string(), font.clone(), theme::ACCENT);
+        let g = ui.painter().layout_no_wrap(name.to_string(), font.clone(), theme::accent());
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(g.size().x + 20.0, 28.0), Sense::click());
         if resp.hovered() && !sel {
-            ui.painter().rect_filled(rect.shrink(2.0), 3.0, theme::HOVER);
+            ui.painter().rect_filled(rect.shrink(2.0), 3.0, theme::hover());
         }
-        ui.painter().text(rect.center(), Align2::CENTER_CENTER, name, font, theme::ACCENT);
+        ui.painter().text(rect.center(), Align2::CENTER_CENTER, name, font, theme::accent());
         if sel {
             ui.painter().line_segment(
                 [Pos2::new(rect.left() + 8.0, rect.bottom() - 2.0), Pos2::new(rect.right() - 8.0, rect.bottom() - 2.0)],
-                Stroke::new(3.0, theme::ACCENT),
+                Stroke::new(3.0, theme::accent()),
             );
         }
         if resp.clicked() {
@@ -490,7 +490,7 @@ impl App {
 fn toggle(ui: &mut egui::Ui, label: &str, on: bool) -> egui::Response {
     let mut b = egui::Button::new(egui::RichText::new(label).size(12.5)).min_size(Vec2::new(0.0, 24.0));
     if on {
-        b = b.fill(theme::CHECKED);
+        b = b.fill(theme::checked());
     }
     ui.add(b)
 }
@@ -499,16 +499,16 @@ fn big_button(ui: &mut egui::Ui, label: &str, tip: &str, icon: impl FnOnce(&Pain
     let font = theme::ui_font(12.0);
     let w = label
         .lines()
-        .map(|l| ui.painter().layout_no_wrap(l.to_string(), font.clone(), theme::TEXT).size().x)
+        .map(|l| ui.painter().layout_no_wrap(l.to_string(), font.clone(), theme::text()).size().x)
         .fold(0.0, f32::max);
     let (rect, resp) = ui.allocate_exact_size(Vec2::new((w + 10.0).max(48.0), BTN_H), Sense::click());
     if resp.hovered() {
-        ui.painter().rect_filled(rect, 3.0, theme::HOVER);
+        ui.painter().rect_filled(rect, 3.0, theme::hover());
     }
     icon(ui.painter(), Rect::from_center_size(Pos2::new(rect.center().x, rect.top() + 19.0), Vec2::splat(26.0)));
     let mut y = rect.top() + 36.0;
     for l in label.lines() {
-        ui.painter().text(Pos2::new(rect.center().x, y), Align2::CENTER_TOP, l, font.clone(), theme::TEXT);
+        ui.painter().text(Pos2::new(rect.center().x, y), Align2::CENTER_TOP, l, font.clone(), theme::text());
         y += 14.0;
     }
     resp.on_hover_text(tip)
@@ -579,7 +579,7 @@ fn paint_kind_icon(p: &Painter, r: Rect, kind: ChartKind) {
 }
 
 fn paint_switch_icon(p: &Painter, r: Rect) {
-    let s = Stroke::new(2.0, theme::ACCENT);
+    let s = Stroke::new(2.0, theme::GRID_ACCENT);
     let c = r.center();
     let d = r.width() * 0.35;
     p.line_segment([c + Vec2::new(-d, -d * 0.5), c + Vec2::new(d, -d * 0.5)], s);

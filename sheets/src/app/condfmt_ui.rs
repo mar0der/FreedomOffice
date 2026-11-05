@@ -333,7 +333,7 @@ fn buttons(ui: &mut egui::Ui, labels: &[&str]) -> Option<usize> {
             for (i, l) in labels.iter().enumerate().rev() {
                 let mut b = egui::Button::new(*l).min_size(Vec2::new(76.0, 24.0));
                 if i == 0 {
-                    b = b.fill(theme::ACCENT_LIGHT);
+                    b = b.fill(theme::accent_light());
                 }
                 if ui.add(b).clicked() {
                     out = Some(i);
@@ -353,7 +353,7 @@ fn format_preview(ui: &mut egui::Ui, f: &DiffFormat, size: Vec2) {
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
     let p = ui.painter();
     p.rect_filled(rect, 0.0, f.fill.map(rgb).unwrap_or(Color32::WHITE));
-    p.rect_stroke(rect, 0.0, Stroke::new(1.0, f.border.map(rgb).unwrap_or(theme::BORDER)), StrokeKind::Inside);
+    p.rect_stroke(rect, 0.0, Stroke::new(1.0, f.border.map(rgb).unwrap_or(theme::border())), StrokeKind::Inside);
     let color = f.color.map(rgb).unwrap_or(Color32::BLACK);
     let line = |on: bool| if on { Stroke::new(1.0, color) } else { Stroke::NONE };
     let text = if f.is_empty() { "No Format Set" } else { "AaBbCcYyZz" };
@@ -441,7 +441,7 @@ fn color_button(ui: &mut egui::Ui, label: &str, c: &mut u32) {
         }
         let (r, _) = ui.allocate_exact_size(Vec2::new(36.0, 16.0), Sense::hover());
         ui.painter().rect_filled(r, 2.0, rgb(*c));
-        ui.painter().rect_stroke(r, 2.0, Stroke::new(1.0, theme::BORDER), StrokeKind::Inside);
+        ui.painter().rect_stroke(r, 2.0, Stroke::new(1.0, theme::border()), StrokeKind::Inside);
         ui.menu_button("▾", |ui| {
             if let Some(Some(n)) = color_grid(ui, false) {
                 *c = n;
@@ -462,7 +462,7 @@ fn opt_color_button(ui: &mut egui::Ui, id: &str, c: &mut Option<u32>) {
                 ui.painter().line_segment([r.left_bottom(), r.right_top()], Stroke::new(1.0, Color32::from_gray(150)));
             }
         }
-        ui.painter().rect_stroke(r, 2.0, Stroke::new(1.0, theme::BORDER), StrokeKind::Inside);
+        ui.painter().rect_stroke(r, 2.0, Stroke::new(1.0, theme::border()), StrokeKind::Inside);
         ui.push_id(id, |ui| {
             ui.menu_button("▾", |ui| {
                 if let Some(n) = color_grid(ui, true) {
@@ -527,7 +527,7 @@ fn format_window(ctx: &egui::Context, f: &mut DiffFormat) -> Option<bool> {
                     if ui.add(egui::Button::new("Cancel").min_size(Vec2::new(76.0, 24.0))).clicked() {
                         out = Some(false);
                     }
-                    if ui.add(egui::Button::new("OK").min_size(Vec2::new(76.0, 24.0)).fill(theme::ACCENT_LIGHT)).clicked() {
+                    if ui.add(egui::Button::new("OK").min_size(Vec2::new(76.0, 24.0)).fill(theme::accent_light())).clicked() {
                         out = Some(true);
                     }
                 });
@@ -727,12 +727,12 @@ impl App {
         });
         ui.menu_button("Data Bars", |ui| {
             for (title, gradient) in [("Gradient Fill", true), ("Solid Fill", false)] {
-                ui.label(RichText::new(title).size(11.0).color(theme::TEXT_DIM));
+                ui.label(RichText::new(title).size(11.0).color(theme::text_dim()));
                 ui.horizontal(|ui| {
                     for (name, color) in BAR_COLORS {
                         let (r, resp) = ui.allocate_exact_size(Vec2::splat(34.0), Sense::click());
                         if resp.hovered() {
-                            ui.painter().rect_filled(r, 2.0, theme::HOVER);
+                            ui.painter().rect_filled(r, 2.0, theme::hover());
                         }
                         bar_preview(ui.painter(), r.shrink(4.0), color, gradient);
                         let tip = format!("{name} Data Bar ({})", if gradient { "gradient" } else { "solid" });
@@ -757,7 +757,7 @@ impl App {
                     for (name, cols) in row {
                         let (r, resp) = ui.allocate_exact_size(Vec2::splat(34.0), Sense::click());
                         if resp.hovered() {
-                            ui.painter().rect_filled(r, 2.0, theme::HOVER);
+                            ui.painter().rect_filled(r, 2.0, theme::hover());
                         }
                         let inner = r.shrink(5.0);
                         let h = inner.height() / 3.0;
@@ -881,7 +881,7 @@ impl App {
                 });
             });
             if matches!(q.kind, Quick::Greater | Quick::Less | Quick::Between | Quick::Equal) {
-                ui.label(RichText::new("Type a number, text, or a reference such as =$A$1.").size(11.0).color(theme::TEXT_DIM));
+                ui.label(RichText::new("Type a number, text, or a reference such as =$A$1.").size(11.0).color(theme::text_dim()));
             }
             ui.add_space(4.0);
             let f = presets.get(q.preset).map(|p| p.1.clone()).unwrap_or_else(|| q.custom.clone());
@@ -1003,7 +1003,7 @@ impl App {
                 }
             });
             ui.add_space(4.0);
-            egui::Frame::new().stroke(Stroke::new(1.0, theme::BORDER)).inner_margin(egui::Margin::same(4)).show(ui, |ui| {
+            egui::Frame::new().stroke(Stroke::new(1.0, theme::border())).inner_margin(egui::Margin::same(4)).show(ui, |ui| {
                 ui.set_min_height(200.0);
                 ui.set_width(620.0);
                 egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
@@ -1129,7 +1129,7 @@ fn rule_editor_ui(ctx: &egui::Context, e: &mut RuleEditor) -> Option<bool> {
         .show(ctx, |ui| {
             ui.set_min_width(460.0);
             ui.label("Select a Rule Type:");
-            egui::Frame::new().stroke(Stroke::new(1.0, theme::BORDER)).inner_margin(egui::Margin::same(3)).show(ui, |ui| {
+            egui::Frame::new().stroke(Stroke::new(1.0, theme::border())).inner_margin(egui::Margin::same(3)).show(ui, |ui| {
                 ui.set_width(450.0);
                 for (i, t) in RULE_TYPES.iter().enumerate() {
                     if ui.selectable_label(e.ty == i, format!("► {t}")).clicked() {
@@ -1140,7 +1140,7 @@ fn rule_editor_ui(ctx: &egui::Context, e: &mut RuleEditor) -> Option<bool> {
             });
             ui.add_space(6.0);
             ui.label("Edit the Rule Description:");
-            egui::Frame::new().fill(Color32::from_gray(248)).stroke(Stroke::new(1.0, theme::BORDER)).inner_margin(egui::Margin::same(8)).show(ui, |ui| {
+            egui::Frame::new().fill(Color32::from_gray(248)).stroke(Stroke::new(1.0, theme::border())).inner_margin(egui::Margin::same(8)).show(ui, |ui| {
                 ui.set_width(440.0);
                 rule_description(ui, e);
             });
@@ -1302,7 +1302,7 @@ fn rule_description(ui: &mut egui::Ui, e: &mut RuleEditor) {
             ui.label(RichText::new("Format values where this formula is true:").strong());
             ui.add(egui::TextEdit::singleline(&mut e.formula).desired_width(420.0).hint_text("=$A1>100"));
             let base = e.ranges.first().map(|r| crate::model::cell_name(r.r1, r.c1)).unwrap_or_else(|| "A1".into());
-            ui.label(RichText::new(format!("Relative references are relative to {base}, the top-left cell of {}.", sqref(&e.ranges))).size(11.0).color(theme::TEXT_DIM));
+            ui.label(RichText::new(format!("Relative references are relative to {base}, the top-left cell of {}.", sqref(&e.ranges))).size(11.0).color(theme::text_dim()));
         }
     }
     ui.add_space(6.0);
@@ -1320,13 +1320,13 @@ pub fn ribbon_button(ui: &mut egui::Ui, size: Vec2, text: &str) -> egui::Respons
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     let p = ui.painter();
     if resp.is_pointer_button_down_on() {
-        p.rect_filled(rect, 3.0, theme::PRESSED);
+        p.rect_filled(rect, 3.0, theme::pressed());
     } else if resp.hovered() {
-        p.rect_filled(rect, 3.0, theme::HOVER);
+        p.rect_filled(rect, 3.0, theme::hover());
     }
     for (i, line) in text.lines().enumerate() {
         let pos = Pos2::new(rect.center().x, rect.top() + 38.0 + i as f32 * 15.0);
-        p.text(pos, Align2::CENTER_CENTER, line, theme::ui_font(12.0), theme::TEXT);
+        p.text(pos, Align2::CENTER_CENTER, line, theme::ui_font(12.0), theme::text());
     }
     resp
 }

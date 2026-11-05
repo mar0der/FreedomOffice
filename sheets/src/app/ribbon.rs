@@ -33,14 +33,14 @@ pub fn color_grid(ui: &mut egui::Ui, allow_none: bool) -> Option<Option<u32>> {
     if allow_none && ui.add(egui::Button::new("No Color / Automatic").frame(false)).clicked() {
         out = Some(None);
     }
-    ui.label(RichText::new("Theme Colors").size(11.0).color(theme::TEXT_DIM));
+    ui.label(RichText::new("Theme Colors").size(11.0).color(theme::text_dim()));
     let sw = |ui: &mut egui::Ui, c: u32| -> bool {
         let (r, resp) = ui.allocate_exact_size(Vec2::splat(17.0), Sense::click());
         ui.painter().rect_filled(r.shrink(1.0), 0.0, rgb(c));
         ui.painter().rect_stroke(
             r.shrink(1.0),
             0.0,
-            Stroke::new(1.0, if resp.hovered() { theme::ACCENT } else { Color32::from_gray(200) }),
+            Stroke::new(1.0, if resp.hovered() { theme::accent() } else { Color32::from_gray(200) }),
             egui::StrokeKind::Inside,
         );
         resp.on_hover_text(format!("#{c:06X}")).clicked()
@@ -66,7 +66,7 @@ pub fn color_grid(ui: &mut egui::Ui, allow_none: bool) -> Option<Option<u32>> {
         });
     }
     ui.add_space(4.0);
-    ui.label(RichText::new("Standard Colors").size(11.0).color(theme::TEXT_DIM));
+    ui.label(RichText::new("Standard Colors").size(11.0).color(theme::text_dim()));
     ui.horizontal(|ui| {
         for c in theme::PALETTE_STANDARD {
             if sw(ui, c) {
@@ -91,7 +91,7 @@ fn icon_job(icon: &str, is_icon: bool, label: &str, size: f32, vertical: bool, c
         job.append(
             &format!("{sep}{label}"),
             0.0,
-            TextFormat { font_id: theme::ui_font(12.0), color: theme::TEXT, valign: Align::Center, ..Default::default() },
+            TextFormat { font_id: theme::ui_font(12.0), color: theme::text(), valign: Align::Center, ..Default::default() },
         );
     }
     if vertical {
@@ -109,14 +109,14 @@ pub fn big_btn(ui: &mut egui::Ui, job: LayoutJob, min_w: f32, checked: bool) -> 
     if !ui.is_enabled() {
         // nothing
     } else if resp.is_pointer_button_down_on() {
-        p.rect(rect, 3.0, theme::PRESSED, Stroke::new(1.0, Color32::from_gray(176)), egui::StrokeKind::Inside);
+        p.rect(rect, 3.0, theme::pressed(), Stroke::new(1.0, theme::button_edge()), egui::StrokeKind::Inside);
     } else if checked {
-        p.rect(rect, 3.0, theme::CHECKED, Stroke::NONE, egui::StrokeKind::Inside);
+        p.rect(rect, 3.0, theme::checked(), Stroke::NONE, egui::StrokeKind::Inside);
     } else if resp.hovered() {
-        p.rect(rect, 3.0, theme::HOVER, Stroke::new(1.0, Color32::from_gray(200)), egui::StrokeKind::Inside);
+        p.rect(rect, 3.0, theme::hover(), Stroke::new(1.0, theme::button_edge()), egui::StrokeKind::Inside);
     }
     let pos = Pos2::new(rect.center().x - galley.rect.center().x, rect.top() + 6.0 - galley.rect.top());
-    p.galley(pos, galley, theme::TEXT);
+    p.galley(pos, galley, theme::text());
     resp
 }
 
@@ -130,7 +130,7 @@ fn big_menu(ui: &mut egui::Ui, job: LayoutJob, add: impl FnOnce(&mut egui::Ui)) 
 impl App {
     fn ib(&self, code: char, fallback: &'static str, label: &str, size: f32, vertical: bool) -> LayoutJob {
         let (g, is_icon) = self.icon(code, fallback);
-        icon_job(&g, is_icon, label, size, vertical, theme::TEXT)
+        icon_job(&g, is_icon, label, size, vertical, theme::text())
     }
 
     fn big(&self, ui: &mut egui::Ui, code: char, fallback: &'static str, label: &str, tip: &str) -> egui::Response {
@@ -142,7 +142,7 @@ impl App {
         let job = self.ib(code, fallback, label, 14.0, false);
         let mut b = egui::Button::new(job).min_size(Vec2::new(24.0, 22.0));
         if checked {
-            b = b.fill(theme::CHECKED);
+            b = b.fill(theme::checked());
         }
         ui.add(b).on_hover_text(tip)
     }
@@ -150,13 +150,13 @@ impl App {
     fn text_btn(ui: &mut egui::Ui, text: &str, tip: &str, checked: bool, w: f32) -> egui::Response {
         let mut b = egui::Button::new(RichText::new(text).size(13.0)).min_size(Vec2::new(w, 22.0));
         if checked {
-            b = b.fill(theme::CHECKED);
+            b = b.fill(theme::checked());
         }
         ui.add(b).on_hover_text(tip)
     }
 
     pub(super) fn group(&mut self, ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut Self, &mut egui::Ui)) {
-        let label_w = ui.painter().layout_no_wrap(label.to_string(), theme::ui_font(11.0), theme::TEXT_DIM).size().x;
+        let label_w = ui.painter().layout_no_wrap(label.to_string(), theme::ui_font(11.0), theme::text_dim()).size().x;
         let resp = ui.vertical(|ui| {
             ui.set_height(GROUP_H + 18.0);
             ui.set_min_width(label_w + 10.0);
@@ -167,10 +167,10 @@ impl App {
             });
         });
         let r = resp.response.rect;
-        ui.painter().text(Pos2::new(r.center().x, r.bottom() - 8.0), Align2::CENTER_CENTER, label, theme::ui_font(11.0), theme::TEXT_DIM);
+        ui.painter().text(Pos2::new(r.center().x, r.bottom() - 8.0), Align2::CENTER_CENTER, label, theme::ui_font(11.5), theme::text());
         ui.add_space(6.0);
         let x = ui.cursor().left();
-        ui.painter().line_segment([Pos2::new(x, r.top() + 6.0), Pos2::new(x, r.bottom() - 4.0)], Stroke::new(1.0, theme::BORDER));
+        ui.painter().line_segment([Pos2::new(x, r.top() + 6.0), Pos2::new(x, r.bottom() - 4.0)], Stroke::new(1.0, theme::border()));
         ui.add_space(7.0);
     }
 
@@ -233,8 +233,13 @@ impl App {
             }
             ui.add_space(10.0);
             // File tab
-            let file = egui::Button::new(RichText::new("File").size(13.0).color(Color32::WHITE)).fill(theme::ACCENT).min_size(Vec2::new(52.0, 26.0));
-            let file_resp = ui.add(file);
+            // File is a plain tab that opens the backstage, as in current desktop Office.
+            let fg = ui.painter().layout_no_wrap("File".to_string(), theme::ui_font(13.0), theme::text());
+            let (frect, file_resp) = ui.allocate_exact_size(Vec2::new(fg.size().x + 20.0, 28.0), Sense::click());
+            if file_resp.hovered() {
+                ui.painter().rect_filled(frect.shrink(2.0), 3.0, theme::hover());
+            }
+            ui.painter().text(frect.center(), Align2::CENTER_CENTER, "File", theme::ui_font(13.0), theme::text());
             self.keytip_badge(ui, file_resp.rect.center_bottom(), "File");
             if file_resp.clicked() {
                 self.commit_edit(false);
@@ -253,17 +258,15 @@ impl App {
             ] {
                 let sel = self.tab == t && !self.ribbon_collapsed;
                 let font = if sel { theme::ui_bold(13.0) } else { theme::ui_font(13.0) };
-                let g = ui.painter().layout_no_wrap(name.to_string(), font.clone(), theme::TEXT);
+                let g = ui.painter().layout_no_wrap(name.to_string(), font.clone(), theme::text());
                 let (rect, resp) = ui.allocate_exact_size(Vec2::new(g.size().x + 20.0, 28.0), Sense::click());
                 if resp.hovered() && !sel {
-                    ui.painter().rect_filled(rect.shrink(2.0), 3.0, theme::HOVER);
+                    ui.painter().rect_filled(rect.shrink(2.0), 3.0, theme::hover());
                 }
-                ui.painter().text(rect.center(), Align2::CENTER_CENTER, name, font, if sel { theme::ACCENT_DARK } else { theme::TEXT });
+                ui.painter().text(rect.center(), Align2::CENTER_CENTER, name, font, theme::text());
                 if sel {
-                    ui.painter().line_segment(
-                        [Pos2::new(rect.left() + 8.0, rect.bottom() - 2.0), Pos2::new(rect.right() - 8.0, rect.bottom() - 2.0)],
-                        Stroke::new(3.0, theme::ACCENT),
-                    );
+                    let y = rect.bottom() - 3.0;
+                    ui.painter().line_segment([Pos2::new(rect.left() + 9.0, y), Pos2::new(rect.right() - 9.0, y)], Stroke::new(3.0, theme::accent()));
                 }
                 self.keytip_badge(ui, rect.center_bottom(), name);
                 if resp.clicked() {
@@ -284,11 +287,11 @@ impl App {
             return;
         }
         let frame = egui::Frame::new()
-            .fill(theme::RIBBON)
-            .stroke(Stroke::new(1.0, theme::BORDER))
-            .corner_radius(6)
-            .inner_margin(egui::Margin { left: 6, right: 6, top: 2, bottom: 0 })
-            .outer_margin(egui::Margin { left: 6, right: 6, top: 0, bottom: 4 });
+            .fill(theme::ribbon())
+            .stroke(if theme::is_dark() { Stroke::NONE } else { Stroke::new(1.0, theme::border()) })
+            .corner_radius(8)
+            .inner_margin(egui::Margin { left: 6, right: 6, top: 4, bottom: 0 })
+            .outer_margin(egui::Margin { left: 6, right: 6, top: 0, bottom: 6 });
         frame.show(ui, |ui| {
             egui::ScrollArea::horizontal().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -548,11 +551,11 @@ impl App {
         });
         self.group(ui, "Styles", |app, ui| {
             app.cf_ribbon_button(ui);
-            let job = icon_job("▦", false, "Format as\nTable", 20.0, true, theme::TEXT);
+            let job = icon_job("▦", false, "Format as\nTable", 20.0, true, theme::text());
             big_menu(ui, job, |ui| {
                 ui.set_min_width(330.0);
                 for (kind, title) in [(0u8, "Light"), (1, "Medium"), (2, "Dark")] {
-                    ui.label(RichText::new(title).size(11.0).color(theme::TEXT_DIM));
+                    ui.label(RichText::new(title).size(11.0).color(theme::text_dim()));
                     ui.horizontal(|ui| {
                         for accent in [0x4472C4u32, 0xED7D31, 0xA5A5A5, 0xFFC000, 0x5B9BD5, 0x70AD47] {
                             let (rect, resp) = ui.allocate_exact_size(Vec2::new(48.0, 34.0), Sense::click());
@@ -574,7 +577,7 @@ impl App {
                             if kind == 0 {
                                 p.line_segment([Pos2::new(rect.left(), rect.top() + rh), Pos2::new(rect.right(), rect.top() + rh)], Stroke::new(1.0, rgb(accent)));
                             }
-                            p.rect_stroke(rect, 0.0, Stroke::new(if resp.hovered() { 2.0 } else { 1.0 }, if resp.hovered() { theme::ACCENT } else { Color32::from_gray(200) }), egui::StrokeKind::Inside);
+                            p.rect_stroke(rect, 0.0, Stroke::new(if resp.hovered() { 2.0 } else { 1.0 }, if resp.hovered() { theme::accent() } else { Color32::from_gray(200) }), egui::StrokeKind::Inside);
                             if resp.clicked() {
                                 app.format_as_table(accent, kind);
                                 ui.close();
@@ -871,13 +874,13 @@ impl App {
         });
         self.group(ui, "Charts", |app, ui| app.chart_insert_buttons(ui));
         self.group(ui, "Functions", |app, ui| {
-            let job = icon_job("fx", false, "Function", 20.0, true, theme::TEXT);
+            let job = icon_job("fx", false, "Function", 20.0, true, theme::text());
             if big_btn(ui, job, 54.0, false).on_hover_text("Insert Function (Shift+F3)").clicked() {
                 app.dialog = Some(Dialog::insert_function());
             }
         });
         self.group(ui, "Links", |app, ui| {
-            let job = icon_job("🔗", false, "Link", 20.0, true, theme::TEXT);
+            let job = icon_job("🔗", false, "Link", 20.0, true, theme::text());
             if big_btn(ui, job, 50.0, false).on_hover_text("Insert Link (Ctrl+K)").clicked() {
                 app.open_link_dialog();
             }
@@ -893,7 +896,7 @@ impl App {
             });
         });
         self.group(ui, "Symbols", |app, ui| {
-            let job = icon_job("Ω", false, "Symbol", 22.0, true, theme::TEXT);
+            let job = icon_job("Ω", false, "Symbol", 22.0, true, theme::text());
             big_menu(ui, job, |ui| {
                 ui.set_min_width(240.0);
                 let syms = "©®™€£¥¢°±×÷≤≥≠≈∞√πΣµΩαβγΔ→←↑↓↔✓✗•…§¶†‰½¼¾²³";
@@ -925,7 +928,7 @@ impl App {
         let metric = crate::page::metric_locale();
         let ps = self.sheet().page.clone();
         self.group(ui, "Page Setup", |app, ui| {
-            let job = icon_job("▭", false, "Margins", 20.0, true, theme::TEXT);
+            let job = icon_job("▭", false, "Margins", 20.0, true, theme::text());
             big_menu(ui, job, |ui| {
                 ui.set_min_width(300.0);
                 for (name, m) in [("Normal", Margins::NORMAL), ("Wide", Margins::WIDE), ("Narrow", Margins::NARROW)] {
@@ -943,7 +946,7 @@ impl App {
                     ui.close();
                 }
             });
-            let job = icon_job("⟲", false, "Orientation", 20.0, true, theme::TEXT);
+            let job = icon_job("⟲", false, "Orientation", 20.0, true, theme::text());
             big_menu(ui, job, |ui| {
                 ui.set_min_width(150.0);
                 if ui.selectable_label(!ps.landscape, "Portrait").clicked() {
@@ -955,7 +958,7 @@ impl App {
                     ui.close();
                 }
             });
-            let job = icon_job("🗋", false, "Size", 20.0, true, theme::TEXT);
+            let job = icon_job("🗋", false, "Size", 20.0, true, theme::text());
             big_menu(ui, job, |ui| {
                 ui.set_min_width(240.0);
                 for p in Paper::ALL {
@@ -970,7 +973,7 @@ impl App {
                     ui.close();
                 }
             });
-            let job = icon_job("▣", false, "Print\nArea", 20.0, true, theme::TEXT);
+            let job = icon_job("▣", false, "Print\nArea", 20.0, true, theme::text());
             big_menu(ui, job, |ui| {
                 ui.set_min_width(170.0);
                 if ui.button("Set Print Area").clicked() {
@@ -982,7 +985,7 @@ impl App {
                     ui.close();
                 }
             });
-            let job = icon_job("⤓", false, "Breaks", 20.0, true, theme::TEXT);
+            let job = icon_job("⤓", false, "Breaks", 20.0, true, theme::text());
             big_menu(ui, job, |ui| {
                 ui.set_min_width(190.0);
                 if ui.button("Insert Page Break").clicked() {
@@ -998,7 +1001,7 @@ impl App {
                     ui.close();
                 }
             });
-            let job = icon_job("☰", false, "Print\nTitles", 20.0, true, theme::TEXT);
+            let job = icon_job("☰", false, "Print\nTitles", 20.0, true, theme::text());
             if big_btn(ui, job, 50.0, false).on_hover_text("Rows and columns to repeat on every printed page").clicked() {
                 app.open_page_setup(3);
             }
@@ -1080,11 +1083,11 @@ impl App {
 
     fn formulas_tab(&mut self, ui: &mut egui::Ui) {
         self.group(ui, "Function Library", |app, ui| {
-            let job = icon_job("fx", false, "Insert\nFunction", 20.0, true, theme::TEXT);
+            let job = icon_job("fx", false, "Insert\nFunction", 20.0, true, theme::text());
             if big_btn(ui, job, 54.0, false).clicked() {
                 app.dialog = Some(Dialog::insert_function());
             }
-            let job = icon_job("Σ", false, "AutoSum", 22.0, true, theme::TEXT);
+            let job = icon_job("Σ", false, "AutoSum", 22.0, true, theme::text());
             big_menu(ui, job, |ui| app.autosum_menu(ui));
             for (cat, label) in [
                 ("Financial", "Financial"),
@@ -1095,7 +1098,7 @@ impl App {
                 ("Math & Trig", "Math &\nTrig"),
                 ("Statistical", "More\nFunctions"),
             ] {
-                let job = icon_job("▤", false, label, 18.0, true, theme::TEXT);
+                let job = icon_job("▤", false, label, 18.0, true, theme::text());
                 big_menu(ui, job, |ui| {
                     egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
                         ui.set_min_width(170.0);
@@ -1116,7 +1119,7 @@ impl App {
             }
         });
         self.group(ui, "Defined Names", |app, ui| {
-            let job = icon_job("🏷", false, "Name\nManager", 18.0, true, theme::TEXT);
+            let job = icon_job("🏷", false, "Name\nManager", 18.0, true, theme::text());
             if big_btn(ui, job, 60.0, false).on_hover_text("Name Manager (Ctrl+F3)").clicked() {
                 app.dialog = Some(Dialog::NameManager { name: String::new(), refers: app.sel_abs_ref(), error: None });
             }
@@ -1128,7 +1131,7 @@ impl App {
         });
         self.group(ui, "Calculation", |app, ui| {
             let (c, ci) = app.icon(ic::CALC, "🖩");
-            let job = icon_job(&c, ci, "Calculate\nNow", 20.0, true, theme::TEXT);
+            let job = icon_job(&c, ci, "Calculate\nNow", 20.0, true, theme::text());
             if big_btn(ui, job, 60.0, false).on_hover_text("Calculate Now (F9)").clicked() {
                 app.recalc_now();
             }
@@ -1168,11 +1171,11 @@ impl App {
             });
         });
         self.group(ui, "Data Tools", |app, ui| {
-            let job = icon_job("⫼", false, "Text to\nColumns", 20.0, true, theme::TEXT);
+            let job = icon_job("⫼", false, "Text to\nColumns", 20.0, true, theme::text());
             if big_btn(ui, job, 60.0, false).clicked() {
                 app.dialog = Some(Dialog::TextToColumns { delim: 0, other: String::new() });
             }
-            let job = icon_job("⧉", false, "Remove\nDuplicates", 20.0, true, theme::TEXT);
+            let job = icon_job("⧉", false, "Remove\nDuplicates", 20.0, true, theme::text());
             if big_btn(ui, job, 66.0, false).clicked() {
                 app.open_remove_duplicates();
             }
@@ -1183,11 +1186,11 @@ impl App {
 
     fn outline_group(&mut self, ui: &mut egui::Ui) {
         self.group(ui, "Outline", |app, ui| {
-            let job = icon_job("⊞", false, "Group", 20.0, true, theme::TEXT);
+            let job = icon_job("⊞", false, "Group", 20.0, true, theme::text());
             if big_btn(ui, job, 50.0, false).on_hover_text("Group rows or columns (Alt+Shift+Right)").clicked() {
                 app.outline_group_cmd(false);
             }
-            let job = icon_job("⊟", false, "Ungroup", 20.0, true, theme::TEXT);
+            let job = icon_job("⊟", false, "Ungroup", 20.0, true, theme::text());
             if big_btn(ui, job, 54.0, false).on_hover_text("Ungroup (Alt+Shift+Left)").clicked() {
                 app.outline_group_cmd(true);
             }
@@ -1198,7 +1201,7 @@ impl App {
         self.group(ui, "Notes", |app, ui| {
             let (r, c) = app.active();
             let has = app.sheet().notes.contains_key(&(r, c));
-            let job = icon_job("🗒", false, if has { "Edit\nNote" } else { "New\nNote" }, 20.0, true, theme::TEXT);
+            let job = icon_job("🗒", false, if has { "Edit\nNote" } else { "New\nNote" }, 20.0, true, theme::text());
             if big_btn(ui, job, 54.0, false).on_hover_text("Shift+F2").clicked() {
                 app.edit_note();
             }
@@ -1213,7 +1216,7 @@ impl App {
             });
         });
         self.group(ui, "Proofing", |app, ui| {
-            let job = icon_job("📊", false, "Workbook\nStatistics", 20.0, true, theme::TEXT);
+            let job = icon_job("📊", false, "Workbook\nStatistics", 20.0, true, theme::text());
             if big_btn(ui, job, 66.0, false).clicked() {
                 app.dialog = Some(Dialog::Stats);
             }
@@ -1236,11 +1239,11 @@ impl App {
             if app.big(ui, ic::ZOOM, "🔍", "Zoom", "Zoom").clicked() {
                 app.dialog = Some(Dialog::Zoom { custom: format!("{}", (app.zoom * 100.0).round()) });
             }
-            let job = icon_job("100", false, "100%", 16.0, true, theme::TEXT);
+            let job = icon_job("100", false, "100%", 16.0, true, theme::text());
             if big_btn(ui, job, 50.0, false).clicked() {
                 app.zoom = 1.0;
             }
-            let job = icon_job("⛶", false, "Zoom to\nSelection", 20.0, true, theme::TEXT);
+            let job = icon_job("⛶", false, "Zoom to\nSelection", 20.0, true, theme::text());
             if big_btn(ui, job, 62.0, false).clicked() {
                 app.zoom_to_selection();
             }
@@ -1271,7 +1274,7 @@ impl App {
             if app.big(ui, ic::INFO, "ℹ", "About", "About FreedomOffice Sheets").clicked() {
                 app.backstage = Some(Backstage::About);
             }
-            let job = icon_job("⌨", false, "Keyboard\nShortcuts", 20.0, true, theme::TEXT);
+            let job = icon_job("⌨", false, "Keyboard\nShortcuts", 20.0, true, theme::text());
             if big_btn(ui, job, 66.0, false).clicked() {
                 app.dialog = Some(Dialog::Shortcuts);
             }

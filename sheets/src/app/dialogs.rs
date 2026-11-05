@@ -125,7 +125,7 @@ fn ok_cancel(ui: &mut egui::Ui) -> (bool, bool) {
         if ui.add(egui::Button::new("Cancel").min_size(Vec2::new(76.0, 24.0))).clicked() {
             cancel = true;
         }
-        if ui.add(egui::Button::new("OK").min_size(Vec2::new(76.0, 24.0)).fill(theme::ACCENT_LIGHT)).clicked() {
+        if ui.add(egui::Button::new("OK").min_size(Vec2::new(76.0, 24.0)).fill(theme::accent_light())).clicked() {
             ok = true;
         }
     });
@@ -216,7 +216,7 @@ impl App {
                     ui.label(RichText::new(format!("Want to save your changes to '{}'?", self.wb.file_name())).size(15.0));
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
-                        if ui.add(egui::Button::new("Save").min_size(Vec2::new(90.0, 26.0)).fill(theme::ACCENT_LIGHT)).clicked() {
+                        if ui.add(egui::Button::new("Save").min_size(Vec2::new(90.0, 26.0)).fill(theme::accent_light())).clicked() {
                             keep = false;
                             if self.save() {
                                 if let Some(p) = self.pending.take() {
@@ -548,7 +548,7 @@ impl App {
                         .collect();
                     ui.label("Select a function:");
                     let mut accept = false;
-                    egui::Frame::new().stroke(egui::Stroke::new(1.0, theme::BORDER)).show(ui, |ui| {
+                    egui::Frame::new().stroke(egui::Stroke::new(1.0, theme::border())).show(ui, |ui| {
                         egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
                             ui.set_width(410.0);
                             for n in &list {
@@ -634,7 +634,7 @@ impl App {
                 let (r, c) = (*r, *c);
                 let yellow = Color32::from_rgb(0xFF, 0xFF, 0xE1);
                 win(&format!("Note - {}", crate::model::cell_name(r, c))).show(ctx, |ui| {
-                    egui::Frame::new().fill(yellow).stroke(egui::Stroke::new(1.0, theme::BORDER)).show(ui, |ui| {
+                    egui::Frame::new().fill(yellow).stroke(egui::Stroke::new(1.0, theme::border())).show(ui, |ui| {
                         let te = ui.add(egui::TextEdit::multiline(text).desired_width(300.0).desired_rows(6).frame(false).background_color(yellow));
                         if *focus {
                             te.request_focus();
@@ -643,7 +643,7 @@ impl App {
                     });
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
-                        if ui.add(egui::Button::new("OK").min_size(Vec2::new(76.0, 24.0)).fill(theme::ACCENT_LIGHT)).clicked() {
+                        if ui.add(egui::Button::new("OK").min_size(Vec2::new(76.0, 24.0)).fill(theme::accent_light())).clicked() {
                             let t = text.clone();
                             self.set_note(r, c, Some(t));
                             keep = false;
@@ -676,10 +676,10 @@ impl App {
                         }
                         ui.end_row();
                     });
-                    ui.label(RichText::new("Web address, e-mail address, or a place in this document (e.g. Sheet2!B5).").size(11.0).color(theme::TEXT_DIM));
+                    ui.label(RichText::new("Web address, e-mail address, or a place in this document (e.g. Sheet2!B5).").size(11.0).color(theme::text_dim()));
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
-                        if ui.add(egui::Button::new("OK").min_size(Vec2::new(76.0, 24.0)).fill(theme::ACCENT_LIGHT)).clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        if ui.add(egui::Button::new("OK").min_size(Vec2::new(76.0, 24.0)).fill(theme::accent_light())).clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                             let (t, a) = (text.clone(), address.clone());
                             self.set_link(r, c, &t, Some(&a));
                             keep = false;
@@ -713,7 +713,7 @@ impl App {
                             .unwrap_or_default();
                         ui.horizontal(|ui| {
                             ui.label(RichText::new(format!("{name} (Recovered)")).strong());
-                            ui.label(RichText::new(when).color(theme::TEXT_DIM));
+                            ui.label(RichText::new(when).color(theme::text_dim()));
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 if ui.button("Delete").clicked() {
                                     remove = Some(i);
@@ -948,7 +948,7 @@ fn number_tab(ui: &mut egui::Ui, fc: &mut FormatCells) {
     ui.horizontal_top(|ui| {
         ui.vertical(|ui| {
             ui.label("Category:");
-            egui::Frame::new().stroke(egui::Stroke::new(1.0, theme::BORDER)).show(ui, |ui| {
+            egui::Frame::new().stroke(egui::Stroke::new(1.0, theme::border())).show(ui, |ui| {
                 ui.set_width(120.0);
                 for (i, c) in CATEGORIES.iter().enumerate() {
                     if ui.selectable_label(fc.category == i, *c).clicked() {
@@ -966,7 +966,7 @@ fn number_tab(ui: &mut egui::Ui, fc: &mut FormatCells) {
             let sample = numfmt::format_value(&fc.sample, &fmt).text;
             ui.group(|ui| {
                 ui.set_width(340.0);
-                ui.label(RichText::new("Sample").size(11.0).color(theme::TEXT_DIM));
+                ui.label(RichText::new("Sample").size(11.0).color(theme::text_dim()));
                 ui.label(if sample.is_empty() { " ".into() } else { sample });
             });
             match CATEGORIES[fc.category] {
@@ -1072,7 +1072,7 @@ fn font_tab(ui: &mut egui::Ui, fc: &mut FormatCells) {
         ui.vertical(|ui| {
             ui.label("Font:");
             let cur = fc.style.font.clone().unwrap_or_else(|| theme::DEFAULT_CELL_FONT.into());
-            egui::Frame::new().stroke(egui::Stroke::new(1.0, theme::BORDER)).show(ui, |ui| {
+            egui::Frame::new().stroke(egui::Stroke::new(1.0, theme::border())).show(ui, |ui| {
                 egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
                     ui.set_width(180.0);
                     for f in theme::FONT_CHOICES {
@@ -1149,7 +1149,7 @@ fn border_tab(ui: &mut egui::Ui, fc: &mut FormatCells) {
     toggle(ui, "Bottom", &mut b.bottom);
     toggle(ui, "Left", &mut b.left);
     toggle(ui, "Right", &mut b.right);
-    ui.label(RichText::new("Applies to each selected cell.").size(11.0).color(theme::TEXT_DIM));
+    ui.label(RichText::new("Applies to each selected cell.").size(11.0).color(theme::text_dim()));
 }
 
 fn fill_tab(ui: &mut egui::Ui, fc: &mut FormatCells) {
@@ -1162,7 +1162,7 @@ fn fill_tab(ui: &mut egui::Ui, fc: &mut FormatCells) {
         ui.label("Sample:");
         let (r, _) = ui.allocate_exact_size(Vec2::new(160.0, 30.0), egui::Sense::hover());
         ui.painter().rect_filled(r, 0.0, fc.style.fill.map(theme::rgb).unwrap_or(Color32::WHITE));
-        ui.painter().rect_stroke(r, 0.0, egui::Stroke::new(1.0, theme::BORDER), egui::StrokeKind::Inside);
+        ui.painter().rect_stroke(r, 0.0, egui::Stroke::new(1.0, theme::border()), egui::StrokeKind::Inside);
     });
 }
 
