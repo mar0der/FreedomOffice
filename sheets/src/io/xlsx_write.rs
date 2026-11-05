@@ -18,18 +18,24 @@ use crate::model::{BorderLine, Cell, HAlign, Range, Sheet, Style, VAlign, Value,
 const MAX_STR: usize = 32_767;
 
 pub fn write(wb: &Workbook, path: &Path) -> Result<(), String> {
-    let mut book = build(wb).map_err(|e| e.to_string())?;
-    book.save(path).map_err(|e| format!("Could not save: {e}"))
+    let mut explosions = Vec::new();
+    let mut book = build(wb, &mut explosions).map_err(|e| e.to_string())?;
+    if explosions.iter().all(Vec::is_empty) {
+        return book.save(path).map_err(|e| format!("Could not save: {e}"));
+    }
+    let buf = book.save_to_buffer().map_err(|e| format!("Could not save: {e}"))?;
+    let buf = charts::patch_explosions(buf, &explosions)?;
+    std::fs::write(path, buf).map_err(|e| format!("Could not save: {e}"))
 }
 
-fn build(wb: &Workbook) -> Result<XWorkbook, XlsxError> {
+fn build(wb: &Workbook, explosions: &mut Vec<charts::Explosions>) -> Result<XWorkbook, XlsxError> {
     let mut book = XWorkbook::new();
     let mut formats: HashMap<u32, Format> = HashMap::new();
     let mut used: Vec<String> = Vec::new();
     for (i, sh) in wb.sheets.iter().enumerate() {
         let ws = book.add_worksheet();
         ws.set_name(safe_sheet_name(&sh.name, i, &mut used))?;
-        write_sheet(wb, sh, ws, &mut formats)?;
+        write_sheet(wb, sh, ws, &mut formats, explosions)?;
         if i == wb.active {
             ws.set_active(true);
         } else if sh.hidden {
@@ -47,7 +53,7 @@ fn format_for<'a>(wb: &Workbook, formats: &'a mut HashMap<u32, Format>, id: u32)
     formats.entry(id).or_insert_with(|| to_format(wb.style(id)))
 }
 
-fn write_sheet(wb: &Workbook, sh: &Sheet, ws: &mut Worksheet, formats: &mut HashMap<u32, Format>) -> Result<(), XlsxError> {
+fn write_sheet(wb: &Workbook, sh: &Sheet, ws: &mut Worksheet, formats: &mut HashMap<u32, Format>, explosions: &mut Vec<charts::Explosions>) -> Result<(), XlsxError> {
     for level in 1..=7u8 {
         for (a, b) in Sheet::outline_runs(&sh.row_levels, level) {
             if b < MAX_ROWS {
@@ -150,7 +156,7 @@ fn write_sheet(wb: &Workbook, sh: &Sheet, ws: &mut Worksheet, formats: &mut Hash
             ws.autofilter(rg.r1, rg.c1 as u16, rg.r2, rg.c2 as u16)?;
         }
     }
-    charts::write(wb, sh, ws)?;
+    charts::write(wb, sh, ws, explosions)?;
     extras::write_sheet_extras(sh, ws);
     page::write(&sh.page, ws);
     Ok(())

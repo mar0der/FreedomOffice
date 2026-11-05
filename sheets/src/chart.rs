@@ -30,17 +30,6 @@ pub enum ChartKind {
 }
 
 impl ChartKind {
-    pub const ALL: [ChartKind; 8] = [
-        ChartKind::Column,
-        ChartKind::Line,
-        ChartKind::Pie,
-        ChartKind::Bar,
-        ChartKind::Area,
-        ChartKind::Scatter,
-        ChartKind::Radar,
-        ChartKind::Doughnut,
-    ];
-
     pub fn label(self) -> &'static str {
         match self {
             ChartKind::Column => "Column",
@@ -121,6 +110,7 @@ pub enum LabelPos {
 }
 
 impl LabelPos {
+    #[cfg(test)]
     pub const ALL: [LabelPos; 10] = [
         LabelPos::Auto,
         LabelPos::Center,
@@ -257,6 +247,7 @@ pub struct Labels {
 }
 
 impl Labels {
+    #[cfg(test)]
     pub fn values() -> Labels {
         Labels { value: true, ..Default::default() }
     }
@@ -762,6 +753,19 @@ impl Chart {
     /// Line colour of series `i`.
     pub fn series_line(&self, i: usize) -> u32 {
         self.series_fmt.get(i).and_then(|f| f.line.or(if self.series_kind(i) == ChartKind::Area { None } else { f.fill })).unwrap_or_else(|| self.color(i))
+    }
+
+    /// Marker of series `i`, `None` when it has no markers.
+    pub fn marker(&self, i: usize) -> Option<MarkerKind> {
+        let kind = self.series_kind(i);
+        if !matches!(kind, ChartKind::Line | ChartKind::Scatter | ChartKind::Radar) || (kind == ChartKind::Radar && self.filled) {
+            return None;
+        }
+        match self.fmt_ref(i).map(|f| f.marker).unwrap_or_default() {
+            MarkerKind::Auto => (self.markers || (kind == ChartKind::Scatter && !self.lines)).then_some(MarkerKind::Circle),
+            MarkerKind::None => None,
+            k => Some(k),
+        }
     }
 
     /// Whether the chart is drawn with axes at all.

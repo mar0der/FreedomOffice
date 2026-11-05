@@ -140,7 +140,9 @@ fn shape_to_ops(shape: &egui::Shape, out: &mut Vec<Op>) {
             let fmt = g.job.sections.first().map(|s| s.format.clone()).unwrap_or_default();
             let color = col32(if fmt.color == Color32::PLACEHOLDER { ts.fallback_color } else { fmt.color }).unwrap_or(0);
             let size = g.size();
-            let rect = PRect::new(ts.pos.x - 2.0, ts.pos.y, size.x + 4.0, size.y);
+            // Text turned a quarter counter-clockwise (vertical axis titles) prints rotated.
+            let up = (ts.angle + std::f32::consts::FRAC_PI_2).abs() < 0.01;
+            let rect = if up { PRect::new(ts.pos.x, ts.pos.y - size.x - 2.0, size.y, size.x + 4.0) } else { PRect::new(ts.pos.x - 2.0, ts.pos.y, size.x + 4.0, size.y) };
             // the chart was drawn in point units, so egui's font size is already in points
             let font = print::FontSpec { family: "Segoe UI".into(), size: fmt.font_id.size, bold: false, italic: false, underline: false, strike: false };
             out.push(Op::Text(TextOp {
@@ -149,13 +151,23 @@ fn shape_to_ops(shape: &egui::Shape, out: &mut Vec<Op>) {
                 text,
                 font,
                 color,
-                halign: Align::Left,
-                valign: VAlign::Top,
+                halign: if up { Align::Center } else { Align::Left },
+                valign: if up { VAlign::Center } else { VAlign::Top },
                 wrap: false,
-                rotation: 0,
+                rotation: if up { 90 } else { 0 },
                 number: false,
                 indent: 0.0,
             }));
+        }
+        Shape::Mesh(m) => {
+            // Filled areas (pie slices, areas): one polygon per triangle.
+            for t in m.indices.chunks_exact(3) {
+                let v = |i: u32| &m.vertices[i as usize];
+                if let Some(c) = col32(v(t[0]).color) {
+                    let pts = vec![(v(t[0]).pos.x, v(t[0]).pos.y), (v(t[1]).pos.x, v(t[1]).pos.y), (v(t[2]).pos.x, v(t[2]).pos.y)];
+                    out.push(Op::Poly { pts, color: c });
+                }
+            }
         }
         _ => {}
     }

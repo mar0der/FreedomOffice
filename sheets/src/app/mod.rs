@@ -1,6 +1,8 @@
 //! Application shell: state, undo, editing and the frame loop.
 
 mod actions;
+mod chart_draw;
+mod chart_pane;
 mod chart_view;
 mod chrome;
 mod condfmt_ui;
@@ -964,10 +966,12 @@ impl eframe::App for App {
                 .frame(egui::Frame::NONE.fill(theme::chrome()))
                 .show_separator_line(false)
                 .show(ctx, |ui| self.sheet_tabs_ui(ui));
+            self.chart_format_pane(ctx);
             egui::CentralPanel::default().frame(egui::Frame::NONE.fill(egui::Color32::WHITE)).show(ctx, |ui| self.grid_ui(ui));
             self.popups_ui(ctx);
             self.keytips_ui(ctx);
         }
         self.dialogs_ui(ctx);
+        self.chart_dialogs(ctx);
     }
 }
