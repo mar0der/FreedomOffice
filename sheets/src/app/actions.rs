@@ -45,6 +45,16 @@ pub enum BorderKind {
     ThickBottom,
 }
 
+/// Trims an area that runs to the sheet's last row or column (whole rows/columns, or
+/// Ctrl+Shift+arrow to the edge) to the used part of the sheet. Any other area is kept
+/// whole, so formatting or filling empty cells beyond the data reaches every selected cell.
+fn clip_to_used(a: Range, extent: Option<(u32, u32)>) -> Range {
+    let (er, ec) = extent.unwrap_or((0, 0));
+    let r2 = if a.r2 >= crate::model::MAX_ROWS - 1 { a.r2.min(er.max(a.r1)) } else { a.r2 };
+    let c2 = if a.c2 >= crate::model::MAX_COLS - 1 { a.c2.min(ec.max(a.c1)) } else { a.c2 };
+    Range { r1: a.r1, c1: a.c1, r2, c2 }
+}
+
 pub(super) fn shift_cell(cell: &mut Cell, dr: i64, dc: i64) {
     if dr == 0 && dc == 0 {
         return;
@@ -63,10 +73,9 @@ impl App {
     // ------------------------------------------------------------------
 
     /// Selection clipped to the used area (for whole-row/column selections).
+    /// The selection, with whole rows/columns trimmed to the used part of the sheet.
     pub fn sel_clipped(&self) -> Range {
-        let sel = self.sel();
-        let (er, ec) = self.sheet().extent().unwrap_or((0, 0));
-        Range { r1: sel.r1, c1: sel.c1, r2: sel.r2.min(er.max(sel.r1)), c2: sel.c2.min(ec.max(sel.c1)) }
+        clip_to_used(self.sel(), self.sheet().extent())
     }
 
     /// All selected areas (Ctrl+click multi-selection), active area last.
@@ -79,8 +88,7 @@ impl App {
 
     /// An area clipped to the used part of the sheet (for whole rows/columns).
     pub fn clip_area(&self, a: Range) -> Range {
-        let (er, ec) = self.sheet().extent().unwrap_or((0, 0));
-        Range { r1: a.r1, c1: a.c1, r2: a.r2.min(er.max(a.r1)), c2: a.c2.min(ec.max(a.c1)) }
+        clip_to_used(a, self.sheet().extent())
     }
 
     /// F4 / Ctrl+Y: repeats the last formatting or insert/delete command.
@@ -2121,6 +2129,32 @@ mod tests {
         App::shift_sheet(&mut sh, true, 0, 5);
         assert_eq!(sh.merges, vec![Range::new(MAX_ROWS - 4, 0, MAX_ROWS - 1, 0)]);
         assert!(sh.tables.is_empty());
+    }
+
+    #[test]
+    fn formatting_and_filling_reach_cells_beyond_the_data() {
+        let (_ctx, mut app) = super::super::data_ui::sample_app();
+        let (er, ec) = app.sheet().extent().unwrap();
+        // A cell style on a block below and right of the data styles every cell of it.
+        let blk = Range::new(er + 3, ec + 2, er + 9, ec + 4);
+        app.select_range(blk);
+        app.apply_style(|s| s.fill = Some(0xC6EFCE));
+        for r in blk.r1..=blk.r2 {
+            for c in blk.c1..=blk.c2 {
+                let st = app.sheet().get(r, c).map_or(0, |x| x.style);
+                assert_eq!(app.wb.style(st).fill, Some(0xC6EFCE), "cell ({r}, {c})");
+            }
+        }
+        // Fill Down reaches rows past the end of the data.
+        let col = ec + 6;
+        app.wb.sheets[0].set(0, col, Some(Cell { value: Value::Number(5.0), ..Default::default() }));
+        app.select_range(Range::new(0, col, er + 20, col));
+        app.fill_down();
+        assert_eq!(app.sheet().value(er + 20, col), &Value::Number(5.0));
+        // Whole columns are still trimmed to the used rows.
+        let (er2, _) = app.sheet().extent().unwrap();
+        assert_eq!(app.clip_area(Range::new(0, 0, MAX_ROWS - 1, 1)).r2, er2);
+        assert_eq!(app.clip_area(Range::new(2, 0, 2, MAX_COLS - 1)).c2, app.sheet().extent().unwrap().1);
     }
 
     #[test]
