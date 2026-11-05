@@ -34,6 +34,18 @@ pub struct Editor {
     pub ac_hidden: bool,
     /// Sheet being pointed at when it differs from the edited cell's sheet.
     pub point_sheet: Option<usize>,
+    /// Editor-local undo (Ctrl+Z while editing): earlier (text, cursor, anchor) states.
+    undo: Vec<(String, usize, usize)>,
+    /// Kind of the last recorded change, so a run of typing undoes as one step.
+    last_change: Change,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Change {
+    None,
+    Typing,
+    Deleting,
+    Pointing,
 }
 
 fn prev_boundary(s: &str, i: usize) -> usize {
@@ -60,7 +72,29 @@ impl Editor {
             ac_index: 0,
             ac_hidden: false,
             point_sheet: None,
+            undo: Vec::new(),
+            last_change: Change::None,
         }
+    }
+
+    /// Records the state before a change; a run of the same kind of change is one undo step.
+    fn checkpoint(&mut self, kind: Change, force: bool) {
+        if force || kind == Change::None || kind != self.last_change || self.undo.is_empty() {
+            self.undo.push((self.text.clone(), self.cursor, self.anchor));
+        }
+        self.last_change = kind;
+    }
+
+    /// Ctrl+Z inside the editor: restores the text before the last editing step.
+    pub fn undo(&mut self) -> bool {
+        let Some((text, cursor, anchor)) = self.undo.pop() else { return false };
+        self.text = text;
+        self.cursor = cursor.min(self.text.len());
+        self.anchor = anchor.min(self.text.len());
+        self.point = None;
+        self.ac_hidden = true;
+        self.last_change = Change::None;
+        true
     }
 
     pub fn is_formula(&self) -> bool {
@@ -90,6 +124,11 @@ impl Editor {
     }
 
     pub fn insert(&mut self, s: &str) {
+        // A run of typed characters is one undo step; a space, a paste or replacing
+        // a selection starts a new one.
+        let single = s.chars().count() == 1;
+        let force = !single || self.has_selection() || s.starts_with(char::is_whitespace);
+        self.checkpoint(if single { Change::Typing } else { Change::None }, force);
         self.delete_selection();
         self.text.insert_str(self.cursor, s);
         self.cursor += s.len();
@@ -102,8 +141,10 @@ impl Editor {
     pub fn backspace(&mut self) {
         self.point = None;
         if self.has_selection() {
+            self.checkpoint(Change::None, true);
             self.delete_selection();
         } else if self.cursor > 0 {
+            self.checkpoint(Change::Deleting, false);
             let p = prev_boundary(&self.text, self.cursor);
             self.text.replace_range(p..self.cursor, "");
             self.cursor = p;
@@ -114,8 +155,10 @@ impl Editor {
     pub fn delete(&mut self) {
         self.point = None;
         if self.has_selection() {
+            self.checkpoint(Change::None, true);
             self.delete_selection();
         } else if self.cursor < self.text.len() {
+            self.checkpoint(Change::Deleting, false);
             let n = next_boundary(&self.text, self.cursor);
             self.text.replace_range(self.cursor..n, "");
         }
@@ -149,6 +192,8 @@ impl Editor {
             self.anchor = self.cursor;
         }
         self.point = None;
+        // Moving the caret ends the current run: the next keystroke starts a new undo step.
+        self.last_change = Change::None;
     }
 
     pub fn left(&mut self, extend: bool, word: bool) {
@@ -212,7 +257,11 @@ impl Editor {
         s.push_str(&rg.to_a1());
         let (start, end) = match &self.point {
             Some(p) if p.end == self.cursor => (p.start, p.end),
-            _ => (self.cursor, self.cursor),
+            _ => {
+                // Pointing a new reference is one undo step, however far the arrows move it.
+                self.checkpoint(Change::Pointing, true);
+                (self.cursor, self.cursor)
+            }
         };
         self.text.replace_range(start..end, &s);
         self.cursor = start + s.len();
@@ -250,6 +299,7 @@ impl Editor {
 
     pub fn accept_function(&mut self, name: &str) {
         if let Some((start, _)) = self.func_prefix() {
+            self.checkpoint(Change::None, true);
             self.text.replace_range(start..self.cursor, &format!("{name}("));
             self.cursor = start + name.len() + 1;
             self.anchor = self.cursor;
@@ -320,6 +370,7 @@ impl Editor {
                     (false, true) => (false, false),
                 };
                 let s2 = format!("{}{}{}{}", if ca { "$" } else { "" }, col_name(p.col), if ra { "$" } else { "" }, p.row + 1);
+                self.checkpoint(Change::None, true);
                 self.text.replace_range(s..e, &s2);
                 self.cursor = s + s2.len();
                 self.anchor = self.cursor;
@@ -367,5 +418,56 @@ impl Editor {
             i += 1;
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn typed(e: &mut Editor, s: &str) {
+        for ch in s.chars() {
+            e.insert(&ch.to_string());
+        }
+    }
+
+    #[test]
+    fn undo_steps_back_through_typing_by_word() {
+        let mut e = Editor::new(0, 0, 0, String::new(), EditMode::Enter);
+        typed(&mut e, "hello world");
+        assert!(e.undo());
+        assert_eq!(e.text, "hello");
+        assert_eq!(e.cursor, 5);
+        assert!(e.undo());
+        assert_eq!(e.text, "");
+        assert!(!e.undo());
+    }
+
+    #[test]
+    fn undo_restores_deleted_text_and_original_value() {
+        let mut e = Editor::new(0, 0, 0, "abc".into(), EditMode::Edit);
+        e.backspace();
+        e.backspace();
+        assert_eq!(e.text, "a");
+        e.move_to(1, false);
+        typed(&mut e, "xy");
+        assert_eq!(e.text, "axy");
+        assert!(e.undo());
+        assert_eq!(e.text, "a");
+        assert!(e.undo());
+        assert_eq!(e.text, "abc");
+        assert_eq!(e.cursor, 3);
+    }
+
+    #[test]
+    fn undo_removes_a_pointed_reference_in_one_step() {
+        let mut e = Editor::new(0, 5, 5, String::new(), EditMode::Enter);
+        typed(&mut e, "=");
+        e.set_point((0, 0), (0, 0), None);
+        e.set_point((0, 0), (1, 0), None);
+        e.set_point((0, 0), (2, 0), None);
+        assert_eq!(e.text, "=A1:A3");
+        assert!(e.undo());
+        assert_eq!(e.text, "=");
     }
 }

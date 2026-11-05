@@ -692,6 +692,15 @@ impl App {
         }
     }
 
+    /// Ctrl+W / Ctrl+F4: closes the workbook. With one workbook per window this closes the
+    /// window, after the same save prompt as the title-bar close button.
+    pub fn close_workbook(&mut self) {
+        self.confirm_then(Pending::Exit);
+        if let Some(ctx) = &self.ctx {
+            ctx.request_repaint();
+        }
+    }
+
     pub fn run_pending(&mut self, p: Pending) {
         match p {
             Pending::New => {

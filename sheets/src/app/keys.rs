@@ -353,7 +353,8 @@ impl App {
             }
             Key::O => self.confirm_then(Pending::Open(None)),
             Key::N => self.confirm_then(Pending::New),
-            Key::W => self.confirm_then(Pending::New),
+            // Closes the workbook (single-document window: close it, after the save prompt).
+            Key::W | Key::F4 => self.close_workbook(),
             Key::F if shift => self.open_format_cells(2),
             Key::F => {
                 self.find.replace = false;
@@ -496,7 +497,10 @@ impl App {
                 let j = self.next_visible_sheet(key == Key::PageDown);
                 self.switch_sheet(j);
             }
-            Key::Z if ctrl => self.cancel_edit(),
+            // Undoes the last typing step and stays in the editor.
+            Key::Z if ctrl => ed!(|e: &mut super::Editor| {
+                e.undo();
+            }),
             _ => {}
         }
         let _ = ctx;
