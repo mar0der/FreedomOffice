@@ -444,3 +444,164 @@ fn moving_fields_between_areas() {
     pt.clear();
     assert!(layout(&pt).placeholder);
 }
+
+/// A workbook with a few reports exercising most of what the file format carries.
+pub(crate) fn rich_workbook() -> Workbook {
+    let mut wb = sample(true);
+    let base = new_pivot(&wb);
+    let (region, product, date, sales, qty) = (f(&base, "Region"), f(&base, "Product"), f(&base, "Date"), f(&base, "Sales"), f(&base, "Qty"));
+    // 1: compact, rows Region > Product, columns Σ Values, a report filter and item filters.
+    let mut a = base.clone();
+    a.add_field(region, Area::Rows, None);
+    a.add_field(product, Area::Rows, None);
+    a.add_field(sales, Area::Values, None);
+    a.add_field(qty, Area::Values, None);
+    a.values[1].agg = Agg::Average;
+    a.values[1].name = "Average of Qty".into();
+    a.values[1].num_fmt = "0.00".into();
+    a.add_field(date, Area::Filters, None);
+    a.fields[region].hidden.insert("north".into());
+    a.fields[region].collapsed.insert("west".into());
+    a.anchor = (3, 7);
+    // 2: tabular, columns Product, % of grand total, sorted descending by value, no column grand totals.
+    let mut b = base.clone();
+    b.name = "PivotTable2".into();
+    b.add_field(region, Area::Rows, None);
+    b.add_field(product, Area::Columns, None);
+    b.add_field(sales, Area::Values, None);
+    b.values[0].show_as = ShowAs::PctGrand;
+    b.values[0].num_fmt = "0.00%".into();
+    b.fields[region].sort = SortOrder::Desc;
+    b.fields[region].sort_by = Some(0);
+    b.form = Form::Tabular;
+    b.col_grand = false;
+    b.style = "PivotStyleMedium9".into();
+    b.anchor = (20, 7);
+    // 3: dates grouped by years and months, counts.
+    let mut c = base.clone();
+    c.name = "PivotTable3".into();
+    c.add_field(date, Area::Rows, None);
+    c.group_dates(date, &[DatePart::Years, DatePart::Months]);
+    c.add_field(qty, Area::Values, None);
+    c.values[0].agg = Agg::Count;
+    c.values[0].name = "Count of Qty".into();
+    c.anchor = (2, 14);
+    // 4: numbers grouped, outline form.
+    let mut d = base;
+    d.name = "PivotTable4".into();
+    d.add_field(sales, Area::Rows, None);
+    d.fields[sales].num_group = Some((0.0, 250.0, 100.0));
+    d.add_field(product, Area::Rows, None);
+    d.add_field(qty, Area::Values, None);
+    d.form = Form::Outline;
+    d.anchor = (2, 20);
+    let mut sh = crate::model::Sheet::new("Report");
+    sh.pivots = vec![a, b, c, d];
+    wb.sheets.push(sh);
+    for i in 0..4 {
+        engine::update(&mut wb, 1, i).unwrap();
+    }
+    wb
+}
+
+#[test]
+fn xlsx_round_trip_keeps_reports() {
+    let wb = rich_workbook();
+    let dir = std::env::temp_dir().join(format!("freedom_sheets_pivot_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("pivots.xlsx");
+    crate::io::save(&wb, &path).unwrap();
+    let back = crate::io::load(&path).unwrap();
+    let (x, y) = (&wb.sheets[1], &back.sheets[1]);
+    assert_eq!(y.pivots.len(), 4);
+    for (p, q) in x.pivots.iter().zip(&y.pivots) {
+        assert_eq!(p.name, q.name);
+        assert_eq!(p.source, q.source);
+        assert_eq!(p.rows, q.rows, "{}", p.name);
+        assert_eq!(p.cols, q.cols, "{}", p.name);
+        assert_eq!(p.filters, q.filters, "{}", p.name);
+        assert_eq!(p.values, q.values, "{}", p.name);
+        assert_eq!(p.form, q.form, "{}", p.name);
+        assert_eq!(p.style, q.style);
+        assert_eq!((p.row_grand, p.col_grand), (q.row_grand, q.col_grand));
+        for (fa, fb) in p.fields.iter().zip(&q.fields) {
+            assert_eq!(fa.name, fb.name);
+            assert_eq!(fa.source, fb.source);
+            assert_eq!(fa.hidden, fb.hidden, "{} {}", p.name, fa.name);
+            assert_eq!(fa.collapsed, fb.collapsed, "{} {}", p.name, fa.name);
+            assert_eq!(fa.num_group, fb.num_group);
+            assert_eq!(fa.sort_by, fb.sort_by, "{} {}", p.name, fa.name);
+        }
+        assert_eq!(p.out.range, q.out.range, "{}", p.name);
+        assert_eq!(p.out.cells, q.out.cells, "{}", p.name);
+        assert_eq!(*p.cache, *q.cache);
+    }
+}
+
+/// Writes the sample reports to FS_PIVOT_XLSX (for opening the file in Excel).
+#[test]
+#[ignore]
+fn export_for_excel() {
+    let path = std::env::var("FS_PIVOT_XLSX").expect("FS_PIVOT_XLSX");
+    let mut wb = rich_workbook();
+    // FS_PIVOT_ONLY="0,2" keeps only those reports.
+    if let Ok(only) = std::env::var("FS_PIVOT_ONLY") {
+        let keep: Vec<usize> = only.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+        let all = std::mem::take(&mut wb.sheets[1].pivots);
+        for (i, p) in all.into_iter().enumerate() {
+            if keep.contains(&i) {
+                wb.sheets[1].pivots.push(p);
+            } else {
+                let full = p.out.full;
+                let keys: Vec<(u32, u32)> = wb.sheets[1].iter_range(full).map(|(r, c, _)| (r, c)).collect();
+                for (r, c) in keys {
+                    wb.sheets[1].remove(r, c);
+                }
+            }
+        }
+    }
+    crate::io::save(&wb, std::path::Path::new(&path)).unwrap();
+}
+
+#[test]
+fn getpivotdata_formula_evaluates() {
+    let mut wb = rich_workbook();
+    let f = |t: &str| Some(Cell { formula: Some(Box::new(crate::model::Formula::new(t))), ..Default::default() });
+    let sh = &mut wb.sheets[1];
+    sh.set(0, 0, f("=GETPIVOTDATA(\"Sales\",$H$4,\"Region\",\"East\")"));
+    sh.set(1, 0, f("=GETPIVOTDATA(\"Sum of Sales\",Report!$H$4)"));
+    sh.set(1, 1, f("=GETPIVOTDATA(\"Sales\",$H$4,\"Region\",\"North\")"));
+    wb.recalc();
+    assert_eq!(wb.sheets[1].value(0, 0), &Value::Number(370.0));
+    // North is filtered out: 710 - 80.
+    assert_eq!(wb.sheets[1].value(1, 0), &Value::Number(630.0));
+    assert_eq!(wb.sheets[1].value(1, 1), &Value::Error(crate::model::ErrorKind::Ref));
+}
+
+/// Prints the sample reports as text (compare with what Excel shows for the exported file).
+#[test]
+#[ignore]
+fn print_pivot_samples() {
+    for p in &rich_workbook().sheets[1].pivots {
+        println!("== {} {}", p.name, p.out.range.to_a1());
+        for l in dump(p) {
+            println!("{l}");
+        }
+    }
+}
+
+/// Prints the reports of the workbook FS_PIVOT_IN (for files saved by Excel).
+#[test]
+#[ignore]
+fn print_pivot_file() {
+    let path = std::env::var("FS_PIVOT_IN").expect("FS_PIVOT_IN");
+    let wb = crate::io::load(std::path::Path::new(&path)).unwrap();
+    for sh in &wb.sheets {
+        for p in &sh.pivots {
+            println!("== {} {} {} rows={:?} cols={:?} filters={:?}", sh.name, p.name, p.out.range.to_a1(), p.rows, p.cols, p.filters);
+            for l in dump(p) {
+                println!("{l}");
+            }
+        }
+    }
+}

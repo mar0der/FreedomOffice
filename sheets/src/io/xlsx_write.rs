@@ -5,6 +5,7 @@ mod extras;
 mod fidelity;
 mod filter;
 mod page;
+mod pivot;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -25,6 +26,7 @@ pub fn write(wb: &Workbook, path: &Path) -> Result<(), String> {
     let bytes = book.save_to_buffer().map_err(|e| format!("Could not save: {e}"))?;
     let bytes = filter::patch(wb, bytes)?;
     let bytes = charts::patch_explosions(bytes, &explosions)?;
+    let bytes = pivot::patch(wb, bytes)?;
     std::fs::write(path, bytes).map_err(|e| format!("Could not save: {e}"))
 }
 

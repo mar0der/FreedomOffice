@@ -5,6 +5,7 @@ mod extras;
 mod fidelity;
 mod filter;
 mod page;
+mod pivot;
 
 use std::collections::HashMap;
 use std::io::{Read, Seek};
@@ -60,6 +61,7 @@ pub fn read<R: Read + Seek>(src: R) -> Result<Workbook, String> {
         None => XfMap { ids: vec![0], date: vec![false] },
     };
     let dxfs = styles_xml.as_deref().map(|x| extras::parse_dxfs(x, &theme)).unwrap_or_default();
+    let pivot_fmts = styles_xml.as_deref().map(pivot::num_formats).unwrap_or_default();
 
     let mut active = 0;
     for (i, sh) in info.sheets.iter().enumerate() {
@@ -111,6 +113,10 @@ pub fn read<R: Read + Seek>(src: R) -> Result<Workbook, String> {
                     if let Some(cx) = pkg.text(&part()) {
                         fidelity::parse_comments(&cx, &theme, &mut sheet);
                     }
+                } else if r.ty.ends_with("/pivotTable") {
+                    if let Some(p) = pivot::read(&mut pkg, &part(), &pivot_fmts) {
+                        sheet.pivots.push(p);
+                    }
                 } else if r.ty.ends_with("/table") {
                     if let Some(mut t) = pkg.text(&part()).and_then(|x| fidelity::parse_table(&x)) {
                         // The header cells are what users see (and what Excel keeps on repair).
@@ -141,6 +147,18 @@ pub fn read<R: Read + Seek>(src: R) -> Result<Workbook, String> {
     }
     wb.active = active.min(wb.sheets.len() - 1);
     wb.names = info.names;
+    // PivotTables are laid out from their caches (or their sources when a cache has no records).
+    for si in 0..wb.sheets.len() {
+        for pi in 0..wb.sheets[si].pivots.len() {
+            if wb.sheets[si].pivots[pi].cache.records.is_empty() {
+                let src = wb.sheets[si].pivots[pi].source.clone();
+                if let Ok(c) = crate::pivot::build_cache(&wb, &src, si) {
+                    wb.sheets[si].pivots[pi].set_cache(c);
+                }
+            }
+            let _ = crate::pivot::engine::update(&mut wb, si, pi);
+        }
+    }
     Ok(wb)
 }
 

@@ -86,6 +86,26 @@ pub fn call(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
             }
         }
         "CELL" => cell_info(ev, a),
+        "GETPIVOTDATA" => {
+            if n < 2 || n % 2 != 0 {
+                return Err(E::Value);
+            }
+            let data = ev.string(a, 0)?;
+            let (s, r, c) = match ev.arg(a, 1)? {
+                EV::R(s, rg) => (s, rg.r1, rg.c1),
+                EV::M(m) if !m.is_empty() => (m[0].0, m[0].1.r1, m[0].1.c1),
+                _ => return Err(E::Ref),
+            };
+            let mut pairs = Vec::new();
+            for k in (2..n).step_by(2) {
+                let f = ev.string(a, k)?;
+                pairs.push((f, ev.value(a, k + 1)?));
+            }
+            match crate::pivot::engine::get_pivot_data(ev.wb, s, r, c, &data, &pairs) {
+                Value::Error(e) => Err(e),
+                v => Ok(EV::V(v)),
+            }
+        }
         "INFO" => {
             need(a, 1, 1)?;
             let t = ev.string(a, 0)?.to_ascii_lowercase();
