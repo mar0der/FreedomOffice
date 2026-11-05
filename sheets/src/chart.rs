@@ -57,6 +57,15 @@ impl ChartKind {
         matches!(self, ChartKind::Column | ChartKind::Bar)
     }
 
+    /// Default series line width in points.
+    pub fn default_width(self) -> f32 {
+        match self {
+            ChartKind::Scatter => 1.5,
+            ChartKind::Line | ChartKind::Radar => 2.25,
+            _ => 0.75,
+        }
+    }
+
     pub fn can_stack(self) -> bool {
         matches!(self, ChartKind::Column | ChartKind::Bar | ChartKind::Line | ChartKind::Area)
     }
@@ -609,7 +618,7 @@ impl Chart {
             smooth: false,
             filled: false,
             x_axis: Axis { major_grid: xy, ..Default::default() },
-            y_axis: Axis { major_grid: true, ..Default::default() },
+            y_axis: Axis { major_grid: !kind.is_round(), ..Default::default() },
             y2_axis: Axis::default(),
             series_fmt: Vec::new(),
             palette: 0,
@@ -1599,5 +1608,156 @@ mod tests {
         assert!(!c.by_cols);
         assert_eq!(c.title.as_deref(), Some(""));
         assert_eq!(resolve(&back, c), resolve(&wb, &line));
+    }
+
+    /// A workbook with one chart per feature: subtypes, axes, formats, trendlines, error bars.
+    fn formatted_charts() -> (Workbook, Vec<Chart>) {
+        let wb = sample();
+        let rg = Range::new(0, 0, 4, 2);
+        let mut charts = Vec::new();
+        let st = |name: &str| *SUBTYPES.iter().find(|s| s.name == name).unwrap();
+
+        let mut a = Chart::with_subtype(&wb, 0, rg, &st("Stacked Column"));
+        a.title = Some("Stacked".into());
+        a.legend_pos = LegendPos::Right;
+        a.data_table = true;
+        a.x_axis.title = Some("Month".into());
+        a.x_axis.reverse = true;
+        a.y_axis = Axis { title: Some(String::new()), min: Some(0.0), max: Some(80.0), major: Some(20.0), minor: Some(5.0), num_fmt: "0.0".into(), minor_grid: true, ..a.y_axis.clone() };
+        a.gap = 80;
+        let f = a.fmt_mut(0);
+        f.fill = Some(0xFF0000);
+        f.line = Some(0x00FF00);
+        f.width = Some(1.5);
+        f.err = Some(ErrorBars { kind: ErrKind::Fixed, amount: 2.0, dir: ErrDir::Plus, cap: false });
+        a.fmt_mut(1).labels = Some(Labels { value: true, category: true, pos: LabelPos::InsideEnd, ..Default::default() });
+        charts.push(a);
+
+        let mut b = Chart::with_subtype(&wb, 0, rg, &st("Clustered Column - Line on Secondary Axis"));
+        b.y2_axis.title = Some("Cost".into());
+        b.y2_axis.max = Some(30.0);
+        b.fmt_mut(0).trend = Some(Trendline { kind: TrendKind::Polynomial, order: 3, show_eq: true, show_r2: true, ..Default::default() });
+        charts.push(b);
+
+        let mut c = Chart::with_subtype(&wb, 0, Range::new(1, 1, 4, 2), &st("Scatter with Smooth Lines and Markers"));
+        c.y_axis.log_base = Some(10.0);
+        c.x_axis.min = Some(5.0);
+        let f = c.fmt_mut(0);
+        f.marker = MarkerKind::Diamond;
+        f.marker_size = 8;
+        f.dash = Dash::Dash;
+        f.width = Some(2.0);
+        f.trend = Some(Trendline { kind: TrendKind::Exponential, forward: 1.0, name: Some("Fit".into()), ..Default::default() });
+        charts.push(c);
+
+        let mut d = Chart::with_subtype(&wb, 0, Range::new(0, 0, 4, 1), &st("Pie"));
+        d.first_angle = 90;
+        d.labels = Labels { category: true, percent: true, pos: LabelPos::OutsideEnd, ..Default::default() };
+        d.fmt_mut(0).points = vec![PointFmt { idx: 1, fill: None, explode: 25 }, PointFmt { idx: 2, fill: Some(0x7030A0), explode: 0 }];
+        charts.push(d);
+
+        let mut e = Chart::with_subtype(&wb, 0, rg, &st("Doughnut"));
+        e.hole = 60;
+        e.fmt_mut(1).explode = 10;
+        charts.push(e);
+
+        charts.push(Chart::with_subtype(&wb, 0, rg, &st("Filled Radar")));
+        let mut g = Chart::with_subtype(&wb, 0, rg, &st("100% Stacked Bar"));
+        g.y_axis.num_fmt = "0%".into();
+        g.bg = Some(0xF2F2F2);
+        g.plot_bg = Some(0xD9E1F2);
+        charts.push(g);
+
+        let mut h = Chart::with_subtype(&wb, 0, rg, &st("Line with Markers"));
+        h.custom = Some(Custom {
+            series: vec![
+                SeriesSrc { name_cell: None, name: "Plan".into(), values: Some(Range::new(1, 2, 4, 2)), xs: None },
+                SeriesSrc { name_cell: Some((0, 1)), name: String::new(), values: Some(Range::new(2, 1, 4, 1)), xs: None },
+            ],
+            cats: Some(Range::new(1, 0, 4, 0)),
+        });
+        h.range = custom_bounds(h.custom.as_ref().unwrap()).unwrap();
+        h.smooth = true;
+        charts.push(h);
+
+        let mut k = Chart::with_subtype(&wb, 0, rg, &st("Stacked Area"));
+        k.palette = 4;
+        charts.push(k);
+
+        for (i, ch) in charts.iter_mut().enumerate() {
+            ch.anchor = (i as u32 * 20, 5);
+        }
+        (wb, charts)
+    }
+
+    fn check_formatted(wb: &Workbook, charts: &[Chart], back: &Workbook) {
+        let got = &back.sheets[0].charts;
+        assert_eq!(got.len(), charts.len());
+        for (want, got) in charts.iter().zip(got) {
+            let mut want = want.clone();
+            let mut got = got.clone();
+            // Placement is checked elsewhere; detection overrides become explicit.
+            got.size = want.size;
+            got.offset = want.offset;
+            want.names_first = got.names_first;
+            want.cats_first = got.cats_first;
+            // Colour schemes are saved as explicit series colours.
+            if want.palette != 0 {
+                let n = resolve(&wb, &want).series.len();
+                for i in 0..n {
+                    let c = want.color(i);
+                    let f = want.fmt_mut(i);
+                    f.fill = f.fill.or(Some(c)).filter(|c| *c != palette_color(0, i));
+                }
+                want.palette = 0;
+            }
+            assert_eq!(resolve(&back, &got), resolve(&wb, &want), "{:?}", want.subtype());
+            assert_eq!(got, want, "{:?}", want.subtype().map(|s| s.name));
+        }
+    }
+
+    /// Every chart option survives a save and reload.
+    #[test]
+    fn xlsx_round_trip_formatting() {
+        let (mut wb, charts) = formatted_charts();
+        wb.sheets[0].charts = charts.clone();
+        let dir = std::env::temp_dir().join(format!("freedom_sheets_chart_fmt_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("formatted.xlsx");
+        crate::io::save(&wb, &path).unwrap();
+        let back = crate::io::load(&path).unwrap();
+        if std::env::var_os("KEEP_CHART_XLSX").is_none() {
+            let _ = std::fs::remove_file(&path);
+        }
+        check_formatted(&wb, &charts, &back);
+    }
+
+    /// The same workbook after Excel opened and re-saved it (path in FS_EXCEL_CHARTS).
+    #[test]
+    #[ignore]
+    fn excel_saved_round_trip() {
+        let (wb, charts) = formatted_charts();
+        let path = std::env::var("FS_EXCEL_CHARTS").expect("FS_EXCEL_CHARTS");
+        let back = crate::io::load(std::path::Path::new(&path)).unwrap();
+        check_formatted(&wb, &charts, &back);
+    }
+
+    /// Prints the charts of a file (path in FS_PRINT_CHARTS), for checking imports by eye.
+    #[test]
+    #[ignore]
+    fn print_file_charts() {
+        let path = std::env::var("FS_PRINT_CHARTS").expect("FS_PRINT_CHARTS");
+        let wb = crate::io::load(std::path::Path::new(&path)).unwrap();
+        for ch in &wb.sheets[0].charts {
+            let d = resolve(&wb, ch);
+            println!("{:?} {:?} sub={:?} custom={} legend={} {:?} table={} title={:?}", ch.kind, ch.grouping, ch.subtype().map(|s| s.name), ch.custom.is_some(), ch.legend, ch.legend_pos, ch.data_table, ch.title);
+            println!("   series={:?} cats={:?}", d.series.iter().map(|s| s.name.clone()).collect::<Vec<_>>(), d.categories);
+            println!("   x={:?}
+   y={:?}
+   labels={:?} gap={} overlap={}", ch.x_axis, ch.y_axis, ch.labels, ch.gap, ch.overlap);
+            for (i, f) in ch.series_fmt.iter().enumerate() {
+                println!("   fmt[{i}]={f:?}");
+            }
+        }
     }
 }

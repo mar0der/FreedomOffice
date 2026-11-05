@@ -172,7 +172,11 @@ fn fill_series(ser: &mut ChartSeries, ch: &Chart, data: &ChartData, k: usize, sr
         None => {}
     }
     let kind = ch.series_kind(k);
-    let f = ch.fmt(k);
+    let mut f = ch.fmt(k);
+    // Colour schemes other than the default are saved as explicit colours.
+    if ch.palette != 0 && !ch.kind.is_round() {
+        f.fill = f.fill.or(Some(ch.color(k)));
+    }
     let lined = matches!(kind, ChartKind::Line | ChartKind::Scatter | ChartKind::Radar) && !(kind == ChartKind::Radar && ch.filled);
     // Fill and line.
     let mut fmt = ChartFormat::new();
@@ -181,7 +185,7 @@ fn fill_series(ser: &mut ChartSeries, ch: &Chart, data: &ChartData, k: usize, sr
         if kind == ChartKind::Scatter && !ch.lines {
             fmt.set_no_line();
             any = true;
-        } else if f.line.is_some() || f.width.is_some() || f.dash != Dash::Solid {
+        } else if f.line.is_some() || f.fill.is_some() || f.width.is_some() || f.dash != Dash::Solid {
             let mut ln = ChartLine::new();
             if let Some(c) = f.line.or(f.fill) {
                 ln.set_color(c);
@@ -249,12 +253,13 @@ fn fill_series(ser: &mut ChartSeries, ch: &Chart, data: &ChartData, k: usize, sr
         ser.set_smooth(true);
     }
     // Pie point colours (exploded points get an explicit colour so their element exists).
-    if ch.kind.is_round() && !f.points.is_empty() {
+    if ch.kind.is_round() && (!f.points.is_empty() || ch.palette != 0) {
         let n = s.values.len();
         let pts: Vec<ChartPoint> = (0..n)
-            .map(|i| match f.point(i) {
-                Some(p) => ChartPoint::new().set_format(ChartFormat::new().set_solid_fill(&solid(p.fill.unwrap_or_else(|| ch.color(i))))),
-                None => ChartPoint::new(),
+            .map(|i| match (f.point(i), ch.palette != 0) {
+                (Some(p), _) => ChartPoint::new().set_format(ChartFormat::new().set_solid_fill(&solid(p.fill.unwrap_or_else(|| ch.color(i))))),
+                (None, true) => ChartPoint::new().set_format(ChartFormat::new().set_solid_fill(&solid(ch.color(i)))),
+                (None, false) => ChartPoint::new(),
             })
             .collect();
         ser.set_points(&pts);

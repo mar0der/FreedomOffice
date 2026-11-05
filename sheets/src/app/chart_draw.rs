@@ -276,7 +276,7 @@ fn series_has_line(ch: &Chart, i: usize) -> bool {
 }
 
 fn line_width(ch: &Chart, i: usize, s: f32) -> f32 {
-    ch.fmt_ref(i).and_then(|f| f.width).unwrap_or(2.25) * PT * s
+    ch.fmt_ref(i).and_then(|f| f.width).unwrap_or(ch.series_kind(i).default_width()) * PT * s
 }
 
 fn marker_radius(ch: &Chart, i: usize, s: f32) -> f32 {
@@ -308,7 +308,7 @@ fn legend_entries(ch: &Chart, data: &ChartData) -> Vec<(String, Swatch)> {
         } else {
             let col = rgb(ch.series_line(i));
             let marker = series_marker(ch, i).map(|m| (m, rgb(ch.series_fill(i))));
-            let width = if series_has_line(ch, i) { 2.25 * PT } else { 0.0 };
+            let width = if series_has_line(ch, i) { ch.series_kind(i).default_width() * PT } else { 0.0 };
             Swatch::Line { col, width, dash: f.dash, marker }
         };
         out.push((ser.name.clone(), sw));

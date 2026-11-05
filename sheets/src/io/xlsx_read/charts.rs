@@ -322,7 +322,7 @@ fn axis_of(e: &El) -> AxisInfo {
     let num_fmt = e.child("numFmt").filter(|n| n.attr("sourceLinked") != Some("1")).and_then(|n| n.attr("formatCode")).unwrap_or("");
     let axis = Axis {
         visible: e.flag("delete") != Some(true),
-        title: e.child("title").map(|t| text_of(t).unwrap_or_default()),
+        title: e.child("title").map(|t| text_of(t).filter(|x| x != "Axis Title").unwrap_or_default()),
         min: scaling.and_then(|s| s.cnum("min")),
         max: scaling.and_then(|s| s.cnum("max")),
         major: e.cnum("majorUnit"),
@@ -360,7 +360,7 @@ fn series_of(s: &El, kind: ChartKind) -> Ser {
     let mut f = SeriesFmt { dash, ..Default::default() };
     if lined {
         f.line = line;
-        f.width = width.filter(|w| (w - 2.25).abs() > 0.01);
+        f.width = width.filter(|w| (w - kind.default_width()).abs() > 0.01);
     } else {
         f.fill = fill;
         f.line = line;

@@ -563,7 +563,7 @@ impl App {
                 });
                 ui.horizontal(|ui| {
                     ui.label("Width (pt)");
-                    let mut w = c.fmt(k).width.unwrap_or(if kind.is_bar() || kind == ChartKind::Area { 0.75 } else { 2.25 });
+                    let mut w = c.fmt(k).width.unwrap_or(kind.default_width());
                     if ui.add(DragValue::new(&mut w).range(0.25..=20.0).speed(0.05).max_decimals(2)).changed() {
                         c.fmt_mut(k).width = Some(w);
                     }
