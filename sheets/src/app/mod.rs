@@ -598,6 +598,10 @@ impl App {
     /// What the formula bar / editor shows for a cell (dates edit as dates).
     pub fn edit_text(&self, r: u32, c: u32) -> String {
         let Some(cell) = self.sheet().get(r, c) else { return String::new() };
+        // Hidden formulas of a protected sheet don't show.
+        if cell.formula.is_some() && self.sheet().protection.is_some() && self.wb.style(cell.style).hide_formula {
+            return String::new();
+        }
         if cell.formula.is_none() {
             if let crate::model::Value::Number(n) = cell.value {
                 if crate::numfmt::is_date_format(&self.wb.style(cell.style).num_fmt) && n >= 0.0 {

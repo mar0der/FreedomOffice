@@ -721,6 +721,7 @@ impl App {
                                 wb.path = None;
                                 wb.recalc();
                                 self.wb = wb;
+                                self.zoom_for = None;
                                 self.dirty = true;
                                 self.status = Some(format!("Recovered '{name}'. Save it to keep the changes."));
                                 let _ = std::fs::remove_file(&f);
