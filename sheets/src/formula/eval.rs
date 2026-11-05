@@ -15,6 +15,24 @@ pub enum EV {
     V(Value),
     R(usize, Range),
     A(Vec<Vec<Value>>),
+    /// Several areas: unions `(A1:A3,C1:C3)` and 3-D references `Sheet1:Sheet3!A1`.
+    M(Vec<(usize, Range)>),
+    /// A function value (LAMBDA).
+    L(Rc<Lambda>),
+}
+
+/// A LAMBDA closure: parameters, body and the LET / parameter bindings in scope where it was
+/// created (lexical scoping).
+#[derive(Debug)]
+pub struct Lambda {
+    pub params: Vec<String>,
+    pub body: Rc<Expr>,
+    pub env: Vec<(String, Rc<EV>)>,
+}
+
+/// Binding of a LAMBDA parameter the caller left out (see ISOMITTED).
+fn is_omitted(v: &EV) -> bool {
+    matches!(v, EV::A(g) if g.is_empty())
 }
 
 pub type Res = Result<EV, ErrorKind>;
@@ -313,8 +331,8 @@ pub struct Evaluator<'a> {
     depth: usize,
     name_depth: u32,
     names: FxMap<String, Option<Rc<Expr>>>,
-    /// LET variables and lifted-argument bindings (innermost last).
-    scopes: Vec<(String, EV)>,
+    /// LET variables, LAMBDA parameters and lifted-argument bindings (innermost last).
+    scopes: Vec<(String, Rc<EV>)>,
     rng: u64,
     pub now: f64,
     /// Dynamic arrays computed in this pass, by anchor.
@@ -594,6 +612,8 @@ impl<'a> Evaluator<'a> {
                 let v = a.first().and_then(|r| r.first()).cloned().unwrap_or(Value::Empty);
                 if v.is_empty() { Value::Number(0.0) } else { v }
             }
+            Ok(EV::M(_)) => Value::Error(ErrorKind::Value),
+            Ok(EV::L(_)) => Value::Error(ErrorKind::Calc),
         }
     }
 
@@ -734,6 +754,7 @@ impl<'a> Evaluator<'a> {
             Expr::Bool(b) => Ok(EV::V(Value::Bool(*b))),
             Expr::Err(e) => Err(*e),
             Expr::Missing => Ok(EV::V(Value::Empty)),
+            Expr::Ref(r) if r.sheet.as_deref().is_some_and(|s| s.contains(':')) => self.ref_3d(r),
             Expr::Ref(r) => {
                 let (s, rg) = self.resolve_ref(r)?;
                 if r.kind == RefKind::Spill {
@@ -776,6 +797,7 @@ impl<'a> Evaluator<'a> {
                 Ok(acc)
             }
             Expr::Func(name, args) => super::functions::call(self, name, args),
+            Expr::Union(_) | Expr::Range(..) | Expr::Isect(..) | Expr::Call(..) => self.eval_ref_op(e),
             Expr::Array(rows) => {
                 let mut out = Vec::with_capacity(rows.len());
                 for row in rows {
@@ -791,6 +813,46 @@ impl<'a> Evaluator<'a> {
                 }
                 Ok(EV::A(out))
             }
+        }
+    }
+
+    /// Reference operators and calls of computed functions (kept out of `eval` so its stack
+    /// frame stays small for deep reference chains).
+    #[inline(never)]
+    fn eval_ref_op(&mut self, e: &Expr) -> Res {
+        match e {
+            Expr::Union(items) => {
+                let mut areas = Vec::new();
+                for e in items {
+                    match self.eval(e)? {
+                        EV::R(s, rg) => areas.push((s, rg)),
+                        EV::M(m) => areas.extend(m),
+                        _ => return Err(ErrorKind::Value),
+                    }
+                }
+                Ok(EV::M(areas))
+            }
+            Expr::Range(a, b) | Expr::Isect(a, b) => {
+                let x = self.eval(a)?;
+                let y = self.eval(b)?;
+                let (Some((s1, r1)), Some((s2, r2))) = (bounds(&x), bounds(&y)) else { return Err(ErrorKind::Value) };
+                if s1 != s2 {
+                    return Err(ErrorKind::Value);
+                }
+                if matches!(e, Expr::Range(..)) {
+                    return Ok(EV::R(s1, Range::new(r1.r1.min(r2.r1), r1.c1.min(r2.c1), r1.r2.max(r2.r2), r1.c2.max(r2.c2))));
+                }
+                let (lo_r, lo_c, hi_r, hi_c) = (r1.r1.max(r2.r1), r1.c1.max(r2.c1), r1.r2.min(r2.r2), r1.c2.min(r2.c2));
+                if lo_r > hi_r || lo_c > hi_c { Err(ErrorKind::Null) } else { Ok(EV::R(s1, Range::new(lo_r, lo_c, hi_r, hi_c))) }
+            }
+            Expr::Call(f, args) => match self.eval(f)? {
+                EV::L(l) => {
+                    let vals = self.lambda_args(args);
+                    self.call_lambda(&l, vals)
+                }
+                _ => Err(ErrorKind::Value),
+            },
+            _ => Err(ErrorKind::Value),
         }
     }
 
@@ -816,7 +878,67 @@ impl<'a> Evaluator<'a> {
 
     /// Binds a LET variable / lifted argument for the duration of a call.
     pub fn bind(&mut self, name: String, v: EV) {
-        self.scopes.push((name, v));
+        self.scopes.push((name, Rc::new(v)));
+    }
+
+    /// The innermost binding of a LET variable / LAMBDA parameter.
+    pub fn bound(&self, n: &str) -> Option<&EV> {
+        self.scopes.iter().rev().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| &**v)
+    }
+
+    /// Whether `n` is a LAMBDA parameter the caller left out.
+    pub fn is_omitted(&self, n: &str) -> bool {
+        self.bound(n).is_some_and(is_omitted)
+    }
+
+    /// Creates a closure over the bindings currently in scope.
+    pub fn make_lambda(&self, params: Vec<String>, body: &Expr) -> EV {
+        EV::L(Rc::new(Lambda { params, body: Rc::new(body.clone()), env: self.scopes.clone() }))
+    }
+
+    /// Evaluates call arguments for a LAMBDA: errors are passed as values, omitted ones marked.
+    pub fn lambda_args(&mut self, args: &[Expr]) -> Vec<EV> {
+        args.iter()
+            .map(|e| match e {
+                Expr::Missing => EV::A(Vec::new()),
+                e => self.eval(e).unwrap_or_else(|k| EV::V(Value::Error(k))),
+            })
+            .collect()
+    }
+
+    /// Calls a LAMBDA with evaluated arguments; parameters not passed count as omitted.
+    pub fn call_lambda(&mut self, f: &Lambda, args: Vec<EV>) -> Res {
+        if args.len() > f.params.len() {
+            return Err(ErrorKind::Value);
+        }
+        if self.too_deep() {
+            self.circular = true;
+            return Err(ErrorKind::Calc);
+        }
+        let mut env = f.env.clone();
+        let mut args = args.into_iter();
+        for p in &f.params {
+            env.push((p.clone(), Rc::new(args.next().unwrap_or(EV::A(Vec::new())))));
+        }
+        let saved = std::mem::replace(&mut self.scopes, env);
+        let r = self.eval(&f.body);
+        self.scopes = saved;
+        r
+    }
+
+    /// `Sheet1:Sheet3!A1:B2`: the same area on every sheet of the span (workbook order).
+    fn ref_3d(&mut self, r: &RefExpr) -> Res {
+        let span = r.sheet.as_deref().unwrap_or_default();
+        let (a, b) = span.split_once(':').ok_or(ErrorKind::Ref)?;
+        let (Some(i), Some(j)) = (self.wb.sheet_index(a), self.wb.sheet_index(b)) else { return Err(ErrorKind::Ref) };
+        if r.kind == RefKind::Spill {
+            return Err(ErrorKind::Ref);
+        }
+        let rg = Range::new(r.a.row, r.a.col, r.b.row, r.b.col);
+        if i == j {
+            return Ok(EV::R(i, rg));
+        }
+        Ok(EV::M((i.min(j)..=i.max(j)).map(|s| (s, rg)).collect()))
     }
 
     pub fn unbind(&mut self, n: usize) {
@@ -824,10 +946,11 @@ impl<'a> Evaluator<'a> {
         self.scopes.truncate(keep);
     }
 
-    fn eval_name(&mut self, n: &str) -> Res {
+    pub fn eval_name(&mut self, n: &str) -> Res {
         if let Some((_, v)) = self.scopes.iter().rev().find(|(k, _)| k.eq_ignore_ascii_case(n)) {
-            return match v {
+            return match &**v {
                 EV::V(Value::Error(e)) => Err(*e),
+                v if is_omitted(v) => Ok(EV::V(Value::Empty)),
                 v => Ok(v.clone()),
             };
         }
@@ -883,7 +1006,8 @@ impl<'a> Evaluator<'a> {
 
     pub fn is_multi(&self, v: &EV) -> bool {
         match v {
-            EV::V(_) => false,
+            EV::V(_) | EV::L(_) => false,
+            EV::M(m) => m.len() != 1 || !m[0].1.is_single(),
             EV::R(_, rg) => !rg.is_single(),
             EV::A(a) => a.len() > 1 || a.first().is_some_and(|r| r.len() > 1),
         }
@@ -901,6 +1025,8 @@ impl<'a> Evaluator<'a> {
                 }
             }
             EV::A(a) => a.into_iter().next().and_then(|r| r.into_iter().next()).unwrap_or(Value::Empty),
+            EV::M(m) if m.len() == 1 => return self.scalar(EV::R(m[0].0, m[0].1)),
+            EV::M(_) | EV::L(_) => return Err(ErrorKind::Value),
         };
         match v {
             Value::Error(e) => Err(e),
@@ -929,6 +1055,9 @@ impl<'a> Evaluator<'a> {
                 }
                 self.grid_of(s, rg)
             }
+            EV::M(m) if m.len() == 1 => self.grid(EV::R(m[0].0, m[0].1)),
+            EV::M(_) => vec![vec![Value::Error(ErrorKind::Value)]],
+            EV::L(_) => vec![vec![Value::Error(ErrorKind::Calc)]],
         }
     }
 
@@ -997,6 +1126,13 @@ impl<'a> Evaluator<'a> {
                 }
                 Ok(())
             }
+            EV::M(m) => {
+                for (s, rg) in m {
+                    self.walk_cells(EV::R(s, rg), skip_hidden, skip_nested, f)?;
+                }
+                Ok(())
+            }
+            EV::L(_) => Err(ErrorKind::Value),
             EV::R(s, rg) => {
                 let wb = self.wb;
                 let Some(sh) = wb.sheets.get(s) else { return Err(ErrorKind::Ref) };
@@ -1096,6 +1232,21 @@ impl<'a> Evaluator<'a> {
             })?;
         }
         Ok(out)
+    }
+}
+
+/// (sheet, bounding range) of a reference result.
+fn bounds(v: &EV) -> Option<(usize, Range)> {
+    match v {
+        EV::R(s, rg) => Some((*s, *rg)),
+        EV::M(m) if !m.is_empty() && m.iter().all(|x| x.0 == m[0].0) => {
+            let mut b = m[0].1;
+            for (_, r) in &m[1..] {
+                b = Range::new(b.r1.min(r.r1), b.c1.min(r.c1), b.r2.max(r.r2), b.c2.max(r.c2));
+            }
+            Some((m[0].0, b))
+        }
+        _ => None,
     }
 }
 

@@ -5,7 +5,7 @@ use eframe::egui::{
 };
 
 use super::theme::{self, rgb};
-use super::{App, Drag, EditMode, FilterPopup, Scope};
+use super::{App, Drag, EditMode, Scope};
 use crate::model::{col_name, BorderLine, HAlign, Range, Style, VAlign, Value, MAX_COLS, MAX_ROWS};
 use crate::numfmt;
 
@@ -262,7 +262,10 @@ impl App {
 
     pub fn grid_ui(&mut self, ui: &mut egui::Ui) {
         let full = ui.available_rect_before_wrap();
-        let (rl, cl) = {
+        // Ctrl+8 hides the outline symbols.
+        let (rl, cl) = if self.kb.outline_hidden {
+            (0, 0)
+        } else {
             let sh = self.sheet();
             (sh.row_levels.values().copied().max().unwrap_or(0), sh.col_levels.values().copied().max().unwrap_or(0))
         };
@@ -294,6 +297,7 @@ impl App {
             self.outline_ui(ui, full, &lay, rl, cl);
         }
         self.context_menu(&resp);
+        self.float_buttons_ui(ui);
     }
 
     // ------------------------------------------------------------------
@@ -352,6 +356,12 @@ impl App {
         }
 
         let Some(pos) = pos else { return };
+        // F8 / Shift+F8 selection modes act like holding Shift / Ctrl while clicking.
+        let mods = self.kb.apply(mods);
+        // Clicks on the floating Auto Fill / Paste Options buttons are theirs.
+        if self.drag == Drag::None && self.menu.float_rects.iter().any(|r| r.contains(pos)) {
+            return;
+        }
         self.hover_cell = if hovered && lay.cells.contains(pos) && self.drag == Drag::None {
             Some((lay.row_near(pos.y), lay.col_near(pos.x)))
         } else {
@@ -848,7 +858,9 @@ impl App {
             Drag::Fill(src) => {
                 let target = self.fill_target(lay, src, pos);
                 if target != src {
-                    self.autofill(src, target);
+                    // Ctrl+drag toggles between copying and filling a series.
+                    let ctrl = self.ctx.as_ref().is_some_and(|x| x.input(|i| i.modifiers.ctrl));
+                    self.autofill_kind(src, target, if ctrl { super::fill::FillKind::Toggle } else { super::fill::FillKind::Auto });
                 }
             }
             Drag::Cells => {
@@ -880,28 +892,6 @@ impl App {
             }
             _ => {}
         }
-    }
-
-    pub(super) fn open_filter_popup(&mut self, col: u32, pos: Pos2) {
-        let Some(f) = self.sheet().filter.clone() else { return };
-        let sh = self.sheet();
-        let mut vals: Vec<String> = Vec::new();
-        for r in f.range.r1 + 1..=f.range.r2 {
-            let t = sh.get(r, col).map(|c| numfmt::format_value(&c.value, &self.wb.style(c.style).num_fmt).text).unwrap_or_default();
-            if !vals.contains(&t) {
-                vals.push(t);
-            }
-        }
-        vals.sort_by_key(|a| a.to_lowercase());
-        let excluded = f.excluded.get(&col).cloned().unwrap_or_default();
-        let values = vals
-            .into_iter()
-            .map(|v| {
-                let on = !excluded.contains(&v);
-                (v, on)
-            })
-            .collect();
-        self.filter_popup = Some(FilterPopup { col, pos, values, search: String::new() });
     }
 
     pub fn vthumb(&self, lay: &Layout) -> (Rect, f32) {
@@ -1365,7 +1355,7 @@ impl App {
                 for c in f.range.c1..=f.range.c2 {
                     if let Some((_, rx)) = lay.col_span(c) {
                         let btn = Rect::from_min_max(Pos2::new(rx - 17.0, b - 17.0), Pos2::new(rx - 1.0, b - 1.0));
-                        let active = f.excluded.get(&c).is_some_and(|s| !s.is_empty());
+                        let active = f.is_filtered(c);
                         cp.rect_filled(btn, 2.0, Color32::from_gray(250));
                         cp.rect_stroke(btn, 2.0, Stroke::new(1.0, Color32::from_gray(170)), StrokeKind::Inside);
                         let (g, is_icon) = self.fonts.icons.get(if active { theme::ic::FILTER } else { theme::ic::DOWN }, "▾");
@@ -1418,11 +1408,14 @@ impl App {
         painter.rect_filled(lay.vbar, 0.0, theme::chrome());
         painter.rect_filled(lay.hbar, 0.0, theme::chrome());
         painter.rect_filled(Rect::from_min_max(Pos2::new(lay.vbar.left(), lay.hbar.top()), lay.rect.right_bottom()), 0.0, theme::chrome());
+        // gaps beside the headers (above the vertical bar, left of the horizontal bar)
+        painter.rect_filled(Rect::from_min_max(Pos2::new(lay.vbar.left(), lay.rect.top()), Pos2::new(lay.rect.right(), lay.vbar.top())), 0.0, theme::grid_gutter());
+        painter.rect_filled(Rect::from_min_max(Pos2::new(lay.rect.left(), lay.hbar.top()), Pos2::new(lay.hbar.left(), lay.rect.bottom())), 0.0, theme::grid_gutter());
         let (vt, _) = self.vthumb(lay);
         let (ht, _) = self.hthumb(lay);
-        let thumb_col = if matches!(self.drag, Drag::VScroll(..)) { Color32::from_gray(120) } else { Color32::from_gray(180) };
+        let thumb_col = if matches!(self.drag, Drag::VScroll(..)) { theme::scroll_thumb_active() } else { theme::scroll_thumb() };
         painter.rect_filled(vt.shrink2(Vec2::new(2.0, 0.0)), 4.0, thumb_col);
-        let thumb_col = if matches!(self.drag, Drag::HScroll(..)) { Color32::from_gray(120) } else { Color32::from_gray(180) };
+        let thumb_col = if matches!(self.drag, Drag::HScroll(..)) { theme::scroll_thumb_active() } else { theme::scroll_thumb() };
         painter.rect_filled(ht.shrink2(Vec2::new(0.0, 2.0)), 4.0, thumb_col);
         let _ = (fr, fc, z);
     }
@@ -1475,7 +1468,7 @@ impl App {
         let s = (corner.height() * 0.55).min(corner.width() * 0.55);
         painter.add(egui::Shape::convex_polygon(
             vec![p, p - Vec2::new(0.0, s), p - Vec2::new(s, 0.0)],
-            Color32::from_gray(185),
+            theme::select_all(),
             Stroke::NONE,
         ));
         painter.line_segment([Pos2::new(lay.rect.left(), lay.cells.top() - 0.5), Pos2::new(lay.cells.left(), lay.cells.top() - 0.5)], line);
@@ -1566,135 +1559,6 @@ impl App {
         painter.ctx().request_repaint_after(std::time::Duration::from_millis(520));
     }
 
-    fn context_menu(&mut self, resp: &egui::Response) {
-        resp.context_menu(|ui| {
-            ui.set_min_width(190.0);
-            let sel = self.sel();
-            if ui.button("Cut").clicked() {
-                self.copy(ui.ctx(), true);
-                ui.close();
-            }
-            if ui.button("Copy").clicked() {
-                self.copy(ui.ctx(), false);
-                ui.close();
-            }
-            if ui.add_enabled(self.clip.is_some(), egui::Button::new("Paste")).clicked() {
-                self.paste_internal(super::actions::PasteMode::All);
-                ui.close();
-            }
-            ui.menu_button("Paste Special", |ui| {
-                for (label, m) in [
-                    ("Values", super::actions::PasteMode::Values),
-                    ("Formulas", super::actions::PasteMode::Formulas),
-                    ("Formatting", super::actions::PasteMode::Formats),
-                    ("Transpose", super::actions::PasteMode::Transpose),
-                ] {
-                    if ui.add_enabled(self.clip.is_some(), egui::Button::new(label)).clicked() {
-                        self.paste_internal(m);
-                        ui.close();
-                    }
-                }
-            });
-            ui.separator();
-            if ui.button("Insert...").clicked() {
-                self.insert_cells_prompt();
-                ui.close();
-            }
-            if ui.button("Delete...").clicked() {
-                self.delete_cells_prompt();
-                ui.close();
-            }
-            if ui.button("Clear Contents").clicked() {
-                self.clear(true, false);
-                ui.close();
-            }
-            ui.separator();
-            let (ar, ac) = self.active();
-            let has_link = self.sheet().links.contains_key(&(ar, ac));
-            if ui.button(if has_link { "Edit Hyperlink..." } else { "Link..." }).clicked() {
-                self.open_link_dialog();
-                ui.close();
-            }
-            if has_link {
-                if ui.button("Open Hyperlink").clicked() {
-                    if let Some(t) = self.sheet().links.get(&(ar, ac)).cloned() {
-                        self.follow_link(&t);
-                    }
-                    ui.close();
-                }
-                if ui.button("Remove Hyperlink").clicked() {
-                    self.set_link(ar, ac, "", None);
-                    ui.close();
-                }
-            }
-            let has_note = self.sheet().notes.contains_key(&(ar, ac));
-            if ui.button(if has_note { "Edit Note" } else { "New Note" }).clicked() {
-                self.edit_note();
-                ui.close();
-            }
-            if has_note && ui.button("Delete Note").clicked() {
-                self.delete_notes_in_selection();
-                ui.close();
-            }
-            ui.separator();
-            ui.menu_button("Filter", |ui| {
-                if ui.button("Filter by Selected Cell's Value").clicked() {
-                    self.filter_by_active_value();
-                    ui.close();
-                }
-                if ui.button("Clear Filter").clicked() {
-                    self.clear_filter();
-                    ui.close();
-                }
-            });
-            ui.menu_button("Sort", |ui| {
-                if ui.button("Sort A to Z").clicked() {
-                    self.sort_simple(false);
-                    ui.close();
-                }
-                if ui.button("Sort Z to A").clicked() {
-                    self.sort_simple(true);
-                    ui.close();
-                }
-                if ui.button("Custom Sort...").clicked() {
-                    self.open_sort_dialog();
-                    ui.close();
-                }
-            });
-            ui.separator();
-            if ui.button("Format Cells...").clicked() {
-                self.open_format_cells(0);
-                ui.close();
-            }
-            if sel.is_full_cols() {
-                if ui.button("Column Width...").clicked() {
-                    self.open_col_width();
-                    ui.close();
-                }
-                if ui.button("Hide").clicked() {
-                    self.hide_cols(true);
-                    ui.close();
-                }
-                if ui.button("Unhide").clicked() {
-                    self.hide_cols(false);
-                    ui.close();
-                }
-            } else if sel.is_full_rows() {
-                if ui.button("Row Height...").clicked() {
-                    self.open_row_height();
-                    ui.close();
-                }
-                if ui.button("Hide").clicked() {
-                    self.hide_rows(true);
-                    ui.close();
-                }
-                if ui.button("Unhide").clicked() {
-                    self.hide_rows(false);
-                    ui.close();
-                }
-            }
-        });
-    }
 }
 
 impl App {

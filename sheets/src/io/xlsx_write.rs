@@ -3,6 +3,7 @@
 mod charts;
 mod extras;
 mod fidelity;
+mod filter;
 mod page;
 
 use std::collections::HashMap;
@@ -20,7 +21,9 @@ const MAX_STR: usize = 32_767;
 
 pub fn write(wb: &Workbook, path: &Path) -> Result<(), String> {
     let mut book = build(wb).map_err(|e| e.to_string())?;
-    book.save(path).map_err(|e| format!("Could not save: {e}"))
+    let bytes = book.save_to_buffer().map_err(|e| format!("Could not save: {e}"))?;
+    let bytes = filter::patch(wb, bytes)?;
+    std::fs::write(path, bytes).map_err(|e| format!("Could not save: {e}"))
 }
 
 fn build(wb: &Workbook) -> Result<XWorkbook, XlsxError> {
@@ -38,8 +41,11 @@ fn build(wb: &Workbook) -> Result<XWorkbook, XlsxError> {
         }
     }
     for (name, text) in &wb.names {
-        // Invalid names are skipped rather than failing the whole save.
-        let _ = book.define_name(name, &format!("={}", text.trim_start_matches('=')));
+        // Invalid names are skipped rather than failing the whole save. Parsed definitions
+        // are written in file form (`_xlfn.LAMBDA(_xlpm.x,...)` for named lambdas).
+        let text = text.trim_start_matches('=');
+        let text = formula::parse(text).map(|e| formula::print_xlsx(&e)).unwrap_or_else(|_| text.to_string());
+        let _ = book.define_name(name, &format!("={text}"));
     }
     // Sheet-scoped names are written as `Sheet!Name`.
     for (sh, written) in wb.sheets.iter().zip(&used) {
@@ -170,12 +176,9 @@ fn write_sheet(wb: &Workbook, sh: &Sheet, ws: &mut Worksheet, formats: &mut Hash
     if let Some(c) = sh.tab_color {
         ws.set_tab_color(Color::RGB(c & 0xFFFFFF));
     }
-    if let Some(f) = &sh.filter {
-        let rg = f.range;
-        // A sheet AutoFilter may not overlap a table (tables carry their own).
-        if rg.r2 < MAX_ROWS && rg.c2 < MAX_COLS && !fidelity::writable_tables(sh).iter().any(|t| t.range.intersects(&rg)) {
-            ws.autofilter(rg.r1, rg.c1 as u16, rg.r2, rg.c2 as u16)?;
-        }
+    // A sheet AutoFilter may not overlap a table (tables carry their own).
+    if !sh.filter.as_ref().is_some_and(|f| fidelity::writable_tables(sh).iter().any(|t| t.range.intersects(&f.range))) {
+        filter::write_range(sh, ws)?;
     }
     if (sh.zoom - 1.0).abs() > 0.004 {
         ws.set_zoom((sh.zoom * 100.0).round().clamp(10.0, 400.0) as u16);

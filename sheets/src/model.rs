@@ -378,12 +378,7 @@ pub struct SheetView {
     pub extra: Vec<Range>,
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct AutoFilter {
-    pub range: Range,
-    /// Per column: displayed values that are filtered out.
-    pub excluded: HashMap<u32, HashSet<String>>,
-}
+pub use crate::filter::AutoFilter;
 
 #[derive(Clone, Debug)]
 pub struct Sheet {

@@ -569,7 +569,13 @@ impl App {
                 // The table's header acts as the sheet's AutoFilter (the file keeps the table's own).
                 let t = self.sheet().tables[i].clone();
                 let rg = Range { r2: t.range.r2 - t.totals as u32, ..t.range };
-                self.sheet_mut().filter = Some(crate::model::AutoFilter { range: rg, excluded: Default::default() });
+                if self.sheet().filter.as_ref().is_some_and(|f| f.range != rg) {
+                    self.status = Some("Clear the sheet's AutoFilter to filter this table.".into());
+                    return true;
+                }
+                if self.sheet().filter.is_none() {
+                    self.sheet_mut().filter = Some(crate::model::AutoFilter::new(rg));
+                }
                 self.open_filter_popup(c, pos);
                 return true;
             }

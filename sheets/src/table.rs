@@ -640,6 +640,10 @@ pub fn rename_column_in(spec: &str, old: &str, new: &str) -> String {
 pub fn file_form(text: &str, table: Option<&str>) -> String {
     let (t, spec) = split(text);
     let t = if t.is_empty() { table.unwrap_or("") } else { t };
+    if t.is_empty() {
+        // Outside any table: keep the text as typed.
+        return text.to_string();
+    }
     let inner = unbracket(spec).trim();
     let spec = match inner.strip_prefix('@') {
         Some(rest) => {

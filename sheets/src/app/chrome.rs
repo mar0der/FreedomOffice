@@ -14,6 +14,7 @@ pub enum Backstage {
     SaveAs,
     Print,
     Export,
+    Account,
     About,
 }
 
@@ -37,7 +38,7 @@ impl App {
 
     pub fn formula_bar_ui(&mut self, ui: &mut egui::Ui) {
         let h = 24.0;
-        ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
             // Name box
             let sel = self.sel();
@@ -55,12 +56,48 @@ impl App {
                 };
             }
             let nb = egui::TextEdit::singleline(&mut self.name_box)
-                .desired_width(96.0)
-                .min_size(Vec2::new(96.0, h))
+                .frame(false)
+                .desired_width(84.0)
+                .min_size(Vec2::new(84.0, h))
                 .vertical_align(egui::Align::Center)
                 .font(theme::ui_font(13.0))
                 .margin(egui::Margin::symmetric(5, 2));
-            let resp = egui::Frame::new().fill(theme::window()).stroke(Stroke::new(1.0, theme::field_edge())).corner_radius(4).show(ui, |ui| ui.add(nb)).inner;
+            // Name box: a combo box whose list holds the defined names.
+            let edge = if self.name_box_editing { theme::accent() } else { theme::field_edge() };
+            let (resp, drop) = egui::Frame::new()
+                .fill(theme::window())
+                .stroke(Stroke::new(1.0, edge))
+                .corner_radius(4)
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    let resp = ui.add(nb);
+                    let (r, drop) = ui.allocate_exact_size(Vec2::new(18.0, h), Sense::click());
+                    if drop.hovered() {
+                        ui.painter().rect_filled(r.shrink(2.0), 3.0, theme::hover());
+                    }
+                    super::ribbon::paint_chevron(ui.painter(), r.center(), false, theme::text());
+                    (resp, drop)
+                })
+                .inner;
+            let mut goto = None;
+            egui::Popup::menu(&drop).show(|ui| {
+                ui.set_min_width(110.0);
+                let names: Vec<String> = self.wb.names.iter().map(|(n, _)| n.clone()).filter(|n| !n.starts_with("_xlnm")).collect();
+                if names.is_empty() {
+                    ui.add_enabled(false, egui::Button::new("(No defined names)"));
+                }
+                for n in names {
+                    if ui.button(&n).clicked() {
+                        goto = Some(n);
+                        ui.close();
+                    }
+                }
+            });
+            if let Some(n) = goto {
+                self.commit_edit(false);
+                self.go_to(&n);
+                ui.memory_mut(|m| m.request_focus(egui::Id::new("grid")));
+            }
             if resp.gained_focus() {
                 self.name_box_editing = true;
                 if let Some(mut st) = egui::TextEdit::load_state(ui.ctx(), resp.id) {
@@ -97,28 +134,46 @@ impl App {
             let (x, xi) = self.icon(ic::CLOSE, "✕");
             let (ok, oki) = self.icon(ic::ACCEPT, "✓");
             let f = |s: String, icon: bool| if icon { RichText::new(s).font(theme::icon_font(12.0)) } else { RichText::new(s) };
-            if ui.add_enabled(editing, egui::Button::new(f(x, xi)).min_size(Vec2::new(26.0, h)).frame(false)).on_hover_text("Cancel").clicked() {
-                self.cancel_edit();
-            }
-            if ui.add_enabled(editing, egui::Button::new(f(ok, oki)).min_size(Vec2::new(26.0, h)).frame(false)).on_hover_text("Enter").clicked() {
-                self.commit_edit(false);
-            }
-            if ui
-                .add(egui::Button::new(RichText::new("fx").italics().font(theme::ui_font(14.0))).min_size(Vec2::new(28.0, h)).frame(false))
-                .on_hover_text("Insert Function (Shift+F3)")
-                .clicked()
-            {
-                self.dialog = Some(Dialog::insert_function());
-            }
+            // Cancel / Enter / Insert Function share one outlined box.
+            egui::Frame::new().fill(theme::window()).stroke(Stroke::new(1.0, theme::field_edge())).corner_radius(4).show(ui, |ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                let bh = h - 2.0;
+                if ui.add_enabled(editing, egui::Button::new(f(x, xi)).min_size(Vec2::new(26.0, bh)).frame(false)).on_hover_text("Cancel").clicked() {
+                    self.cancel_edit();
+                }
+                if ui.add_enabled(editing, egui::Button::new(f(ok, oki)).min_size(Vec2::new(26.0, bh)).frame(false)).on_hover_text("Enter").clicked() {
+                    self.commit_edit(false);
+                }
+                if ui
+                    .add(egui::Button::new(RichText::new("fx").italics().font(theme::ui_font(14.0))).min_size(Vec2::new(28.0, bh)).frame(false))
+                    .on_hover_text("Insert Function (Shift+F3)")
+                    .clicked()
+                {
+                    self.dialog = Some(Dialog::insert_function());
+                }
+            });
             ui.add_space(4.0);
             self.formula_field(ui, h);
+            // Expand / collapse the formula bar (Ctrl+Shift+U).
+            let (r, resp) = ui.allocate_exact_size(Vec2::new(24.0, h), Sense::click());
+            if resp.hovered() {
+                ui.painter().rect_filled(r.shrink(2.0), 3.0, if resp.is_pointer_button_down_on() { theme::pressed() } else { theme::hover() });
+            }
+            super::ribbon::paint_chevron(ui.painter(), r.center(), self.formula_bar_tall, theme::text());
+            let tip = if self.formula_bar_tall { "Collapse Formula Bar (Ctrl+Shift+U)" } else { "Expand Formula Bar (Ctrl+Shift+U)" };
+            if resp.on_hover_text(tip).clicked() {
+                self.formula_bar_tall = !self.formula_bar_tall;
+            }
         });
     }
 
     fn formula_field(&mut self, ui: &mut egui::Ui, h: f32) {
-        let w = ui.available_width();
+        let w = ui.available_width() - 26.0;
         let lines = self.edit.as_ref().filter(|e| e.in_bar).map(|e| e.text.lines().count().max(1)).unwrap_or(1).min(6) as f32;
-        let hh = if lines > 1.0 { lines * 17.0 + 6.0 } else { h };
+        let mut hh = if lines > 1.0 { lines * 17.0 + 6.0 } else { h };
+        if self.formula_bar_tall {
+            hh = hh.max(3.0 * 17.0 + 6.0);
+        }
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, hh), Sense::click_and_drag());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 4.0, theme::window());
@@ -142,9 +197,13 @@ impl App {
                     Some(anchor) => (anchor.input_text(), theme::text_dim()),
                     None => (if sh.get(r, c).is_some() { self.edit_text(r, c) } else { String::new() }, theme::text()),
                 };
-                let first = t.lines().next().unwrap_or("").to_string();
-                let more = t.lines().count() > 1;
-                painter.layout_no_wrap(if more { format!("{first} …") } else { first }, font.clone(), color)
+                if self.formula_bar_tall {
+                    painter.layout_no_wrap(t, font.clone(), color)
+                } else {
+                    let first = t.lines().next().unwrap_or("").to_string();
+                    let more = t.lines().count() > 1;
+                    painter.layout_no_wrap(if more { format!("{first} …") } else { first }, font.clone(), color)
+                }
             }
         };
         if let Some(e) = &self.edit {
@@ -445,6 +504,10 @@ impl App {
         ui.horizontal_centered(|ui| {
             ui.add_space(10.0);
             ui.label(RichText::new(self.mode_label()).size(12.0).color(theme::text_dim()));
+            for m in self.kb.status() {
+                ui.add_space(16.0);
+                ui.label(RichText::new(m).size(12.0).color(theme::text_dim()));
+            }
             if let Some(s) = &self.status {
                 ui.add_space(16.0);
                 ui.label(RichText::new(s).size(12.0).color(theme::text_dim()));
@@ -555,6 +618,9 @@ impl App {
                     if item(ui, "About", page == Backstage::About) {
                         self.backstage = Some(Backstage::About);
                     }
+                    if item(ui, "Account", page == Backstage::Account) {
+                        self.backstage = Some(Backstage::Account);
+                    }
                 });
             });
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(theme::window()).inner_margin(egui::Margin::same(36))).show(ctx, |ui| {
@@ -593,29 +659,44 @@ impl App {
                 Backstage::Open => {
                     ui.label(RichText::new("Open").size(28.0));
                     ui.add_space(14.0);
-                    let (f, fi) = self.icon(ic::FOLDER, "📂");
-                    let t = if fi { format!("{f}") } else { f };
-                    ui.horizontal(|ui| {
-                        if ui.add(egui::Button::new(RichText::new(t).font(if fi { theme::icon_font(20.0) } else { theme::ui_font(20.0) })).min_size(Vec2::new(44.0, 44.0))).clicked()
-                            || ui.add(egui::Button::new(RichText::new("Browse").size(15.0)).frame(false)).clicked()
-                        {
-                            self.backstage = None;
-                            self.confirm_then(Pending::Open(None));
+                    ui.horizontal_top(|ui| {
+                        if !self.cloud_places_ui(ui, false) {
+                            return;
                         }
+                        ui.vertical(|ui| {
+                            let (f, fi) = self.icon(ic::FOLDER, "📂");
+                            let t = if fi { format!("{f}") } else { f };
+                            ui.horizontal(|ui| {
+                                if ui.add(egui::Button::new(RichText::new(t).font(if fi { theme::icon_font(20.0) } else { theme::ui_font(20.0) })).min_size(Vec2::new(44.0, 44.0))).clicked()
+                                    || ui.add(egui::Button::new(RichText::new("Browse").size(15.0)).frame(false)).clicked()
+                                {
+                                    self.backstage = None;
+                                    self.confirm_then(Pending::Open(None));
+                                }
+                            });
+                            ui.add_space(18.0);
+                            self.recent_list(ui);
+                        });
                     });
-                    ui.add_space(18.0);
-                    self.recent_list(ui);
                 }
                 Backstage::SaveAs => {
                     ui.label(RichText::new("Save As").size(28.0));
                     ui.add_space(14.0);
-                    ui.label("Workbook (*.xlsx), CSV UTF-8 (*.csv), Text (Tab delimited) (*.txt)");
-                    ui.add_space(8.0);
-                    if ui.add(egui::Button::new(RichText::new("Browse...").size(15.0)).min_size(Vec2::new(120.0, 34.0))).clicked() {
-                        self.backstage = None;
-                        self.save_as();
-                    }
+                    ui.horizontal_top(|ui| {
+                        if !self.cloud_places_ui(ui, true) {
+                            return;
+                        }
+                        ui.vertical(|ui| {
+                            ui.label("Workbook (*.xlsx), CSV UTF-8 (*.csv), Text (Tab delimited) (*.txt)");
+                            ui.add_space(8.0);
+                            if ui.add(egui::Button::new(RichText::new("Browse...").size(15.0)).min_size(Vec2::new(120.0, 34.0))).clicked() {
+                                self.backstage = None;
+                                self.save_as();
+                            }
+                        });
+                    });
                 }
+                Backstage::Account => self.account_page_ui(ui),
                 Backstage::Print => self.print_page_ui(ui),
                 Backstage::Export => {
                     ui.label(RichText::new("Export").size(28.0));
@@ -736,86 +817,5 @@ impl App {
         }
         self.filter_popup_ui(ctx);
         self.dv_popups_ui(ctx);
-    }
-
-    fn filter_popup_ui(&mut self, ctx: &egui::Context) {
-        let Some(mut fp) = self.filter_popup.take() else { return };
-        let mut close = false;
-        let mut apply = false;
-        let mut sort: Option<bool> = None;
-        let resp = egui::Area::new(egui::Id::new("filter_popup")).fixed_pos(fp.pos + Vec2::new(-200.0, 10.0)).order(egui::Order::Foreground).show(ctx, |ui| {
-            egui::Frame::popup(ui.style()).inner_margin(egui::Margin::same(6)).show(ui, |ui| {
-                ui.set_width(230.0);
-                if ui.add(egui::Button::new("Sort A to Z").frame(false)).clicked() {
-                    sort = Some(false);
-                }
-                if ui.add(egui::Button::new("Sort Z to A").frame(false)).clicked() {
-                    sort = Some(true);
-                }
-                ui.separator();
-                if ui.add(egui::Button::new("Clear Filter From This Column").frame(false)).clicked() {
-                    for v in fp.values.iter_mut() {
-                        v.1 = true;
-                    }
-                    apply = true;
-                }
-                ui.add(egui::TextEdit::singleline(&mut fp.search).hint_text("Search").desired_width(218.0));
-                egui::Frame::new().stroke(Stroke::new(1.0, theme::border())).inner_margin(egui::Margin::same(4)).show(ui, |ui| {
-                    egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
-                        ui.set_width(210.0);
-                        let mut all = fp.values.iter().all(|v| v.1);
-                        if ui.checkbox(&mut all, "(Select All)").changed() {
-                            for v in fp.values.iter_mut() {
-                                v.1 = all;
-                            }
-                        }
-                        let q = fp.search.to_lowercase();
-                        for (v, on) in fp.values.iter_mut() {
-                            if !q.is_empty() && !v.to_lowercase().contains(&q) {
-                                continue;
-                            }
-                            let label = if v.is_empty() { "(Blanks)".to_string() } else { v.clone() };
-                            ui.checkbox(on, label);
-                        }
-                    });
-                });
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Cancel").clicked() {
-                            close = true;
-                        }
-                        if ui.button("   OK   ").clicked() {
-                            apply = true;
-                        }
-                    });
-                });
-            });
-        });
-        let outside = ctx.input(|i| i.pointer.any_pressed()) && !resp.response.rect.contains(ctx.input(|i| i.pointer.interact_pos().unwrap_or_default()));
-        if let Some(desc) = sort {
-            let col = fp.col;
-            if let Some(f) = self.sheet().filter.clone() {
-                let a = self.active();
-                self.sheet_mut().view.active = (a.0, col);
-                self.sort_range(f.range, true, &[(col, desc)]);
-            }
-            return;
-        }
-        if apply {
-            let si = self.wb.active;
-            let ex: std::collections::HashSet<String> = fp.values.iter().filter(|v| !v.1).map(|v| v.0.clone()).collect();
-            self.push_undo(&[super::Scope::Sheet(si)]);
-            if let Some(f) = &mut self.wb.sheets[si].filter {
-                f.excluded.insert(fp.col, ex);
-            }
-            self.apply_filter();
-            return;
-        }
-        if close || outside {
-            return;
-        }
-        self.filter_popup = Some(fp);
-        let _ = Rect::NOTHING;
     }
 }

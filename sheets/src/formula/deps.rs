@@ -14,7 +14,7 @@ use super::parser::{Expr, RefKind};
 use crate::model::{Range, Workbook};
 
 const WIDE: u32 = 32;
-const VOLATILE: &[&str] = &["NOW", "TODAY", "RAND", "RANDBETWEEN", "RANDARRAY", "OFFSET", "INDIRECT"];
+const VOLATILE: &[&str] = &["NOW", "TODAY", "RAND", "RANDBETWEEN", "RANDARRAY", "OFFSET", "INDIRECT", "CELL", "INFO"];
 
 #[derive(Clone, Copy)]
 struct FInfo {
@@ -310,6 +310,17 @@ fn collect(
     names: &mut HashMap<String, Option<Expr>>,
 ) {
     match e {
+        Expr::Ref(r) if r.sheet.as_deref().is_some_and(|s| s.contains(':')) => {
+            // 3-D reference: the area on every sheet of the span.
+            let span = r.sheet.as_deref().unwrap_or_default();
+            if let Some((a, b)) = span.split_once(':') {
+                if let (Some(i), Some(j)) = (wb.sheet_index(a), wb.sheet_index(b)) {
+                    for s in i.min(j)..=i.max(j) {
+                        out.push((s, Range::new(r.a.row, r.a.col, r.b.row, r.b.col)));
+                    }
+                }
+            }
+        }
         Expr::Ref(r) => {
             let s = match &r.sheet {
                 Some(n) => match wb.sheet_index(n) {
@@ -353,6 +364,21 @@ fn collect(
             }
         }
         Expr::Neg(a) | Expr::Plus(a) | Expr::Percent(a) | Expr::Paren(a) => collect(a, wb, cur, out, vol, depth, names),
+        Expr::Range(a, b) | Expr::Isect(a, b) => {
+            collect(a, wb, cur, out, vol, depth, names);
+            collect(b, wb, cur, out, vol, depth, names);
+        }
+        Expr::Union(items) => {
+            for a in items {
+                collect(a, wb, cur, out, vol, depth, names);
+            }
+        }
+        Expr::Call(f, args) => {
+            collect(f, wb, cur, out, vol, depth, names);
+            for a in args {
+                collect(a, wb, cur, out, vol, depth, names);
+            }
+        }
         Expr::Bin(..) => {
             // Operator chains nest to the left: walk the spine iteratively (names expanded up
             // to 16 levels would otherwise multiply the recursion depth).
@@ -366,6 +392,10 @@ fn collect(
         Expr::Func(name, args) => {
             if VOLATILE.contains(&name.as_str()) {
                 *vol = true;
+            }
+            // A call of a named LAMBDA reads whatever its definition reads.
+            if !wb.names.is_empty() && !super::functions::is_builtin(name) {
+                collect(&Expr::Name(name.clone()), wb, cur, out, vol, depth, names);
             }
             for a in args {
                 collect(a, wb, cur, out, vol, depth, names);
