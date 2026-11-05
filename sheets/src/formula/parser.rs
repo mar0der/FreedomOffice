@@ -263,7 +263,7 @@ pub fn lex(src: &str) -> Result<Vec<Spanned>, String> {
             // External workbook prefix `[Book.xlsx]Sheet1!` (or `[1]Sheet1!` as stored in files).
             '[' => {
                 let mut j = i + 1;
-                while j < n && !matches!(at(j), ']' | '[') {
+                while j < n && !matches!(at(j), ']' | '[') && !at(j).is_whitespace() {
                     j += 1;
                 }
                 let k0 = j + 1;
@@ -511,6 +511,29 @@ impl Parser {
             });
         }
         let mut e = self.primary()?;
+        // Reference operators bind tighter than any other: range `:`, intersection ` `,
+        // and invocation of a computed function `f(...)(args)`.
+        loop {
+            let d0 = self.d;
+            if self.peek() == Some(&Tok::Colon) {
+                self.i += 1;
+                let b = self.nested(Self::primary)?;
+                self.set_depth(d0.max(self.d) + 1)?;
+                e = Expr::Range(Box::new(e), Box::new(b));
+            } else if self.is_op(" ") {
+                self.i += 1;
+                let b = self.nested(Self::primary)?;
+                self.set_depth(d0.max(self.d) + 1)?;
+                e = Expr::Isect(Box::new(e), Box::new(b));
+            } else if self.peek() == Some(&Tok::LParen) && matches!(e, Expr::Func(..) | Expr::Call(..) | Expr::Paren(_)) {
+                self.i += 1;
+                let args = self.args()?;
+                self.set_depth(d0.max(self.d) + 1)?;
+                e = Expr::Call(Box::new(e), args);
+            } else {
+                break;
+            }
+        }
         while self.is_op("%") {
             self.i += 1;
             self.set_depth(self.d + 1)?;
@@ -623,11 +646,23 @@ impl Parser {
             }
             Tok::LParen => {
                 self.i += 1;
-                let e = self.expr()?;
+                let mut e = self.expr()?;
+                let mut deepest = self.d;
+                if self.peek() == Some(&Tok::Comma) {
+                    // Union: `(A1:A3,C1:C3)`.
+                    let mut items = vec![e];
+                    while self.peek() == Some(&Tok::Comma) {
+                        self.i += 1;
+                        items.push(self.expr()?);
+                        deepest = deepest.max(self.d);
+                    }
+                    deepest += 1;
+                    e = Expr::Union(items);
+                }
                 if self.next() != Some(Tok::RParen) {
                     return Err("missing )".into());
                 }
-                self.set_depth(self.d + 1)?;
+                self.set_depth(deepest + 1)?;
                 Ok(Expr::Paren(Box::new(e)))
             }
             Tok::LBrace => {
@@ -649,7 +684,11 @@ impl Parser {
                 if id.eq_ignore_ascii_case("FALSE") {
                     return Ok(Expr::Bool(false));
                 }
-                Ok(Expr::Name(id))
+                // LET / LAMBDA parameters are stored with an `_xlpm.` prefix in files.
+                match id.get(..6) {
+                    Some(p) if p.eq_ignore_ascii_case("_xlpm.") && id.len() > 6 => Ok(Expr::Name(id[6..].to_string())),
+                    _ => Ok(Expr::Name(id)),
+                }
             }
             Tok::Op(o) => Err(format!("unexpected operator {o}")),
             other => Err(format!("unexpected {other:?}")),
@@ -694,17 +733,31 @@ impl Parser {
     /// Function call after `name(`.
     fn call(&mut self, id: &str) -> Result<Expr, String> {
         let mut name = id.to_ascii_uppercase();
-        for p in ["_XLFN._XLWS.", "_XLFN.", "_XLWS."] {
+        for p in ["_XLFN._XLWS.", "_XLFN.", "_XLWS.", "_XLPM."] {
             if let Some(rest) = name.strip_prefix(p) {
                 name = rest.to_string();
             }
         }
+        let args = self.args()?;
+        if let (true, [Expr::Ref(r)]) = (name == "ANCHORARRAY", args.as_slice()) {
+            if r.kind == RefKind::Cell {
+                self.d = 1;
+                return Ok(Expr::Ref(RefExpr { kind: RefKind::Spill, ..r.clone() }));
+            }
+        }
+        self.set_depth(self.d + 1)?;
+        Ok(Expr::Func(name, args))
+    }
+
+    /// Call arguments after `(` up to the closing `)`; `self.d` is set to the deepest one.
+    fn args(&mut self) -> Result<Vec<Expr>, String> {
         let mut args = Vec::new();
+        let mut deepest = 0;
         if self.peek() == Some(&Tok::RParen) {
             self.i += 1;
-            return Ok(Expr::Func(name, args));
+            self.d = 0;
+            return Ok(args);
         }
-        let mut deepest = 0;
         loop {
             if matches!(self.peek(), Some(Tok::Comma) | Some(Tok::RParen)) {
                 args.push(Expr::Missing);
@@ -715,17 +768,11 @@ impl Parser {
             match self.next() {
                 Some(Tok::Comma) => continue,
                 Some(Tok::RParen) => break,
-                _ => return Err(format!("missing ) in {name}")),
+                _ => return Err("missing )".into()),
             }
         }
-        if let (true, [Expr::Ref(r)]) = (name == "ANCHORARRAY", args.as_slice()) {
-            if r.kind == RefKind::Cell {
-                self.d = 1;
-                return Ok(Expr::Ref(RefExpr { kind: RefKind::Spill, ..r.clone() }));
-            }
-        }
-        self.set_depth(deepest + 1)?;
-        Ok(Expr::Func(name, args))
+        self.d = deepest;
+        Ok(args)
     }
 
     fn try_ref(&mut self, sheet: Option<String>) -> Result<Expr, String> {
@@ -779,8 +826,27 @@ fn part_str(p: &CellPart) -> String {
     format!("{}{}{}{}", if p.col_abs { "$" } else { "" }, col_name(p.col), if p.row_abs { "$" } else { "" }, p.row + 1)
 }
 
+/// `Sheet!` prefix of a reference. 3-D spans (`Jan:Dec`) and external books (`[Book.xlsx]Data`)
+/// are written unquoted when every part is a plain name, and quoted as a whole otherwise.
+fn sheet_prefix(name: &str) -> String {
+    let plain = |s: &str| quote_sheet(s) == s;
+    let (book, rest) = match name.strip_prefix('[').and_then(|r| r.split_once(']')) {
+        Some((b, r)) if !b.is_empty() && !b.contains(['\'', ' ', '[']) => (format!("[{b}]"), r),
+        _ => (String::new(), name),
+    };
+    let simple = match rest.split_once(':') {
+        Some((a, b)) => plain(a) && plain(b),
+        None => plain(rest),
+    };
+    if simple && !rest.is_empty() { format!("{book}{rest}!") } else { format!("{}!", quote_whole(name)) }
+}
+
+fn quote_whole(name: &str) -> String {
+    format!("'{}'", name.replace('\'', "''"))
+}
+
 pub fn ref_str(r: &RefExpr) -> String {
-    let prefix = r.sheet.as_ref().map(|s| format!("{}!", quote_sheet(s))).unwrap_or_default();
+    let prefix = r.sheet.as_deref().map(sheet_prefix).unwrap_or_default();
     let body = match r.kind {
         RefKind::Cell => part_str(&r.a),
         RefKind::Spill => format!("{}#", part_str(&r.a)),
@@ -865,9 +931,14 @@ fn write_expr(e: &Expr, out: &mut String, xlsx: &mut Option<Vec<String>>) {
             write_expr(&args[0], out, xlsx);
         }
         Expr::Func(name, args) => {
+            // A call of a LET / LAMBDA variable holding a function: `_xlpm.f(2)` in files.
+            if xlsx.as_ref().is_some_and(|lets| lets.iter().any(|l| l.eq_ignore_ascii_case(name))) {
+                out.push_str("_xlpm.");
+            }
             let lets = match xlsx {
-                Some(l) if name == "LET" => {
-                    let names: Vec<String> = args.iter().step_by(2).filter_map(|a| if let Expr::Name(n) = a { Some(n.clone()) } else { None }).collect();
+                Some(l) if name == "LET" || name == "LAMBDA" => {
+                    let params = if name == "LET" { args.iter().step_by(2).collect::<Vec<_>>() } else { args.iter().take(args.len().saturating_sub(1)).collect() };
+                    let names: Vec<String> = params.into_iter().filter_map(|a| if let Expr::Name(n) = a { Some(n.clone()) } else { None }).collect();
                     let k = names.len();
                     l.extend(names);
                     k
@@ -875,16 +946,31 @@ fn write_expr(e: &Expr, out: &mut String, xlsx: &mut Option<Vec<String>>) {
                 _ => 0,
             };
             out.push_str(name);
-            out.push('(');
-            for (i, a) in args.iter().enumerate() {
+            write_args(args, out, xlsx);
+            if let Some(l) = xlsx {
+                l.truncate(l.len() - lets);
+            }
+        }
+        Expr::Call(f, args) => {
+            write_expr(f, out, xlsx);
+            write_args(args, out, xlsx);
+        }
+        Expr::Range(a, b) => {
+            write_expr(a, out, xlsx);
+            out.push(':');
+            write_expr(b, out, xlsx);
+        }
+        Expr::Isect(a, b) => {
+            write_expr(a, out, xlsx);
+            out.push(' ');
+            write_expr(b, out, xlsx);
+        }
+        Expr::Union(items) => {
+            for (i, a) in items.iter().enumerate() {
                 if i > 0 {
                     out.push(',');
                 }
                 write_expr(a, out, xlsx);
-            }
-            out.push(')');
-            if let Some(l) = xlsx {
-                l.truncate(l.len() - lets);
             }
         }
         Expr::Array(rows) => {
@@ -911,6 +997,17 @@ fn write_expr(e: &Expr, out: &mut String, xlsx: &mut Option<Vec<String>>) {
     }
 }
 
+fn write_args(args: &[Expr], out: &mut String, xlsx: &mut Option<Vec<String>>) {
+    out.push('(');
+    for (i, a) in args.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        write_expr(a, out, xlsx);
+    }
+    out.push(')');
+}
+
 // ---------------------------------------------------------------------------
 // Transforms
 // ---------------------------------------------------------------------------
@@ -924,11 +1021,15 @@ pub fn map_refs(e: &mut Expr, f: &mut dyn FnMut(&mut RefExpr) -> bool) {
             }
         }
         Expr::Neg(a) | Expr::Plus(a) | Expr::Percent(a) | Expr::Paren(a) => map_refs(a, f),
-        Expr::Bin(_, a, b) => {
+        Expr::Bin(_, a, b) | Expr::Range(a, b) | Expr::Isect(a, b) => {
             map_refs(a, f);
             map_refs(b, f);
         }
-        Expr::Func(_, args) => args.iter_mut().for_each(|a| map_refs(a, f)),
+        Expr::Func(_, args) | Expr::Union(args) => args.iter_mut().for_each(|a| map_refs(a, f)),
+        Expr::Call(g, args) => {
+            map_refs(g, f);
+            args.iter_mut().for_each(|a| map_refs(a, f));
+        }
         _ => {}
     }
 }
@@ -1025,6 +1126,10 @@ pub fn rename_sheet(e: &mut Expr, old: &str, new: &str) {
         if let Some(s) = &mut r.sheet {
             if s.eq_ignore_ascii_case(old) {
                 *s = new.to_string();
+            } else if let Some((a, b)) = s.split_once(':') {
+                // Either end of a 3-D span.
+                let fix = |x: &str| if x.eq_ignore_ascii_case(old) { new.to_string() } else { x.to_string() };
+                *s = format!("{}:{}", fix(a), fix(b));
             }
         }
         true
