@@ -370,12 +370,12 @@ impl App {
             .order(egui::Order::Foreground)
             .interactable(false)
             .show(ctx, |ui| {
-                egui::Frame::popup(ui.style()).fill(Color32::from_rgb(0xFB, 0xFB, 0xFB)).inner_margin(egui::Margin::same(8)).show(ui, |ui| {
+                egui::Frame::popup(ui.style()).fill(theme::keytip_panel()).inner_margin(egui::Margin::same(8)).show(ui, |ui| {
                     ui.label(RichText::new(title).strong().color(theme::accent_dark()));
                     ui.add_space(4.0);
                     egui::Grid::new("kt").num_columns(4).spacing(Vec2::new(10.0, 2.0)).show(ui, |ui| {
                         for (i, (k, l)) in next.iter().take(60).enumerate() {
-                            ui.label(RichText::new(k.as_str()).monospace().strong().background_color(Color32::from_rgb(0xFF, 0xF4, 0xC2)));
+                            ui.label(RichText::new(k.as_str()).monospace().strong().background_color(theme::keytip_key()));
                             ui.label(RichText::new(*l).size(12.0));
                             if i % 2 == 1 {
                                 ui.end_row();

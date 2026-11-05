@@ -38,7 +38,7 @@ impl App {
 
     pub fn formula_bar_ui(&mut self, ui: &mut egui::Ui) {
         let h = 24.0;
-        ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
             // Name box
             let sel = self.sel();
@@ -56,12 +56,48 @@ impl App {
                 };
             }
             let nb = egui::TextEdit::singleline(&mut self.name_box)
-                .desired_width(96.0)
-                .min_size(Vec2::new(96.0, h))
+                .frame(false)
+                .desired_width(84.0)
+                .min_size(Vec2::new(84.0, h))
                 .vertical_align(egui::Align::Center)
                 .font(theme::ui_font(13.0))
                 .margin(egui::Margin::symmetric(5, 2));
-            let resp = egui::Frame::new().fill(theme::window()).stroke(Stroke::new(1.0, theme::field_edge())).corner_radius(4).show(ui, |ui| ui.add(nb)).inner;
+            // Name box: a combo box whose list holds the defined names.
+            let edge = if self.name_box_editing { theme::accent() } else { theme::field_edge() };
+            let (resp, drop) = egui::Frame::new()
+                .fill(theme::window())
+                .stroke(Stroke::new(1.0, edge))
+                .corner_radius(4)
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    let resp = ui.add(nb);
+                    let (r, drop) = ui.allocate_exact_size(Vec2::new(18.0, h), Sense::click());
+                    if drop.hovered() {
+                        ui.painter().rect_filled(r.shrink(2.0), 3.0, theme::hover());
+                    }
+                    super::ribbon::paint_chevron(ui.painter(), r.center(), false, theme::text());
+                    (resp, drop)
+                })
+                .inner;
+            let mut goto = None;
+            egui::Popup::menu(&drop).show(|ui| {
+                ui.set_min_width(110.0);
+                let names: Vec<String> = self.wb.names.iter().map(|(n, _)| n.clone()).filter(|n| !n.starts_with("_xlnm")).collect();
+                if names.is_empty() {
+                    ui.add_enabled(false, egui::Button::new("(No defined names)"));
+                }
+                for n in names {
+                    if ui.button(&n).clicked() {
+                        goto = Some(n);
+                        ui.close();
+                    }
+                }
+            });
+            if let Some(n) = goto {
+                self.commit_edit(false);
+                self.go_to(&n);
+                ui.memory_mut(|m| m.request_focus(egui::Id::new("grid")));
+            }
             if resp.gained_focus() {
                 self.name_box_editing = true;
                 if let Some(mut st) = egui::TextEdit::load_state(ui.ctx(), resp.id) {
@@ -98,28 +134,46 @@ impl App {
             let (x, xi) = self.icon(ic::CLOSE, "✕");
             let (ok, oki) = self.icon(ic::ACCEPT, "✓");
             let f = |s: String, icon: bool| if icon { RichText::new(s).font(theme::icon_font(12.0)) } else { RichText::new(s) };
-            if ui.add_enabled(editing, egui::Button::new(f(x, xi)).min_size(Vec2::new(26.0, h)).frame(false)).on_hover_text("Cancel").clicked() {
-                self.cancel_edit();
-            }
-            if ui.add_enabled(editing, egui::Button::new(f(ok, oki)).min_size(Vec2::new(26.0, h)).frame(false)).on_hover_text("Enter").clicked() {
-                self.commit_edit(false);
-            }
-            if ui
-                .add(egui::Button::new(RichText::new("fx").italics().font(theme::ui_font(14.0))).min_size(Vec2::new(28.0, h)).frame(false))
-                .on_hover_text("Insert Function (Shift+F3)")
-                .clicked()
-            {
-                self.dialog = Some(Dialog::insert_function());
-            }
+            // Cancel / Enter / Insert Function share one outlined box.
+            egui::Frame::new().fill(theme::window()).stroke(Stroke::new(1.0, theme::field_edge())).corner_radius(4).show(ui, |ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                let bh = h - 2.0;
+                if ui.add_enabled(editing, egui::Button::new(f(x, xi)).min_size(Vec2::new(26.0, bh)).frame(false)).on_hover_text("Cancel").clicked() {
+                    self.cancel_edit();
+                }
+                if ui.add_enabled(editing, egui::Button::new(f(ok, oki)).min_size(Vec2::new(26.0, bh)).frame(false)).on_hover_text("Enter").clicked() {
+                    self.commit_edit(false);
+                }
+                if ui
+                    .add(egui::Button::new(RichText::new("fx").italics().font(theme::ui_font(14.0))).min_size(Vec2::new(28.0, bh)).frame(false))
+                    .on_hover_text("Insert Function (Shift+F3)")
+                    .clicked()
+                {
+                    self.dialog = Some(Dialog::insert_function());
+                }
+            });
             ui.add_space(4.0);
             self.formula_field(ui, h);
+            // Expand / collapse the formula bar (Ctrl+Shift+U).
+            let (r, resp) = ui.allocate_exact_size(Vec2::new(24.0, h), Sense::click());
+            if resp.hovered() {
+                ui.painter().rect_filled(r.shrink(2.0), 3.0, if resp.is_pointer_button_down_on() { theme::pressed() } else { theme::hover() });
+            }
+            super::ribbon::paint_chevron(ui.painter(), r.center(), self.formula_bar_tall, theme::text());
+            let tip = if self.formula_bar_tall { "Collapse Formula Bar (Ctrl+Shift+U)" } else { "Expand Formula Bar (Ctrl+Shift+U)" };
+            if resp.on_hover_text(tip).clicked() {
+                self.formula_bar_tall = !self.formula_bar_tall;
+            }
         });
     }
 
     fn formula_field(&mut self, ui: &mut egui::Ui, h: f32) {
-        let w = ui.available_width();
+        let w = ui.available_width() - 26.0;
         let lines = self.edit.as_ref().filter(|e| e.in_bar).map(|e| e.text.lines().count().max(1)).unwrap_or(1).min(6) as f32;
-        let hh = if lines > 1.0 { lines * 17.0 + 6.0 } else { h };
+        let mut hh = if lines > 1.0 { lines * 17.0 + 6.0 } else { h };
+        if self.formula_bar_tall {
+            hh = hh.max(3.0 * 17.0 + 6.0);
+        }
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, hh), Sense::click_and_drag());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 4.0, theme::window());
@@ -143,9 +197,13 @@ impl App {
                     Some(anchor) => (anchor.input_text(), theme::text_dim()),
                     None => (if sh.get(r, c).is_some() { self.edit_text(r, c) } else { String::new() }, theme::text()),
                 };
-                let first = t.lines().next().unwrap_or("").to_string();
-                let more = t.lines().count() > 1;
-                painter.layout_no_wrap(if more { format!("{first} …") } else { first }, font.clone(), color)
+                if self.formula_bar_tall {
+                    painter.layout_no_wrap(t, font.clone(), color)
+                } else {
+                    let first = t.lines().next().unwrap_or("").to_string();
+                    let more = t.lines().count() > 1;
+                    painter.layout_no_wrap(if more { format!("{first} …") } else { first }, font.clone(), color)
+                }
             }
         };
         if let Some(e) = &self.edit {

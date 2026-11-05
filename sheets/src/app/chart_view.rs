@@ -521,7 +521,7 @@ fn kind_button(ui: &mut egui::Ui, kind: ChartKind, label: &str, tip: &str) -> eg
 fn paint_kind_icon(p: &Painter, r: Rect, kind: ChartKind) {
     let (c0, c1, c2) = (series_color(0), series_color(1), series_color(2));
     let at = |fx: f32, fy: f32| Pos2::new(r.left() + fx * r.width(), r.top() + fy * r.height());
-    let axis = Stroke::new(1.0, Color32::from_gray(120));
+    let axis = Stroke::new(1.0, theme::icon_line());
     match kind {
         ChartKind::Column => {
             for (i, (h, c)) in [(0.55, c0), (0.85, c1), (0.4, c2)].iter().enumerate() {

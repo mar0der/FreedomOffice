@@ -550,7 +550,7 @@ impl App {
 
         // ---------------- preview
         let painter = ui.painter_at(right);
-        painter.rect_filled(right, 0.0, Color32::from_rgb(0xE6, 0xE6, 0xE6));
+        painter.rect_filled(right, 0.0, theme::preview_bg());
         let nav_h = 34.0;
         let area = Rect::from_min_max(right.min + Vec2::new(20.0, 20.0), Pos2::new(right.right() - 20.0, right.bottom() - nav_h - 8.0));
         let n = pages.len();
@@ -956,9 +956,9 @@ impl App {
                         ui.painter().rect_filled(rect, 0.0, Color32::WHITE);
                         ui.painter().rect_stroke(rect, 0.0, Stroke::new(1.0, theme::border()), StrokeKind::Inside);
                         let r = |s: &str| crate::page::render_hf(s, &sample);
-                        ui.painter().text(rect.left_center() + Vec2::new(8.0, 0.0), Align2::LEFT_CENTER, r(&hf.left), theme::ui_font(11.5), theme::text());
-                        ui.painter().text(rect.center(), Align2::CENTER_CENTER, r(&hf.center), theme::ui_font(11.5), theme::text());
-                        ui.painter().text(rect.right_center() - Vec2::new(8.0, 0.0), Align2::RIGHT_CENTER, r(&hf.right), theme::ui_font(11.5), theme::text());
+                        ui.painter().text(rect.left_center() + Vec2::new(8.0, 0.0), Align2::LEFT_CENTER, r(&hf.left), theme::ui_font(11.5), theme::PAPER_TEXT);
+                        ui.painter().text(rect.center(), Align2::CENTER_CENTER, r(&hf.center), theme::ui_font(11.5), theme::PAPER_TEXT);
+                        ui.painter().text(rect.right_center() - Vec2::new(8.0, 0.0), Align2::RIGHT_CENTER, r(&hf.right), theme::ui_font(11.5), theme::PAPER_TEXT);
                         ui.horizontal(|ui| {
                             ui.label(label);
                             let cur = presets.iter().find(|(_, p)| p == hf).map(|(n, _)| n.to_string()).unwrap_or_else(|| "(custom)".into());
@@ -1021,7 +1021,7 @@ impl App {
                 }
             }
             if let Some(e) = &d.error {
-                ui.colored_label(Color32::from_rgb(0xC0, 0, 0), e);
+                ui.colored_label(theme::error_text(), e);
             }
             ui.separator();
             ui.horizontal(|ui| {

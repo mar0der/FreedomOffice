@@ -22,9 +22,18 @@ pub fn set_dark(dark: bool) {
     DARK.store(dark, Ordering::Relaxed);
 }
 
+/// Windows app mode, unless FREEDOMOFFICE_THEME=light|dark overrides it (for testing).
+pub fn system_dark() -> bool {
+    match std::env::var("FREEDOMOFFICE_THEME").as_deref() {
+        Ok("dark") => true,
+        Ok("light") => false,
+        _ => os_dark(),
+    }
+}
+
 /// Windows Settings > Personalization > Colors > "Choose your default app mode".
 #[cfg(windows)]
-pub fn system_dark() -> bool {
+fn os_dark() -> bool {
     use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
     let key: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize\0".encode_utf16().collect();
     let val: Vec<u16> = "AppsUseLightTheme\0".encode_utf16().collect();
@@ -37,7 +46,7 @@ pub fn system_dark() -> bool {
 }
 
 #[cfg(not(windows))]
-pub fn system_dark() -> bool {
+fn os_dark() -> bool {
     false
 }
 
@@ -57,7 +66,7 @@ palette! {
     /// Soft accent for selected list items and default buttons.
     accent_light = 0xD5EADD, 0x2B4F3A;
     /// Window background behind the ribbon, formula bar, sheet tabs and status bar.
-    chrome = 0xF3F3F3, 0x161B1E;
+    chrome = 0xF3F3F3, 0x121A1E;
     /// Ribbon body.
     ribbon = 0xFAFAFA, 0x292929;
     /// Popups, dialogs, backstage pages and input fields.
@@ -77,17 +86,41 @@ palette! {
     button_edge = 0xC8C8C8, 0x8A8A8A;
     /// Outline of the name box and formula field.
     field_edge = 0xD4D4D4, 0x666666;
+    /// Vertical line between ribbon groups.
+    separator = 0xD4D4D4, 0x666666;
+    /// Frame around the cells of a ribbon gallery (Cell Styles).
+    gallery_edge = 0xC6C6C6, 0xADADAD;
     /// File backstage navigation pane.
     backstage_nav = 0x185C37, 0x1F3D2B;
     backstage_sel = 0x217346, 0x2F5E42;
     backstage_hover = 0x206B45, 0x2A4F3A;
     /// Formula autocomplete / argument tooltip.
     tooltip = 0xFFFFF4, 0x333333;
+    /// Validation and parse errors shown in dialogs.
+    error_text = 0xC00000, 0xFF7B7B;
+    /// Inset panel inside a dialog (rule description box).
+    inset = 0xF8F8F8, 0x262626;
+    /// Outlines of small painted ribbon icons.
+    icon_line = 0x787878, 0xADADAD;
+    /// Scrollbar thumb, idle and dragged.
+    scroll_thumb = 0xB4B4B4, 0x6B6B6B;
+    scroll_thumb_active = 0x787878, 0x9E9E9E;
+    /// Gaps beside the headers at the scrollbars (white sheet in light mode, window colour in dark).
+    grid_gutter = 0xFFFFFF, 0x121A1E;
+    /// Select-all triangle in the header corner.
+    select_all = 0xB9B9B9, 0x6E6E6E;
+    /// KeyTips help panel and its key badges.
+    keytip_panel = 0xFBFBFB, 0x292929;
+    keytip_key = 0xFFF4C2, 0x5C4E1E;
+    /// Background around the pages in the print preview.
+    preview_bg = 0xE6E6E6, 0x1F1F1F;
 }
 
 /// Accent drawn on the (always white) cell area: selection border, fill handle, copy marquee.
 pub const GRID_ACCENT: Color32 = Color32::from_rgb(0x21, 0x73, 0x46);
 pub const GRID_LINE: Color32 = Color32::from_rgb(0xDD, 0xDD, 0xDD);
+/// Text drawn on white previews of paper or cells (stays dark in dark mode).
+pub const PAPER_TEXT: Color32 = Color32::from_rgb(0x20, 0x20, 0x20);
 
 pub fn grid_line() -> Color32 {
     GRID_LINE

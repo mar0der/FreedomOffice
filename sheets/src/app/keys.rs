@@ -313,6 +313,15 @@ impl App {    pub fn handle_keys(&mut self, ctx: &egui::Context) {
 
     fn on_key(&mut self, ctx: &egui::Context, key: Key, m: Modifiers) {
         let ctrl = m.ctrl || m.command;
+        // ribbon and formula bar toggles also work while editing a cell
+        if ctrl && key == Key::F1 {
+            self.ribbon_collapsed = !self.ribbon_collapsed;
+            return;
+        }
+        if ctrl && m.shift && key == Key::U {
+            self.formula_bar_tall = !self.formula_bar_tall;
+            return;
+        }
         if self.edit.is_some() {
             self.on_key_editing(ctx, key, m);
             return;

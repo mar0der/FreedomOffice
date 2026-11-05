@@ -139,6 +139,8 @@ pub struct App {
     pub zoom: f32,
     pub show_formulas: bool,
     pub show_formula_bar: bool,
+    /// Formula bar expanded to three lines (Ctrl+Shift+U).
+    pub formula_bar_tall: bool,
     pub show_headings: bool,
     pub status: Option<String>,
     pub dirty: bool,
@@ -229,6 +231,7 @@ impl App {
             zoom: 1.0,
             show_formulas: false,
             show_formula_bar: true,
+            formula_bar_tall: false,
             show_headings: true,
             status: None,
             dirty: false,

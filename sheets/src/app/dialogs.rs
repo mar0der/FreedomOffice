@@ -613,7 +613,7 @@ impl App {
                         ui.end_row();
                     });
                     if let Some(e) = error {
-                        ui.colored_label(Color32::from_rgb(0xC0, 0, 0), e.as_str());
+                        ui.colored_label(theme::error_text(), e.as_str());
                     }
                     ui.horizontal(|ui| {
                         if ui.button("Add").clicked() {
@@ -637,6 +637,11 @@ impl App {
                 let yellow = Color32::from_rgb(0xFF, 0xFF, 0xE1);
                 win(&format!("Note - {}", crate::model::cell_name(r, c))).show(ctx, |ui| {
                     egui::Frame::new().fill(yellow).stroke(egui::Stroke::new(1.0, theme::border())).show(ui, |ui| {
+                        // notes stay yellow with dark text, as on the sheet
+                        ui.visuals_mut().override_text_color = Some(theme::PAPER_TEXT);
+                        if theme::is_dark() {
+                            ui.visuals_mut().text_cursor.stroke.color = theme::PAPER_TEXT;
+                        }
                         let te = ui.add(egui::TextEdit::multiline(text).desired_width(300.0).desired_rows(6).frame(false).background_color(yellow));
                         if *focus {
                             te.request_focus();
@@ -1160,6 +1165,8 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Ctrl+Z / Ctrl+Y", "Undo / Redo"),
     ("Ctrl+B / I / U / 5", "Bold / Italic / Underline / Strikethrough"),
     ("Ctrl+1", "Format Cells"),
+    ("Ctrl+F1", "Show or hide the ribbon"),
+    ("Ctrl+Shift+U", "Expand or collapse the formula bar"),
     ("Ctrl+Shift+$ % # @ ! ^ ~", "Currency, Percent, Date, Time, Number, Scientific, General"),
     ("Ctrl+Shift+& / Ctrl+Shift+_", "Outline border / remove borders"),
     ("Ctrl+D / Ctrl+R", "Fill down / right"),
