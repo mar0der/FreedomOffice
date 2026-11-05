@@ -104,12 +104,17 @@ fn parse_cf_rule(rd: &mut XmlReader, e: &BytesStart, is_start: bool, ranges: &[c
     let mut formulas: Vec<String> = Vec::new();
     let mut colors: Vec<u32> = Vec::new();
     let mut ext_id = None;
+    // Icon sets: (iconSet name, showValue, reverse) and the thresholds (type, val, gte).
+    let mut icon_set: Option<(String, bool, bool)> = None;
+    let mut cfvos: Vec<(String, String, bool)> = Vec::new();
     if is_start {
         loop {
             match rd.read_event() {
                 Ok(Event::Start(c)) => match local(&c) {
                     "formula" => formulas.push(clean_formula(&read_text(rd, "formula"))),
                     "id" => ext_id = Some(read_text(rd, "id").trim().to_string()),
+                    "iconSet" => icon_set = Some(super::analysis::icon_set_attrs(&c)),
+                    "cfvo" => cfvos.push(super::analysis::cfvo_attrs(&c)),
                     "color" => {
                         colors.extend(parse_color(&c, theme, &INDEXED));
                         skip(rd, &c);
@@ -117,6 +122,8 @@ fn parse_cf_rule(rd: &mut XmlReader, e: &BytesStart, is_start: bool, ranges: &[c
                     _ => {}
                 },
                 Ok(Event::Empty(c)) if local(&c) == "color" => colors.extend(parse_color(&c, theme, &INDEXED)),
+                Ok(Event::Empty(c)) if local(&c) == "cfvo" => cfvos.push(super::analysis::cfvo_attrs(&c)),
+                Ok(Event::Empty(c)) if local(&c) == "iconSet" => icon_set = Some(super::analysis::icon_set_attrs(&c)),
                 Ok(Event::End(c)) if is_end(&c, "cfRule") => break,
                 Ok(Event::Eof) | Err(_) => break,
                 _ => {}
@@ -154,6 +161,7 @@ fn parse_cf_rule(rd: &mut XmlReader, e: &BytesStart, is_start: bool, ranges: &[c
         "notContainsErrors" => RuleKind::Errors { not: true },
         "expression" => RuleKind::Expression { formula: formulas.first().cloned()? },
         "dataBar" => RuleKind::DataBar { color: colors.first().copied().unwrap_or(0x638EC6), gradient: true },
+        "iconSet" => RuleKind::IconSet(super::analysis::icon_rule(icon_set.as_ref(), &cfvos, Vec::new())?),
         "colorScale" if colors.len() >= 2 => RuleKind::ColorScale { colors: colors.into_iter().take(3).collect() },
         _ => return None,
     };
@@ -277,6 +285,10 @@ pub(super) fn parse_sheet_extras(xml: &str, theme: &Theme, dxfs: &[DiffFormat], 
             Ok(Event::Eof) | Err(_) => break,
             _ => {}
         }
+    }
+    // Icon sets that only exist in the Excel 2010 extension (3 Stars, 3 Triangles, 5 Boxes, custom icons).
+    for (priority, rule) in super::analysis::x14_icon_sets(xml) {
+        rules.push(RawRule { priority, rule, ext_id: None });
     }
     rules.sort_by_key(|r| r.priority);
     for mut r in rules {

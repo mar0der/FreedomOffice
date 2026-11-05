@@ -1,5 +1,6 @@
 //! Streaming .xlsx/.xlsm reader (zip + quick-xml) that keeps formatting.
 
+mod analysis;
 mod charts;
 mod extras;
 mod fidelity;
@@ -87,6 +88,7 @@ pub fn read<R: Read + Seek>(src: R) -> Result<Workbook, String> {
             filter::parse_autofilter(&x, &dxfs, &mut sheet);
             page::parse_page_setup(&x, &mut sheet.page);
             charts::read(&mut pkg, &path, &mut sheet);
+            analysis::read_sheet(&x, &theme, &mut sheet);
         }
         let srels = format!("{}_rels/{}.rels", dir_of(&path), file_of(&path));
         if let Some(rx) = pkg.text(&srels) {

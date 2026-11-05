@@ -1,5 +1,6 @@
 //! .xlsx writer built on rust_xlsxwriter.
 
+mod analysis;
 mod charts;
 mod extras;
 mod fidelity;
@@ -25,6 +26,7 @@ pub fn write(wb: &Workbook, path: &Path) -> Result<(), String> {
     let bytes = book.save_to_buffer().map_err(|e| format!("Could not save: {e}"))?;
     let bytes = filter::patch(wb, bytes)?;
     let bytes = charts::patch_explosions(bytes, &explosions)?;
+    let bytes = analysis::patch(wb, bytes)?;
     std::fs::write(path, bytes).map_err(|e| format!("Could not save: {e}"))
 }
 
@@ -189,6 +191,7 @@ fn write_sheet(wb: &Workbook, sh: &Sheet, ws: &mut Worksheet, formats: &mut Hash
     fidelity::write_images(sh, ws);
     charts::write(wb, sh, ws, explosions)?;
     extras::write_sheet_extras(sh, ws);
+    analysis::write_sparklines(sh, ws);
     page::write(&sh.page, ws);
     Ok(())
 }
@@ -197,6 +200,10 @@ fn write_sheet(wb: &Workbook, sh: &Sheet, ws: &mut Worksheet, formats: &mut Hash
 /// or None when nothing needs rewriting.
 fn file_cell(sh: &Sheet, r: u32, c: u32, cell: &Cell) -> Option<Cell> {
     let f = cell.formula.as_ref()?;
+    if f.text.starts_with("TABLE(") {
+        // Data table results are saved as values; the dataTable formula is patched in afterwards.
+        return Some(Cell { value: cell.value.clone(), formula: None, style: cell.style });
+    }
     if !f.text.contains('[') {
         return None;
     }

@@ -3,13 +3,15 @@
 use rust_xlsxwriter::{
     Color, ConditionalFormat2ColorScale, ConditionalFormat3ColorScale, ConditionalFormatAverage,
     ConditionalFormatAverageRule, ConditionalFormatBlank, ConditionalFormatCell, ConditionalFormatCellRule,
-    ConditionalFormatDataBar, ConditionalFormatDuplicate, ConditionalFormatError, ConditionalFormatFormula,
+    ConditionalFormatCustomIcon, ConditionalFormatDataBar, ConditionalFormatDuplicate, ConditionalFormatError,
+    ConditionalFormatFormula, ConditionalFormatIconSet, ConditionalFormatIconType, ConditionalFormatType, ConditionalFormatValue,
     ConditionalFormatText, ConditionalFormatTextRule, ConditionalFormatTop, ConditionalFormatTopRule, DataValidation,
     DataValidationErrorStyle, DataValidationRule, Format, FormatBorder, FormatUnderline,
     Formula as XFormula, Worksheet,
 };
 
 use crate::condfmt::{sqref, CmpOp, CondFormat, DiffFormat, RuleKind, TextOp};
+use crate::iconset::{IconSetRule, IconStyle, ThresholdKind};
 use crate::model::{Range, Sheet, MAX_COLS, MAX_ROWS};
 use crate::validation::{Allow, ErrorStyle, Validation};
 
@@ -151,7 +153,65 @@ fn write_cf(ws: &mut Worksheet, rule: &CondFormat) {
             }
             _ => {}
         },
+        RuleKind::IconSet(ic) => add_cf!(ws, rule, first, icon_set(ic)),
     }
+}
+
+fn icon_type(s: IconStyle) -> ConditionalFormatIconType {
+    use ConditionalFormatIconType as T;
+    match s {
+        IconStyle::Arrows3 => T::ThreeArrows,
+        IconStyle::ArrowsGray3 => T::ThreeArrowsGray,
+        IconStyle::Flags3 => T::ThreeFlags,
+        IconStyle::TrafficLights3 => T::ThreeTrafficLights,
+        IconStyle::TrafficLightsRim3 => T::ThreeTrafficLightsWithRim,
+        IconStyle::Signs3 => T::ThreeSigns,
+        IconStyle::SymbolsCircled3 => T::ThreeSymbolsCircled,
+        IconStyle::Symbols3 => T::ThreeSymbols,
+        IconStyle::Stars3 => T::ThreeStars,
+        IconStyle::Triangles3 => T::ThreeTriangles,
+        IconStyle::Arrows4 => T::FourArrows,
+        IconStyle::ArrowsGray4 => T::FourArrowsGray,
+        IconStyle::RedToBlack4 => T::FourRedToBlack,
+        IconStyle::Rating4 => T::FourHistograms,
+        IconStyle::TrafficLights4 => T::FourTrafficLights,
+        IconStyle::Arrows5 => T::FiveArrows,
+        IconStyle::ArrowsGray5 => T::FiveArrowsGray,
+        IconStyle::Rating5 => T::FiveHistograms,
+        IconStyle::Quarters5 => T::FiveQuadrants,
+        IconStyle::Boxes5 => T::FiveBoxes,
+    }
+}
+
+/// An icon set rule; custom icons and the 2010 sets go to the x14 extension (rust_xlsxwriter decides).
+fn icon_set(ic: &IconSetRule) -> ConditionalFormatIconSet {
+    let icons: Vec<ConditionalFormatCustomIcon> = ic
+        .thresholds
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let kind = match t.kind {
+                ThresholdKind::Number => ConditionalFormatType::Number,
+                ThresholdKind::Percent => ConditionalFormatType::Percent,
+                ThresholdKind::Formula => ConditionalFormatType::Formula,
+                ThresholdKind::Percentile => ConditionalFormatType::Percentile,
+            };
+            let text = t.value.trim().trim_start_matches('=');
+            let value: ConditionalFormatValue = match text.parse::<f64>() {
+                Ok(n) if t.kind != ThresholdKind::Formula => n.into(),
+                _ => XFormula::new(if text.is_empty() { "0" } else { text }).into(),
+            };
+            let mut icon = ConditionalFormatCustomIcon::new().set_rule(kind, value).set_greater_than(!t.gte);
+            if !ic.custom.is_empty() {
+                icon = match ic.custom.get(i).copied().flatten() {
+                    Some((st, idx)) => icon.set_icon_type(icon_type(st), idx),
+                    None => icon.set_no_icon(true),
+                };
+            }
+            icon
+        })
+        .collect();
+    ConditionalFormatIconSet::new().set_icon_type(icon_type(ic.style)).reverse_icons(ic.reverse).show_icons_only(ic.icon_only).set_icons(&icons)
 }
 
 /// Truncates to Excel's UTF-16 length limit for validation titles and messages.
