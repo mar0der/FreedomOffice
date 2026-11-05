@@ -27,14 +27,14 @@ pub enum Dialog {
     Find,
     GoTo { text: String, focus: bool },
     InsertCells { delete: bool, choice: u8 },
-    Sort { range: Range, header: bool, keys: Vec<(u32, bool)> },
     ColWidth { text: String },
     RowHeight { text: String },
     InsertFunction { search: String, category: String, selected: Option<&'static str> },
     NameManager { name: String, refers: String, error: Option<String> },
     Zoom { custom: String },
     RemoveDuplicates { range: Range, header: bool, cols: Vec<(u32, bool)> },
-    TextToColumns { delim: u8, other: String },
+    /// Sort, Text to Columns, Subtotal, Custom AutoFilter, Top 10.
+    Data(Box<super::data_ui::DataDlg>),
     ConfirmDeleteSheet(usize),
     Stats,
     Shortcuts,
@@ -197,6 +197,8 @@ impl App {
             Dialog::CondFmt(cf) => keep = self.cf_dialog_ui(ctx, cf),
             Dialog::Validation(dv) => keep = self.dv_dialog_ui(ctx, dv),
             Dialog::DvAlert(a) => keep = self.dv_alert_ui(ctx, a),
+            Dialog::Data(dd) => keep = self.data_dialog_ui(ctx, dd),
+            Dialog::Find => keep = self.find_dialog_ui(ctx),
             Dialog::Message { title, text } => {
                 win(title).show(ctx, |ui| {
                     ui.set_min_width(320.0);
@@ -287,62 +289,6 @@ impl App {
                     }
                 });
             }
-            Dialog::Find => {
-                let title = if self.find.replace { "Find and Replace" } else { "Find" };
-                egui::Window::new(title).collapsible(false).resizable(false).default_pos(ctx.content_rect().center() - Vec2::new(200.0, 100.0)).show(ctx, |ui| {
-                    ui.set_min_width(400.0);
-                    ui.horizontal(|ui| {
-                        if ui.selectable_label(!self.find.replace, "Find").clicked() {
-                            self.find.replace = false;
-                        }
-                        if ui.selectable_label(self.find.replace, "Replace").clicked() {
-                            self.find.replace = true;
-                        }
-                    });
-                    ui.separator();
-                    egui::Grid::new("find_grid").num_columns(2).show(ui, |ui| {
-                        ui.label("Find what:");
-                        let r = ui.add(egui::TextEdit::singleline(&mut self.find.what).desired_width(280.0));
-                        if self.find.focus {
-                            r.request_focus();
-                            self.find.focus = false;
-                        }
-                        ui.end_row();
-                        if self.find.replace {
-                            ui.label("Replace with:");
-                            ui.add(egui::TextEdit::singleline(&mut self.find.with).desired_width(280.0));
-                            ui.end_row();
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.checkbox(&mut self.find.match_case, "Match case");
-                        ui.checkbox(&mut self.find.whole, "Match entire cell contents");
-                    });
-                    ui.horizontal(|ui| {
-                        ui.checkbox(&mut self.find.all_sheets, "Within workbook");
-                        ui.checkbox(&mut self.find.in_formulas, "Look in formulas");
-                    });
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        if self.find.replace {
-                            if ui.button("Replace All").clicked() {
-                                let n = self.replace_all();
-                                self.status = Some(format!("All done. We made {n} replacements."));
-                            }
-                            if ui.button("Replace").clicked() {
-                                self.replace_one();
-                            }
-                        }
-                        if ui.button("Find Next").clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                            let back = ui.input(|i| i.modifiers.shift);
-                            self.find_next(back);
-                        }
-                        if ui.button("Close").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                            keep = false;
-                        }
-                    });
-                });
-            }
             Dialog::InsertCells { delete, choice } => {
                 let title = if *delete { "Delete" } else { "Insert" };
                 let delete = *delete;
@@ -420,54 +366,22 @@ impl App {
                     }
                 });
             }
-            Dialog::Sort { range, header, keys } => {
-                let range = *range;
-                win("Sort").show(ctx, |ui| {
-                    ui.set_min_width(420.0);
-                    ui.checkbox(header, "My data has headers");
-                    ui.separator();
-                    let hdr = *header;
-                    let mut remove = None;
-                    for (i, (col, desc)) in keys.iter_mut().enumerate() {
-                        ui.horizontal(|ui| {
-                            ui.label(if i == 0 { "Sort by   " } else { "Then by   " });
-                            egui::ComboBox::from_id_salt(("sort_col", i)).width(170.0).selected_text(self.col_label(*col, hdr, range.r1)).show_ui(ui, |ui| {
-                                for c in range.c1..=range.c2 {
-                                    let l = self.col_label(c, hdr, range.r1);
-                                    ui.selectable_value(col, c, l);
-                                }
-                            });
-                            egui::ComboBox::from_id_salt(("sort_ord", i)).width(110.0).selected_text(if *desc { "Largest to Smallest" } else { "Smallest to Largest" }).show_ui(ui, |ui| {
-                                ui.selectable_value(desc, false, "Smallest to Largest (A to Z)");
-                                ui.selectable_value(desc, true, "Largest to Smallest (Z to A)");
-                            });
-                            if i > 0 && ui.button("✕").clicked() {
-                                remove = Some(i);
-                            }
-                        });
-                    }
-                    if let Some(i) = remove {
-                        keys.remove(i);
-                    }
-                    if keys.len() < 4 && ui.button("+ Add Level").clicked() {
-                        keys.push((range.c1, false));
-                    }
-                    let (ok, cancel) = ok_cancel(ui);
-                    if ok {
-                        let k = keys.clone();
-                        self.sort_range(range, hdr, &k);
-                        keep = false;
-                    } else if cancel {
-                        keep = false;
-                    }
-                });
-            }
             Dialog::RemoveDuplicates { range, header, cols } => {
                 let range = *range;
                 win("Remove Duplicates").show(ctx, |ui| {
                     ui.set_min_width(320.0);
                     ui.label("To delete duplicate values, select one or more columns that contain duplicates.");
-                    ui.checkbox(header, "My data has headers");
+                    ui.horizontal(|ui| {
+                        if ui.button("Select All").clicked() {
+                            cols.iter_mut().for_each(|c| c.1 = true);
+                        }
+                        if ui.button("Unselect All").clicked() {
+                            cols.iter_mut().for_each(|c| c.1 = false);
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.checkbox(header, "My data has headers");
+                        });
+                    });
                     let hdr = *header;
                     egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
                         for (c, on) in cols.iter_mut() {
@@ -480,36 +394,14 @@ impl App {
                         let cs: Vec<u32> = cols.iter().filter(|c| c.1).map(|c| c.0).collect();
                         if !cs.is_empty() {
                             let n = self.remove_duplicates(range, hdr, &cs);
-                            self.dialog = Some(Dialog::Message {
-                                title: "Remove Duplicates".into(),
-                                text: format!("{n} duplicate values found and removed."),
-                            });
+                            let left = range.rows() as usize - hdr as usize - n;
+                            let text = if n == 0 {
+                                "No duplicate values found.".to_string()
+                            } else {
+                                format!("{n} duplicate value{} found and removed; {left} unique value{} remain.", if n == 1 { "" } else { "s" }, if left == 1 { "" } else { "s" })
+                            };
+                            self.dialog = Some(Dialog::Message { title: "Remove Duplicates".into(), text });
                             return;
-                        }
-                        keep = false;
-                    } else if cancel {
-                        keep = false;
-                    }
-                });
-            }
-            Dialog::TextToColumns { delim, other } => {
-                win("Convert Text to Columns").show(ctx, |ui| {
-                    ui.label("Split the selected column by:");
-                    for (i, l) in ["Comma", "Semicolon", "Tab", "Space", "Other:"].iter().enumerate() {
-                        ui.radio_value(delim, i as u8, *l);
-                    }
-                    ui.add(egui::TextEdit::singleline(other).desired_width(40.0).char_limit(1));
-                    let (ok, cancel) = ok_cancel(ui);
-                    if ok {
-                        let ch = match *delim {
-                            0 => Some(','),
-                            1 => Some(';'),
-                            2 => Some('\t'),
-                            3 => Some(' '),
-                            _ => other.chars().next(),
-                        };
-                        if let Some(ch) = ch {
-                            self.text_to_columns(ch);
                         }
                         keep = false;
                     } else if cancel {
@@ -526,7 +418,7 @@ impl App {
                     });
                     ui.horizontal(|ui| {
                         ui.label("Or select a category:");
-                        let cats = ["Most Recently Used", "All", "Financial", "Date & Time", "Math & Trig", "Statistical", "Lookup & Reference", "Text", "Logical", "Information", "Engineering"];
+                        let cats = ["Most Recently Used", "All", "Financial", "Date & Time", "Math & Trig", "Statistical", "Lookup & Reference", "Database", "Text", "Logical", "Information", "Engineering", "Web"];
                         egui::ComboBox::from_id_salt("fcat").width(200.0).selected_text(category.as_str()).show_ui(ui, |ui| {
                             for c in cats {
                                 ui.selectable_value(category, c.to_string(), c);

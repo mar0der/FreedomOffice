@@ -4,7 +4,11 @@ mod deps;
 mod eval;
 mod ext;
 mod functions;
+mod lambda;
+mod more;
 mod parser;
+#[cfg(test)]
+mod parity_tests;
 #[cfg(test)]
 mod bench;
 #[cfg(test)]

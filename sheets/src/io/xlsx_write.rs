@@ -2,6 +2,7 @@
 
 mod charts;
 mod extras;
+mod filter;
 mod page;
 
 use std::collections::HashMap;
@@ -20,12 +21,10 @@ const MAX_STR: usize = 32_767;
 pub fn write(wb: &Workbook, path: &Path) -> Result<(), String> {
     let mut explosions = Vec::new();
     let mut book = build(wb, &mut explosions).map_err(|e| e.to_string())?;
-    if explosions.iter().all(Vec::is_empty) {
-        return book.save(path).map_err(|e| format!("Could not save: {e}"));
-    }
-    let buf = book.save_to_buffer().map_err(|e| format!("Could not save: {e}"))?;
-    let buf = charts::patch_explosions(buf, &explosions)?;
-    std::fs::write(path, buf).map_err(|e| format!("Could not save: {e}"))
+    let bytes = book.save_to_buffer().map_err(|e| format!("Could not save: {e}"))?;
+    let bytes = filter::patch(wb, bytes)?;
+    let bytes = charts::patch_explosions(bytes, &explosions)?;
+    std::fs::write(path, bytes).map_err(|e| format!("Could not save: {e}"))
 }
 
 fn build(wb: &Workbook, explosions: &mut Vec<charts::Explosions>) -> Result<XWorkbook, XlsxError> {
@@ -43,8 +42,11 @@ fn build(wb: &Workbook, explosions: &mut Vec<charts::Explosions>) -> Result<XWor
         }
     }
     for (name, text) in &wb.names {
-        // Invalid names are skipped rather than failing the whole save.
-        let _ = book.define_name(name, &format!("={}", text.trim_start_matches('=')));
+        // Invalid names are skipped rather than failing the whole save. Parsed definitions
+        // are written in file form (`_xlfn.LAMBDA(_xlpm.x,...)` for named lambdas).
+        let text = text.trim_start_matches('=');
+        let text = formula::parse(text).map(|e| formula::print_xlsx(&e)).unwrap_or_else(|_| text.to_string());
+        let _ = book.define_name(name, &format!("={text}"));
     }
     Ok(book)
 }
@@ -150,12 +152,7 @@ fn write_sheet(wb: &Workbook, sh: &Sheet, ws: &mut Worksheet, formats: &mut Hash
     if let Some(c) = sh.tab_color {
         ws.set_tab_color(Color::RGB(c & 0xFFFFFF));
     }
-    if let Some(f) = &sh.filter {
-        let rg = f.range;
-        if rg.r2 < MAX_ROWS && rg.c2 < MAX_COLS {
-            ws.autofilter(rg.r1, rg.c1 as u16, rg.r2, rg.c2 as u16)?;
-        }
-    }
+    filter::write_range(sh, ws)?;
     charts::write(wb, sh, ws, explosions)?;
     extras::write_sheet_extras(sh, ws);
     page::write(&sh.page, ws);

@@ -7,10 +7,13 @@ mod chart_view;
 mod chrome;
 mod cloud_ui;
 mod condfmt_ui;
+mod data_ui;
 mod dialogs;
 mod editor;
 mod fill;
 mod flash;
+mod filter_ui;
+mod find_ui;
 mod grid;
 mod keys;
 mod keytips;
@@ -108,24 +111,8 @@ pub enum Pending {
     Exit,
 }
 
-pub struct FilterPopup {
-    pub col: u32,
-    pub pos: egui::Pos2,
-    pub values: Vec<(String, bool)>,
-    pub search: String,
-}
-
-#[derive(Default)]
-pub struct FindState {
-    pub what: String,
-    pub with: String,
-    pub match_case: bool,
-    pub whole: bool,
-    pub in_formulas: bool,
-    pub all_sheets: bool,
-    pub replace: bool,
-    pub focus: bool,
-}
+pub use filter_ui::FilterPopup;
+pub use find_ui::FindState;
 
 pub struct App {
     pub wb: Workbook,
@@ -210,38 +197,21 @@ const MAX_UNDO: usize = 100;
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, path: Option<PathBuf>) -> Self {
-        theme::set_dark(theme::system_dark());
         #[cfg(windows)]
         let hwnd = window_handle(cc);
-        #[cfg(windows)]
-        set_caption_color(hwnd);
         #[cfg(not(windows))]
         let hwnd = 0;
-        let mut app = Self::with_context(&cc.egui_ctx, hwnd);
-        if let Some(p) = path {
-            app.open_path(p);
-        }
-        // Offer files left behind by a session that ended unexpectedly.
-        if let Some(dir) = recovery_dir() {
-            if let Ok(rd) = std::fs::read_dir(&dir) {
-                let files: Vec<PathBuf> = rd
-                    .flatten()
-                    .map(|e| e.path())
-                    .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("xlsx")) && Some(p) != app.recovery_path.as_ref())
-                    .collect();
-                if !files.is_empty() {
-                    app.dialog = Some(dialogs::Dialog::Recover { files });
-                }
-            }
-        }
-        app
+        Self::with_context(&cc.egui_ctx, hwnd, path)
     }
 
-    /// Fresh application state on an egui context (also used by UI tests).
-    fn with_context(egui_ctx: &egui::Context, hwnd: isize) -> Self {
+    /// Builds the app on an egui context (also used headless by tests).
+    pub(crate) fn with_context(egui_ctx: &egui::Context, hwnd: isize, path: Option<PathBuf>) -> Self {
+        theme::set_dark(theme::system_dark());
         theme::apply_style(egui_ctx);
         let fonts = FontManager::new(egui_ctx);
-        App {
+        #[cfg(windows)]
+        set_caption_color(hwnd);
+        let mut app = App {
             wb: Workbook::new(),
             fonts,
             undo: Vec::new(),
@@ -304,7 +274,24 @@ impl App {
             paste_button: None,
             kb: Default::default(),
             menu: Default::default(),
+        };
+        if let Some(p) = path {
+            app.open_path(p);
         }
+        // Offer files left behind by a session that ended unexpectedly.
+        if let Some(dir) = recovery_dir() {
+            if let Ok(rd) = std::fs::read_dir(&dir) {
+                let files: Vec<PathBuf> = rd
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("xlsx")) && Some(p) != app.recovery_path.as_ref())
+                    .collect();
+                if !files.is_empty() {
+                    app.dialog = Some(dialogs::Dialog::Recover { files });
+                }
+            }
+        }
+        app
     }
 
     /// Writes a recovery copy every few minutes while there are unsaved changes.

@@ -976,7 +976,7 @@ pub fn call(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
             }
             num((fv / pv).powf(1.0 / np) - 1.0)
         }
-        _ => Err(E::Name),
+        _ => super::more::call(ev, name, a),
     }
 }
 
@@ -1307,7 +1307,7 @@ fn fmt_radix(mut v: u64, radix: u32) -> String {
 }
 
 /// Parses up to 10 digits; a 10-digit value with the top bit set is two's complement.
-fn from_radix10(s: &str, radix: u32) -> Result<f64, E> {
+pub(super) fn from_radix10(s: &str, radix: u32) -> Result<f64, E> {
     let s = s.trim();
     if s.is_empty() {
         return Ok(0.0);
@@ -1384,7 +1384,7 @@ fn arabic(s: &str) -> Result<f64, E> {
     Ok(if neg { -total } else { total })
 }
 
-fn combin(n: f64, k: f64) -> Result<f64, E> {
+pub(super) fn combin(n: f64, k: f64) -> Result<f64, E> {
     let (n, k) = (n.trunc(), k.trunc());
     if n < 0.0 || k < 0.0 || n < k {
         return Err(E::Num);
@@ -1642,7 +1642,7 @@ pub fn norm_cdf(x: f64) -> f64 {
     if x > 0.0 { 1.0 - c } else { c }
 }
 
-fn norm_pdf(z: f64) -> f64 {
+pub(super) fn norm_pdf(z: f64) -> f64 {
     (-z * z / 2.0).exp() / (2.0 * PI).sqrt()
 }
 
@@ -1671,7 +1671,7 @@ pub fn norm_s_inv(p: f64) -> f64 {
     x
 }
 
-fn ln_gamma(x: f64) -> f64 {
+pub(super) fn ln_gamma(x: f64) -> f64 {
     const G: [f64; 9] = [
         0.999_999_999_999_809_9,
         676.520_368_121_885_1,
@@ -1740,7 +1740,7 @@ fn betacf(a: f64, b: f64, x: f64) -> f64 {
 }
 
 /// Regularized incomplete beta function I_x(a, b).
-fn betai(a: f64, b: f64, x: f64) -> f64 {
+pub(super) fn betai(a: f64, b: f64, x: f64) -> f64 {
     if x <= 0.0 {
         return 0.0;
     }
@@ -1751,7 +1751,7 @@ fn betai(a: f64, b: f64, x: f64) -> f64 {
     if x < (a + 1.0) / (a + b + 2.0) { bt * betacf(a, b, x) / a } else { 1.0 - bt * betacf(b, a, 1.0 - x) / b }
 }
 
-fn t_cdf(t: f64, df: f64) -> f64 {
+pub(super) fn t_cdf(t: f64, df: f64) -> f64 {
     let ib = betai(df / 2.0, 0.5, df / (df + t * t));
     if t > 0.0 { 1.0 - 0.5 * ib } else { 0.5 * ib }
 }

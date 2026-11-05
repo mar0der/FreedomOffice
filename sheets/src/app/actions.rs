@@ -1,6 +1,5 @@
 //! Commands: clipboard, fill, sort, filter, formatting, structure and sheets.
 
-use std::cmp::Ordering;
 use std::collections::HashSet;
 
 use eframe::egui;
@@ -551,7 +550,12 @@ impl App {
         sh.merges = sh.merges.iter().filter_map(|m| fix(*m)).filter(|m| !m.is_single()).collect();
         if let Some(f) = &mut sh.filter {
             match fix(f.range) {
-                Some(r) => f.range = r,
+                Some(r) => {
+                    f.range = r;
+                    if !rows {
+                        f.columns = std::mem::take(&mut f.columns).into_iter().filter_map(|(c, cf)| map(c).map(|nc| (nc, cf))).collect();
+                    }
+                }
                 None => sh.filter = None,
             }
         }
@@ -595,6 +599,12 @@ impl App {
             }
         }
         self.push_undo(&[Scope::All]);
+        self.shift_structure(rows, at, n);
+        self.changed();
+    }
+
+    /// Inserts (n > 0) or deletes rows/columns of the active sheet without an undo step.
+    fn shift_structure(&mut self, rows: bool, at: u32, n: i64) {
         let si = self.wb.active;
         Self::shift_sheet(&mut self.wb.sheets[si], rows, at, n);
         crate::condfmt::shift_sheet_rules(&mut self.wb.sheets[si], rows, at, n);
@@ -602,7 +612,11 @@ impl App {
         self.transform_formulas(|e, fsi| formula::shift_for_structure(e, &name, fsi == si, rows, at, n));
         crate::chart::shift_for_structure(&mut self.wb, si, rows, at, n);
         self.clip = None;
-        self.changed();
+    }
+
+    /// Row insert/delete used by multi-step commands (Subtotal) that record one undo step.
+    pub(super) fn shift_rows_no_undo(&mut self, at: u32, n: i64) {
+        self.shift_structure(true, at, n);
     }
 
     /// Insert cells shifting right/down within the selection's band.
@@ -1275,163 +1289,6 @@ impl App {
     // Sort & filter
     // ------------------------------------------------------------------
 
-    pub(super) fn sort_area(&self) -> (Range, bool) {
-        let sel = self.sel();
-        let rg = if sel.is_single() { self.current_region() } else { self.sel_clipped() };
-        // header heuristic: first row all text, second row has non-text
-        let sh = self.sheet();
-        let first_text = (rg.c1..=rg.c2).all(|c| matches!(sh.value(rg.r1, c), Value::Text(_) | Value::Empty))
-            && (rg.c1..=rg.c2).any(|c| matches!(sh.value(rg.r1, c), Value::Text(_)));
-        let second_other = rg.r2 > rg.r1 && (rg.c1..=rg.c2).any(|c| !matches!(sh.value(rg.r1 + 1, c), Value::Text(_) | Value::Empty));
-        let header = (first_text && second_other) || sh.filter.as_ref().is_some_and(|f| f.range.r1 == rg.r1);
-        (rg, header)
-    }
-
-    pub fn sort_simple(&mut self, desc: bool) {
-        let (rg, header) = self.sort_area();
-        let c = self.active().1.clamp(rg.c1, rg.c2);
-        self.sort_range(rg, header, &[(c, desc)]);
-    }
-
-    pub fn open_sort_dialog(&mut self) {
-        let (rg, header) = self.sort_area();
-        let c = self.active().1.clamp(rg.c1, rg.c2);
-        self.dialog = Some(Dialog::Sort { range: rg, header, keys: vec![(c, false)] });
-    }
-
-    pub fn sort_range(&mut self, rg: Range, header: bool, keys: &[(u32, bool)]) {
-        let si = self.wb.active;
-        let r1 = if header { rg.r1 + 1 } else { rg.r1 };
-        if r1 >= rg.r2 + 1 {
-            return;
-        }
-        let data = Range::new(r1, rg.c1, rg.r2, rg.c2);
-        self.push_undo(&[Scope::Range(si, data)]);
-        let sh = &self.wb.sheets[si];
-        let mut rows: Vec<(u32, Vec<(u32, Cell)>)> = (data.r1..=data.r2)
-            .map(|r| (r, (data.c1..=data.c2).filter_map(|c| sh.get(r, c).map(|x| (c, x.clone()))).collect()))
-            .collect();
-        let key_val = |row: &Vec<(u32, Cell)>, c: u32| -> Value { row.iter().find(|(cc, _)| *cc == c).map(|(_, x)| x.value.clone()).unwrap_or_default() };
-        rows.sort_by(|a, b| {
-            for &(c, desc) in keys {
-                let (va, vb) = (key_val(&a.1, c), key_val(&b.1, c));
-                let o = sort_cmp(&va, &vb, desc);
-                if o != Ordering::Equal {
-                    return o;
-                }
-            }
-            Ordering::Equal
-        });
-        let sh = &mut self.wb.sheets[si];
-        let old: Vec<(u32, u32)> = sh.iter_range(data).map(|(r, c, _)| (r, c)).collect();
-        for (r, c) in old {
-            sh.remove(r, c);
-        }
-        let mut moved: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
-        for (i, (orig, cells)) in rows.into_iter().enumerate() {
-            let nr = data.r1 + i as u32;
-            moved.insert(orig, nr);
-            for (c, mut cell) in cells {
-                shift_cell(&mut cell, nr as i64 - orig as i64, 0);
-                sh.set(nr, c, Some(cell));
-            }
-        }
-        let remap = |m: &mut std::collections::HashMap<(u32, u32), String>| {
-            *m = m
-                .drain()
-                .map(|((r, c), t)| if data.contains(r, c) { ((moved.get(&r).copied().unwrap_or(r), c), t) } else { ((r, c), t) })
-                .collect();
-        };
-        remap(&mut sh.notes);
-        remap(&mut sh.links);
-        self.changed();
-    }
-
-    pub fn toggle_filter(&mut self) {
-        let si = self.wb.active;
-        self.push_undo(&[Scope::Sheet(si)]);
-        if self.sheet().filter.is_some() {
-            let sh = self.sheet_mut();
-            if let Some(f) = sh.filter.take() {
-                for r in f.range.r1..=f.range.r2 {
-                    sh.hidden_rows.remove(&r);
-                }
-            }
-        } else {
-            let rg = if self.sel().is_single() { self.current_region() } else { self.sel_clipped() };
-            self.sheet_mut().filter = Some(crate::model::AutoFilter { range: rg, excluded: Default::default() });
-        }
-        self.changed();
-    }
-
-    pub fn apply_filter(&mut self) {
-        let si = self.wb.active;
-        let Some(mut f) = self.wb.sheets[si].filter.clone() else { return };
-        // extend to data below
-        let (er, _) = self.wb.sheets[si].extent().unwrap_or((0, 0));
-        let sh = &self.wb.sheets[si];
-        let mut r2 = f.range.r2;
-        while r2 < er && (f.range.c1..=f.range.c2).any(|c| sh.is_populated(r2 + 1, c)) {
-            r2 += 1;
-        }
-        f.range.r2 = r2;
-        let mut hide = Vec::new();
-        let mut show = Vec::new();
-        for r in f.range.r1 + 1..=f.range.r2 {
-            let mut visible = true;
-            for (c, ex) in &f.excluded {
-                if ex.is_empty() {
-                    continue;
-                }
-                let t = sh.get(r, *c).map(|x| numfmt::format_value(&x.value, &self.wb.style(x.style).num_fmt).text).unwrap_or_default();
-                if ex.contains(&t) {
-                    visible = false;
-                    break;
-                }
-            }
-            if visible { show.push(r) } else { hide.push(r) }
-        }
-        let sh = &mut self.wb.sheets[si];
-        for r in show {
-            sh.hidden_rows.remove(&r);
-        }
-        for r in hide {
-            sh.hidden_rows.insert(r);
-        }
-        sh.filter = Some(f);
-        // SUBTOTAL(101..)/AGGREGATE ignore hidden rows, so totals change with the filter.
-        self.changed();
-    }
-
-    pub fn clear_filter(&mut self) {
-        let si = self.wb.active;
-        if let Some(f) = &mut self.wb.sheets[si].filter {
-            f.excluded.clear();
-        }
-        self.apply_filter();
-    }
-
-    pub fn filter_by_active_value(&mut self) {
-        if self.sheet().filter.is_none() {
-            self.toggle_filter();
-        }
-        let (r, c) = self.active();
-        let want = self.sheet().get(r, c).map(|x| numfmt::format_value(&x.value, &self.wb.style(x.style).num_fmt).text).unwrap_or_default();
-        let si = self.wb.active;
-        let Some(f) = self.wb.sheets[si].filter.clone() else { return };
-        let mut ex = HashSet::new();
-        for rr in f.range.r1 + 1..=f.range.r2 {
-            let t = self.wb.sheets[si].get(rr, c).map(|x| numfmt::format_value(&x.value, &self.wb.style(x.style).num_fmt).text).unwrap_or_default();
-            if t != want {
-                ex.insert(t);
-            }
-        }
-        if let Some(f) = &mut self.wb.sheets[si].filter {
-            f.excluded.insert(c, ex);
-        }
-        self.apply_filter();
-    }
-
     pub fn remove_duplicates(&mut self, rg: Range, header: bool, cols: &[u32]) -> usize {
         let si = self.wb.active;
         let r1 = if header { rg.r1 + 1 } else { rg.r1 };
@@ -1465,121 +1322,6 @@ impl App {
         }
         self.changed();
         removed
-    }
-
-    pub fn text_to_columns(&mut self, delim: char) {
-        let sel = self.sel_clipped();
-        let si = self.wb.active;
-        let c = sel.c1;
-        let lines: Vec<(u32, String)> = (sel.r1..=sel.r2)
-            .filter_map(|r| match self.wb.sheets[si].value(r, c) {
-                Value::Text(t) => Some((r, t.clone())),
-                _ => None,
-            })
-            .collect();
-        let max_parts = lines.iter().map(|(_, t)| t.split(delim).count()).max().unwrap_or(1) as u32;
-        self.push_undo(&[Scope::Range(si, Range::new(sel.r1, c, sel.r2, (c + max_parts - 1).min(MAX_COLS - 1)))]);
-        for (r, t) in lines {
-            for (i, part) in t.split(delim).enumerate() {
-                let cc = c + i as u32;
-                if cc >= MAX_COLS {
-                    break;
-                }
-                let style = self.wb.sheets[si].get(r, cc).map(|x| x.style).unwrap_or(0);
-                let cell = cell_from_input(&mut self.wb, part.trim(), style);
-                self.wb.sheets[si].set(r, cc, cell);
-            }
-        }
-        self.changed();
-    }
-
-    // ------------------------------------------------------------------
-    // Find & replace
-    // ------------------------------------------------------------------
-
-    fn cell_matches(&self, si: usize, r: u32, c: u32) -> bool {
-        let f = &self.find;
-        if f.what.is_empty() {
-            return false;
-        }
-        let Some(cell) = self.wb.sheets[si].get(r, c) else { return false };
-        let hay = if f.in_formulas { cell.input_text() } else { numfmt::format_value(&cell.value, &self.wb.style(cell.style).num_fmt).text };
-        let (h, w) = if f.match_case { (hay, f.what.clone()) } else { (hay.to_lowercase(), f.what.to_lowercase()) };
-        if f.whole { h == w } else { h.contains(&w) }
-    }
-
-    pub fn find_next(&mut self, backwards: bool) -> bool {
-        let si0 = self.wb.active;
-        let order: Vec<usize> = if self.find.all_sheets {
-            (0..self.wb.sheets.len()).map(|k| (si0 + k) % self.wb.sheets.len()).collect()
-        } else {
-            vec![si0]
-        };
-        let (ar, ac) = self.active();
-        for (k, &si) in order.iter().enumerate() {
-            let mut coords: Vec<(u32, u32)> =
-                self.wb.sheets[si].rows.iter().flat_map(|(r, row)| row.keys().map(move |c| (*r, *c))).collect();
-            if backwards {
-                coords.reverse();
-            }
-            let start = if k == 0 {
-                coords.iter().position(|&(r, c)| if backwards { (r, c) < (ar, ac) } else { (r, c) > (ar, ac) }).unwrap_or(coords.len())
-            } else {
-                0
-            };
-            let wrapped: Vec<(u32, u32)> = coords[start..].iter().chain(if order.len() == 1 { coords[..start].iter() } else { [].iter() }).copied().collect();
-            for (r, c) in wrapped {
-                if self.cell_matches(si, r, c) {
-                    self.wb.active = si;
-                    self.select(r, c, false);
-                    return true;
-                }
-            }
-        }
-        self.status = Some("We couldn't find what you were looking for.".into());
-        false
-    }
-
-    pub fn replace_one(&mut self) {
-        let (r, c) = self.active();
-        let si = self.wb.active;
-        if self.cell_matches(si, r, c) {
-            self.replace_at(si, r, c);
-            self.changed();
-        }
-        self.find_next(false);
-    }
-
-    fn replace_at(&mut self, si: usize, r: u32, c: u32) {
-        let Some(cell) = self.wb.sheets[si].get(r, c).cloned() else { return };
-        let text = cell.input_text();
-        let new = if self.find.match_case {
-            text.replace(&self.find.what, &self.find.with)
-        } else {
-            replace_ci(&text, &self.find.what, &self.find.with)
-        };
-        let cell = cell_from_input(&mut self.wb, &new, cell.style);
-        self.wb.sheets[si].set(r, c, cell);
-    }
-
-    pub fn replace_all(&mut self) -> usize {
-        let sheets: Vec<usize> = if self.find.all_sheets { (0..self.wb.sheets.len()).collect() } else { vec![self.wb.active] };
-        self.push_undo(&[Scope::All]);
-        let mut n = 0;
-        let in_formulas = self.find.in_formulas;
-        self.find.in_formulas = true;
-        for si in sheets {
-            let coords: Vec<(u32, u32)> = self.wb.sheets[si].rows.iter().flat_map(|(r, row)| row.keys().map(move |c| (*r, *c))).collect();
-            for (r, c) in coords {
-                if self.cell_matches(si, r, c) {
-                    self.replace_at(si, r, c);
-                    n += 1;
-                }
-            }
-        }
-        self.find.in_formulas = in_formulas;
-        self.changed();
-        n
     }
 
     // ------------------------------------------------------------------
@@ -1979,30 +1721,10 @@ impl App {
                 self.wb.sheets[si].tidy(r, c);
             }
         }
-        self.wb.sheets[si].filter = Some(crate::model::AutoFilter { range: rg, excluded: Default::default() });
+        self.wb.sheets[si].filter = Some(crate::model::AutoFilter::new(rg));
         self.select_range(Range::new(rg.r1, rg.c1, rg.r2, rg.c2));
         self.dirty = true;
     }
-}
-
-/// Case-insensitive match of `needle` at byte `start` of `hay`; returns the end byte.
-fn match_ci_at(hay: &str, start: usize, needle: &[char]) -> Option<usize> {
-    let mut k = 0;
-    let mut end = start;
-    for (j, ch) in hay[start..].char_indices() {
-        if k == needle.len() {
-            break;
-        }
-        for lc in ch.to_lowercase() {
-            if k < needle.len() && lc == needle[k] {
-                k += 1;
-            } else {
-                return None;
-            }
-        }
-        end = start + j + ch.len_utf8();
-    }
-    (k == needle.len()).then_some(end)
 }
 
 impl App {
@@ -2147,54 +1869,6 @@ impl App {
         }
         self.select_areas(hits);
     }
-}
-
-fn replace_ci(text: &str, what: &str, with: &str) -> String {
-    if what.is_empty() {
-        return text.to_string();
-    }
-    let needle: Vec<char> = what.chars().flat_map(|c| c.to_lowercase()).collect();
-    let mut out = String::new();
-    let mut i = 0;
-    while i < text.len() {
-        match match_ci_at(text, i, &needle) {
-            Some(end) if end > i => {
-                out.push_str(with);
-                i = end;
-            }
-            _ => {
-                let ch = text[i..].chars().next().unwrap_or(' ');
-                out.push(ch);
-                i += ch.len_utf8().max(1);
-            }
-        }
-    }
-    out
-}
-
-fn sort_cmp(a: &Value, b: &Value, desc: bool) -> Ordering {
-    let rank = |v: &Value| match v {
-        Value::Number(_) => 0,
-        Value::Text(_) => 1,
-        Value::Bool(_) => 2,
-        Value::Error(_) => 3,
-        Value::Empty => 4,
-    };
-    let (ra, rb) = (rank(a), rank(b));
-    if ra == 4 || rb == 4 {
-        return ra.cmp(&rb); // blanks always last
-    }
-    let o = if ra != rb {
-        ra.cmp(&rb)
-    } else {
-        match (a, b) {
-            (Value::Number(x), Value::Number(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
-            (Value::Text(x), Value::Text(y)) => x.to_lowercase().cmp(&y.to_lowercase()),
-            (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
-            _ => Ordering::Equal,
-        }
-    };
-    if desc { o.reverse() } else { o }
 }
 
 /// Splits clipboard text (tab separated, quoted fields allowed) into rows.

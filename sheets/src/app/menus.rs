@@ -3,11 +3,10 @@
 
 use eframe::egui::{self, Align2, Pos2, Vec2};
 
-use super::actions::shift_cell;
 use super::dialogs::Dialog;
 use super::theme;
-use super::{App, Scope};
-use crate::model::{Cell, Range, Sheet, Value, MAX_COLS, MAX_ROWS};
+use super::App;
+use crate::model::{Range, Sheet, Value, MAX_COLS, MAX_ROWS};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MenuKind {
@@ -231,16 +230,13 @@ impl App {
         }
         ui.separator();
         let (ar, ac) = self.active();
-        let filter_col = self.sheet().filter.as_ref().filter(|f| f.range.c1 <= ac && ac <= f.range.c2).map(|f| (f.range.r1, f.excluded.get(&ac).is_some_and(|s| !s.is_empty())));
+        let filter_col = self.sheet().filter.as_ref().filter(|f| f.range.c1 <= ac && ac <= f.range.c2).map(|f| (f.range.r1, f.is_filtered(ac)));
         ui.menu_button("Filter", |ui| {
             let has_filter = self.sheet().filter.is_some();
             let header = filter_col.map(|(hr, _)| crate::numfmt::value_to_text(self.sheet().value(hr, ac))).unwrap_or_default();
             let label = if header.is_empty() { "Clear Filter".to_string() } else { format!("Clear Filter From \"{header}\"") };
             if ui.add_enabled(filter_col.is_some_and(|f| f.1), egui::Button::new(label)).clicked() {
-                if let Some(f) = &mut self.sheet_mut().filter {
-                    f.excluded.remove(&ac);
-                }
-                self.apply_filter();
+                self.set_column_filter(ac, None);
                 ui.close();
             }
             if ui.add_enabled(has_filter, egui::Button::new("Reapply")).clicked() {
@@ -249,15 +245,15 @@ impl App {
             }
             ui.separator();
             if ui.button("Filter by Selected Cell's Value").clicked() {
-                self.filter_by_active_value();
+                self.filter_by_cell_value();
                 ui.close();
             }
             if ui.button("Filter by Selected Cell's Color").clicked() {
-                self.filter_by_color(false);
+                self.filter_by_cell_color();
                 ui.close();
             }
             if ui.button("Filter by Selected Cell's Font Color").clicked() {
-                self.filter_by_color(true);
+                self.filter_by_font_color();
                 ui.close();
             }
         });
@@ -277,11 +273,11 @@ impl App {
             }
             ui.separator();
             if ui.button("Put Selected Cell Color On Top").clicked() {
-                self.color_on_top(false);
+                self.sort_by_cell_color();
                 ui.close();
             }
             if ui.button("Put Selected Font Color On Top").clicked() {
-                self.color_on_top(true);
+                self.sort_by_font_color();
                 ui.close();
             }
             ui.separator();
@@ -348,49 +344,6 @@ impl App {
         self.dialog = Some(Dialog::NameManager { name, refers: self.sel_abs_ref(), error: None });
     }
 
-    /// Cell colour of a cell (fill or font) as shown, for the colour sort/filter commands.
-    fn cell_color(&self, r: u32, c: u32, font: bool) -> Option<u32> {
-        let st = self.wb.style(self.sheet().get(r, c).map_or(0, |x| x.style));
-        if font { st.color } else { st.fill }
-    }
-
-    /// Sort > Put Selected Cell (Font) Color On Top: rows whose cell in the active column has
-    /// that colour move to the top, keeping their order.
-    pub fn color_on_top(&mut self, font: bool) {
-        let (rg, header) = self.sort_area();
-        let (ar, ac) = self.active();
-        let want = self.cell_color(ar, ac, font);
-        let r1 = if header { rg.r1 + 1 } else { rg.r1 };
-        if r1 > rg.r2 {
-            return;
-        }
-        let data = Range::new(r1, rg.c1, rg.r2, rg.c2);
-        let mut order: Vec<u32> = (data.r1..=data.r2).collect();
-        order.sort_by_key(|&r| self.cell_color(r, ac, font) != want);
-        let si = self.wb.active;
-        self.push_undo(&[Scope::Range(si, data)]);
-        reorder_rows(&mut self.wb.sheets[si], data, &order);
-        self.changed();
-    }
-
-    /// Filter > Filter by Selected Cell's (Font) Color: hides rows of a different colour.
-    pub fn filter_by_color(&mut self, font: bool) {
-        if self.sheet().filter.is_none() {
-            self.toggle_filter();
-        }
-        let (ar, ac) = self.active();
-        let want = self.cell_color(ar, ac, font);
-        let Some(f) = self.sheet().filter.clone() else { return };
-        let hide: Vec<u32> = (f.range.r1 + 1..=f.range.r2).filter(|&r| self.cell_color(r, ac, font) != want).collect();
-        let si = self.wb.active;
-        self.push_undo(&[Scope::Sheet(si)]);
-        let sh = self.sheet_mut();
-        for r in hide {
-            sh.hidden_rows.insert(r);
-        }
-        self.changed();
-    }
-
     /// Ctrl+Shift+F3: Create Names from Selection.
     pub fn open_create_names(&mut self) {
         self.commit_edit(false);
@@ -442,30 +395,6 @@ impl App {
     }
 }
 
-/// Rewrites the rows of `data` in the given order of source rows.
-fn reorder_rows(sh: &mut Sheet, data: Range, order: &[u32]) {
-    let rows: Vec<Vec<(u32, Cell)>> = order.iter().map(|&r| (data.c1..=data.c2).filter_map(|c| sh.get(r, c).map(|x| (c, x.clone()))).collect()).collect();
-    let old: Vec<(u32, u32)> = sh.iter_range(data).map(|(r, c, _)| (r, c)).collect();
-    for (r, c) in old {
-        sh.remove(r, c);
-    }
-    let mut moved = std::collections::HashMap::new();
-    for (i, cells) in rows.into_iter().enumerate() {
-        let nr = data.r1 + i as u32;
-        let orig = order[i];
-        moved.insert(orig, nr);
-        for (c, mut cell) in cells {
-            shift_cell(&mut cell, nr as i64 - orig as i64, 0);
-            sh.set(nr, c, Some(cell));
-        }
-    }
-    let remap = |m: &mut std::collections::HashMap<(u32, u32), String>| {
-        *m = m.drain().map(|((r, c), t)| if data.contains(r, c) { ((moved.get(&r).copied().unwrap_or(r), c), t) } else { ((r, c), t) }).collect();
-    };
-    remap(&mut sh.notes);
-    remap(&mut sh.links);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -490,18 +419,5 @@ mod tests {
         assert!(n.contains(&("Apples".to_string(), "Data!$B$2:$C$2".to_string())));
         assert!(n.contains(&("_2024".to_string(), "Data!$B$3:$C$3".to_string())));
         assert!(n.contains(&("Unit_price".to_string(), "Data!$B$2:$B$3".to_string())));
-    }
-
-    #[test]
-    fn reorder_moves_cells_and_notes() {
-        let mut sh = Sheet::new("S");
-        for r in 0..3 {
-            sh.set(r, 0, Some(Cell { value: Value::Number(r as f64), ..Default::default() }));
-        }
-        sh.notes.insert((2, 0), "n".into());
-        reorder_rows(&mut sh, Range::new(0, 0, 2, 0), &[2, 0, 1]);
-        assert_eq!(sh.value(0, 0), &Value::Number(2.0));
-        assert_eq!(sh.value(1, 0), &Value::Number(0.0));
-        assert_eq!(sh.notes.get(&(0, 0)).map(String::as_str), Some("n"));
     }
 }

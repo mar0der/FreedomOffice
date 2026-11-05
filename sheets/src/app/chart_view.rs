@@ -1181,7 +1181,7 @@ mod tests {
     #[test]
     fn chart_ui_smoke() {
         let ctx = egui::Context::default();
-        let mut app = App::with_context(&ctx, 0);
+        let mut app = App::with_context(&ctx, 0, None);
         let mut sh = Sheet::new("S");
         let text = |t: &str| Some(Cell { value: Value::Text(t.into()), ..Default::default() });
         sh.set(0, 1, text("A"));
