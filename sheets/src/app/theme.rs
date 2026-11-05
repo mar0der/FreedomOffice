@@ -96,11 +96,29 @@ palette! {
     backstage_hover = 0x206B45, 0x2A4F3A;
     /// Formula autocomplete / argument tooltip.
     tooltip = 0xFFFFF4, 0x333333;
+    /// Validation and parse errors shown in dialogs.
+    error_text = 0xC00000, 0xFF7B7B;
+    /// Inset panel inside a dialog (rule description box).
+    inset = 0xF8F8F8, 0x262626;
+    /// Outlines of small painted ribbon icons.
+    icon_line = 0x787878, 0xADADAD;
+    /// Scrollbar thumb, idle and dragged.
+    scroll_thumb = 0xB4B4B4, 0x6B6B6B;
+    scroll_thumb_active = 0x787878, 0x9E9E9E;
+    /// Select-all triangle in the header corner.
+    select_all = 0xB9B9B9, 0x6E6E6E;
+    /// KeyTips help panel and its key badges.
+    keytip_panel = 0xFBFBFB, 0x292929;
+    keytip_key = 0xFFF4C2, 0x5C4E1E;
+    /// Background around the pages in the print preview.
+    preview_bg = 0xE6E6E6, 0x1F1F1F;
 }
 
 /// Accent drawn on the (always white) cell area: selection border, fill handle, copy marquee.
 pub const GRID_ACCENT: Color32 = Color32::from_rgb(0x21, 0x73, 0x46);
 pub const GRID_LINE: Color32 = Color32::from_rgb(0xDD, 0xDD, 0xDD);
+/// Text drawn on white previews of paper or cells (stays dark in dark mode).
+pub const PAPER_TEXT: Color32 = Color32::from_rgb(0x20, 0x20, 0x20);
 
 pub fn grid_line() -> Color32 {
     GRID_LINE

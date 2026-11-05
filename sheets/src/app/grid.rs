@@ -1367,9 +1367,9 @@ impl App {
         painter.rect_filled(Rect::from_min_max(Pos2::new(lay.vbar.left(), lay.hbar.top()), lay.rect.right_bottom()), 0.0, theme::chrome());
         let (vt, _) = self.vthumb(lay);
         let (ht, _) = self.hthumb(lay);
-        let thumb_col = if matches!(self.drag, Drag::VScroll(..)) { Color32::from_gray(120) } else { Color32::from_gray(180) };
+        let thumb_col = if matches!(self.drag, Drag::VScroll(..)) { theme::scroll_thumb_active() } else { theme::scroll_thumb() };
         painter.rect_filled(vt.shrink2(Vec2::new(2.0, 0.0)), 4.0, thumb_col);
-        let thumb_col = if matches!(self.drag, Drag::HScroll(..)) { Color32::from_gray(120) } else { Color32::from_gray(180) };
+        let thumb_col = if matches!(self.drag, Drag::HScroll(..)) { theme::scroll_thumb_active() } else { theme::scroll_thumb() };
         painter.rect_filled(ht.shrink2(Vec2::new(0.0, 2.0)), 4.0, thumb_col);
         let _ = (fr, fc, z);
     }
@@ -1422,7 +1422,7 @@ impl App {
         let s = (corner.height() * 0.55).min(corner.width() * 0.55);
         painter.add(egui::Shape::convex_polygon(
             vec![p, p - Vec2::new(0.0, s), p - Vec2::new(s, 0.0)],
-            Color32::from_gray(185),
+            theme::select_all(),
             Stroke::NONE,
         ));
         painter.line_segment([Pos2::new(lay.rect.left(), lay.cells.top() - 0.5), Pos2::new(lay.cells.left(), lay.cells.top() - 0.5)], line);
