@@ -29,5 +29,9 @@ regex-lite = "0.1.9"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Graphics_Printing", "Win32_Security_Cryptography", "Win32_Storage_Xps", "Win32_Globalization", "Win32_UI_WindowsAndMessaging", "Win32_System_Registry"] }
 
+[dev-dependencies]
+# End-to-end tests of the server client against a real server on 127.0.0.1 (tests only).
+freedomoffice-server = { path = "../server" }
+
 [build-dependencies]
 embed-resource = "3"

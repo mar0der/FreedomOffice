@@ -1134,6 +1134,7 @@ dependencies = [
  "csv",
  "eframe",
  "embed-resource",
+ "freedomoffice-server",
  "image",
  "quick-xml 0.42.0",
  "raw-window-handle",

@@ -1,13 +1,122 @@
-//! Microsoft 365 cloud documents: sign-in, OneDrive / SharePoint files and sharing
-//! through Microsoft Graph v1.0. No UI here; see `app::cloud_ui`.
+//! Cloud documents: Microsoft 365 (OneDrive / SharePoint through Microsoft Graph v1.0) and
+//! self-hosted FreedomOffice servers. No UI here; see `app::cloud_ui`.
 
 pub mod auth;
 pub mod graph;
+pub mod server;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 pub use graph::{CloudDoc, DriveItem, Kind, Permission, Session, Target, UploadError, User};
+pub use server::ServerSession;
+
+/// Where a cloud document lives.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Provider {
+    #[default]
+    Microsoft,
+    /// A FreedomOffice server, by base URL (`https://files.example.com`).
+    FreedomServer(String),
+}
+
+/// A signed-in connection to either provider: the operations Open, Save, Save As and the
+/// conflict dialog share. Sharing and version history differ and are called on the session.
+#[derive(Clone)]
+pub enum Conn {
+    Microsoft(Arc<Session>),
+    Server(Arc<ServerSession>),
+}
+
+impl Conn {
+    pub fn provider(&self) -> Provider {
+        match self {
+            Conn::Microsoft(_) => Provider::Microsoft,
+            Conn::Server(s) => s.provider(),
+        }
+    }
+
+    pub fn list(&self, target: &Target) -> Result<Vec<DriveItem>, String> {
+        match self {
+            Conn::Microsoft(s) => s.list(target),
+            Conn::Server(s) => s.list(target),
+        }
+    }
+
+    /// Where clicking a row navigates (`None` for files).
+    pub fn target_of(&self, item: &DriveItem) -> Option<Target> {
+        match self {
+            Conn::Microsoft(_) => item.target(),
+            Conn::Server(_) => (item.kind != Kind::File).then(|| Target::Folder(item.id.clone())),
+        }
+    }
+
+    /// The folder reference new files are uploaded into, for a listed place or folder.
+    pub fn folder_of(&self, target: &Target) -> Option<String> {
+        match (self, target) {
+            (Conn::Microsoft(_), t) => t.folder_path(),
+            (Conn::Server(_), Target::MyFiles) => Some("root".into()),
+            (Conn::Server(_), Target::Folder(id)) => Some(id.clone()),
+            (Conn::Server(_), _) => None,
+        }
+    }
+
+    pub fn open(&self, item: &DriveItem, root: &Path) -> Result<CloudDoc, String> {
+        match self {
+            Conn::Microsoft(s) => s.open(item, root),
+            Conn::Server(s) => s.open(item, root),
+        }
+    }
+
+    /// Saves over the document; with `etag`, `Conflict` when someone else saved.
+    pub fn upload(&self, doc: &CloudDoc, etag: Option<&str>, data: &[u8]) -> Result<DriveItem, UploadError> {
+        match self {
+            Conn::Microsoft(s) => s.upload(&doc.item_path(), etag, data).map(|i| with_drive(s, i)),
+            Conn::Server(s) => s.upload(&doc.item_id, etag, data),
+        }
+    }
+
+    /// Creates a file in a folder. `behavior`: "fail", "rename" or "replace".
+    pub fn upload_new(&self, folder: &str, name: &str, data: &[u8], behavior: &str) -> Result<DriveItem, UploadError> {
+        match self {
+            Conn::Microsoft(s) => s.upload_new(folder, name, data, behavior).map(|i| with_drive(s, i)),
+            Conn::Server(s) => s.upload_new(folder, name, data, behavior),
+        }
+    }
+
+    /// The document record for an uploaded item.
+    pub fn doc_from(&self, item: &DriveItem, local: PathBuf) -> CloudDoc {
+        match self {
+            Conn::Microsoft(_) => CloudDoc::from_item(item, local),
+            Conn::Server(s) => server::doc_from_item(&s.account.url, item, local),
+        }
+    }
+
+    /// Where downloaded documents are kept locally.
+    pub fn cache_root(&self) -> Option<PathBuf> {
+        match self {
+            Conn::Microsoft(_) => cache_dir(),
+            Conn::Server(s) => server::cache_root(&s.account.url),
+        }
+    }
+}
+
+/// Fills in the drive id when a Graph upload answer omits it.
+fn with_drive(session: &Session, item: DriveItem) -> DriveItem {
+    if !item.drive_id.is_empty() || item.id.is_empty() {
+        return item;
+    }
+    session.item(&format!("/me/drive/items/{}", item.id)).unwrap_or(item)
+}
+
+/// "OneDrive" or the server's host name, for status messages and the title bar.
+pub fn place_name(p: &Provider) -> String {
+    match p {
+        Provider::Microsoft => "OneDrive".into(),
+        Provider::FreedomServer(url) => server::host_of(url),
+    }
+}
 
 /// File types offered when browsing OneDrive and SharePoint.
 pub const SPREADSHEET_EXTS: &[&str] = &["xlsx", "xlsm", "xls", "xlsb", "ods", "csv"];

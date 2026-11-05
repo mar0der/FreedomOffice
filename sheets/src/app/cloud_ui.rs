@@ -1,5 +1,6 @@
-//! Microsoft 365 in the UI: Account page, OneDrive / SharePoint places in Open and Save As,
-//! saving back with conflict handling, AutoSave, and the Share button and dialog.
+//! Cloud documents in the UI: Account page, OneDrive / SharePoint and FreedomOffice Server
+//! places in Open and Save As, saving back with conflict handling, AutoSave, the Share button
+//! and dialog, and version history for server documents.
 //! Network work runs on background threads; results come back over a channel.
 
 use std::path::PathBuf;
@@ -13,7 +14,8 @@ use super::chrome::Backstage;
 use super::dialogs::Dialog;
 use super::theme::{self, ic};
 use super::{App, Pending};
-use crate::cloud::{self, graph, CloudDoc, DriveItem, Kind, Permission, Session, Target, UploadError, User};
+use crate::cloud::server::{self, VersionInfo};
+use crate::cloud::{self, graph, CloudDoc, Conn, DriveItem, Kind, Permission, Provider, ServerSession, Session, Target, UploadError, User};
 
 const SHARE: char = '\u{E72D}';
 const CLOUD: char = '\u{E753}';
@@ -21,6 +23,8 @@ const PEOPLE: char = '\u{E716}';
 const GLOBE: char = '\u{E774}';
 const CLOCK: char = '\u{E823}';
 const PC: char = '\u{E7F8}';
+const SERVER: char = '\u{E968}';
+const HISTORY: char = '\u{E81C}';
 
 const ENTRA_URL: &str = "https://entra.microsoft.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade";
 
@@ -33,6 +37,18 @@ const SETUP_STEPS: &[&str] = &[
     "Copy the Application (client) ID from the Overview page and paste it below.",
 ];
 
+/// Link expiry choices in the server Share dialog (days; 0 = never).
+const LINK_DAYS: &[(u32, &str)] = &[(0, "Never expires"), (1, "Expires in 1 day"), (7, "Expires in 7 days"), (30, "Expires in 30 days"), (90, "Expires in 90 days")];
+
+/// The three views of a FreedomOffice server place.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ServerView {
+    #[default]
+    MyFiles,
+    Shared,
+    Recent,
+}
+
 /// A place in File > Open / Save As.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Place {
@@ -43,16 +59,28 @@ pub enum Place {
     Recent,
     Shared,
     Sites,
+    /// "FreedomOffice Server" before any server is added.
+    AddServer,
+    /// A signed-in server (index into `CloudState::servers`).
+    Server(usize, ServerView),
 }
 
 impl Place {
     fn target(self) -> Option<Target> {
         match self {
-            Place::Local => None,
-            Place::MyFiles => Some(Target::MyFiles),
-            Place::Recent => Some(Target::Recent),
-            Place::Shared => Some(Target::Shared),
+            Place::Local | Place::AddServer => None,
+            Place::MyFiles | Place::Server(_, ServerView::MyFiles) => Some(Target::MyFiles),
+            Place::Recent | Place::Server(_, ServerView::Recent) => Some(Target::Recent),
+            Place::Shared | Place::Server(_, ServerView::Shared) => Some(Target::Shared),
             Place::Sites => Some(Target::Sites),
+        }
+    }
+
+    /// Same row in the places column (the server view doesn't matter).
+    fn same_row(self, other: Place) -> bool {
+        match (self, other) {
+            (Place::Server(a, _), Place::Server(b, _)) => a == b,
+            _ => self == other,
         }
     }
 }
@@ -65,6 +93,8 @@ pub struct Browser {
     pub items: Vec<DriveItem>,
     pub loading: bool,
     pub error: Option<String>,
+    /// Name typed for a new folder (Some while the box is shown).
+    pub new_folder: Option<String>,
     seq: u64,
 }
 
@@ -73,7 +103,7 @@ enum UploadKind {
     Save,
     /// "Save a Copy" next to the open document after a conflict.
     Copy,
-    /// Save As into a OneDrive / SharePoint folder.
+    /// Save As into a cloud folder.
     New { folder: String, name: String },
 }
 
@@ -81,17 +111,24 @@ enum Event {
     Session { result: Result<Option<(Arc<Session>, User)>, String>, interactive: bool },
     Listing(u64, Result<Vec<DriveItem>, String>),
     Opened(Result<CloudDoc, String>),
-    Uploaded { kind: UploadKind, local: PathBuf, result: Result<DriveItem, UploadError> },
+    Uploaded { kind: UploadKind, local: PathBuf, conn: Conn, result: Result<DriveItem, UploadError> },
     Invited(Result<usize, String>),
     Link(Result<String, String>),
     Permissions(Result<Vec<Permission>, String>),
+    ServerSignedIn(Result<Arc<ServerSession>, String>),
+    ServerChecked { url: String, username: String, result: Result<String, String> },
+    Users(u64, Result<Vec<(String, String)>, String>),
+    FolderCreated(Result<DriveItem, String>),
+    Versions(Result<Vec<VersionInfo>, String>),
+    VersionRestored(Result<DriveItem, String>),
+    VersionCopy(Result<PathBuf, String>),
 }
 
 pub enum Conflict {
     /// HTTP 412 on save.
     Changed,
     /// Save As target name exists.
-    Exists { folder: String, name: String, local: PathBuf },
+    Exists { conn: Conn, folder: String, name: String, local: PathBuf },
 }
 
 #[derive(Default)]
@@ -107,6 +144,43 @@ pub struct ShareState {
     pub perms: Option<Vec<Permission>>,
     pub busy: bool,
     pub info: Option<String>,
+    pub error: Option<String>,
+    // FreedomOffice server: people search, chosen people, link options.
+    pub user_query: String,
+    searched: String,
+    user_seq: u64,
+    pub user_results: Vec<(String, String)>,
+    pub invite: Vec<(String, String)>,
+    pub link_days: u32,
+    pub link_password: String,
+}
+
+/// A FreedomOffice server account in this session.
+pub struct ServerEntry {
+    pub session: Arc<ServerSession>,
+    /// Set when the server rejected the device token (signed out elsewhere, revoked).
+    pub error: Option<String>,
+}
+
+/// The "Add server" form (Account page and the FreedomOffice Server place).
+#[derive(Default)]
+pub struct AddServer {
+    pub open: bool,
+    /// 0: server address, 1: username and password.
+    pub stage: u8,
+    pub url_input: String,
+    pub url: String,
+    pub username: String,
+    /// Typed by the user, sent once to the server, never stored.
+    pub password: String,
+    pub busy: bool,
+    pub error: Option<String>,
+}
+
+pub struct VersionsState {
+    pub doc: CloudDoc,
+    pub list: Option<Vec<VersionInfo>>,
+    pub busy: bool,
     pub error: Option<String>,
 }
 
@@ -126,7 +200,7 @@ pub struct CloudState {
     pub save_place: Place,
     pub browser: Browser,
     pub save_name: String,
-    /// The open document lives in OneDrive / SharePoint.
+    /// The open document lives in OneDrive / SharePoint or on a FreedomOffice server.
     pub doc: Option<CloudDoc>,
     /// A downloaded document waiting for the open (after the save prompt).
     pub pending_open: Option<CloudDoc>,
@@ -139,6 +213,10 @@ pub struct CloudState {
     pub autosave: bool,
     last_edits: u64,
     last_edit_time: f64,
+    /// Signed-in FreedomOffice servers.
+    pub servers: Vec<ServerEntry>,
+    pub add_server: AddServer,
+    pub versions: Option<VersionsState>,
 }
 
 impl Default for CloudState {
@@ -170,12 +248,19 @@ impl Default for CloudState {
             autosave: false,
             last_edits: 0,
             last_edit_time: 0.0,
+            servers: Vec::new(),
+            add_server: AddServer::default(),
+            versions: None,
         }
     }
 }
 
 fn share_green() -> Color32 {
     if theme::is_dark() { theme::rgb(0x37A660) } else { theme::rgb(0x217346) }
+}
+
+fn error_red() -> Color32 {
+    if theme::is_dark() { theme::rgb(0xFF99A4) } else { theme::rgb(0xC42B1C) }
 }
 
 /// "OneDrive - contoso.com" / "OneDrive - Personal"
@@ -189,6 +274,10 @@ fn org_label(user: Option<&User>) -> String {
     }
 }
 
+fn server_user(s: &ServerSession) -> User {
+    User { name: s.account.display_name.clone(), email: s.account.username.clone() }
+}
+
 impl App {
     fn cloud_spawn(&self, f: impl FnOnce() -> Event + Send + 'static) {
         let tx = self.cloud.tx.clone();
@@ -199,6 +288,49 @@ impl App {
                 c.request_repaint();
             }
         });
+    }
+
+    // ------------------------------------------------------------------
+    // Connections
+    // ------------------------------------------------------------------
+
+    fn server_index(&self, url: &str) -> Option<usize> {
+        self.cloud.servers.iter().position(|e| e.session.account.url == url)
+    }
+
+    /// The signed-in connection for a place in Open / Save As.
+    fn place_conn(&self, place: Place) -> Option<Conn> {
+        match place {
+            Place::Local | Place::AddServer => None,
+            Place::Server(i, _) => self.cloud.servers.get(i).map(|e| Conn::Server(e.session.clone())),
+            _ => self.cloud.session.clone().map(Conn::Microsoft),
+        }
+    }
+
+    /// The signed-in connection for a cloud document.
+    fn doc_conn(&self, doc: &CloudDoc) -> Option<Conn> {
+        match &doc.provider {
+            Provider::Microsoft => self.cloud.session.clone().map(Conn::Microsoft),
+            Provider::FreedomServer(url) => self.server_index(url).map(|i| Conn::Server(self.cloud.servers[i].session.clone())),
+        }
+    }
+
+    fn doc_server(&self) -> Option<Arc<ServerSession>> {
+        match self.cloud.doc.as_ref().map(|d| &d.provider) {
+            Some(Provider::FreedomServer(url)) => self.server_index(url).map(|i| self.cloud.servers[i].session.clone()),
+            _ => None,
+        }
+    }
+
+    fn browser_conn(&self) -> Option<Conn> {
+        self.cloud.browser.root.and_then(|p| self.place_conn(p))
+    }
+
+    fn save_servers(&mut self) {
+        let accounts: Vec<server::Account> = self.cloud.servers.iter().map(|e| e.session.account.clone()).collect();
+        if let Err(e) = server::save_accounts(&accounts) {
+            self.status = Some(format!("Couldn't remember the server sign-in: {e}"));
+        }
     }
 
     // ------------------------------------------------------------------
@@ -221,6 +353,7 @@ impl App {
                     });
                 }
             }
+            self.restore_servers();
             self.cloud_demo();
         }
         while let Ok(ev) = self.cloud.rx.try_recv() {
@@ -242,6 +375,16 @@ impl App {
         }
     }
 
+    /// Server accounts from the encrypted cache; tokens are checked in the background.
+    fn restore_servers(&mut self) {
+        for account in server::load_accounts() {
+            let session = Arc::new(ServerSession::new(account, Box::new(cloud::Http::new())));
+            let s = session.clone();
+            self.cloud_spawn(move || Event::ServerChecked { url: s.account.url.clone(), username: s.account.username.clone(), result: s.me() });
+            self.cloud.servers.push(ServerEntry { session, error: None });
+        }
+    }
+
     /// Hidden screenshot helper: `FREEDOMOFFICE_CLOUD_DEMO=share|account|open` shows the cloud UI
     /// with a sample document and no network access.
     fn cloud_demo(&mut self) {
@@ -257,6 +400,7 @@ impl App {
                     web_url: String::new(),
                     parent: None,
                     local: PathBuf::from("Budget 2026.xlsx"),
+                    provider: Provider::Microsoft,
                 });
                 self.wb.path = Some(PathBuf::from("Budget 2026.xlsx"));
                 self.cloud_open_share();
@@ -320,7 +464,7 @@ impl App {
                     Err(e) => self.dialog = Some(Dialog::Message { title: "Open".into(), text: format!("Sorry, we couldn't open the file from the cloud.\n\n{e}") }),
                 }
             }
-            Event::Uploaded { kind, local, result } => self.cloud_uploaded(kind, local, result),
+            Event::Uploaded { kind, local, conn, result } => self.cloud_uploaded(kind, local, conn, result),
             Event::Invited(result) => {
                 if let Some(sh) = &mut self.cloud.share {
                     sh.busy = false;
@@ -330,6 +474,9 @@ impl App {
                             sh.error = None;
                             sh.emails.clear();
                             sh.message.clear();
+                            sh.invite.clear();
+                            sh.user_query.clear();
+                            sh.user_results.clear();
                             sh.perms = None;
                         }
                         Err(e) => sh.error = Some(e),
@@ -347,6 +494,7 @@ impl App {
                             sh.info = Some("Link copied to the clipboard.".into());
                             sh.error = None;
                             sh.link = Some(url);
+                            sh.link_password.clear();
                             sh.perms = None;
                         }
                         Err(e) => sh.error = Some(e),
@@ -365,25 +513,133 @@ impl App {
                     }
                 }
             }
+            Event::ServerSignedIn(result) => {
+                let a = &mut self.cloud.add_server;
+                a.busy = false;
+                match result {
+                    Ok(session) => {
+                        let host = session.host();
+                        let (url, username) = (session.account.url.clone(), session.account.username.clone());
+                        let entry = ServerEntry { session, error: None };
+                        let i = match self.cloud.servers.iter().position(|e| e.session.account.url == url && e.session.account.username == username) {
+                            Some(i) => {
+                                self.cloud.servers[i] = entry;
+                                i
+                            }
+                            None => {
+                                // One account per server: signing in as someone else replaces it.
+                                self.cloud.servers.retain(|e| e.session.account.url != url);
+                                self.cloud.servers.push(entry);
+                                self.cloud.servers.len() - 1
+                            }
+                        };
+                        self.cloud.add_server = AddServer::default();
+                        self.save_servers();
+                        self.status = Some(format!("Signed in to {host}."));
+                        for p in [&mut self.cloud.open_place, &mut self.cloud.save_place] {
+                            if matches!(*p, Place::AddServer | Place::Server(..)) {
+                                *p = Place::Server(i, ServerView::MyFiles);
+                            }
+                        }
+                        self.cloud.browser.root = None;
+                        if self.cloud.upload_again {
+                            self.cloud.upload_again = false;
+                            self.cloud_upload(UploadKind::Save, true);
+                        }
+                    }
+                    Err(e) => a.error = Some(e),
+                }
+            }
+            Event::ServerChecked { url, username, result } => {
+                if let Err(e) = result {
+                    // Offline is fine (the token is checked again on use); a rejected token isn't.
+                    if e.contains("expired or was revoked") {
+                        if let Some(entry) = self.cloud.servers.iter_mut().find(|x| x.session.account.url == url && x.session.account.username == username) {
+                            entry.error = Some(e);
+                        }
+                    }
+                }
+            }
+            Event::Users(seq, result) => {
+                if let Some(sh) = &mut self.cloud.share {
+                    if seq == sh.user_seq {
+                        match result {
+                            Ok(list) => sh.user_results = list,
+                            Err(e) => sh.error = Some(e),
+                        }
+                    }
+                }
+            }
+            Event::FolderCreated(result) => match result {
+                Ok(item) => {
+                    self.cloud.browser.new_folder = None;
+                    self.status = Some(format!("Created the folder {}.", item.name));
+                    if let Some((_, t)) = self.cloud.browser.crumbs.last().cloned() {
+                        self.cloud_navigate(t, String::new(), false);
+                    }
+                }
+                Err(e) => self.cloud.browser.error = Some(e),
+            },
+            Event::Versions(result) => {
+                if let Some(v) = &mut self.cloud.versions {
+                    v.busy = false;
+                    match result {
+                        Ok(list) => v.list = Some(list),
+                        Err(e) => {
+                            v.list = Some(Vec::new());
+                            v.error = Some(e);
+                        }
+                    }
+                }
+            }
+            Event::VersionRestored(result) => match result {
+                Ok(item) => {
+                    self.cloud.versions = None;
+                    self.status = Some("Version restored. Opening it...".into());
+                    let conn = self.cloud.doc.as_ref().and_then(|d| self.doc_conn(d));
+                    if let Some(conn) = conn {
+                        self.cloud_open_with(conn, item);
+                    }
+                }
+                Err(e) => {
+                    if let Some(v) = &mut self.cloud.versions {
+                        v.busy = false;
+                        v.error = Some(e);
+                    }
+                }
+            },
+            Event::VersionCopy(result) => match result {
+                Ok(path) => {
+                    self.cloud.versions = None;
+                    self.confirm_then(Pending::Open(Some(path)));
+                }
+                Err(e) => {
+                    if let Some(v) = &mut self.cloud.versions {
+                        v.busy = false;
+                        v.error = Some(e);
+                    }
+                }
+            },
         }
     }
 
-    fn cloud_uploaded(&mut self, kind: UploadKind, local: PathBuf, result: Result<DriveItem, UploadError>) {
+    fn cloud_uploaded(&mut self, kind: UploadKind, local: PathBuf, conn: Conn, result: Result<DriveItem, UploadError>) {
         self.cloud.uploading = false;
+        let place = cloud::place_name(&conn.provider());
         match (kind, result) {
             (UploadKind::Save, Ok(item)) => {
                 if let Some(doc) = &mut self.cloud.doc {
                     doc.update_from(&item);
                 }
                 self.cloud.upload_failed = false;
-                self.status = Some("Saved to OneDrive.".into());
+                self.status = Some(format!("Saved to {place}."));
             }
             (UploadKind::Copy | UploadKind::New { .. }, Ok(item)) => {
-                let mut doc = CloudDoc::from_item(&item, local);
-                if doc.drive_id.is_empty() {
+                let mut doc = conn.doc_from(&item, local);
+                if doc.drive_id.is_empty() && doc.provider == Provider::Microsoft {
                     doc.drive_id = self.cloud.doc.as_ref().map(|d| d.drive_id.clone()).unwrap_or_default();
                 }
-                self.status = Some(format!("Saved to OneDrive as {}.", doc.name));
+                self.status = Some(format!("Saved to {place} as {}.", doc.name));
                 self.cloud.doc = Some(doc);
                 self.cloud.upload_failed = false;
             }
@@ -393,15 +649,15 @@ impl App {
             }
             (UploadKind::New { folder, name }, Err(UploadError::Exists)) => {
                 self.cloud.upload_failed = true;
-                self.cloud.conflict = Some(Conflict::Exists { folder, name, local });
+                self.cloud.conflict = Some(Conflict::Exists { conn, folder, name, local });
             }
             (_, Err(e)) => {
                 self.cloud.upload_failed = true;
-                self.status = Some(format!("Couldn't save to OneDrive: {e} Your changes are saved on this PC."));
+                self.status = Some(format!("Couldn't save to {place}: {e} Your changes are saved on this PC."));
                 if !self.cloud.autosave {
                     self.dialog = Some(Dialog::Message {
                         title: "Save".into(),
-                        text: format!("Couldn't upload to OneDrive.\n\n{e}\n\nYour changes are saved on this PC in\n{}", local.display()),
+                        text: format!("Couldn't upload to {place}.\n\n{e}\n\nYour changes are saved on this PC in\n{}", local.display()),
                     });
                 }
             }
@@ -442,9 +698,54 @@ impl App {
         self.status = Some("Signed out.".into());
     }
 
+    /// Sends the typed credentials to the server (HTTPS, or http://localhost) for a device token.
+    fn server_sign_in(&mut self) {
+        let a = &mut self.cloud.add_server;
+        if a.busy || a.username.trim().is_empty() || a.password.is_empty() {
+            return;
+        }
+        a.busy = true;
+        a.error = None;
+        let (url, user) = (a.url.clone(), a.username.trim().to_string());
+        let password = std::mem::take(&mut a.password);
+        self.cloud_spawn(move || {
+            let result = ServerSession::login(Box::new(cloud::Http::new()), &url, &user, &password, &server::device_name());
+            drop(password);
+            Event::ServerSignedIn(result.map(Arc::new))
+        });
+    }
+
+    /// Signs out of a server: revokes the device token there and forgets it here.
+    fn server_sign_out(&mut self, i: usize) {
+        if i >= self.cloud.servers.len() {
+            return;
+        }
+        let entry = self.cloud.servers.remove(i);
+        let host = entry.session.host();
+        let s = entry.session.clone();
+        std::thread::spawn(move || {
+            let _ = s.logout();
+        });
+        self.save_servers();
+        for p in [&mut self.cloud.open_place, &mut self.cloud.save_place] {
+            if let Place::Server(j, _) = *p {
+                *p = if j == i { Place::Local } else if j > i { Place::Server(j - 1, ServerView::MyFiles) } else { *p };
+            }
+        }
+        self.cloud.browser = Browser::default();
+        self.status = Some(format!("Signed out of {host}."));
+    }
+
     // ------------------------------------------------------------------
     // Saving
     // ------------------------------------------------------------------
+
+    fn place_of_doc(&self, doc: &CloudDoc) -> Place {
+        match &doc.provider {
+            Provider::Microsoft => Place::MyFiles,
+            Provider::FreedomServer(url) => self.server_index(url).map(|i| Place::Server(i, ServerView::MyFiles)).unwrap_or(Place::AddServer),
+        }
+    }
 
     /// Ctrl+S on a cloud document: write the local copy, then upload in the background.
     pub fn cloud_save(&mut self) -> bool {
@@ -454,9 +755,10 @@ impl App {
             // .xls / .csv / .ods can't be written back: save a workbook copy instead.
             let stem = doc.name.rsplit_once('.').map(|(s, _)| s.to_string()).unwrap_or(doc.name.clone());
             self.cloud.save_name = format!("{stem}.xlsx");
-            self.cloud.save_place = Place::MyFiles;
+            let place = self.place_of_doc(&doc);
+            self.cloud.save_place = place;
             if let Some(parent) = &doc.parent {
-                self.cloud.browser = Browser { root: Some(Place::MyFiles), ..Default::default() };
+                self.cloud.browser = Browser { root: Some(place), ..Default::default() };
                 self.cloud_navigate(Target::Folder(parent.clone()), "Folder".into(), true);
             }
             self.backstage = Some(Backstage::SaveAs);
@@ -484,12 +786,16 @@ impl App {
             self.cloud.upload_again = true;
             return;
         }
-        let Some(session) = self.cloud.session.clone() else {
-            if self.cloud.restoring {
+        let place = cloud::place_name(&doc.provider);
+        let Some(conn) = self.doc_conn(&doc) else {
+            if doc.provider == Provider::Microsoft && self.cloud.restoring {
                 self.cloud.upload_again = true;
-            } else {
+            } else if doc.provider == Provider::Microsoft {
                 self.cloud.upload_failed = true;
                 self.status = Some("Saved on this PC. Sign in (File > Account) to save to OneDrive.".into());
+            } else {
+                self.cloud.upload_failed = true;
+                self.status = Some(format!("Saved on this PC. Sign in to {place} (File > Account) to save to the server."));
             }
             return;
         };
@@ -501,29 +807,28 @@ impl App {
             }
         };
         self.cloud.uploading = true;
-        self.status = Some(format!("Saving to OneDrive ({})...", size_label(data.len())));
+        self.status = Some(format!("Saving to {place} ({})...", size_label(data.len())));
         self.cloud_spawn(move || {
             let result = match &kind {
-                UploadKind::Save => session.upload(&doc.item_path(), check.then_some(doc.etag.as_str()), &data),
+                UploadKind::Save => conn.upload(&doc, check.then_some(doc.etag.as_str()), &data),
                 UploadKind::Copy => match &doc.parent {
-                    Some(parent) => session.upload_new(parent, &graph::copy_name(&doc.name), &data, "rename"),
+                    Some(parent) => conn.upload_new(parent, &graph::copy_name(&doc.name), &data, "rename"),
                     None => Err(UploadError::Failed("The file's folder is unknown.".into())),
                 },
-                UploadKind::New { folder, name } => session.upload_new(folder, name, &data, if check { "fail" } else { "replace" }),
+                UploadKind::New { folder, name } => conn.upload_new(folder, name, &data, if check { "fail" } else { "replace" }),
             };
-            Event::Uploaded { kind, local: doc.local.clone(), result: result.map(|i| with_drive(&session, i)) }
+            Event::Uploaded { kind, local: doc.local.clone(), conn, result }
         });
     }
 
     /// Save As into the folder shown in the cloud browser.
-    fn cloud_save_as(&mut self, folder: String, name: String, replace: bool) {
+    fn cloud_save_as(&mut self, conn: Conn, folder: String, name: String, replace: bool) {
         self.commit_edit(false);
-        let Some(session) = self.cloud.session.clone() else { return };
         let mut name = name.trim().to_string();
         if !name.to_lowercase().ends_with(".xlsx") && !name.to_lowercase().ends_with(".xlsm") {
             name.push_str(".xlsx");
         }
-        let Some(dir) = cloud::cache_dir().map(|d| d.join(format!("new-{}", cloud::auth::now_secs()))) else { return };
+        let Some(dir) = conn.cache_root().map(|d| d.join(format!("new-{}", cloud::auth::now_secs()))) else { return };
         let local = cloud::local_copy_path(&dir, "", &name);
         if let Some(d) = local.parent() {
             let _ = std::fs::create_dir_all(d);
@@ -537,10 +842,10 @@ impl App {
         self.remove_recovery();
         self.cloud.doc = None;
         self.backstage = None;
-        self.start_new_upload(session, folder, name, local, replace);
+        self.start_new_upload(conn, folder, name, local, replace);
     }
 
-    fn start_new_upload(&mut self, session: Arc<Session>, folder: String, name: String, local: PathBuf, replace: bool) {
+    fn start_new_upload(&mut self, conn: Conn, folder: String, name: String, local: PathBuf, replace: bool) {
         let data = match std::fs::read(&local) {
             Ok(d) => d,
             Err(e) => {
@@ -549,21 +854,21 @@ impl App {
             }
         };
         self.cloud.uploading = true;
-        self.status = Some(format!("Saving {name} to OneDrive..."));
+        self.status = Some(format!("Saving {name} to {}...", cloud::place_name(&conn.provider())));
         self.cloud_spawn(move || {
-            let result = session.upload_new(&folder, &name, &data, if replace { "replace" } else { "fail" });
-            Event::Uploaded { kind: UploadKind::New { folder, name }, local, result: result.map(|i| with_drive(&session, i)) }
+            let result = conn.upload_new(&folder, &name, &data, if replace { "replace" } else { "fail" });
+            Event::Uploaded { kind: UploadKind::New { folder, name }, local, conn, result }
         });
     }
 
-    /// Title bar suffix like "Saved to OneDrive".
-    pub fn cloud_title_suffix(&self) -> &'static str {
+    /// Title bar suffix like "Saved to OneDrive" or "Saved to files.example.com".
+    pub fn cloud_title_suffix(&self) -> String {
         match &self.cloud.doc {
-            None => "",
-            Some(_) if self.cloud.uploading => " - Saving...",
-            Some(_) if self.cloud.upload_failed => " - Not saved to OneDrive",
-            Some(_) if !self.dirty => " - Saved to OneDrive",
-            Some(_) => "",
+            None => String::new(),
+            Some(_) if self.cloud.uploading => " - Saving...".into(),
+            Some(d) if self.cloud.upload_failed => format!(" - Not saved to {}", cloud::place_name(&d.provider)),
+            Some(d) if !self.dirty => format!(" - Saved to {}", cloud::place_name(&d.provider)),
+            Some(_) => String::new(),
         }
     }
 
@@ -580,16 +885,23 @@ impl App {
         b.loading = true;
         b.error = None;
         b.items.clear();
+        b.new_folder = None;
         let seq = b.seq;
-        let Some(session) = self.cloud.session.clone() else { return };
-        self.cloud_spawn(move || Event::Listing(seq, session.list(&target)));
+        let Some(conn) = self.browser_conn() else { return };
+        self.cloud_spawn(move || Event::Listing(seq, conn.list(&target)));
+    }
+
+    fn cloud_open_with(&mut self, conn: Conn, item: DriveItem) {
+        let Some(root) = conn.cache_root() else { return };
+        self.cloud.opening = Some(item.name.clone());
+        self.status = Some(format!("Downloading {}...", item.name));
+        self.cloud_spawn(move || Event::Opened(conn.open(&item, &root)));
     }
 
     fn cloud_open_item(&mut self, item: DriveItem) {
-        let (Some(session), Some(root)) = (self.cloud.session.clone(), cloud::cache_dir()) else { return };
-        self.cloud.opening = Some(item.name.clone());
-        self.status = Some(format!("Downloading {}...", item.name));
-        self.cloud_spawn(move || Event::Opened(session.open(&item, &root)));
+        if let Some(conn) = self.browser_conn() {
+            self.cloud_open_with(conn, item);
+        }
     }
 
     /// Places column for File > Open / Save As. Draws the cloud browser for cloud places and
@@ -605,6 +917,12 @@ impl App {
         }
         places.push((Place::Shared, PEOPLE, "👥", "Shared with me".into()));
         places.push((Place::Sites, GLOBE, "🌐", format!("Sites - {org}")));
+        if self.cloud.servers.is_empty() {
+            places.push((Place::AddServer, SERVER, "🖧", "FreedomOffice Server".into()));
+        }
+        for (i, e) in self.cloud.servers.iter().enumerate() {
+            places.push((Place::Server(i, ServerView::MyFiles), SERVER, "🖧", format!("FreedomOffice - {}", e.session.host())));
+        }
         let current = if save_as { self.cloud.save_place } else { self.cloud.open_place };
         let mut picked = None;
         ui.vertical(|ui| {
@@ -612,7 +930,7 @@ impl App {
             ui.spacing_mut().item_spacing.y = 2.0;
             for (place, code, fallback, label) in places {
                 let (rect, resp) = ui.allocate_exact_size(Vec2::new(230.0, 40.0), Sense::click());
-                if place == current {
+                if place.same_row(current) {
                     ui.painter().rect_filled(rect, 3.0, theme::accent_light());
                 } else if resp.hovered() {
                     ui.painter().rect_filled(rect, 3.0, theme::hover());
@@ -620,17 +938,16 @@ impl App {
                 let (g, is_icon) = self.icon(code, fallback);
                 let font = if is_icon { theme::icon_font(17.0) } else { theme::ui_font(16.0) };
                 ui.painter().text(Pos2::new(rect.left() + 20.0, rect.center().y), Align2::CENTER_CENTER, g, font, theme::accent_dark());
-                ui.painter().text(Pos2::new(rect.left() + 42.0, rect.center().y), Align2::LEFT_CENTER, label, theme::ui_font(13.5), theme::text());
-                if resp.clicked() {
+                let clip = ui.painter().with_clip_rect(rect.shrink(2.0));
+                clip.text(Pos2::new(rect.left() + 42.0, rect.center().y), Align2::LEFT_CENTER, label, theme::ui_font(13.5), theme::text());
+                if resp.clicked() && !place.same_row(current) {
                     picked = Some(place);
                 }
             }
         });
         if let Some(p) = picked {
             if save_as { self.cloud.save_place = p } else { self.cloud.open_place = p }
-            if p != current {
-                self.cloud.browser.root = None;
-            }
+            self.cloud.browser.root = None;
         }
         let place = if save_as { self.cloud.save_place } else { self.cloud.open_place };
         if place == Place::Local {
@@ -685,24 +1002,69 @@ impl App {
     }
 
     fn cloud_browser_ui(&mut self, ui: &mut egui::Ui, place: Place, save_as: bool) {
-        if self.cloud.session.is_none() {
+        if place == Place::AddServer {
+            ui.label(RichText::new("Connect to a FreedomOffice server").size(17.0).color(theme::text()));
+            ui.add_space(6.0);
+            ui.label(RichText::new("Open, save and share workbooks on your own document server, without a Microsoft account.").color(theme::text_dim()));
+            ui.add_space(10.0);
+            self.cloud.add_server.open = true;
+            self.add_server_ui(ui);
+            return;
+        }
+        if let Place::Server(i, _) = place {
+            match self.cloud.servers.get(i) {
+                None => return,
+                Some(e) if e.error.is_some() => {
+                    let (msg, url, user) = (e.error.clone().unwrap_or_default(), e.session.account.url.clone(), e.session.account.username.clone());
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(msg).color(error_red()));
+                    ui.add_space(8.0);
+                    if ui.add(egui::Button::new("Sign in again").min_size(Vec2::new(130.0, 28.0))).clicked() {
+                        self.cloud.add_server = AddServer { open: true, stage: 1, url_input: url.clone(), url, username: user, ..Default::default() };
+                        self.backstage = Some(Backstage::Account);
+                    }
+                    return;
+                }
+                Some(_) => {}
+            }
+        } else if self.cloud.session.is_none() {
             self.signed_out_ui(ui);
             return;
         }
         if self.cloud.browser.root != Some(place) {
             let root = place.target().unwrap_or(Target::MyFiles);
             let label = match place {
-                Place::Recent => "Recent",
-                Place::Shared => "Shared with me",
+                Place::Recent | Place::Server(_, ServerView::Recent) => "Recent",
+                Place::Shared | Place::Server(_, ServerView::Shared) => "Shared with me",
                 Place::Sites => "Sites",
                 _ => "My files",
             };
             self.cloud.browser = Browser { root: Some(place), seq: self.cloud.browser.seq, ..Default::default() };
             self.cloud_navigate(root, label.into(), true);
         }
+        // Server views: My files / Shared with me / Recent.
+        if let Place::Server(i, view) = place {
+            let mut pick = None;
+            ui.horizontal(|ui| {
+                for (v, label) in [(ServerView::MyFiles, "My files"), (ServerView::Shared, "Shared with me"), (ServerView::Recent, "Recent")] {
+                    if (!save_as || v != ServerView::Recent) && ui.selectable_label(view == v, RichText::new(label).size(13.5)).clicked() && view != v {
+                        pick = Some(v);
+                    }
+                }
+            });
+            if let Some(v) = pick {
+                let p = Place::Server(i, v);
+                if save_as { self.cloud.save_place = p } else { self.cloud.open_place = p }
+            }
+            ui.add_space(6.0);
+        }
         // Breadcrumb
         let mut go: Option<usize> = None;
         let mut refresh = false;
+        let conn = self.browser_conn();
+        let folder = self.cloud.browser.crumbs.last().and_then(|(_, t)| conn.as_ref().and_then(|c| c.folder_of(t)));
+        let is_server = matches!(place, Place::Server(..));
+        let mut new_folder = false;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             let n = self.cloud.browser.crumbs.len();
@@ -720,7 +1082,16 @@ impl App {
             if ui.add(egui::Button::new(RichText::new("⟳").size(15.0)).frame(false)).on_hover_text("Refresh").clicked() {
                 refresh = true;
             }
+            if is_server && folder.is_some() && self.cloud.browser.new_folder.is_none() {
+                ui.add_space(8.0);
+                if ui.add(egui::Button::new(RichText::new("+ New folder").size(13.0).color(theme::accent_dark())).frame(false)).clicked() {
+                    new_folder = true;
+                }
+            }
         });
+        if new_folder {
+            self.cloud.browser.new_folder = Some(String::new());
+        }
         if let Some(i) = go {
             self.cloud.browser.crumbs.truncate(i + 1);
             refresh = true;
@@ -730,8 +1101,28 @@ impl App {
                 self.cloud_navigate(t, String::new(), false);
             }
         }
+        // New folder box (servers).
+        if let (Some(mut name), Some(f), Some(Conn::Server(s))) = (self.cloud.browser.new_folder.clone(), folder.clone(), conn.clone()) {
+            let mut create = false;
+            let mut cancel = false;
+            ui.horizontal(|ui| {
+                let r = ui.add(egui::TextEdit::singleline(&mut name).hint_text("Folder name").desired_width(260.0));
+                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    create = true;
+                }
+                if ui.add_enabled(!name.trim().is_empty(), egui::Button::new("Create")).clicked() {
+                    create = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+            self.cloud.browser.new_folder = if cancel { None } else { Some(name.clone()) };
+            if create && !name.trim().is_empty() {
+                self.cloud_spawn(move || Event::FolderCreated(s.create_folder(&f, &name)));
+            }
+        }
         ui.add_space(8.0);
-        let folder = self.cloud.browser.crumbs.last().and_then(|(_, t)| t.folder_path());
         if save_as {
             ui.horizontal(|ui| {
                 if self.cloud.save_name.is_empty() {
@@ -742,8 +1133,10 @@ impl App {
                 let ok = folder.is_some() && !self.cloud.save_name.trim().is_empty() && !self.cloud.uploading;
                 let b = egui::Button::new(RichText::new("Save").size(14.0)).min_size(Vec2::new(90.0, 28.0)).fill(theme::accent_light());
                 if ui.add_enabled(ok, b).on_disabled_hover_text("Open a folder to save in").clicked() {
-                    let (f, n) = (folder.clone().unwrap_or_default(), self.cloud.save_name.clone());
-                    self.cloud_save_as(f, n, false);
+                    if let Some(c) = conn.clone() {
+                        let (f, n) = (folder.clone().unwrap_or_default(), self.cloud.save_name.clone());
+                        self.cloud_save_as(c, f, n, false);
+                    }
                 }
             });
             if folder.is_none() {
@@ -812,7 +1205,7 @@ impl App {
             }
         });
         if let Some(it) = clicked {
-            match it.target() {
+            match conn.as_ref().and_then(|c| c.target_of(&it)) {
                 Some(t) => self.cloud_navigate(t, it.name.clone(), true),
                 None if save_as => self.cloud.save_name = it.name.clone(),
                 None => {
@@ -840,54 +1233,58 @@ impl App {
             ui.set_max_width(720.0);
             if self.cloud.client_id.is_none() {
                 self.setup_ui(ui);
-                return;
+            } else {
+                self.microsoft_account_ui(ui);
             }
-            ui.label(RichText::new("User Information").size(17.0).color(theme::text()));
-            ui.add_space(10.0);
-            match self.cloud.user.clone() {
-                Some(u) => {
-                    ui.horizontal(|ui| {
-                        initials_badge(ui, &u.initials(), 52.0);
-                        ui.add_space(8.0);
-                        ui.vertical(|ui| {
-                            ui.label(RichText::new(&u.name).size(16.0).color(theme::text()));
-                            ui.label(RichText::new(&u.email).color(theme::text_dim()));
-                        });
+            ui.add_space(28.0);
+            self.server_accounts_ui(ui);
+        });
+    }
+
+    fn microsoft_account_ui(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("User Information").size(17.0).color(theme::text()));
+        ui.add_space(10.0);
+        match self.cloud.user.clone() {
+            Some(u) => {
+                ui.horizontal(|ui| {
+                    initials_badge(ui, &u.initials(), 52.0);
+                    ui.add_space(8.0);
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new(&u.name).size(16.0).color(theme::text()));
+                        ui.label(RichText::new(&u.email).color(theme::text_dim()));
                     });
-                    ui.add_space(12.0);
-                    ui.horizontal(|ui| {
-                        if ui.add(egui::Button::new("Sign out").min_size(Vec2::new(110.0, 28.0))).clicked() {
-                            self.cloud_sign_out();
-                        }
-                        if ui.add(egui::Button::new("Switch account").min_size(Vec2::new(130.0, 28.0))).clicked() {
-                            self.cloud_sign_out();
-                            self.cloud_sign_in();
-                        }
-                    });
-                    ui.add_space(6.0);
-                    ui.label(
-                        RichText::new("You stay signed in on this PC; the sign-in is stored encrypted for your Windows account.").size(12.0).color(theme::text_dim()),
-                    );
-                }
-                None => {
-                    ui.label(RichText::new("Sign in with your work, school or personal Microsoft account to open, save and share files in OneDrive and SharePoint.").color(theme::text_dim()));
-                    ui.add_space(10.0);
-                    self.sign_in_button(ui);
-                }
+                });
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.add(egui::Button::new("Sign out").min_size(Vec2::new(110.0, 28.0))).clicked() {
+                        self.cloud_sign_out();
+                    }
+                    if ui.add(egui::Button::new("Switch account").min_size(Vec2::new(130.0, 28.0))).clicked() {
+                        self.cloud_sign_out();
+                        self.cloud_sign_in();
+                    }
+                });
+                ui.add_space(6.0);
+                ui.label(RichText::new("You stay signed in on this PC; the sign-in is stored encrypted for your Windows account.").size(12.0).color(theme::text_dim()));
             }
-            ui.add_space(24.0);
-            ui.label(RichText::new("App registration").size(15.0).color(theme::text()));
-            ui.add_space(4.0);
-            let id = self.cloud.client_id.clone().unwrap_or_default();
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("Client ID: {id}")).size(12.5).color(theme::text_dim()));
-                if std::env::var("FREEDOMOFFICE_CLIENT_ID").map(|v| !v.trim().is_empty()).unwrap_or(false) {
-                    ui.label(RichText::new("(from FREEDOMOFFICE_CLIENT_ID)").size(12.0).color(theme::text_dim()));
-                } else if self.cloud.user.is_none() && ui.add(egui::Button::new(RichText::new("Change").size(12.5)).frame(false)).clicked() {
-                    self.cloud.client_id_input = id.clone();
-                    self.cloud.client_id = None;
-                }
-            });
+            None => {
+                ui.label(RichText::new("Sign in with your work, school or personal Microsoft account to open, save and share files in OneDrive and SharePoint.").color(theme::text_dim()));
+                ui.add_space(10.0);
+                self.sign_in_button(ui);
+            }
+        }
+        ui.add_space(24.0);
+        ui.label(RichText::new("App registration").size(15.0).color(theme::text()));
+        ui.add_space(4.0);
+        let id = self.cloud.client_id.clone().unwrap_or_default();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("Client ID: {id}")).size(12.5).color(theme::text_dim()));
+            if std::env::var("FREEDOMOFFICE_CLIENT_ID").map(|v| !v.trim().is_empty()).unwrap_or(false) {
+                ui.label(RichText::new("(from FREEDOMOFFICE_CLIENT_ID)").size(12.0).color(theme::text_dim()));
+            } else if self.cloud.user.is_none() && ui.add(egui::Button::new(RichText::new("Change").size(12.5)).frame(false)).clicked() {
+                self.cloud.client_id_input = id.clone();
+                self.cloud.client_id = None;
+            }
         });
     }
 
@@ -942,8 +1339,144 @@ impl App {
         }
     }
 
+    /// File > Account: signed-in FreedomOffice servers and "Add server".
+    fn server_accounts_ui(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("FreedomOffice Server").size(17.0).color(theme::text()));
+        ui.add_space(4.0);
+        ui.label(RichText::new("Open, save and share workbooks on your own document server.").color(theme::text_dim()));
+        ui.add_space(10.0);
+        let mut sign_out = None;
+        let mut again = None;
+        for (i, e) in self.cloud.servers.iter().enumerate() {
+            let u = server_user(&e.session);
+            ui.horizontal(|ui| {
+                initials_badge(ui, &u.initials(), 40.0);
+                ui.add_space(6.0);
+                ui.vertical(|ui| {
+                    ui.label(RichText::new(format!("{} ({})", u.name, u.email)).size(14.5).color(theme::text()));
+                    ui.label(RichText::new(&e.session.account.url).size(12.5).color(theme::text_dim()));
+                    if let Some(err) = &e.error {
+                        ui.label(RichText::new(err).size(12.5).color(error_red()));
+                    }
+                });
+                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                    if ui.add(egui::Button::new("Sign out").min_size(Vec2::new(90.0, 26.0))).on_hover_text("Signs this PC out on the server too").clicked() {
+                        sign_out = Some(i);
+                    }
+                    if e.error.is_some() && ui.add(egui::Button::new("Sign in again").min_size(Vec2::new(110.0, 26.0))).clicked() {
+                        again = Some(i);
+                    }
+                });
+            });
+            ui.add_space(8.0);
+        }
+        if let Some(i) = again {
+            let a = &self.cloud.servers[i].session.account;
+            self.cloud.add_server = AddServer { open: true, stage: 1, url_input: a.url.clone(), url: a.url.clone(), username: a.username.clone(), ..Default::default() };
+        }
+        if let Some(i) = sign_out {
+            self.server_sign_out(i);
+        }
+        if self.cloud.add_server.open {
+            ui.add_space(4.0);
+            self.add_server_ui(ui);
+        } else if ui.add(egui::Button::new("Add server").min_size(Vec2::new(120.0, 28.0))).clicked() {
+            self.cloud.add_server = AddServer { open: true, ..Default::default() };
+        }
+    }
+
+    /// Server address, then username and password.
+    fn add_server_ui(&mut self, ui: &mut egui::Ui) {
+        let mut next = false;
+        let mut sign_in = false;
+        let mut back = false;
+        let mut cancel = false;
+        let has_servers = !self.cloud.servers.is_empty();
+        let a = &mut self.cloud.add_server;
+        egui::Frame::group(ui.style()).inner_margin(12.0).show(ui, |ui| {
+            ui.set_max_width(520.0);
+            if a.stage == 0 {
+                ui.label("Server address:");
+                let r = ui.add_enabled(!a.busy, egui::TextEdit::singleline(&mut a.url_input).hint_text("https://files.example.com").desired_width(380.0));
+                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    next = true;
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.add(egui::Button::new("Next").min_size(Vec2::new(90.0, 26.0)).fill(theme::accent_light())).clicked() {
+                        next = true;
+                    }
+                    if has_servers && ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            } else {
+                ui.label(RichText::new(format!("Sign in to {}", server::host_of(&a.url))).size(15.0).color(theme::text()));
+                ui.add_space(6.0);
+                egui::Grid::new("server_sign_in").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                    ui.label("Username:");
+                    ui.add_enabled(!a.busy, egui::TextEdit::singleline(&mut a.username).desired_width(260.0));
+                    ui.end_row();
+                    ui.label("Password:");
+                    let r = ui.add_enabled(!a.busy, egui::TextEdit::singleline(&mut a.password).password(true).desired_width(260.0));
+                    if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        sign_in = true;
+                    }
+                    ui.end_row();
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let ok = !a.busy && !a.username.trim().is_empty() && !a.password.is_empty();
+                    let b = egui::Button::new(RichText::new("Sign in").color(Color32::WHITE)).fill(share_green()).min_size(Vec2::new(100.0, 28.0));
+                    if ui.add_enabled(ok, b).clicked() {
+                        sign_in = true;
+                    }
+                    if ui.add_enabled(!a.busy, egui::Button::new("Back")).clicked() {
+                        back = true;
+                    }
+                    if a.busy {
+                        ui.add(egui::Spinner::new());
+                        ui.label("Signing in...");
+                    }
+                });
+                ui.add_space(4.0);
+                let note = if a.url.starts_with("https://") {
+                    "Your password goes only to this server, encrypted (HTTPS), and isn't stored. This PC keeps a device sign-in, encrypted for your Windows account."
+                } else {
+                    "Local test server (http://localhost): the connection isn't encrypted. Your password isn't stored."
+                };
+                ui.add(egui::Label::new(RichText::new(note).size(12.0).color(theme::text_dim())).wrap());
+            }
+            if let Some(e) = &a.error {
+                ui.add_space(4.0);
+                ui.add(egui::Label::new(RichText::new(e).color(error_red())).wrap());
+            }
+        });
+        if next {
+            match server::normalize_url(&a.url_input) {
+                Ok(url) => {
+                    a.url = url;
+                    a.stage = 1;
+                    a.error = None;
+                }
+                Err(e) => a.error = Some(e),
+            }
+        }
+        if back {
+            a.stage = 0;
+            a.password.clear();
+            a.error = None;
+        }
+        if cancel {
+            *a = AddServer::default();
+        }
+        if sign_in && !a.busy {
+            self.server_sign_in();
+        }
+    }
+
     // ------------------------------------------------------------------
-    // Tab strip: AutoSave, Share, account
+    // Tab strip: AutoSave, Share, Version History, account
     // ------------------------------------------------------------------
 
     /// Right end of the ribbon tab row.
@@ -983,6 +1516,15 @@ impl App {
                 self.commit_edit(false);
                 self.cloud_open_share();
             }
+            // Version History (FreedomOffice server documents)
+            if matches!(self.cloud.doc.as_ref().map(|d| &d.provider), Some(Provider::FreedomServer(_))) {
+                let (g, is_icon) = self.icon(HISTORY, "🕘");
+                let t = RichText::new(g).font(if is_icon { theme::icon_font(14.0) } else { theme::ui_font(14.0) }).color(theme::text());
+                if ui.add(egui::Button::new(t).frame(false)).on_hover_text("Version History").clicked() {
+                    self.commit_edit(false);
+                    self.cloud_open_versions();
+                }
+            }
             // AutoSave toggle (cloud documents only)
             let enabled = self.cloud.doc.is_some();
             let on = self.cloud.autosave && enabled;
@@ -996,7 +1538,11 @@ impl App {
                 p.rect_stroke(tr, 9.0, Stroke::new(1.0, theme::text_dim().gamma_multiply(alpha)), StrokeKind::Inside);
                 p.circle_filled(Pos2::new(tr.left() + 9.0, tr.center().y), 5.0, theme::text_dim().gamma_multiply(alpha));
             }
-            let tip = if enabled { "AutoSave saves your changes to OneDrive a few seconds after you stop editing." } else { "AutoSave works for files in OneDrive and SharePoint." };
+            let tip = match self.cloud.doc.as_ref().map(|d| &d.provider) {
+                Some(Provider::FreedomServer(url)) => format!("AutoSave saves your changes to {} a few seconds after you stop editing.", server::host_of(url)),
+                Some(_) => "AutoSave saves your changes to OneDrive a few seconds after you stop editing.".into(),
+                None => "AutoSave works for files in OneDrive, SharePoint and on FreedomOffice servers.".into(),
+            };
             if tresp.on_hover_text(tip).clicked() && enabled {
                 self.cloud.autosave = !self.cloud.autosave;
             }
@@ -1013,18 +1559,31 @@ impl App {
         self.cloud.share = Some(sh);
     }
 
+    pub fn cloud_open_versions(&mut self) {
+        let Some(doc) = self.cloud.doc.clone() else { return };
+        let Some(s) = self.doc_server() else {
+            self.status = Some(format!("Sign in to {} (File > Account) to see the version history.", cloud::place_name(&doc.provider)));
+            return;
+        };
+        let id = doc.item_id.clone();
+        self.cloud.versions = Some(VersionsState { doc, list: None, busy: true, error: None });
+        self.cloud_spawn(move || Event::Versions(s.versions(&id)));
+    }
+
     // ------------------------------------------------------------------
-    // Dialogs: Share, save conflict
+    // Dialogs: Share, save conflict, version history
     // ------------------------------------------------------------------
 
     pub fn cloud_dialogs_ui(&mut self, ctx: &egui::Context) {
         self.conflict_ui(ctx);
         self.share_ui(ctx);
+        self.versions_ui(ctx);
     }
 
     fn conflict_ui(&mut self, ctx: &egui::Context) {
         let Some(c) = self.cloud.conflict.take() else { return };
         let name = self.cloud.doc.as_ref().map(|d| d.name.clone()).unwrap_or_else(|| self.wb.file_name());
+        let place = self.cloud.doc.as_ref().map(|d| cloud::place_name(&d.provider)).unwrap_or_else(|| "OneDrive".into());
         let mut keep = true;
         let win = egui::Window::new("FreedomOffice Sheets").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, -40.0]);
         win.show(ctx, |ui| {
@@ -1046,11 +1605,12 @@ impl App {
                         }
                         if ui.add(egui::Button::new("Cancel").min_size(Vec2::new(90.0, 26.0))).clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                             keep = false;
-                            self.status = Some(format!("Not saved to OneDrive. Your changes are saved on this PC ({name})."));
+                            self.status = Some(format!("Not saved to {place}. Your changes are saved on this PC ({name})."));
                         }
                     });
                 }
-                Conflict::Exists { folder, name, local } => {
+                Conflict::Exists { conn, folder, name, local } => {
+                    let place = cloud::place_name(&conn.provider());
                     ui.label(RichText::new(format!("A file named '{name}' already exists in this location.")).size(15.0));
                     ui.add_space(4.0);
                     ui.label(RichText::new("Do you want to replace it?").color(theme::text_dim()));
@@ -1058,13 +1618,11 @@ impl App {
                     ui.horizontal(|ui| {
                         if ui.add(egui::Button::new("Replace").min_size(Vec2::new(100.0, 26.0)).fill(theme::accent_light())).clicked() {
                             keep = false;
-                            if let Some(s) = self.cloud.session.clone() {
-                                self.start_new_upload(s, folder.clone(), name.clone(), local.clone(), true);
-                            }
+                            self.start_new_upload(conn.clone(), folder.clone(), name.clone(), local.clone(), true);
                         }
                         if ui.add(egui::Button::new("Cancel").min_size(Vec2::new(90.0, 26.0))).clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                             keep = false;
-                            self.status = Some("Not saved to OneDrive. Your changes are saved on this PC.".into());
+                            self.status = Some(format!("Not saved to {place}. Your changes are saved on this PC."));
                         }
                     });
                 }
@@ -1076,6 +1634,10 @@ impl App {
     }
 
     fn share_ui(&mut self, ctx: &egui::Context) {
+        if matches!(self.cloud.doc.as_ref().map(|d| &d.provider), Some(Provider::FreedomServer(_))) {
+            self.server_share_ui(ctx);
+            return;
+        }
         let Some(mut sh) = self.cloud.share.take() else { return };
         let mut open = true;
         let doc = self.cloud.doc.clone();
@@ -1090,14 +1652,27 @@ impl App {
                 ui.add_space(4.0);
                 ui.label(RichText::new("People you share with can then open the same file and see your saved changes.").color(theme::text_dim()));
                 ui.add_space(12.0);
-                let b = egui::Button::new(RichText::new("Upload to OneDrive").color(Color32::WHITE)).fill(share_green()).min_size(Vec2::new(160.0, 30.0));
-                if ui.add(b).clicked() {
-                    self.cloud.save_place = Place::MyFiles;
-                    self.cloud.browser.root = None;
-                    self.cloud.save_name = self.default_cloud_name();
-                    self.backstage = Some(Backstage::SaveAs);
-                    sh.tab = 255;
-                }
+                ui.horizontal(|ui| {
+                    let b = egui::Button::new(RichText::new("Upload to OneDrive").color(Color32::WHITE)).fill(share_green()).min_size(Vec2::new(160.0, 30.0));
+                    if ui.add(b).clicked() {
+                        self.cloud.save_place = Place::MyFiles;
+                        self.cloud.browser.root = None;
+                        self.cloud.save_name = self.default_cloud_name();
+                        self.backstage = Some(Backstage::SaveAs);
+                        sh.tab = 255;
+                    }
+                    let servers: Vec<(usize, String)> = self.cloud.servers.iter().enumerate().map(|(i, e)| (i, e.session.host())).collect();
+                    for (i, host) in servers {
+                        let b = egui::Button::new(RichText::new(format!("Upload to {host}")).color(Color32::WHITE)).fill(share_green()).min_size(Vec2::new(160.0, 30.0));
+                        if ui.add(b).clicked() {
+                            self.cloud.save_place = Place::Server(i, ServerView::MyFiles);
+                            self.cloud.browser.root = None;
+                            self.cloud.save_name = self.default_cloud_name();
+                            self.backstage = Some(Backstage::SaveAs);
+                            sh.tab = 255;
+                        }
+                    }
+                });
                 return;
             };
             let session = self.cloud.session.clone();
@@ -1190,66 +1765,20 @@ impl App {
                             self.cloud_spawn(move || Event::Permissions(s.permissions(&p)));
                         }
                     }
-                    let mut remove: Option<String> = None;
-                    match &sh.perms {
-                        None if sh.busy => {
-                            ui.horizontal(|ui| {
-                                ui.add(egui::Spinner::new());
-                                ui.label("Loading...");
+                    if let Some(id) = permissions_list_ui(ui, &sh) {
+                        if let Some(s) = session.clone() {
+                            sh.busy = true;
+                            sh.error = None;
+                            let p = path.clone();
+                            self.cloud_spawn(move || {
+                                let r = s.delete_permission(&p, &id).and_then(|_| s.permissions(&p));
+                                Event::Permissions(r)
                             });
                         }
-                        None => {}
-                        Some(list) if list.is_empty() => {
-                            ui.label(RichText::new("Only you have access.").color(theme::text_dim()));
-                        }
-                        Some(list) => {
-                            egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
-                                for p in list {
-                                    ui.horizontal(|ui| {
-                                        ui.vertical(|ui| {
-                                            ui.set_width(300.0);
-                                            ui.label(RichText::new(&p.who).color(theme::text()));
-                                            if !p.detail.is_empty() && p.detail != p.who {
-                                                ui.label(RichText::new(&p.detail).size(11.5).color(theme::text_dim()));
-                                            }
-                                        });
-                                        ui.label(RichText::new(p.role_label()).size(12.5).color(theme::text_dim()));
-                                        if p.removable() {
-                                            if ui.add_enabled(!sh.busy, egui::Button::new("Remove")).clicked() {
-                                                remove = Some(p.id.clone());
-                                            }
-                                        } else if p.inherited {
-                                            ui.label(RichText::new("(from folder)").size(11.5).color(theme::text_dim()));
-                                        }
-                                    });
-                                    ui.add_space(2.0);
-                                }
-                            });
-                        }
-                    }
-                    if let (Some(id), Some(s)) = (remove, session.clone()) {
-                        sh.busy = true;
-                        sh.error = None;
-                        let p = path.clone();
-                        self.cloud_spawn(move || {
-                            let r = s.delete_permission(&p, &id).and_then(|_| s.permissions(&p));
-                            Event::Permissions(r)
-                        });
                     }
                 }
             }
-            if sh.busy && sh.tab != 2 {
-                ui.horizontal(|ui| {
-                    ui.add(egui::Spinner::new());
-                    ui.label("Working...");
-                });
-            }
-            if let Some(i) = &sh.info {
-                ui.label(RichText::new(i).color(theme::accent_dark()));
-            }
-            if let Some(e) = &sh.error {
-                ui.label(RichText::new(e).color(theme::rgb(0xC42B1C)));
-            }
+            share_status_ui(ui, &sh);
             ui.add_space(6.0);
             ui.separator();
             ui.horizontal(|ui| {
@@ -1267,14 +1796,329 @@ impl App {
             self.cloud.share = Some(sh);
         }
     }
+
+    /// Share dialog for documents on a FreedomOffice server: invite server users, links with
+    /// expiry and password, manage access.
+    fn server_share_ui(&mut self, ctx: &egui::Context) {
+        let Some(mut sh) = self.cloud.share.take() else { return };
+        let Some(doc) = self.cloud.doc.clone() else { return };
+        let session = self.doc_server();
+        let host = cloud::place_name(&doc.provider);
+        let mut open = true;
+        let mut versions = false;
+        egui::Window::new(format!("Share '{}'", doc.name)).open(&mut open).collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, -40.0]).show(ctx, |ui| {
+            ui.set_width(480.0);
+            if session.is_none() {
+                ui.label(RichText::new(format!("Sign in to {host} (File > Account) to share this workbook.")).color(theme::text_dim()));
+                ui.add_space(6.0);
+            }
+            ui.horizontal(|ui| {
+                for (k, label) in [(0u8, "Invite people"), (1, "Copy link"), (2, "Manage access")] {
+                    if ui.selectable_label(sh.tab == k, RichText::new(label).size(13.5)).clicked() && sh.tab != k {
+                        sh.tab = k;
+                        sh.info = None;
+                        sh.error = None;
+                    }
+                }
+            });
+            ui.separator();
+            ui.add_space(4.0);
+            let id = doc.item_id.clone();
+            match sh.tab {
+                0 => {
+                    ui.label(format!("People with an account on {host}:"));
+                    let r = ui.add(egui::TextEdit::singleline(&mut sh.user_query).hint_text("Search by name or username").desired_width(f32::INFINITY));
+                    if sh.user_query != sh.searched {
+                        sh.searched = sh.user_query.clone();
+                        sh.user_seq += 1;
+                        if sh.user_query.trim().is_empty() {
+                            sh.user_results.clear();
+                        } else if let Some(s) = session.clone() {
+                            let (q, seq) = (sh.user_query.clone(), sh.user_seq);
+                            self.cloud_spawn(move || Event::Users(seq, s.search_users(&q)));
+                        }
+                    }
+                    let _ = r;
+                    let mut add = None;
+                    if !sh.user_results.is_empty() {
+                        egui::Frame::group(ui.style()).inner_margin(4.0).show(ui, |ui| {
+                            egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
+                                for (u, name) in &sh.user_results {
+                                    let chosen = sh.invite.iter().any(|(x, _)| x == u);
+                                    let t = RichText::new(format!("{name}  ({u})")).color(if chosen { theme::text_dim() } else { theme::text() });
+                                    if ui.add_enabled(!chosen, egui::Button::new(t).frame(false)).clicked() {
+                                        add = Some((u.clone(), name.clone()));
+                                    }
+                                }
+                            });
+                        });
+                    } else if !sh.user_query.trim().is_empty() {
+                        ui.label(RichText::new("No matching people.").size(12.0).color(theme::text_dim()));
+                    }
+                    if let Some(p) = add {
+                        sh.invite.push(p);
+                    }
+                    if !sh.invite.is_empty() {
+                        ui.add_space(4.0);
+                        let mut remove = None;
+                        ui.horizontal_wrapped(|ui| {
+                            for (i, (_, name)) in sh.invite.iter().enumerate() {
+                                if ui.button(format!("{name}  ✕")).on_hover_text("Remove").clicked() {
+                                    remove = Some(i);
+                                }
+                            }
+                        });
+                        if let Some(i) = remove {
+                            sh.invite.remove(i);
+                        }
+                    }
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt("server_invite_role").selected_text(if sh.can_edit { "Can edit" } else { "Can view" }).show_ui(ui, |ui| {
+                            ui.selectable_value(&mut sh.can_edit, true, "Can edit");
+                            ui.selectable_value(&mut sh.can_edit, false, "Can view");
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                            let b = egui::Button::new(RichText::new("Share").color(Color32::WHITE)).fill(share_green()).min_size(Vec2::new(90.0, 28.0));
+                            if ui.add_enabled(!sh.invite.is_empty() && !sh.busy && session.is_some(), b).clicked() {
+                                if let Some(s) = session.clone() {
+                                    sh.busy = true;
+                                    sh.info = None;
+                                    sh.error = None;
+                                    let (edit, people, id) = (sh.can_edit, sh.invite.clone(), id.clone());
+                                    self.cloud_spawn(move || {
+                                        let r = people.iter().try_for_each(|(u, _)| s.grant(&id, u, edit)).map(|_| people.len());
+                                        Event::Invited(r)
+                                    });
+                                }
+                            }
+                        });
+                    });
+                    ui.label(RichText::new("They'll find it under Shared with me.").size(12.0).color(theme::text_dim()));
+                }
+                1 => {
+                    ui.label("Anyone with the link:");
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt("server_link_role").selected_text(if sh.link_edit { "Can edit" } else { "Can view" }).show_ui(ui, |ui| {
+                            ui.selectable_value(&mut sh.link_edit, true, "Can edit");
+                            ui.selectable_value(&mut sh.link_edit, false, "Can view");
+                        });
+                        let label = LINK_DAYS.iter().find(|(d, _)| *d == sh.link_days).map(|(_, l)| *l).unwrap_or("Never expires");
+                        egui::ComboBox::from_id_salt("server_link_days").width(170.0).selected_text(label).show_ui(ui, |ui| {
+                            for (d, l) in LINK_DAYS {
+                                ui.selectable_value(&mut sh.link_days, *d, *l);
+                            }
+                        });
+                    });
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Password (optional):");
+                        ui.add(egui::TextEdit::singleline(&mut sh.link_password).password(true).desired_width(200.0));
+                    });
+                    ui.add_space(8.0);
+                    ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), 30.0), egui::Layout::right_to_left(Align::Center), |ui| {
+                        let b = egui::Button::new(RichText::new("Copy link").color(Color32::WHITE)).fill(share_green()).min_size(Vec2::new(100.0, 28.0));
+                        if ui.add_enabled(!sh.busy && session.is_some(), b).clicked() {
+                            if let Some(s) = session.clone() {
+                                sh.busy = true;
+                                sh.info = None;
+                                sh.error = None;
+                                let (edit, days, pw, id) = (sh.link_edit, sh.link_days, sh.link_password.clone(), id.clone());
+                                self.cloud_spawn(move || Event::Link(s.create_link(&id, edit, Some(days), &pw)));
+                            }
+                        }
+                    });
+                    if let Some(l) = &sh.link {
+                        ui.add_space(6.0);
+                        let mut t = l.clone();
+                        ui.add(egui::TextEdit::singleline(&mut t).desired_width(f32::INFINITY));
+                        ui.label(RichText::new("The link is shown only once; copy it now. Remove it under Manage access.").size(12.0).color(theme::text_dim()));
+                    }
+                }
+                _ => {
+                    if sh.perms.is_none() && !sh.busy {
+                        if let Some(s) = session.clone() {
+                            sh.busy = true;
+                            let id = id.clone();
+                            self.cloud_spawn(move || Event::Permissions(s.permissions(&id)));
+                        }
+                    }
+                    if let Some(pid) = permissions_list_ui(ui, &sh) {
+                        if let Some(s) = session.clone() {
+                            sh.busy = true;
+                            sh.error = None;
+                            let id = id.clone();
+                            self.cloud_spawn(move || Event::Permissions(s.remove_permission(&id, &pid).and_then(|_| s.permissions(&id))));
+                        }
+                    }
+                }
+            }
+            share_status_ui(ui, &sh);
+            ui.add_space(6.0);
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.add_enabled(session.is_some(), egui::Button::new("Version History")).clicked() {
+                    versions = true;
+                }
+                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button("Close").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        sh.tab = 255;
+                    }
+                });
+            });
+        });
+        if open && sh.tab != 255 && !versions {
+            self.cloud.share = Some(sh);
+        }
+        if versions {
+            self.cloud_open_versions();
+        }
+    }
+
+    fn versions_ui(&mut self, ctx: &egui::Context) {
+        let Some(mut v) = self.cloud.versions.take() else { return };
+        let mut open = true;
+        let mut close = false;
+        let session = self.doc_server();
+        let dirty = self.dirty;
+        egui::Window::new(format!("Version History - {}", v.doc.name)).open(&mut open).collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, -40.0]).show(ctx, |ui| {
+            ui.set_width(560.0);
+            ui.label(RichText::new("Restore makes an older version the current one; the newer versions stay in the history.").size(12.5).color(theme::text_dim()));
+            ui.add_space(6.0);
+            let mut restore = None;
+            let mut copy = None;
+            match &v.list {
+                None => {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new());
+                        ui.label("Loading...");
+                    });
+                }
+                Some(list) if list.is_empty() => {
+                    ui.label(RichText::new("No versions.").color(theme::text_dim()));
+                }
+                Some(list) => {
+                    egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                        egui::Grid::new("server_versions").num_columns(5).spacing([14.0, 6.0]).striped(true).show(ui, |ui| {
+                            for h in ["Version", "Modified", "Modified by", "Size", ""] {
+                                ui.label(RichText::new(h).size(12.0).color(theme::text_dim()));
+                            }
+                            ui.end_row();
+                            for x in list {
+                                ui.label(if x.current { format!("{} (current)", x.version) } else { x.version.to_string() });
+                                ui.label(graph::short_date(&x.modified));
+                                ui.label(&x.modified_by);
+                                ui.label(size_label(x.size as usize));
+                                ui.horizontal(|ui| {
+                                    if ui.add_enabled(!v.busy, egui::Button::new("Open a copy")).clicked() {
+                                        copy = Some(x.version);
+                                    }
+                                    if !x.current {
+                                        let b = ui.add_enabled(!v.busy && !dirty, egui::Button::new("Restore"));
+                                        if b.on_disabled_hover_text("Save or undo your changes first").clicked() {
+                                            restore = Some(x.version);
+                                        }
+                                    }
+                                });
+                                ui.end_row();
+                            }
+                        });
+                    });
+                }
+            }
+            if let Some(e) = &v.error {
+                ui.label(RichText::new(e).color(error_red()));
+            }
+            if v.busy && v.list.is_some() {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new());
+                    ui.label("Working...");
+                });
+            }
+            if let (Some(n), Some(s)) = (restore, session.clone()) {
+                v.busy = true;
+                v.error = None;
+                let id = v.doc.item_id.clone();
+                self.cloud_spawn(move || Event::VersionRestored(s.restore_version(&id, n)));
+            }
+            if let (Some(n), Some(s)) = (copy, session.clone()) {
+                let dest = v.doc.local.parent().map(|d| d.join("versions").join(server::version_copy_name(&v.doc.name, n)));
+                if let Some(dest) = dest {
+                    v.busy = true;
+                    v.error = None;
+                    let id = v.doc.item_id.clone();
+                    self.cloud_spawn(move || Event::VersionCopy(s.download_version(&id, n, &dest).map(|_| dest)));
+                }
+            }
+            ui.add_space(6.0);
+            ui.separator();
+            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                if ui.button("Close").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    close = true;
+                }
+            });
+        });
+        if open && !close {
+            self.cloud.versions = Some(v);
+        }
+    }
 }
 
-/// Fills in the drive id when an upload answer omits it.
-fn with_drive(session: &Session, item: DriveItem) -> DriveItem {
-    if !item.drive_id.is_empty() || item.id.is_empty() {
-        return item;
+/// Manage access rows; returns the id of a row whose Remove button was clicked.
+fn permissions_list_ui(ui: &mut egui::Ui, sh: &ShareState) -> Option<String> {
+    let mut remove: Option<String> = None;
+    match &sh.perms {
+        None if sh.busy => {
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new());
+                ui.label("Loading...");
+            });
+        }
+        None => {}
+        Some(list) if list.is_empty() => {
+            ui.label(RichText::new("Only you have access.").color(theme::text_dim()));
+        }
+        Some(list) => {
+            egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
+                for p in list {
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.set_width(300.0);
+                            ui.label(RichText::new(&p.who).color(theme::text()));
+                            if !p.detail.is_empty() && p.detail != p.who {
+                                ui.label(RichText::new(&p.detail).size(11.5).color(theme::text_dim()));
+                            }
+                        });
+                        ui.label(RichText::new(p.role_label()).size(12.5).color(theme::text_dim()));
+                        if p.removable() {
+                            if ui.add_enabled(!sh.busy, egui::Button::new("Remove")).clicked() {
+                                remove = Some(p.id.clone());
+                            }
+                        } else if p.inherited {
+                            ui.label(RichText::new("(from folder)").size(11.5).color(theme::text_dim()));
+                        }
+                    });
+                    ui.add_space(2.0);
+                }
+            });
+        }
     }
-    session.item(&format!("/me/drive/items/{}", item.id)).unwrap_or(item)
+    remove
+}
+
+fn share_status_ui(ui: &mut egui::Ui, sh: &ShareState) {
+    if sh.busy && sh.tab != 2 {
+        ui.horizontal(|ui| {
+            ui.add(egui::Spinner::new());
+            ui.label("Working...");
+        });
+    }
+    if let Some(i) = &sh.info {
+        ui.label(RichText::new(i).color(theme::accent_dark()));
+    }
+    if let Some(e) = &sh.error {
+        ui.label(RichText::new(e).color(theme::rgb(0xC42B1C)));
+    }
 }
 
 fn size_label(n: usize) -> String {

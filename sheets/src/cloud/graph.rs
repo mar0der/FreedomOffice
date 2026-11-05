@@ -195,6 +195,8 @@ pub struct CloudDoc {
     pub parent: Option<String>,
     /// The local working copy.
     pub local: PathBuf,
+    /// Microsoft 365 or a FreedomOffice server.
+    pub provider: super::Provider,
 }
 
 impl CloudDoc {
@@ -207,6 +209,7 @@ impl CloudDoc {
             web_url: item.web_url.clone(),
             parent: item.parent_path(),
             local,
+            provider: super::Provider::Microsoft,
         }
     }
 
@@ -680,6 +683,7 @@ mod tests {
             web_url: String::new(),
             parent: None,
             local: PathBuf::new(),
+            provider: crate::cloud::Provider::Microsoft,
         };
         let item = s.upload(&doc.item_path(), Some(&doc.etag), b"data").unwrap();
         doc.update_from(&item);
