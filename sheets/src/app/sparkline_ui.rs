@@ -260,6 +260,9 @@ impl App {
 
     fn apply_sparklines(&mut self, d: &CreateDlg) -> Result<(), String> {
         let si = d.sheet;
+        if self.protect_blocks_at(si, super::review_ui::Change::Objects) {
+            return Ok(());
+        }
         let (ds, data) = crate::whatif::parse_range_ref(&self.wb, &d.data).ok_or("Data Range is not valid.")?;
         let data_sheet = self.wb.sheets[ds].name.clone();
         if let Some((g, Some(i))) = d.edit {
@@ -344,6 +347,9 @@ impl App {
     fn edit_group(&mut self, f: impl FnOnce(&mut SparklineGroup)) {
         let Some((g, _)) = self.active_sparkline() else { return };
         let si = self.wb.active;
+        if self.protect_blocks_at(si, super::review_ui::Change::Objects) {
+            return;
+        }
         let mut new = self.wb.sheets[si].sparklines[g].clone();
         f(&mut new);
         if new != self.wb.sheets[si].sparklines[g] {

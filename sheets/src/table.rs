@@ -107,10 +107,18 @@ pub struct Table {
     pub last_col: bool,
     /// Filter buttons in the header row.
     pub filter: bool,
+    /// The table's own AutoFilter criteria, keyed by sheet column.
+    pub criteria: std::collections::BTreeMap<u32, crate::filter::ColumnFilter>,
     pub columns: Vec<TableColumn>,
 }
 
 impl Table {
+    /// The table's AutoFilter: header and data rows (not the total row) with its criteria.
+    pub fn autofilter(&self) -> crate::filter::AutoFilter {
+        let range = Range { r2: self.range.r2 - (self.totals && self.range.rows() > 1) as u32, ..self.range };
+        crate::filter::AutoFilter { range, columns: self.criteria.clone() }
+    }
+
     pub fn new(name: &str, range: Range, style: &str) -> Table {
         Table {
             name: name.to_string(),
@@ -123,6 +131,7 @@ impl Table {
             first_col: false,
             last_col: false,
             filter: true,
+            criteria: Default::default(),
             columns: (0..range.cols()).map(|i| TableColumn { name: format!("Column{}", i + 1), ..Default::default() }).collect(),
         }
     }

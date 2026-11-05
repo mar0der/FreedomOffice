@@ -467,6 +467,8 @@ impl RichText {
 pub struct Protection {
     /// Excel's legacy 16-bit password hash, 0 = no password.
     pub hash: u16,
+    /// The iterated, salted password hash Excel 2013+ writes instead (kept as read).
+    pub modern: Option<PasswordHash>,
     pub select_locked: bool,
     pub select_unlocked: bool,
     pub format_cells: bool,
@@ -488,6 +490,7 @@ impl Default for Protection {
     fn default() -> Self {
         Protection {
             hash: 0,
+            modern: None,
             select_locked: true,
             select_unlocked: true,
             format_cells: false,
@@ -503,6 +506,49 @@ impl Default for Protection {
             pivot_tables: false,
             edit_objects: false,
             edit_scenarios: false,
+        }
+    }
+}
+
+/// `algorithmName`, `hashValue`, `saltValue` and `spinCount` of `sheetProtection`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PasswordHash {
+    pub algorithm: String,
+    /// Base64 of the final hash.
+    pub hash: String,
+    /// Base64 of the salt.
+    pub salt: String,
+    pub spin: u32,
+}
+
+impl PasswordHash {
+    /// Excel's check: H0 = SHA-512(salt + UTF-16LE password), then `spin` rounds of
+    /// H = SHA-512(H + round number as 4 little-endian bytes). Only SHA-512 (what Excel
+    /// writes) is supported; any other algorithm never matches, so the sheet stays protected.
+    pub fn matches(&self, pw: &str) -> bool {
+        if !self.algorithm.eq_ignore_ascii_case("SHA-512") {
+            return false;
+        }
+        let (Some(salt), Some(want)) = (crate::hash::base64_decode(&self.salt), crate::hash::base64_decode(&self.hash)) else { return false };
+        let mut data = salt;
+        data.extend(pw.encode_utf16().flat_map(u16::to_le_bytes));
+        let mut h = crate::hash::sha512(&data);
+        let mut buf = [0u8; 68];
+        for i in 0..self.spin {
+            buf[..64].copy_from_slice(&h);
+            buf[64..].copy_from_slice(&i.to_le_bytes());
+            h = crate::hash::sha512(&buf);
+        }
+        h[..] == want[..]
+    }
+}
+
+impl Protection {
+    /// Whether `pw` unprotects the sheet (any password does when none was set).
+    pub fn password_ok(&self, pw: &str) -> bool {
+        match &self.modern {
+            Some(m) => m.matches(pw),
+            None => self.hash == 0 || legacy_password_hash(pw) == self.hash,
         }
     }
 }
@@ -612,6 +658,7 @@ impl Sheet {
     }
 
     /// True when the sheet is protected and the cell is locked.
+    #[cfg(test)]
     pub fn is_locked(&self, wb_styles: &Workbook, r: u32, c: u32) -> bool {
         self.protection.is_some() && !wb_styles.style(self.get(r, c).map_or(0, |x| x.style)).unlocked
     }

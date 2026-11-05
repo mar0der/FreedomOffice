@@ -25,6 +25,7 @@ pub fn write(wb: &Workbook, path: &Path) -> Result<(), String> {
     let mut book = build(wb, &mut explosions).map_err(|e| e.to_string())?;
     let bytes = book.save_to_buffer().map_err(|e| format!("Could not save: {e}"))?;
     let bytes = filter::patch(wb, bytes)?;
+    let bytes = fidelity::patch_protection(wb, bytes)?;
     let bytes = charts::patch_explosions(bytes, &explosions)?;
     let bytes = analysis::patch(wb, bytes)?;
     std::fs::write(path, bytes).map_err(|e| format!("Could not save: {e}"))

@@ -176,6 +176,33 @@ fn deep_chain_does_not_overflow() {
     assert_eq!(wb.sheets[0].value(0, 0), &n(n_rows as f64 + 1.0));
 }
 
+/// A range whose end is computed (`A1:INDEX(...)`) reads cells that are in neither operand.
+#[test]
+fn computed_range_ends_are_dependencies() {
+    let mut wb = book(&[
+        ("A1", "1"),
+        ("A2", "2"),
+        ("A3", "3"),
+        ("A5", "5"),
+        ("B5", "100"),
+        ("E1", "=SUM(A1:INDEX(B:B,5))"),
+        ("C1", "=SUM(A1:(A4))"),
+        ("D1", "=COUNT((A2):A3:A5)"),
+    ]);
+    assert_eq!(shown(&wb, "E1"), n(111.0));
+    type_in(&mut wb, "A3", "30");
+    assert_eq!(shown(&wb, "E1"), n(138.0));
+    type_in(&mut wb, "A4", "4");
+    assert_eq!(shown(&wb, "E1"), n(142.0));
+    assert_eq!(shown(&wb, "C1"), n(37.0));
+    put(&mut wb, 0, "A4", "");
+    recalc_ranges(&mut wb, &[(0, Range::cell(3, 0))]);
+    assert_eq!(shown(&wb, "C1"), n(33.0));
+    assert_eq!(shown(&wb, "D1"), n(3.0));
+    type_in(&mut wb, "A4", "9");
+    assert_eq!(shown(&wb, "D1"), n(4.0));
+}
+
 #[test]
 fn paste_range_incremental() {
     let mut wb = book(&[("A1", "1"), ("A2", "2"), ("B1", "=SUM(A1:A3)")]);

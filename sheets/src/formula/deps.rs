@@ -364,7 +364,39 @@ fn collect(
             }
         }
         Expr::Neg(a) | Expr::Plus(a) | Expr::Percent(a) | Expr::Paren(a) => collect(a, wb, cur, out, vol, depth, names),
-        Expr::Range(a, b) | Expr::Isect(a, b) => {
+        Expr::Range(a, b) => {
+            collect(a, wb, cur, out, vol, depth, names);
+            collect(b, wb, cur, out, vol, depth, names);
+            // `A1:INDEX(B:B,5)` reads the whole area between its ends, which isn't known
+            // until evaluation. Two plain references on one sheet give the bounding box;
+            // anything else is recalculated every time, like a volatile function.
+            let plain = |x: &Expr| -> Option<(Option<String>, Range)> {
+                let mut x = x;
+                while let Expr::Paren(i) = x {
+                    x = i;
+                }
+                match x {
+                    Expr::Ref(r) if !r.sheet.as_deref().is_some_and(|s| s.contains(':')) => {
+                        Some((r.sheet.clone(), Range::new(r.a.row, r.a.col, r.b.row, r.b.col)))
+                    }
+                    _ => None,
+                }
+            };
+            match (plain(a), plain(b)) {
+                (Some((sa, ra)), Some((sb, rb))) if sa == sb => {
+                    let s = match &sa {
+                        Some(n) => wb.sheet_index(n),
+                        None => Some(cur),
+                    };
+                    if let Some(s) = s {
+                        out.push((s, ra.union(&rb)));
+                    }
+                }
+                _ => *vol = true,
+            }
+        }
+        Expr::Isect(a, b) => {
+            // The intersection lies inside both operands, so their precedents cover it.
             collect(a, wb, cur, out, vol, depth, names);
             collect(b, wb, cur, out, vol, depth, names);
         }

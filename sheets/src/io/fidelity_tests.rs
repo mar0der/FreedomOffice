@@ -127,6 +127,33 @@ fn rich_text_round_trip() {
     assert_eq!(rt.runs[2].size, Some(14.0));
 }
 
+/// Excel 2013+ protects with an iterated SHA-512 hash: it must be verified on Unprotect and
+/// written back unchanged (a lost hash would leave the sheet protected without a password).
+#[test]
+fn modern_protection_password_round_trip() {
+    // Hash of "Secret1" with salt 00 01 .. 0F and 100000 spins (Python hashlib, same algorithm).
+    let m = crate::model::PasswordHash {
+        algorithm: "SHA-512".into(),
+        hash: "A5/DGG2yRNJKVZSVgt4KbLetHxCMseyalSmU01nIFs4fnVIcy1YVYniahyacT/gB0zEoGnIPmhMJLBs2EXnbcg==".into(),
+        salt: "AAECAwQFBgcICQoLDA0ODw==".into(),
+        spin: 100_000,
+    };
+    assert!(m.matches("Secret1"));
+    assert!(!m.matches("secret1") && !m.matches(""));
+    let mut wb = Workbook::empty_with(vec![Sheet::new("A"), Sheet::new("B")]);
+    put(&mut wb, 0, 0, 0, "x");
+    wb.sheets[0].protection = Some(Protection { modern: Some(m.clone()), ..Default::default() });
+    // A legacy hash with no known password survives too (no brute force on save).
+    wb.sheets[1].protection = Some(Protection { hash: 0xCC3D, ..Default::default() });
+    let back = round_trip(&wb, "protect_sha512.xlsx");
+    let p = back.sheets[0].protection.as_ref().expect("protected");
+    assert_eq!(p.modern.as_ref(), Some(&m));
+    assert!(p.password_ok("Secret1") && !p.password_ok("") && !p.password_ok("wrong"));
+    let q = back.sheets[1].protection.as_ref().expect("protected");
+    assert_eq!((q.hash, q.modern.is_none()), (0xCC3D, true));
+    assert!(!q.password_ok(""));
+}
+
 #[test]
 fn protection_and_view_round_trip() {
     let mut wb = Workbook::empty_with(vec![Sheet::new("A"), Sheet::new("B")]);

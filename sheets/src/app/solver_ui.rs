@@ -348,6 +348,9 @@ impl App {
     }
 
     pub(super) fn run_solver(&mut self, si: usize, m: SolverModel) {
+        if m.vars.iter().any(|rg| self.protect_blocks_at(si, super::review_ui::Change::Cells(*rg))) {
+            return;
+        }
         // The undo step covers the model names and the variable cells.
         self.push_undo(&[Scope::Sheet(si)]);
         self.save_solver_model(si, &m);

@@ -542,6 +542,7 @@ impl App {
             if self.edit.is_some() && !self.commit_edit(false) {
                 return;
             }
+            self.filter_table = None;
             self.open_filter_popup(c, pos);
             return;
         }
@@ -602,6 +603,9 @@ impl App {
                     self.autofit_cols(&[c]);
                     return;
                 }
+                if self.protect_blocks(super::Change::FormatCols) {
+                    return;
+                }
                 self.push_undo(&[Scope::Sheet(self.wb.active)]);
                 let start = lay.col_span(c).map(|s| s.0).unwrap_or(pos.x);
                 self.drag = Drag::ResizeCol(c, start);
@@ -626,6 +630,9 @@ impl App {
             if let Some(r) = self.row_border_at(lay, pos.y) {
                 if dbl {
                     self.autofit_rows(&[r]);
+                    return;
+                }
+                if self.protect_blocks(super::Change::FormatRows) {
                     return;
                 }
                 self.push_undo(&[Scope::Sheet(self.wb.active)]);
@@ -840,7 +847,7 @@ impl App {
         let vert = down.max(up);
         let horiz = right.max(left);
         if vert <= 0 && horiz <= 0 {
-            return src;
+            return super::fill::shrink_target(src, r, c);
         }
         if vert >= horiz {
             if down > 0 { Range::new(src.r1, src.c1, r, src.c2) } else { Range::new(r, src.c1, src.r2, src.c2) }
@@ -857,7 +864,10 @@ impl App {
         match d {
             Drag::Fill(src) => {
                 let target = self.fill_target(lay, src, pos);
-                if target != src {
+                if target != src && src.contains(target.r1, target.c1) && src.contains(target.r2, target.c2) {
+                    // Dragged back inside the selection: the cells left out lose their contents.
+                    self.fill_shrink(src, target);
+                } else if target != src {
                     // Ctrl+drag toggles between copying and filling a series.
                     let ctrl = self.ctx.as_ref().is_some_and(|x| x.input(|i| i.modifiers.ctrl));
                     self.autofill_kind(src, target, if ctrl { super::fill::FillKind::Toggle } else { super::fill::FillKind::Auto });
@@ -1329,6 +1339,9 @@ impl App {
         if let Drag::Fill(src) = self.drag {
             if let Some(p) = ui.input(|i| i.pointer.interact_pos()) {
                 let t = self.fill_target(lay, src, p);
+                if let Some(gone) = super::fill::shrunk_part(src, t) {
+                    cp.rect_filled(self.range_rect(lay, gone), 0.0, theme::fill_shrink());
+                }
                 let r = self.range_rect(lay, t);
                 dashed_rect(&cp, r, Color32::from_gray(90), 0.0);
             }

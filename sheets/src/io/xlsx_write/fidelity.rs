@@ -1,13 +1,14 @@
 //! Writes tables, pictures, sheet protection and rich text with rust_xlsxwriter.
 
 use std::collections::HashMap;
+use std::io::{Cursor, Read, Write};
 
 use rust_xlsxwriter::{
     Color, Format, FormatUnderline, Image, ProtectionOptions, Table as XTable, TableColumn as XColumn, TableFunction,
     TableStyle, Worksheet, XlsxError,
 };
 
-use crate::model::{legacy_password_hash, RichText, Sheet, Style, MAX_COLS, MAX_ROWS};
+use crate::model::{Protection, RichText, Sheet, Style, Workbook, MAX_COLS, MAX_ROWS};
 use crate::table::{Table, TotalFn};
 
 /// Header cells of the sheet's tables: position -> column name (written as text, as Excel requires).
@@ -114,29 +115,8 @@ pub(super) fn write_images(sh: &Sheet, ws: &mut Worksheet) {
     }
 }
 
-/// A password whose legacy hash equals `hash` (the hash is all the file keeps, and the writer
-/// only takes a password). Any such password unlocks the sheet in Excel.
-pub(crate) fn password_for_hash(hash: u16) -> Option<String> {
-    const CH: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    // Short passwords only reach the low bits of the hash; ten random characters cover all
-    // 15 bits about evenly, so a match turns up after ~32k tries on average.
-    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
-    for _ in 0..4_000_000 {
-        let s: String = (0..10)
-            .map(|_| {
-                x ^= x << 13;
-                x ^= x >> 7;
-                x ^= x << 17;
-                CH[(x % CH.len() as u64) as usize] as char
-            })
-            .collect();
-        if legacy_password_hash(&s) == hash {
-            return Some(s);
-        }
-    }
-    None
-}
-
+/// Writes the options; the password hash is patched into the finished package
+/// (`patch_protection`), as the writer only takes a plain password.
 pub(super) fn write_protection(sh: &Sheet, ws: &mut Worksheet) {
     let Some(p) = &sh.protection else { return };
     let opts = ProtectionOptions {
@@ -157,12 +137,57 @@ pub(super) fn write_protection(sh: &Sheet, ws: &mut Worksheet) {
         edit_objects: p.edit_objects,
         ..Default::default()
     };
-    if p.hash != 0 {
-        if let Some(pw) = password_for_hash(p.hash) {
-            ws.protect_with_password(&pw);
+    ws.protect_with_options(&opts);
+}
+
+/// The password attributes of a sheet's `<sheetProtection>`: the SHA-512 hash as read from
+/// Excel, or the legacy hash. None without a password.
+pub(super) fn protection_attrs(p: &Protection) -> Option<String> {
+    let esc = |s: &str| s.replace('&', "&amp;").replace('"', "&quot;").replace('<', "&lt;");
+    match &p.modern {
+        Some(m) => Some(format!(
+            "algorithmName=\"{}\" hashValue=\"{}\" saltValue=\"{}\" spinCount=\"{}\"",
+            esc(&m.algorithm),
+            esc(&m.hash),
+            esc(&m.salt),
+            m.spin
+        )),
+        None if p.hash != 0 => Some(format!("password=\"{:04X}\"", p.hash)),
+        None => None,
+    }
+}
+
+/// Adds the attributes to the `<sheetProtection` element of a worksheet part.
+fn add_protection_attrs(xml: &str, attrs: &str) -> Option<String> {
+    let at = xml.find("<sheetProtection ")? + "<sheetProtection ".len();
+    Some(format!("{}{} {}", &xml[..at], attrs, &xml[at..]))
+}
+
+/// Puts the password hashes into the worksheet parts of the saved package.
+pub(super) fn patch_protection(wb: &Workbook, pkg: Vec<u8>) -> Result<Vec<u8>, String> {
+    let attrs: Vec<Option<String>> = wb.sheets.iter().map(|s| s.protection.as_ref().and_then(protection_attrs)).collect();
+    if attrs.iter().all(Option::is_none) {
+        return Ok(pkg);
+    }
+    let mut zin = zip::ZipArchive::new(Cursor::new(pkg)).map_err(|e| e.to_string())?;
+    let mut zout = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    for i in 0..zin.len() {
+        let mut f = zin.by_index(i).map_err(|e| e.to_string())?;
+        let name = f.name().map_err(|e| e.to_string())?.to_string();
+        let idx = name.strip_prefix("xl/worksheets/sheet").and_then(|s| s.strip_suffix(".xml")).and_then(|s| s.parse::<usize>().ok());
+        match idx.and_then(|k| attrs.get(k.wrapping_sub(1))).and_then(Option::as_ref) {
+            Some(a) => {
+                let mut xml = String::new();
+                f.read_to_string(&mut xml).map_err(|e| e.to_string())?;
+                let xml = add_protection_attrs(&xml, a).unwrap_or(xml);
+                let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+                zout.start_file(name, opts).map_err(|e| e.to_string())?;
+                zout.write_all(xml.as_bytes()).map_err(|e| e.to_string())?;
+            }
+            None => zout.raw_copy_file(f).map_err(|e| e.to_string())?,
         }
     }
-    ws.protect_with_options(&opts);
+    Ok(zout.finish().map_err(|e| e.to_string())?.into_inner())
 }
 
 /// Format of one rich-text run on top of the cell's font.
@@ -271,14 +296,24 @@ fn table_style(name: &str) -> TableStyle {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
-    fn password_preimage() {
-        for pw in ["secret", "Excel2024", "x"] {
-            let h = crate::model::legacy_password_hash(pw);
-            let found = super::password_for_hash(h).unwrap();
-            assert_eq!(crate::model::legacy_password_hash(&found), h);
-        }
+    fn password_hashes_go_straight_into_the_xml() {
         // Excel's documented example: "test" hashes to CBEB.
         assert_eq!(crate::model::legacy_password_hash("test"), 0xCBEB);
+        let p = Protection { hash: 0xCBEB, ..Default::default() };
+        let xml = "<worksheet><sheetData/><sheetProtection sheet=\"1\" objects=\"1\"/></worksheet>";
+        assert_eq!(
+            add_protection_attrs(xml, &protection_attrs(&p).unwrap()).unwrap(),
+            "<worksheet><sheetData/><sheetProtection password=\"CBEB\" sheet=\"1\" objects=\"1\"/></worksheet>"
+        );
+        assert_eq!(protection_attrs(&Protection::default()), None);
+        let m = crate::model::PasswordHash { algorithm: "SHA-512".into(), hash: "aGFzaA==".into(), salt: "c2FsdA==".into(), spin: 100000 };
+        let p = Protection { modern: Some(m), ..Default::default() };
+        assert_eq!(
+            protection_attrs(&p).unwrap(),
+            "algorithmName=\"SHA-512\" hashValue=\"aGFzaA==\" saltValue=\"c2FsdA==\" spinCount=\"100000\""
+        );
     }
 }

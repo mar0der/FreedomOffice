@@ -6,6 +6,7 @@ use eframe::egui::{self, Align2, Rect, RichText, Stroke, Vec2};
 
 use super::dialogs::Dialog;
 use super::theme;
+use super::review_ui::{protection_blocks, Change};
 use super::{App, Scope};
 use crate::model::{cell_name, col_name, Cell, Range, Value};
 use crate::whatif::{self, CellRef, Scenario};
@@ -340,8 +341,8 @@ impl App {
         if self.wb.sheets[changing.0].get(changing.1, changing.2).is_some_and(|c| c.formula.is_some()) {
             return message(self, title, "Cell must contain a value.");
         }
-        if self.wb.sheets[changing.0].protection.is_some() && self.wb.sheets[changing.0].is_locked(&self.wb, changing.1, changing.2) {
-            return message(self, title, "The cell you're trying to change is on a protected sheet.");
+        if self.protect_blocks_at(changing.0, Change::Cells(Range::cell(changing.1, changing.2))) {
+            return;
         }
         let original = self.wb.sheets[changing.0].get(changing.1, changing.2).cloned();
         let res = whatif::goal_seek(&mut self.wb, set, target, changing, 100, 0.001);
@@ -514,6 +515,10 @@ impl App {
     }
 
     fn set_scenarios(&mut self, si: usize, f: impl FnOnce(&mut crate::whatif::Scenarios)) {
+        let allowed = self.wb.sheets[si].protection.as_ref().is_none_or(|p| p.edit_scenarios);
+        if !allowed && self.protect_blocks_at(si, Change::Any) {
+            return;
+        }
         self.push_undo(&[Scope::Sheet(si)]);
         f(&mut self.wb.sheets[si].scenarios);
         self.dirty = true;
@@ -639,6 +644,11 @@ impl App {
     }
 
     fn show_scenario_now(&mut self, si: usize, sc: &Scenario) {
+        if let Some(((r, c), _)) = sc.cells.iter().find(|((r, c), _)| protection_blocks(&self.wb, si, Change::Cells(Range::cell(*r, *c)))) {
+            let (r, c) = (*r, *c);
+            self.protect_blocks_at(si, Change::Cells(Range::cell(r, c)));
+            return;
+        }
         whatif::show_scenario(&mut self.wb, si, sc);
         self.generation += 1;
         self.cf.invalidate();

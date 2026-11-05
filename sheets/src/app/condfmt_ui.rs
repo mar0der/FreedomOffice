@@ -589,6 +589,9 @@ impl App {
 
     fn cf_add_rule(&mut self, rule: CondFormat) {
         self.commit_edit(false);
+        if self.format_block() {
+            return;
+        }
         let si = self.wb.active;
         self.push_undo(&[Scope::Sheet(si)]);
         // New rules take the highest priority, like the familiar behaviour.
@@ -598,7 +601,7 @@ impl App {
 
     fn cf_set_rules(&mut self, rules: Vec<CondFormat>) {
         let si = self.wb.active;
-        if self.wb.sheets[si].cond_formats == rules {
+        if self.wb.sheets[si].cond_formats == rules || self.format_block() {
             return;
         }
         self.push_undo(&[Scope::Sheet(si)]);
@@ -624,6 +627,9 @@ impl App {
 
     pub(super) fn cf_open_quick(&mut self, kind: Quick) {
         self.commit_edit(false);
+        if self.format_block() {
+            return;
+        }
         let nums = self.cf_sel_numbers();
         let fmt = |n: f64| crate::numfmt::general(n);
         let (mut v1, mut v2) = (String::new(), String::new());
@@ -667,11 +673,17 @@ impl App {
 
     pub(super) fn cf_open_editor(&mut self, ty: usize) {
         self.commit_edit(false);
+        if self.format_block() {
+            return;
+        }
         self.dialog = Some(Dialog::CondFmt(Box::new(CfDialog::Rule(RuleEditor::new(self.cf_selection(), ty)))));
     }
 
     pub fn cf_open_manager(&mut self) {
         self.commit_edit(false);
+        if self.format_block() {
+            return;
+        }
         let rules = self.sheet().cond_formats.clone();
         let applies = rules.iter().map(|r| r.applies_to()).collect();
         self.dialog = Some(Dialog::CondFmt(Box::new(CfDialog::Manage(Manager {

@@ -266,6 +266,10 @@ impl App {
         let look = self.find.look_in;
         self.find.look_in = LookIn::Formulas;
         if self.cell_matches(si, r, c) {
+            if self.locked_block(crate::model::Range::cell(r, c)) {
+                self.find.look_in = look;
+                return;
+            }
             self.push_undo(&[Scope::Range(si, crate::model::Range::cell(r, c))]);
             self.replace_at(si, r, c);
             self.changed();
@@ -285,6 +289,14 @@ impl App {
                     hits.push((si, r, c));
                 }
             }
+        }
+        // Like Excel, nothing is replaced when a match sits in a locked cell of a protected sheet.
+        let fmt = self.find.with_fmt.is_some();
+        if hits.iter().any(|&(si, r, c)| {
+            self.protect_blocks_at(si, super::Change::Cells(crate::model::Range::cell(r, c))) || (fmt && self.protect_blocks_at(si, super::Change::Format))
+        }) {
+            self.find.look_in = look;
+            return 0;
         }
         if !hits.is_empty() {
             self.push_undo(&[Scope::All]);
@@ -429,7 +441,7 @@ impl App {
                     if self.find.replace {
                         if b(ui, "Replace All") {
                             let n = self.replace_all();
-                            self.find.message = Some(if n == 0 {
+                            self.find.message = (self.dialog.is_none() || n > 0).then(|| if n == 0 {
                                 "We couldn't find anything to replace. Click Options for more ways to search.".into()
                             } else {
                                 format!("All done. We made {n} replacement{}.", if n == 1 { "" } else { "s" })

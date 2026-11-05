@@ -6,7 +6,7 @@ use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 
 use super::{attr, attr_bool, decode_ooxml_escapes, flag, local, parse_color, parse_ref, read_text, skip, Theme, XmlReader, INDEXED};
-use crate::model::{Protection, Range, RichRun, RichText, Sheet};
+use crate::model::{PasswordHash, Protection, Range, RichRun, RichText, Sheet};
 use crate::table::{Table, TableColumn, TotalFn};
 
 // ---------------------------------------------------------------------------
@@ -100,8 +100,19 @@ pub(super) fn parse_protection(e: &BytesStart) -> Option<Protection> {
         return None;
     }
     let prot = |name: &str, def: bool| attr_bool(e, name).unwrap_or(def);
+    // Excel 2013+ writes an iterated SHA-512 hash instead of the legacy `password`.
+    let modern = match (attr(e, "algorithmName"), attr(e, "hashValue"), attr(e, "saltValue")) {
+        (Some(algorithm), Some(hash), Some(salt)) => Some(PasswordHash {
+            algorithm,
+            hash,
+            salt,
+            spin: attr(e, "spinCount").and_then(|v| v.trim().parse().ok()).unwrap_or(0),
+        }),
+        _ => None,
+    };
     Some(Protection {
         hash: attr(e, "password").and_then(|v| u16::from_str_radix(v.trim(), 16).ok()).unwrap_or(0),
+        modern,
         select_locked: !prot("selectLockedCells", false),
         select_unlocked: !prot("selectUnlockedCells", false),
         format_cells: !prot("formatCells", true),
