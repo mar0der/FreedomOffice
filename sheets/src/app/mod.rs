@@ -146,6 +146,9 @@ pub struct App {
     pub rename_tab: Option<(usize, String)>,
     pub format_painter: Option<(Vec<(u32, u32, Style)>, u32, u32, bool)>,
     pub filter_popup: Option<FilterPopup>,
+    /// Table (of the active sheet) whose own AutoFilter the filter commands act on; None = the
+    /// sheet's AutoFilter.
+    pub filter_table: Option<usize>,
     pub title: String,
     pub recent: Vec<PathBuf>,
     pub find: FindState,
@@ -247,6 +250,7 @@ impl App {
             rename_tab: None,
             format_painter: None,
             filter_popup: None,
+            filter_table: None,
             title: String::new(),
             recent: load_recent(),
             find: FindState::default(),

@@ -471,10 +471,17 @@ impl App {
     /// Filter buttons of table headers (when the sheet has no AutoFilter of its own there).
     pub(super) fn paint_table_filter_buttons(&self, p: &egui::Painter, lay: &Layout) {
         for (t, btns) in self.table_filter_buttons(lay) {
-            let _ = t;
-            for (_, b) in btns {
+            let criteria = &self.sheet().tables[t].criteria;
+            for (col, b) in btns {
                 p.rect_filled(b, 2.0, Color32::from_gray(250));
                 p.rect_stroke(b, 2.0, Stroke::new(1.0, Color32::from_gray(170)), StrokeKind::Inside);
+                if criteria.contains_key(&col) {
+                    // Filtered column: the funnel, like the sheet's AutoFilter buttons.
+                    let (g, is_icon) = self.fonts.icons.get(theme::ic::FILTER, "▾");
+                    let font = if is_icon { theme::icon_font(9.0) } else { theme::ui_font(11.0) };
+                    p.text(b.center(), Align2::CENTER_CENTER, g, font, theme::PAPER_TEXT);
+                    continue;
+                }
                 let c = b.center();
                 p.add(egui::Shape::convex_polygon(
                     vec![Pos2::new(c.x - 3.5, c.y - 1.5), Pos2::new(c.x + 3.5, c.y - 1.5), Pos2::new(c.x, c.y + 2.5)],
@@ -578,16 +585,8 @@ impl App {
         }
         for (i, btns) in self.table_filter_buttons(lay) {
             if let Some((c, _)) = btns.into_iter().find(|(_, b)| b.contains(pos)) {
-                // The table's header acts as the sheet's AutoFilter (the file keeps the table's own).
-                let t = self.sheet().tables[i].clone();
-                let rg = Range { r2: t.range.r2 - t.totals as u32, ..t.range };
-                if self.sheet().filter.as_ref().is_some_and(|f| f.range != rg) {
-                    self.status = Some("Clear the sheet's AutoFilter to filter this table.".into());
-                    return true;
-                }
-                if self.sheet().filter.is_none() {
-                    self.sheet_mut().filter = Some(crate::model::AutoFilter::new(rg));
-                }
+                // Each table filters with its own AutoFilter.
+                self.filter_table = Some(i);
                 self.open_filter_popup(c, pos);
                 return true;
             }
@@ -694,7 +693,7 @@ impl App {
             });
             ui.vertical(|ui| {
                 if check(ui, "Filter Button", t.filter) {
-                    app.edit_table(s, i, |t| t.filter = !t.filter);
+                    app.toggle_table_filter(s, i);
                 }
             });
         });

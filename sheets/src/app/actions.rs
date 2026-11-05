@@ -577,6 +577,9 @@ impl App {
             Some(r) if r.rows() > t.header as u32 + t.totals as u32 => {
                 let resized = r.cols() != t.range.cols();
                 t.range = r;
+                if !rows {
+                    t.criteria = std::mem::take(&mut t.criteria).into_iter().filter_map(|(c, cf)| map(c).map(|nc| (nc, cf))).collect();
+                }
                 if resized {
                     crate::table::sync_columns_from_cells(sh, t);
                 }

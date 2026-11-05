@@ -112,7 +112,12 @@ pub fn read<R: Read + Seek>(src: R) -> Result<Workbook, String> {
                         fidelity::parse_comments(&cx, &theme, &mut sheet);
                     }
                 } else if r.ty.ends_with("/table") {
-                    if let Some(mut t) = pkg.text(&part()).and_then(|x| fidelity::parse_table(&x)) {
+                    let xml = pkg.text(&part());
+                    if let Some(mut t) = xml.as_deref().and_then(fidelity::parse_table) {
+                        // The table's own AutoFilter criteria.
+                        if t.filter {
+                            t.criteria = filter::parse_criteria(xml.as_deref().unwrap_or_default(), &dxfs, t.range.c1);
+                        }
                         // The header cells are what users see (and what Excel keeps on repair).
                         if let Some(hr) = t.header_row() {
                             for (k, col) in t.columns.iter_mut().enumerate() {

@@ -160,7 +160,15 @@ pub(super) fn patch(wb: &Workbook, pkg: Vec<u8>) -> Result<Vec<u8>, String> {
         .enumerate()
         .filter_map(|(i, s)| s.filter.as_ref().filter(|f| !f.columns.is_empty() && f.range.r2 < MAX_ROWS && f.range.c2 < MAX_COLS).map(|f| (i, f)))
         .collect();
-    if filtered.is_empty() {
+    // Tables keep their own criteria in their table part, found by name.
+    let tables: Vec<(String, AutoFilter)> = wb
+        .sheets
+        .iter()
+        .flat_map(super::fidelity::writable_tables)
+        .filter(|t| t.filter && t.header && !t.criteria.is_empty())
+        .map(|t| (format!(" displayName=\"{}\"", esc(&t.name)), t.autofilter()))
+        .collect();
+    if filtered.is_empty() && tables.is_empty() {
         return Ok(pkg);
     }
     let mut zin = zip::ZipArchive::new(Cursor::new(pkg)).map_err(|e| e.to_string())?;
@@ -179,6 +187,14 @@ pub(super) fn patch(wb: &Workbook, pkg: Vec<u8>) -> Result<Vec<u8>, String> {
         let name = format!("xl/worksheets/sheet{}.xml", si + 1);
         if let Some(p) = parts.iter_mut().find(|p| p.0 == name) {
             if let Some(new) = patch_sheet(&String::from_utf8_lossy(&p.1), f, base, &mut dxfs) {
+                p.1 = new.into_bytes();
+            }
+        }
+    }
+    for p in parts.iter_mut().filter(|p| p.0.starts_with("xl/tables/table") && p.0.ends_with(".xml")) {
+        let xml = String::from_utf8_lossy(&p.1).to_string();
+        if let Some((_, f)) = tables.iter().find(|(key, _)| xml.contains(key.as_str())) {
+            if let Some(new) = patch_sheet(&xml, f, base, &mut dxfs) {
                 p.1 = new.into_bytes();
             }
         }
@@ -213,6 +229,40 @@ mod tests {
         let s = add_dxfs("<x><dxfs count=\"1\"><dxf>a</dxf></dxfs></x>", &["<dxf/>".into()]).unwrap();
         assert_eq!(s, "<x><dxfs count=\"2\"><dxf>a</dxf><dxf/></dxfs></x>");
         assert_eq!(dxf_count(&s), 2);
+    }
+
+    /// A table's own AutoFilter criteria survive a save / load (in the table part).
+    #[test]
+    fn table_filter_round_trip() {
+        let mut wb = Workbook::new();
+        let yellow = wb.intern_style(Style { fill: Some(0xFFFF00), ..Default::default() });
+        let s = &mut wb.sheets[0];
+        let put = |s: &mut Sheet, r: u32, c: u32, v: Value, style: u32| s.set(r, c, Some(Cell { value: v, formula: None, style }));
+        put(s, 0, 1, Value::Text("Rep".into()), 0);
+        put(s, 0, 2, Value::Text("Qty".into()), 0);
+        for r in 1..=5u32 {
+            put(s, r, 1, Value::Text(format!("r{r}")), if r % 2 == 1 { yellow } else { 0 });
+            put(s, r, 2, Value::Number(r as f64), 0);
+        }
+        let mut t = crate::table::Table::new("Sales", Range::new(0, 1, 5, 2), "TableStyleMedium2");
+        t.columns[0].name = "Rep".into();
+        t.columns[1].name = "Qty".into();
+        t.criteria.insert(2, ColumnFilter::Top10 { top: true, percent: false, val: 3.0 });
+        t.criteria.insert(1, ColumnFilter::Color { font: false, color: Some(0xFFFF00) });
+        let vis = crate::filter::row_visibility(&wb, &wb.sheets[0], &t.autofilter(), 0.0);
+        wb.sheets[0].hidden_rows = vis.iter().filter(|v| !v.1).map(|v| v.0).collect();
+        wb.sheets[0].tables.push(t.clone());
+        let dir = std::env::temp_dir().join(format!("freedom_sheets_tfilter_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("table_filter.xlsx");
+        crate::io::save(&wb, &path).unwrap();
+        let back = crate::io::load(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let bt = &back.sheets[0].tables[0];
+        assert_eq!(bt.criteria, t.criteria);
+        assert!(back.sheets[0].filter.is_none());
+        assert_eq!(back.sheets[0].hidden_rows, wb.sheets[0].hidden_rows);
+        assert_eq!(back.sheets[0].hidden_rows.len(), 3);
     }
 
     #[test]

@@ -222,24 +222,58 @@ impl App {
     // Commands
     // ------------------------------------------------------------------
 
+    /// The AutoFilter the filter commands act on (`filter_table`): a table's own, or the
+    /// sheet's (its range grown to the data below).
+    pub(super) fn cur_filter(&self) -> Option<AutoFilter> {
+        match self.filter_table {
+            Some(i) => self.sheet().tables.get(i).filter(|t| t.filter && t.header).map(|t| t.autofilter()),
+            None => self.sheet().filter.clone().map(|mut f| {
+                f.range.r2 = filter::data_end(self.sheet(), f.range);
+                f
+            }),
+        }
+    }
+
+    /// Stores the criteria (and for the sheet, the range) of `cur_filter`.
+    fn put_filter(&mut self, f: AutoFilter) {
+        let si = self.wb.active;
+        match self.filter_table {
+            Some(i) => {
+                if let Some(t) = self.wb.sheets[si].tables.get_mut(i) {
+                    t.criteria = f.columns;
+                }
+            }
+            None => self.wb.sheets[si].filter = Some(f),
+        }
+    }
+
+    /// Points the filter commands at the table holding the active cell when it has filter
+    /// buttons, otherwise at the sheet's AutoFilter.
+    fn target_active_filter(&mut self) {
+        let (r, c) = self.active();
+        let sh = self.sheet();
+        let in_sheet_filter = sh.filter.as_ref().is_some_and(|f| f.range.contains(r, c));
+        self.filter_table = if in_sheet_filter { None } else { sh.tables.iter().position(|t| t.filter && t.header && t.range.contains(r, c)) };
+    }
+
     /// Data > Filter (Ctrl+Shift+L): turns the AutoFilter on for the current region, or off.
+    /// Inside a table it shows or hides the table's filter buttons.
     pub fn toggle_filter(&mut self) {
         if self.protect_blocks(super::Change::Any) {
             return;
         }
+        let (r, c) = self.active();
+        if let Some(i) = self.sheet().tables.iter().position(|t| t.header && t.range.contains(r, c)) {
+            if self.sheet().filter.as_ref().is_none_or(|f| !f.range.contains(r, c)) {
+                return self.toggle_table_filter(self.wb.active, i);
+            }
+        }
         let si = self.wb.active;
         self.push_undo(&[Scope::Sheet(si)]);
-        if let Some(mut f) = self.sheet().filter.clone() {
-            // Show the rows the criteria hid; rows hidden by hand stay hidden.
-            f.range.r2 = filter::data_end(self.sheet(), f.range);
-            let vis = filter::row_visibility(&self.wb, self.sheet(), &f, numfmt::now_serial());
-            let sh = self.sheet_mut();
-            sh.filter = None;
-            for (r, shown) in vis {
-                if !shown {
-                    sh.hidden_rows.remove(&r);
-                }
-            }
+        self.filter_table = None;
+        if let Some(f) = self.cur_filter() {
+            self.sheet_mut().filter = None;
+            self.show_filtered_rows(&f);
             self.status = None;
         } else {
             let rg = if self.sel().is_single() { self.current_region() } else { self.sel_clipped() };
@@ -248,11 +282,36 @@ impl App {
         self.changed();
     }
 
+    /// Shows the rows the criteria hid; rows hidden by hand stay hidden.
+    fn show_filtered_rows(&mut self, f: &AutoFilter) {
+        let vis = filter::row_visibility(&self.wb, self.sheet(), f, numfmt::now_serial());
+        let sh = self.sheet_mut();
+        for (r, shown) in vis {
+            if !shown {
+                sh.hidden_rows.remove(&r);
+            }
+        }
+    }
+
+    /// Table Design > Filter Button: turning the buttons off also drops the table's criteria.
+    pub(super) fn toggle_table_filter(&mut self, s: usize, i: usize) {
+        if s != self.wb.active || i >= self.sheet().tables.len() || self.protect_blocks(super::Change::Any) {
+            return;
+        }
+        self.push_undo(&[Scope::Sheet(s)]);
+        let t = self.sheet().tables[i].clone();
+        if t.filter {
+            self.show_filtered_rows(&t.autofilter());
+            self.sheet_mut().tables[i].criteria.clear();
+        }
+        self.sheet_mut().tables[i].filter = !t.filter;
+        self.changed();
+    }
+
     /// Re-evaluates the criteria and hides the rows that fail (no undo step).
     pub fn refilter(&mut self) {
         let si = self.wb.active;
-        let Some(mut f) = self.wb.sheets[si].filter.clone() else { return };
-        f.range.r2 = filter::data_end(&self.wb.sheets[si], f.range);
+        let Some(f) = self.cur_filter() else { return };
         let vis = filter::row_visibility(&self.wb, &self.wb.sheets[si], &f, numfmt::now_serial());
         let total = vis.len();
         let shown = vis.iter().filter(|v| v.1).count();
@@ -265,7 +324,7 @@ impl App {
                 sh.hidden_rows.insert(r);
             }
         }
-        sh.filter = Some(f);
+        self.put_filter(f);
         // SUBTOTAL(101..)/AGGREGATE ignore hidden rows, so totals change with the filter.
         self.changed();
         self.status = if any { Some(format!("{shown} of {total} records found")) } else { None };
@@ -273,8 +332,9 @@ impl App {
 
     /// Data > Reapply.
     pub fn apply_filter(&mut self) {
+        self.target_active_filter();
         let si = self.wb.active;
-        if self.wb.sheets[si].filter.is_none() || self.protect_blocks(super::Change::Filter) {
+        if self.cur_filter().is_none() || self.protect_blocks(super::Change::Filter) {
             return;
         }
         self.push_undo(&[Scope::Sheet(si)]);
@@ -283,44 +343,46 @@ impl App {
 
     /// Data > Clear: removes all criteria, keeping the dropdowns.
     pub fn clear_filter(&mut self) {
+        self.target_active_filter();
         let si = self.wb.active;
-        if self.wb.sheets[si].filter.is_none() || self.protect_blocks(super::Change::Filter) {
+        let Some(mut f) = self.cur_filter() else { return };
+        if self.protect_blocks(super::Change::Filter) {
             return;
         }
         self.push_undo(&[Scope::Sheet(si)]);
-        if let Some(f) = &mut self.wb.sheets[si].filter {
-            f.columns.clear();
-        }
+        f.columns.clear();
+        self.put_filter(f);
         self.refilter();
     }
 
-    /// Sets (or with `None` clears) the criteria of one column and refilters.
+    /// Sets (or with `None` clears) the criteria of one column of `cur_filter` and refilters.
     pub fn set_column_filter(&mut self, col: u32, cf: Option<ColumnFilter>) {
         let si = self.wb.active;
-        if self.wb.sheets[si].filter.is_none() || self.protect_blocks(super::Change::Filter) {
+        let Some(mut f) = self.cur_filter() else { return };
+        if self.protect_blocks(super::Change::Filter) {
             return;
         }
         self.push_undo(&[Scope::Sheet(si)]);
-        if let Some(f) = &mut self.wb.sheets[si].filter {
-            match cf {
-                Some(cf) => {
-                    f.columns.insert(col, cf);
-                }
-                None => {
-                    f.columns.remove(&col);
-                }
+        match cf {
+            Some(cf) => {
+                f.columns.insert(col, cf);
+            }
+            None => {
+                f.columns.remove(&col);
             }
         }
+        self.put_filter(f);
         self.refilter();
     }
 
     /// Turns the filter on (if needed) and returns the active cell's column inside it.
     fn filter_for_active(&mut self) -> Option<(u32, Probe)> {
-        if self.sheet().filter.is_none() {
+        self.target_active_filter();
+        if self.cur_filter().is_none() {
             self.toggle_filter();
         }
         let (r, c) = self.active();
-        let f = self.sheet().filter.as_ref()?;
+        let f = self.cur_filter()?;
         if c < f.range.c1 || c > f.range.c2 {
             return None;
         }
@@ -352,12 +414,8 @@ impl App {
 
     /// Sorts the filter range (or the current region) putting one colour on top.
     pub fn sort_by_color(&mut self, col: u32, font: bool, color: Option<u32>) {
-        let (rg, header) = match self.sheet().filter.as_ref() {
-            Some(f) if f.range.c1 <= col && col <= f.range.c2 => {
-                let mut rg = f.range;
-                rg.r2 = filter::data_end(self.sheet(), rg);
-                (rg, true)
-            }
+        let (rg, header) = match self.cur_filter() {
+            Some(f) if f.range.c1 <= col && col <= f.range.c2 => (f.range, true),
             _ => self.sort_area(),
         };
         let key = SortKey { line: col, on: if font { SortOn::FontColor } else { SortOn::CellColor }, order: SortOrder::ColorTop(color) };
@@ -366,6 +424,7 @@ impl App {
 
     /// Context menu Sort > Put Selected Cell Color On Top.
     pub fn sort_by_cell_color(&mut self) {
+        self.target_active_filter();
         let (r, c) = self.active();
         let fill = filter::probe(&self.wb, self.sheet(), r, c).fill;
         self.sort_by_color(c, false, fill);
@@ -373,6 +432,7 @@ impl App {
 
     /// Context menu Sort > Put Selected Font Color On Top.
     pub fn sort_by_font_color(&mut self) {
+        self.target_active_filter();
         let (r, c) = self.active();
         let font = filter::probe(&self.wb, self.sheet(), r, c).font;
         self.sort_by_color(c, true, font);
@@ -381,10 +441,8 @@ impl App {
     /// Cells of a filter column: rows passing the other columns' criteria (for the checklist)
     /// or all data rows.
     fn filter_column_probes(&self, col: u32, others_only: bool) -> Vec<Probe> {
-        let Some(f) = self.sheet().filter.clone() else { return Vec::new() };
+        let Some(f) = self.cur_filter() else { return Vec::new() };
         let sh = self.sheet();
-        let mut f = f;
-        f.range.r2 = filter::data_end(sh, f.range);
         let rows: Vec<u32> = if others_only {
             let mut g = f.clone();
             g.columns.remove(&col);
@@ -396,7 +454,7 @@ impl App {
     }
 
     fn filter_header(&self, col: u32) -> String {
-        let Some(f) = self.sheet().filter.as_ref() else { return String::new() };
+        let Some(f) = self.cur_filter() else { return String::new() };
         let t = numfmt::value_to_text(self.sheet().display_value(f.range.r1, col));
         if t.is_empty() { format!("Column {}", crate::model::col_name(col)) } else { t }
     }
@@ -406,7 +464,7 @@ impl App {
     // ------------------------------------------------------------------
 
     pub fn open_filter_popup(&mut self, col: u32, pos: Pos2) {
-        let Some(f) = self.sheet().filter.clone() else { return };
+        let Some(f) = self.cur_filter() else { return };
         let current = f.columns.get(&col).cloned();
         let all = self.filter_column_probes(col, false);
         let kind = filter::column_kind(&all);
@@ -727,9 +785,8 @@ impl App {
         let col = fp.col;
         match act {
             Some(Act::Sort(desc)) => {
-                if let Some(f) = self.sheet().filter.clone() {
-                    let mut rg = f.range;
-                    rg.r2 = filter::data_end(self.sheet(), rg);
+                if let Some(f) = self.cur_filter() {
+                    let rg = f.range;
                     let a = self.active();
                     self.sheet_mut().view.active = (a.0, col);
                     self.sort_range_by(rg, true, &[SortKey::values(col, desc)], SortOptions::default());
@@ -761,7 +818,7 @@ impl App {
         }
         let mut d = CustomFilterDlg { col, header: self.filter_header(col), kind, op1, v1: String::new(), and: true, op2, v2: String::new(), values };
         // Reopening shows the column's current custom criteria.
-        if let Some(Some(ColumnFilter::Custom { and, c1, c2 })) = self.sheet().filter.as_ref().map(|f| f.columns.get(&col).cloned()) {
+        if let Some(Some(ColumnFilter::Custom { and, c1, c2 })) = self.cur_filter().map(|f| f.columns.get(&col).cloned()) {
             if op1 == UiOp::Equals && op2.is_none() {
                 d.op1 = filter::ui_op(&c1);
                 d.v1 = filter::ui_value(&c1);
@@ -775,7 +832,7 @@ impl App {
 
     fn open_top10(&mut self, col: u32) {
         let mut d = Top10Dlg { col, top: true, val: 10.0, percent: false };
-        if let Some(Some(ColumnFilter::Top10 { top, percent, val })) = self.sheet().filter.as_ref().map(|f| f.columns.get(&col).cloned()) {
+        if let Some(Some(ColumnFilter::Top10 { top, percent, val })) = self.cur_filter().map(|f| f.columns.get(&col).cloned()) {
             d = Top10Dlg { col, top, val, percent };
         }
         self.dialog = Some(Dialog::Data(Box::new(DataDlg::Top10(d))));
@@ -1036,6 +1093,37 @@ mod tests {
         app.toggle_filter();
         assert!(app.sheet().filter.is_none());
         assert_eq!(hidden(&app), vec![4]);
+    }
+
+    #[test]
+    fn table_header_buttons_use_the_tables_own_filter() {
+        let (_ctx, mut app) = sample_app();
+        app.toggle_filter(); // the sheet's AutoFilter over A1:E8
+        // A table in H1:H6 next to it.
+        let sh = &mut app.wb.sheets[0];
+        sh.set(0, 7, Some(crate::model::Cell { value: crate::model::Value::Text("Qty".into()), ..Default::default() }));
+        for r in 1..=5u32 {
+            sh.set(r, 7, Some(crate::model::Cell { value: crate::model::Value::Number(r as f64), ..Default::default() }));
+        }
+        let mut t = crate::table::Table::new("Qty", crate::model::Range::new(0, 7, 5, 7), "TableStyleMedium2");
+        t.columns[0].name = "Qty".into();
+        sh.tables.push(t);
+        app.filter_table = Some(0);
+        app.set_column_filter(7, Some(ColumnFilter::Top10 { top: false, percent: false, val: 2.0 }));
+        assert_eq!(app.sheet().tables[0].criteria.len(), 1);
+        assert!(app.sheet().filter.as_ref().unwrap().columns.is_empty());
+        assert_eq!(hidden(&app), vec![4, 5, 6]);
+        // Ctrl+Shift+L in the table turns its buttons (and criteria) off; the sheet keeps its own.
+        app.select(2, 7, false);
+        app.toggle_filter();
+        assert!(!app.sheet().tables[0].filter && app.sheet().tables[0].criteria.is_empty());
+        assert!(hidden(&app).is_empty());
+        assert!(app.sheet().filter.is_some());
+        // Inside the sheet's AutoFilter, filter commands act on it again.
+        app.select(1, 0, false);
+        app.filter_by_cell_value();
+        assert_eq!(hidden(&app), vec![3, 5, 6, 7]);
+        assert!(app.sheet().tables[0].criteria.is_empty());
     }
 
     #[test]

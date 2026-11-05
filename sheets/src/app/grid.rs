@@ -542,6 +542,7 @@ impl App {
             if self.edit.is_some() && !self.commit_edit(false) {
                 return;
             }
+            self.filter_table = None;
             self.open_filter_popup(c, pos);
             return;
         }

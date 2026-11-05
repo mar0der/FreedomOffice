@@ -1,6 +1,6 @@
 //! Reads AutoFilter criteria (`<filterColumn>`) from a worksheet part.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use quick_xml::events::Event;
 use quick_xml::Reader;
@@ -16,11 +16,19 @@ fn is_end(e: &quick_xml::events::BytesEnd, name: &str) -> bool {
 }
 
 pub(super) fn parse_autofilter(xml: &str, dxfs: &[DiffFormat], sheet: &mut Sheet) {
-    if !xml.contains("filterColumn") {
-        return;
+    if let Some(f) = sheet.filter.as_mut() {
+        f.columns = parse_criteria(xml, dxfs, f.range.c1);
     }
-    let Some(f) = sheet.filter.as_mut() else { return };
-    let c1 = f.range.c1;
+}
+
+/// The criteria of the first `<autoFilter>` in a worksheet or table part, keyed by sheet
+/// column (`c1` is the filter range's first column).
+pub(super) fn parse_criteria(xml: &str, dxfs: &[DiffFormat], c1: u32) -> BTreeMap<u32, ColumnFilter> {
+    let mut out = BTreeMap::new();
+    if !xml.contains("filterColumn") {
+        return out;
+    }
+    let f = &mut out;
     let mut rd = Reader::from_str(xml);
     let mut in_af = false;
     let mut col: Option<u32> = None;
@@ -100,7 +108,7 @@ pub(super) fn parse_autofilter(xml: &str, dxfs: &[DiffFormat], sheet: &mut Sheet
                         }
                     }
                     if let (Some(c), Some(cf)) = (col.take(), cur.take()) {
-                        f.columns.insert(c, cf);
+                        f.insert(c, cf);
                     }
                 } else if is_end(e, "autoFilter") {
                     break;
@@ -110,4 +118,5 @@ pub(super) fn parse_autofilter(xml: &str, dxfs: &[DiffFormat], sheet: &mut Sheet
             _ => {}
         }
     }
+    out
 }
