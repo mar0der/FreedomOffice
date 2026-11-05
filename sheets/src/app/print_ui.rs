@@ -189,9 +189,9 @@ fn chart_ops(ctx: &egui::Context, wb: &crate::model::Workbook, si: usize, k: usi
 
 fn two_line(title: &str, sub: &str) -> LayoutJob {
     let mut job = LayoutJob::default();
-    job.append(title, 0.0, TextFormat { font_id: theme::ui_bold(12.5), color: theme::TEXT, ..Default::default() });
+    job.append(title, 0.0, TextFormat { font_id: theme::ui_bold(12.5), color: theme::text(), ..Default::default() });
     if !sub.is_empty() {
-        job.append(&format!("\n{sub}"), 0.0, TextFormat { font_id: theme::ui_font(11.0), color: theme::TEXT_DIM, ..Default::default() });
+        job.append(&format!("\n{sub}"), 0.0, TextFormat { font_id: theme::ui_font(11.0), color: theme::text_dim(), ..Default::default() });
     }
     job
 }
@@ -399,8 +399,8 @@ impl App {
             ui.horizontal(|ui| {
                 let (pg, pi) = self.icon('\u{E749}', "🖶");
                 let mut job = LayoutJob::default();
-                job.append(&pg, 0.0, TextFormat { font_id: if pi { theme::icon_font(28.0) } else { theme::ui_font(28.0) }, color: theme::TEXT, ..Default::default() });
-                job.append("\nPrint", 0.0, TextFormat { font_id: theme::ui_font(13.0), color: theme::TEXT, ..Default::default() });
+                job.append(&pg, 0.0, TextFormat { font_id: if pi { theme::icon_font(28.0) } else { theme::ui_font(28.0) }, color: theme::text(), ..Default::default() });
+                job.append("\nPrint", 0.0, TextFormat { font_id: theme::ui_font(13.0), color: theme::text(), ..Default::default() });
                 job.halign = egui::Align::Center;
                 let btn = super::ribbon::big_btn(ui, job, 76.0, false);
                 if btn.on_hover_text("Print (Ctrl+P)").clicked() && !self.print.busy {
@@ -419,7 +419,7 @@ impl App {
             ui.label(RichText::new("Printer").size(15.0).strong());
             let printers = self.print.printers.clone().unwrap_or_default();
             if printers.is_empty() {
-                ui.label(RichText::new("No printers found").color(theme::TEXT_DIM));
+                ui.label(RichText::new("No printers found").color(theme::text_dim()));
             } else {
                 let cur = printers.iter().find(|p| p.name == self.print.printer).cloned();
                 let shown = cur.as_ref().map(|p| (p.name.clone(), p.status.clone())).unwrap_or_default();
@@ -544,7 +544,7 @@ impl App {
             }
             if self.print.busy {
                 ui.add_space(8.0);
-                ui.label(RichText::new("Sending to the printer...").color(theme::TEXT_DIM));
+                ui.label(RichText::new("Sending to the printer...").color(theme::text_dim()));
             }
         });
 
@@ -555,7 +555,7 @@ impl App {
         let area = Rect::from_min_max(right.min + Vec2::new(20.0, 20.0), Pos2::new(right.right() - 20.0, right.bottom() - nav_h - 8.0));
         let n = pages.len();
         if n == 0 {
-            painter.text(area.center(), Align2::CENTER_CENTER, "We didn't find anything to print.", theme::ui_font(15.0), theme::TEXT_DIM);
+            painter.text(area.center(), Align2::CENTER_CENTER, "We didn't find anything to print.", theme::ui_font(15.0), theme::text_dim());
             return;
         }
         self.print.page = self.print.page.min(n - 1);
@@ -890,7 +890,7 @@ impl App {
                         ui.add_enabled(fit, egui::DragValue::new(&mut tall).range(0..=32767).custom_formatter(move |v, _| auto(v)));
                         ui.label("tall");
                     });
-                    ui.label(RichText::new("Leave a box empty (0) for automatic.").size(11.0).color(theme::TEXT_DIM));
+                    ui.label(RichText::new("Leave a box empty (0) for automatic.").size(11.0).color(theme::text_dim()));
                     d.ps.scaling = if fit { Scaling::Fit { wide, tall } } else { Scaling::Percent(pct) };
                     ui.add_space(8.0);
                     egui::Grid::new("ps_page").num_columns(2).spacing(Vec2::new(10.0, 8.0)).show(ui, |ui| {
@@ -929,7 +929,7 @@ impl App {
                         let (rect, _) = ui.allocate_exact_size(Vec2::new(150.0, 120.0), Sense::hover());
                         let pr = Rect::from_center_size(rect.center(), Vec2::new(80.0, 104.0));
                         ui.painter().rect_filled(pr, 0.0, Color32::WHITE);
-                        ui.painter().rect_stroke(pr, 0.0, Stroke::new(1.0, theme::BORDER), StrokeKind::Inside);
+                        ui.painter().rect_stroke(pr, 0.0, Stroke::new(1.0, theme::border()), StrokeKind::Inside);
                         ui.painter().rect_stroke(pr.shrink(12.0), 0.0, Stroke::new(1.0, Color32::from_gray(160)), StrokeKind::Inside);
                         field(ui, "Right:", &mut d.ps.margins.right);
                     });
@@ -954,11 +954,11 @@ impl App {
                         // preview box
                         let (rect, _) = ui.allocate_exact_size(Vec2::new(500.0, 34.0), Sense::hover());
                         ui.painter().rect_filled(rect, 0.0, Color32::WHITE);
-                        ui.painter().rect_stroke(rect, 0.0, Stroke::new(1.0, theme::BORDER), StrokeKind::Inside);
+                        ui.painter().rect_stroke(rect, 0.0, Stroke::new(1.0, theme::border()), StrokeKind::Inside);
                         let r = |s: &str| crate::page::render_hf(s, &sample);
-                        ui.painter().text(rect.left_center() + Vec2::new(8.0, 0.0), Align2::LEFT_CENTER, r(&hf.left), theme::ui_font(11.5), theme::TEXT);
-                        ui.painter().text(rect.center(), Align2::CENTER_CENTER, r(&hf.center), theme::ui_font(11.5), theme::TEXT);
-                        ui.painter().text(rect.right_center() - Vec2::new(8.0, 0.0), Align2::RIGHT_CENTER, r(&hf.right), theme::ui_font(11.5), theme::TEXT);
+                        ui.painter().text(rect.left_center() + Vec2::new(8.0, 0.0), Align2::LEFT_CENTER, r(&hf.left), theme::ui_font(11.5), theme::text());
+                        ui.painter().text(rect.center(), Align2::CENTER_CENTER, r(&hf.center), theme::ui_font(11.5), theme::text());
+                        ui.painter().text(rect.right_center() - Vec2::new(8.0, 0.0), Align2::RIGHT_CENTER, r(&hf.right), theme::ui_font(11.5), theme::text());
                         ui.horizontal(|ui| {
                             ui.label(label);
                             let cur = presets.iter().find(|(_, p)| p == hf).map(|(n, _)| n.to_string()).unwrap_or_else(|| "(custom)".into());
@@ -973,7 +973,7 @@ impl App {
                         ui.horizontal(|ui| {
                             for (sec, text) in [("Left", &mut hf.left), ("Center", &mut hf.center), ("Right", &mut hf.right)] {
                                 ui.vertical(|ui| {
-                                    ui.label(RichText::new(format!("{sec} section")).size(11.0).color(theme::TEXT_DIM));
+                                    ui.label(RichText::new(format!("{sec} section")).size(11.0).color(theme::text_dim()));
                                     ui.add(egui::TextEdit::singleline(text).desired_width(158.0));
                                 });
                             }
@@ -983,7 +983,7 @@ impl App {
                     ui.label(
                         RichText::new("Codes: &P page number, &N number of pages, &D date, &T time, &A sheet name, &F file name, &Z file path, && ampersand")
                             .size(11.0)
-                            .color(theme::TEXT_DIM),
+                            .color(theme::text_dim()),
                     );
                     let _ = HeaderFooter::default();
                 }
@@ -1033,7 +1033,7 @@ impl App {
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let cancel = ui.add(egui::Button::new("Cancel").min_size(Vec2::new(76.0, 24.0))).clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape));
-                    let ok = ui.add(egui::Button::new("OK").min_size(Vec2::new(76.0, 24.0)).fill(theme::ACCENT_LIGHT)).clicked();
+                    let ok = ui.add(egui::Button::new("OK").min_size(Vec2::new(76.0, 24.0)).fill(theme::accent_light())).clicked();
                     if cancel {
                         keep = false;
                     } else if ok || go_print {

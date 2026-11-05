@@ -369,7 +369,7 @@ impl App {
             .interactable(false)
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style()).fill(Color32::from_rgb(0xFB, 0xFB, 0xFB)).inner_margin(egui::Margin::same(8)).show(ui, |ui| {
-                    ui.label(RichText::new(title).strong().color(theme::ACCENT_DARK));
+                    ui.label(RichText::new(title).strong().color(theme::accent_dark()));
                     ui.add_space(4.0);
                     egui::Grid::new("kt").num_columns(4).spacing(Vec2::new(10.0, 2.0)).show(ui, |ui| {
                         for (i, (k, l)) in next.iter().take(60).enumerate() {
@@ -381,7 +381,7 @@ impl App {
                         }
                     });
                     ui.add_space(4.0);
-                    ui.label(RichText::new("Esc to go back").size(11.0).color(theme::TEXT_DIM));
+                    ui.label(RichText::new("Esc to go back").size(11.0).color(theme::text_dim()));
                 });
             });
     }

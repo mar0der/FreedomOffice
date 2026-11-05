@@ -169,6 +169,8 @@ pub struct App {
     pub edits: u64,
     /// Native window handle (for printer dialogs).
     pub hwnd: isize,
+    /// When the Windows light/dark app mode was last checked.
+    pub theme_checked: f64,
     pub last_press_pos: Option<egui::Pos2>,
     pub pending_link: Option<((u32, u32), String)>,
     /// AutoRecover: where this session's recovery copy is written, and when it was last written.
@@ -187,10 +189,13 @@ const MAX_UNDO: usize = 100;
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, path: Option<PathBuf>) -> Self {
+        theme::set_dark(theme::system_dark());
         theme::apply_style(&cc.egui_ctx);
         let fonts = FontManager::new(&cc.egui_ctx);
         #[cfg(windows)]
-        let hwnd = set_caption_color(cc);
+        let hwnd = window_handle(cc);
+        #[cfg(windows)]
+        set_caption_color(hwnd);
         #[cfg(not(windows))]
         let hwnd = 0;
         let mut app = App {
@@ -240,6 +245,7 @@ impl App {
             print: Default::default(),
             edits: 0,
             hwnd,
+            theme_checked: 0.0,
             last_press_pos: None,
             pending_link: None,
             recovery_path: recovery_dir().map(|d| d.join(format!("Recovered-{}.xlsx", std::process::id()))),
@@ -820,6 +826,22 @@ impl App {
     // Frame
     // ------------------------------------------------------------------
 
+    /// Switches between light and dark when the Windows app mode changes, like desktop Office does.
+    fn follow_system_theme(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|i| i.time);
+        if now - self.theme_checked >= 2.0 {
+            self.theme_checked = now;
+            let dark = theme::system_dark();
+            if dark != theme::is_dark() {
+                theme::set_dark(dark);
+                theme::apply_style(ctx);
+                #[cfg(windows)]
+                set_caption_color(self.hwnd);
+            }
+        }
+        ctx.request_repaint_after(std::time::Duration::from_secs(2));
+    }
+
     fn update_title(&mut self, ctx: &egui::Context) {
         let t = format!("{}{} - FreedomOffice Sheets", self.wb.file_name(), if self.dirty { " •" } else { "" });
         if t != self.title {
@@ -859,24 +881,34 @@ fn save_recent(v: &[PathBuf]) {
 }
 
 #[cfg(windows)]
-fn set_caption_color(cc: &eframe::CreationContext<'_>) -> isize {
+fn window_handle(cc: &eframe::CreationContext<'_>) -> isize {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
-    let Ok(h) = cc.window_handle() else { return 0 };
-    if let RawWindowHandle::Win32(w) = h.as_raw() {
-        let hwnd = w.hwnd.get() as windows_sys::Win32::Foundation::HWND;
-        // COLORREF is 0x00BBGGRR
-        let caption: u32 = 0x0046_7321;
-        let text: u32 = 0x00FF_FFFF;
-        unsafe {
-            DwmSetWindowAttribute(hwnd, 35, &caption as *const u32 as *const _, 4);
-            DwmSetWindowAttribute(hwnd, 36, &text as *const u32 as *const _, 4);
-        }
-        return hwnd as isize;
+    match cc.window_handle().map(|h| h.as_raw()) {
+        Ok(RawWindowHandle::Win32(w)) => w.hwnd.get(),
+        _ => 0,
     }
-    0
 }
 
+/// Title bar colours: the familiar green in light mode, the chrome colour with a dark frame in dark mode.
+#[cfg(windows)]
+fn set_caption_color(hwnd: isize) {
+    use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
+    if hwnd == 0 {
+        return;
+    }
+    let dark = theme::is_dark();
+    // COLORREF is 0x00BBGGRR
+    let c = if dark { theme::chrome() } else { egui::Color32::from_rgb(0x21, 0x73, 0x46) };
+    let caption: u32 = (c.b() as u32) << 16 | (c.g() as u32) << 8 | c.r() as u32;
+    let text: u32 = 0x00FF_FFFF;
+    let immersive_dark: u32 = dark as u32;
+    let h = hwnd as windows_sys::Win32::Foundation::HWND;
+    unsafe {
+        DwmSetWindowAttribute(h, 20, &immersive_dark as *const u32 as *const _, 4);
+        DwmSetWindowAttribute(h, 35, &caption as *const u32 as *const _, 4);
+        DwmSetWindowAttribute(h, 36, &text as *const u32 as *const _, 4);
+    }
+}
 impl eframe::App for App {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // Normal exit (after the save prompt): the recovery copy is no longer needed.
@@ -903,6 +935,7 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
+        self.follow_system_theme(ctx);
         self.handle_keys(ctx);
         self.update_title(ctx);
         self.poll_print();
@@ -912,23 +945,23 @@ impl eframe::App for App {
             self.backstage_ui(ctx);
         } else {
             egui::TopBottomPanel::top("ribbon")
-                .frame(egui::Frame::NONE.fill(theme::CHROME))
+                .frame(egui::Frame::NONE.fill(theme::chrome()))
                 .show_separator_line(false)
                 .show(ctx, |ui| self.ribbon_ui(ui));
             if self.show_formula_bar {
                 egui::TopBottomPanel::top("formula_bar")
-                    .frame(egui::Frame::NONE.fill(theme::CHROME).inner_margin(egui::Margin { left: 4, right: 4, top: 4, bottom: 4 }))
+                    .frame(egui::Frame::NONE.fill(theme::chrome()).inner_margin(egui::Margin { left: 4, right: 4, top: 4, bottom: 4 }))
                     .show_separator_line(false)
                     .show(ctx, |ui| self.formula_bar_ui(ui));
             }
             egui::TopBottomPanel::bottom("status")
                 .exact_height(24.0)
-                .frame(egui::Frame::NONE.fill(theme::CHROME))
+                .frame(egui::Frame::NONE.fill(theme::chrome()))
                 .show_separator_line(false)
                 .show(ctx, |ui| self.status_bar_ui(ui));
             egui::TopBottomPanel::bottom("tabs")
                 .exact_height(28.0)
-                .frame(egui::Frame::NONE.fill(theme::CHROME))
+                .frame(egui::Frame::NONE.fill(theme::chrome()))
                 .show_separator_line(false)
                 .show(ctx, |ui| self.sheet_tabs_ui(ui));
             egui::CentralPanel::default().frame(egui::Frame::NONE.fill(egui::Color32::WHITE)).show(ctx, |ui| self.grid_ui(ui));
