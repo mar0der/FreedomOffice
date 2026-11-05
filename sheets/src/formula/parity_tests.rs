@@ -135,7 +135,7 @@ fn lambda_spills_and_files() {
     // parameters are written with the _xlpm. prefix, including calls of LET-bound lambdas
     let e = parse("LET(f,LAMBDA(x,y,x+y),f(1,2))").unwrap();
     assert_eq!(print(&e), "LET(f,LAMBDA(x,y,x+y),F(1,2))");
-    assert_eq!(print_xlsx(&e), "LET(_xlpm.f,LAMBDA(_xlpm.x,_xlpm.y,_xlpm.x+_xlpm.y),_xlpm.F(1,2))");
+    assert_eq!(print_xlsx(&e), "_xlfn.LET(_xlpm.f,_xlfn.LAMBDA(_xlpm.x,_xlpm.y,_xlpm.x+_xlpm.y),_xlpm.F(1,2))");
     // and read back without it
     let back = parse("_xlfn.LET(_xlpm.f,_xlfn.LAMBDA(_xlpm.x,_xlpm.x*2),_xlpm.f(3))").unwrap();
     assert_eq!(print(&back), "LET(f,LAMBDA(x,x*2),F(3))");
@@ -309,6 +309,43 @@ fn unparsed_formulas_survive_save_and_load() {
         let cell = back.sheets[0].get(i as u32, 0).expect("cell kept");
         assert_eq!(cell.formula.as_ref().map(|x| x.text.as_str()), Some(*f));
     }
+}
+
+#[test]
+fn lambdas_and_new_functions_round_trip_through_xlsx() {
+    let mut wb = Workbook::new();
+    wb.names.push(("DOUBLE".into(), "LAMBDA(x,x*2)".into()));
+    for (a, f) in [
+        ("A1", "1"),
+        ("A2", "2"),
+        ("B1", "=DOUBLE(4)"),
+        ("C1", "=GROUPBY(A1:A2,A1:A2,SUM,0,0)"),
+        ("E1", "=REGEXTEST(\"a1\",\"\\d\")"),
+        ("F1", "=SUM((A1,A2))+SUM(A1:A2 A2)"),
+    ] {
+        put(&mut wb, 0, a, f);
+    }
+    recalc(&mut wb);
+    let path = std::env::temp_dir().join(format!("freedom_formula_lambda_{}.xlsx", std::process::id()));
+    crate::io::save(&wb, &path).unwrap();
+    // the file holds Excel's prefixed forms
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+    let mut xml = String::new();
+    for part in ["xl/workbook.xml", "xl/worksheets/sheet1.xml"] {
+        std::io::Read::read_to_string(&mut zip.by_name(part).unwrap(), &mut xml).unwrap();
+    }
+    assert!(xml.contains("_xlfn.LAMBDA(_xlpm.x,_xlpm.x*2)"), "{xml}");
+    assert!(xml.contains("_xlfn.GROUPBY(A1:A2,A1:A2,_xleta.SUM,0,0)"), "{xml}");
+    assert!(xml.contains("_xlfn.REGEXTEST("), "{xml}");
+    let mut back = crate::io::load(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    recalc(&mut back);
+    let s = &back.sheets[0];
+    assert_eq!(s.value(0, 1), &n(8.0));
+    assert_eq!(s.get(0, 2).and_then(|c| c.formula.as_ref()).map(|f| f.text.as_str()), Some("GROUPBY(A1:A2,A1:A2,SUM,0,0)"));
+    assert_eq!(s.display_value(1, 3), &n(2.0));
+    assert_eq!(s.value(0, 4), &Value::Bool(true));
+    assert_eq!(s.value(0, 5), &n(5.0));
 }
 
 // ---------------------------------------------------------------------------

@@ -37,8 +37,11 @@ fn build(wb: &Workbook) -> Result<XWorkbook, XlsxError> {
         }
     }
     for (name, text) in &wb.names {
-        // Invalid names are skipped rather than failing the whole save.
-        let _ = book.define_name(name, &format!("={}", text.trim_start_matches('=')));
+        // Invalid names are skipped rather than failing the whole save. Parsed definitions
+        // are written in file form (`_xlfn.LAMBDA(_xlpm.x,...)` for named lambdas).
+        let text = text.trim_start_matches('=');
+        let text = formula::parse(text).map(|e| formula::print_xlsx(&e)).unwrap_or_else(|_| text.to_string());
+        let _ = book.define_name(name, &format!("={text}"));
     }
     Ok(book)
 }

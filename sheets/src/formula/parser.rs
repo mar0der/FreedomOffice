@@ -684,11 +684,14 @@ impl Parser {
                 if id.eq_ignore_ascii_case("FALSE") {
                     return Ok(Expr::Bool(false));
                 }
-                // LET / LAMBDA parameters are stored with an `_xlpm.` prefix in files.
-                match id.get(..6) {
-                    Some(p) if p.eq_ignore_ascii_case("_xlpm.") && id.len() > 6 => Ok(Expr::Name(id[6..].to_string())),
-                    _ => Ok(Expr::Name(id)),
+                // LET / LAMBDA parameters (`_xlpm.x`) and built-ins passed as functions
+                // (`_xleta.SUM`) carry a prefix in files.
+                for p in ["_xlpm.", "_xleta."] {
+                    if id.len() > p.len() && id.get(..p.len()).is_some_and(|s| s.eq_ignore_ascii_case(p)) {
+                        return Ok(Expr::Name(id[p.len()..].to_string()));
+                    }
                 }
+                Ok(Expr::Name(id))
             }
             Tok::Op(o) => Err(format!("unexpected operator {o}")),
             other => Err(format!("unexpected {other:?}")),
@@ -879,8 +882,39 @@ pub fn print(e: &Expr) -> String {
     s
 }
 
+/// Functions newer than Excel 2007, stored with the `_xlfn.` prefix in files (sorted).
+const FUTURE: &[&str] = &[
+    "ACOT", "ACOTH", "AGGREGATE", "ANCHORARRAY", "ARABIC", "ARRAYTOTEXT", "BASE", "BETA.DIST", "BETA.INV", "BINOM.DIST",
+    "BINOM.DIST.RANGE", "BINOM.INV", "BITAND", "BITLSHIFT", "BITOR", "BITRSHIFT", "BITXOR", "BYCOL", "BYROW", "CEILING.MATH",
+    "CEILING.PRECISE", "CHISQ.DIST", "CHISQ.DIST.RT", "CHISQ.INV", "CHISQ.INV.RT", "CHISQ.TEST", "CHOOSECOLS", "CHOOSEROWS",
+    "COMBINA", "CONCAT", "CONFIDENCE.NORM", "CONFIDENCE.T", "COT", "COTH", "COVARIANCE.P", "COVARIANCE.S", "CSC", "CSCH",
+    "DAYS", "DECIMAL", "DROP", "ENCODEURL", "ERF.PRECISE", "ERFC.PRECISE", "EXPAND", "EXPON.DIST", "F.DIST", "F.DIST.RT",
+    "F.INV", "F.INV.RT", "F.TEST", "FIELDVALUE", "FILTER", "FILTERXML", "FLOOR.MATH", "FLOOR.PRECISE", "FORECAST.ETS",
+    "FORECAST.ETS.CONFINT", "FORECAST.ETS.SEASONALITY", "FORECAST.ETS.STAT", "FORECAST.LINEAR", "FORMULATEXT", "GAMMA",
+    "GAMMA.DIST", "GAMMA.INV", "GAMMALN.PRECISE", "GAUSS", "GROUPBY", "HSTACK", "HYPGEOM.DIST", "IFNA", "IFS", "IMAGE",
+    "IMCOSH", "IMCOT", "IMCSC", "IMCSCH", "IMSEC", "IMSECH", "IMSINH", "IMTAN", "ISFORMULA", "ISOMITTED", "ISOWEEKNUM",
+    "LAMBDA", "LET", "LOGNORM.DIST", "LOGNORM.INV", "MAKEARRAY", "MAP", "MAXIFS", "MINIFS", "MODE.MULT", "MODE.SNGL", "MUNIT",
+    "NEGBINOM.DIST", "NORM.DIST", "NORM.INV", "NORM.S.DIST", "NORM.S.INV", "NUMBERVALUE", "PDURATION", "PERCENTILE.EXC",
+    "PERCENTILE.INC", "PERCENTOF", "PERCENTRANK.EXC", "PERCENTRANK.INC", "PERMUTATIONA", "PHI", "PIVOTBY", "POISSON.DIST",
+    "QUARTILE.EXC", "QUARTILE.INC", "RANDARRAY", "RANK.AVG", "RANK.EQ", "REDUCE", "REGEXEXTRACT", "REGEXREPLACE", "REGEXTEST",
+    "RRI", "SCAN", "SEC", "SECH", "SEQUENCE", "SHEET", "SHEETS", "SINGLE", "SKEW.P", "SORT", "SORTBY", "STDEV.P", "STDEV.S",
+    "SWITCH", "T.DIST", "T.DIST.2T", "T.DIST.RT", "T.INV", "T.INV.2T", "T.TEST", "TAKE", "TEXTAFTER", "TEXTBEFORE", "TEXTJOIN",
+    "TEXTSPLIT", "TOCOL", "TOROW", "TRIMRANGE", "UNICHAR", "UNICODE", "UNIQUE", "VALUETOTEXT", "VAR.P", "VAR.S", "VSTACK",
+    "WEBSERVICE", "WEIBULL.DIST", "WRAPCOLS", "WRAPROWS", "XLOOKUP", "XMATCH", "XOR", "Z.TEST",
+];
+
+/// File prefix of a function name (`_xlfn.`, `_xlfn._xlws.` for FILTER and SORT, or none).
+fn future_prefix(name: &str) -> &'static str {
+    match name {
+        "FILTER" | "SORT" => "_xlfn._xlws.",
+        _ if FUTURE.binary_search(&name).is_ok() => "_xlfn.",
+        _ => "",
+    }
+}
+
 /// Prints a formula as stored in .xlsx files: `A1#` as `ANCHORARRAY(A1)`, `@x` as
-/// `SINGLE(x)` and LET parameters with the `_xlpm.` prefix.
+/// `SINGLE(x)`, newer functions with `_xlfn.`, LET / LAMBDA parameters with `_xlpm.` and
+/// built-ins passed as function values with `_xleta.`.
 pub fn print_xlsx(e: &Expr) -> String {
     let mut s = String::new();
     write_expr(e, &mut s, &mut Some(Vec::new()));
@@ -900,12 +934,17 @@ fn write_expr(e: &Expr, out: &mut String, xlsx: &mut Option<Vec<String>>) {
         Expr::Err(e) => out.push_str(e.as_str()),
         Expr::Ref(r) if r.kind == RefKind::Spill && xlsx.is_some() => {
             let cell = RefExpr { kind: RefKind::Cell, ..r.clone() };
-            out.push_str(&format!("ANCHORARRAY({})", ref_str(&cell)));
+            out.push_str(&format!("_xlfn.ANCHORARRAY({})", ref_str(&cell)));
         }
         Expr::Ref(r) => out.push_str(&ref_str(r)),
         Expr::Name(n) => {
-            if xlsx.as_ref().is_some_and(|lets| lets.iter().any(|l| l.eq_ignore_ascii_case(n))) {
-                out.push_str("_xlpm.");
+            if let Some(lets) = xlsx {
+                if lets.iter().any(|l| l.eq_ignore_ascii_case(n)) {
+                    out.push_str("_xlpm.");
+                } else if super::functions::is_builtin(&n.to_ascii_uppercase()) {
+                    // A built-in passed as a function value: `GROUPBY(A:A,B:B,SUM)`.
+                    out.push_str("_xleta.");
+                }
             }
             out.push_str(n)
         }
@@ -945,6 +984,9 @@ fn write_expr(e: &Expr, out: &mut String, xlsx: &mut Option<Vec<String>>) {
                 }
                 _ => 0,
             };
+            if xlsx.is_some() {
+                out.push_str(future_prefix(name));
+            }
             out.push_str(name);
             write_args(args, out, xlsx);
             if let Some(l) = xlsx {
@@ -1184,7 +1226,11 @@ mod tests {
         assert!(parse("#").is_err());
         assert_eq!(rt("_xlfn.ANCHORARRAY(B2)*2"), "B2#*2");
         let e = parse("SUM(A1#)+@B1:B3+LET(x,2,x*A1)").unwrap();
-        assert_eq!(print_xlsx(&e), "SUM(ANCHORARRAY(A1))+SINGLE(B1:B3)+LET(_xlpm.x,2,_xlpm.x*A1)");
+        assert_eq!(print_xlsx(&e), "SUM(_xlfn.ANCHORARRAY(A1))+_xlfn.SINGLE(B1:B3)+_xlfn.LET(_xlpm.x,2,_xlpm.x*A1)");
+        let e = parse("_xlfn._xlws.SORT(_xlfn.GROUPBY(A1:A9,B1:B9,_xleta.SUM))").unwrap();
+        assert_eq!(print(&e), "SORT(GROUPBY(A1:A9,B1:B9,SUM))");
+        assert_eq!(print_xlsx(&e), "_xlfn._xlws.SORT(_xlfn.GROUPBY(A1:A9,B1:B9,_xleta.SUM))");
+        assert!(FUTURE.windows(2).all(|w| w[0] < w[1]), "FUTURE must stay sorted");
     }
 
     #[test]
