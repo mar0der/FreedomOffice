@@ -345,6 +345,8 @@ pub struct Evaluator<'a> {
     lookups: FxMap<(usize, Range), Rc<LookupCol>>,
     stack_base: usize,
     stack_budget: usize,
+    /// Cell values replaced while a data table cell is evaluated.
+    overrides: Option<Rc<FxMap<Key, Value>>>,
 }
 
 #[inline(never)]
@@ -398,6 +400,7 @@ impl<'a> Evaluator<'a> {
             lookups: FxMap::default(),
             stack_base: stack_pos(),
             stack_budget: 512 * 1024,
+            overrides: None,
         }
     }
 
@@ -432,6 +435,9 @@ impl<'a> Evaluator<'a> {
     pub fn cell_value(&mut self, s: usize, r: u32, c: u32) -> Value {
         let wb = self.wb;
         let Some(sh) = wb.sheets.get(s) else { return Value::Empty };
+        if let Some(v) = self.overrides.as_ref().and_then(|o| o.get(&(s, r, c))) {
+            return v.clone();
+        }
         match sh.get(r, c) {
             Some(cell) if cell.formula.is_some() => {
                 let key = (s, r, c);
@@ -471,6 +477,29 @@ impl<'a> Evaluator<'a> {
         self.stack.remove(&key);
         self.results.insert(key, v.clone());
         v
+    }
+
+    /// TABLE(): a cell of a What-If data table. The table's formula is evaluated afresh with the
+    /// input cell(s) replaced by this cell's row/column values.
+    pub fn data_table(&mut self) -> Res {
+        let (s, r, c) = self.cur;
+        let wb = self.wb;
+        let Some((f, subs)) = wb.sheets.get(s).and_then(|sh| crate::whatif::table_inputs(sh, r, c)) else { return Err(ErrorKind::Ref) };
+        let mut ov: FxMap<Key, Value> = self.overrides.as_deref().cloned().unwrap_or_default();
+        for (input, src) in subs {
+            let v = self.cell_value(s, src.0, src.1);
+            ov.insert((s, input.0, input.1), v);
+        }
+        let mut sub = Evaluator::new(wb, Mode::All);
+        sub.overrides = Some(Rc::new(ov));
+        sub.stack_base = self.stack_base;
+        sub.stack_budget = self.stack_budget;
+        sub.depth = self.depth + 1;
+        sub.now = self.now;
+        sub.cur = (s, f.0, f.1);
+        let v = sub.cell_value(s, f.0, f.1);
+        self.circular |= sub.circular;
+        Ok(EV::V(v))
     }
 
     /// Value of an empty cell: whatever a dynamic array spills into it.

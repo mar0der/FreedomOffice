@@ -187,6 +187,7 @@ pub enum RuleKind {
     DataBar { color: u32, gradient: bool },
     /// Two (min, max) or three (min, 50th percentile, max) colours.
     ColorScale { colors: Vec<u32> },
+    IconSet(crate::iconset::IconSetRule),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -224,13 +225,13 @@ impl CondFormat {
 
     /// Visual rules (bars, scales) colour cells by value rather than by a true/false test.
     pub fn is_visual(&self) -> bool {
-        matches!(self.kind, RuleKind::DataBar { .. } | RuleKind::ColorScale { .. })
+        matches!(self.kind, RuleKind::DataBar { .. } | RuleKind::ColorScale { .. } | RuleKind::IconSet(_))
     }
 
     fn needs_stats(&self) -> bool {
         matches!(
             self.kind,
-            RuleKind::Duplicate { .. } | RuleKind::Top { .. } | RuleKind::Average { .. } | RuleKind::DataBar { .. } | RuleKind::ColorScale { .. }
+            RuleKind::Duplicate { .. } | RuleKind::Top { .. } | RuleKind::Average { .. } | RuleKind::DataBar { .. } | RuleKind::ColorScale { .. } | RuleKind::IconSet(_)
         )
     }
 
@@ -264,6 +265,7 @@ impl CondFormat {
             RuleKind::Expression { formula } => format!("Formula: ={formula}"),
             RuleKind::DataBar { .. } => "Data Bar".into(),
             RuleKind::ColorScale { colors } => if colors.len() >= 3 { "Graded Color Scale (3)".into() } else { "Graded Color Scale".into() },
+            RuleKind::IconSet(_) => "Icon Set".into(),
         }
     }
 }
@@ -354,6 +356,7 @@ pub fn shift_sheet_rules(sh: &mut Sheet, rows: bool, at: u32, n: i64) {
         shift_list(&mut dv.ranges, rows, at, n);
     }
     sh.validations.retain(|dv| !dv.ranges.is_empty());
+    crate::whatif::shift_sheet(sh, rows, at, n);
 }
 
 /// Applies a formula transform to a stored formula text (no leading '=').
@@ -379,6 +382,11 @@ pub fn map_sheet_formulas(sh: &mut Sheet, f: &mut dyn FnMut(&mut Expr)) {
                 map_formula_text(f2, f);
             }
             RuleKind::Expression { formula } => map_formula_text(formula, f),
+            RuleKind::IconSet(ic) => {
+                for t in ic.thresholds.iter_mut().filter(|t| t.kind == crate::iconset::ThresholdKind::Formula) {
+                    map_formula_text(&mut t.value, f);
+                }
+            }
             _ => {}
         }
     }
@@ -432,6 +440,8 @@ pub struct RuleStats {
     /// Top/bottom rule cut-off value.
     pub threshold: f64,
     pub dups: HashMap<String, u32>,
+    /// The numbers in the range, ascending (icon sets only).
+    pub sorted: Vec<f64>,
 }
 
 /// Key used to compare values for duplicate detection (case-insensitive text).
@@ -478,6 +488,9 @@ pub fn compute_stats(sheet: &Sheet, rule: &CondFormat) -> RuleStats {
     }
     nums.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
     st.count = nums.len();
+    if matches!(rule.kind, RuleKind::IconSet(_)) {
+        st.sorted = nums.clone();
+    }
     if let (Some(&lo), Some(&hi)) = (nums.first(), nums.last()) {
         st.min = lo;
         st.max = hi;
@@ -566,6 +579,7 @@ pub struct CfOverride {
     pub strike: bool,
     pub border: Option<u32>,
     pub bar: Option<DataBarDraw>,
+    pub icon: Option<crate::iconset::IconDraw>,
 }
 
 impl CfOverride {
@@ -683,6 +697,15 @@ impl CfFrame {
                         any = true;
                     }
                 }
+                RuleKind::IconSet(ic) => {
+                    if let (Some(n), Some(st), None) = (crate::iconset::numeric(v), &p.stats, out.icon) {
+                        let b = crate::iconset::bounds(ic, &st.sorted, &mut |f| {
+                            parse_opt(f).and_then(|e| eval_at(wb, si, p.base, &e, p.base.0, p.base.1).as_number())
+                        });
+                        out.icon = Some(crate::iconset::IconDraw { icon: ic.icon_at(ic.position(n, &b)), icon_only: ic.icon_only });
+                        any = true;
+                    }
+                }
                 _ => {
                     if self.matches(p, wb, si, v, r, c) {
                         out.merge(&p.rule.format);
@@ -752,7 +775,7 @@ impl CfFrame {
                 Some(e) => truthy(&eval_at(wb, si, p.base, e, r, c)),
                 None => false,
             },
-            RuleKind::DataBar { .. } | RuleKind::ColorScale { .. } => false,
+            RuleKind::DataBar { .. } | RuleKind::ColorScale { .. } | RuleKind::IconSet(_) => false,
         }
     }
 }

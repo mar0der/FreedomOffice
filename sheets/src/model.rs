@@ -344,6 +344,9 @@ impl Cell {
     /// Text shown in the formula bar / when editing.
     pub fn input_text(&self) -> String {
         if let Some(f) = &self.formula {
+            if f.text.starts_with("TABLE(") {
+                return format!("{{={}}}", f.text);
+            }
             return format!("={}", f.text);
         }
         match &self.value {
@@ -425,6 +428,12 @@ pub struct Sheet {
     pub note_authors: HashMap<(u32, u32), String>,
     /// Pictures floating over the cells.
     pub images: Vec<Picture>,
+    /// What-If data tables ({=TABLE(r,c)} areas).
+    pub data_tables: Vec<crate::whatif::DataTable>,
+    /// Scenario Manager scenarios.
+    pub scenarios: crate::whatif::Scenarios,
+    /// Sparkline groups drawn in cells.
+    pub sparklines: Vec<crate::sparkline::SparklineGroup>,
 }
 
 /// One run of a rich-text cell.
@@ -587,6 +596,9 @@ impl Sheet {
             zoom: 1.0,
             note_authors: HashMap::new(),
             images: Vec::new(),
+            data_tables: Vec::new(),
+            scenarios: Default::default(),
+            sparklines: Vec::new(),
         }
     }
 

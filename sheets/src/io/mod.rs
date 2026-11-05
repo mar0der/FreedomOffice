@@ -7,6 +7,8 @@ mod fidelity_tests;
 mod xlsx_read;
 mod xlsx_write;
 
+pub(crate) use xlsx_read::apply_tint as tint;
+
 use std::path::Path;
 
 use crate::model::Workbook;

@@ -14,7 +14,7 @@ use super::parser::{Expr, RefKind};
 use crate::model::{Range, Workbook};
 
 const WIDE: u32 = 32;
-const VOLATILE: &[&str] = &["NOW", "TODAY", "RAND", "RANDBETWEEN", "RANDARRAY", "OFFSET", "INDIRECT", "CELL", "INFO"];
+const VOLATILE: &[&str] = &["NOW", "TODAY", "RAND", "RANDBETWEEN", "RANDARRAY", "OFFSET", "INDIRECT", "CELL", "INFO", "TABLE"];
 
 #[derive(Clone, Copy)]
 struct FInfo {

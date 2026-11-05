@@ -15,7 +15,7 @@ mod bench;
 mod tests;
 
 pub use deps::CalcState;
-pub use eval::{compare, eval_expr, eval_grid, recalc, recalc_ranges};
+pub use eval::{compare, defined_name, eval_expr, eval_grid, recalc, recalc_ranges};
 #[cfg(test)]
 pub use eval::{eval_array, eval_formula, recalc_cells};
 pub use functions::{function_names, signature};

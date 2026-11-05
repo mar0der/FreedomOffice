@@ -10,13 +10,17 @@ mod datatools;
 mod filter;
 mod formula;
 mod icon;
+mod iconset;
 mod io;
 mod model;
 mod numfmt;
 mod page;
 mod print;
+mod solver;
+mod sparkline;
 mod table;
 mod validation;
+mod whatif;
 
 use eframe::egui;
 

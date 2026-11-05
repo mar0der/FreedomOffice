@@ -1099,6 +1099,8 @@ fn find_exact(col: &LookupCol, key: &Value, wildcard: bool, reverse: bool) -> Op
 fn dispatch(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
     let n = a.len();
     match name {
+        // What-If data table cell (written by Data > What-If Analysis > Data Table).
+        "TABLE" => ev.data_table(),
         // ----- Math -----
         "SUM" => num(ev.numbers(a, false)?.iter().sum()),
         "PRODUCT" => num(ev.numbers(a, false)?.iter().product()),
