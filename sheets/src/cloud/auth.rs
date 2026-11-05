@@ -201,13 +201,18 @@ pub fn refresh(http: &dyn Transport, client_id: &str, refresh_token: &str) -> Re
 // ---------------------------------------------------------------------------
 
 /// Reads the redirect's request target (`/?code=...&state=...`). `None` for other paths
-/// (e.g. `/favicon.ico`), which are ignored while waiting.
+/// (e.g. `/favicon.ico`) and for requests without this sign-in's `state`: anything on the
+/// machine can reach the loopback port, so those are ignored and the wait goes on
+/// (RFC 8252 §8.9). Only an answer carrying the right state can end the sign-in.
 pub fn parse_callback(target: &str, state: &str) -> Option<Result<String, String>> {
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     if path != "/" || query.is_empty() {
         return None;
     }
     let param = |name: &str| query.split('&').filter_map(|kv| kv.split_once('=')).find(|(k, _)| *k == name).map(|(_, v)| pct_decode(v));
+    if param("state").as_deref() != Some(state) {
+        return None;
+    }
     if let Some(err) = param("error") {
         let desc = param("error_description").unwrap_or_default();
         let desc = desc.lines().next().unwrap_or("").trim().to_string();
@@ -218,9 +223,6 @@ pub fn parse_callback(target: &str, state: &str) -> Option<Result<String, String
         } else {
             format!("Sign-in failed: {desc}")
         }));
-    }
-    if param("state").as_deref() != Some(state) {
-        return Some(Err("The sign-in answer didn't match this request. Try again.".into()));
     }
     param("code").filter(|c| !c.is_empty()).map(Ok)
 }
@@ -431,7 +433,10 @@ mod tests {
     #[test]
     fn callback_parsing() {
         assert_eq!(parse_callback("/?code=M.C1%2Fx&state=s1", "s1"), Some(Ok("M.C1/x".into())));
-        assert!(matches!(parse_callback("/?code=abc&state=other", "s1"), Some(Err(_))));
+        // Answers for another (or no) state are ignored, errors included.
+        assert_eq!(parse_callback("/?code=abc&state=other", "s1"), None);
+        assert_eq!(parse_callback("/?error=access_denied&state=other", "s1"), None);
+        assert_eq!(parse_callback("/?error=access_denied", "s1"), None);
         assert_eq!(parse_callback("/?error=access_denied&error_description=x&state=s1", "s1"), Some(Err("Sign-in was cancelled.".into())));
         assert_eq!(
             parse_callback("/?error=invalid_request&error_description=AADSTS50011%3A+bad+redirect%0D%0ATrace&state=s1", "s1"),
@@ -446,11 +451,17 @@ mod tests {
         let lb = Loopback::bind().unwrap();
         let port = lb.port;
         let client = std::thread::spawn(move || {
-            let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
-            s.write_all(b"GET /?code=the-code&state=xyz HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
-            let mut out = String::new();
-            let _ = s.read_to_string(&mut out);
-            out
+            let get = |target: &str| {
+                let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+                s.write_all(format!("GET {target} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes()).unwrap();
+                let mut out = String::new();
+                let _ = s.read_to_string(&mut out);
+                out
+            };
+            // A forged error with the wrong state must not end the sign-in.
+            let forged = get("/?error=access_denied&state=evil");
+            assert!(forged.starts_with("HTTP/1.1 404"));
+            get("/?code=the-code&state=xyz")
         });
         let cancel = AtomicBool::new(false);
         assert_eq!(lb.wait_for_code("xyz", &cancel, Duration::from_secs(10)), Ok("the-code".into()));
