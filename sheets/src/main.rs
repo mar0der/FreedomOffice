@@ -9,6 +9,7 @@ mod condfmt;
 mod datatools;
 mod filter;
 mod formula;
+mod hash;
 mod icon;
 mod io;
 mod model;

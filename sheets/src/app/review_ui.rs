@@ -170,13 +170,13 @@ impl App {
                     }
                     let mut p = d.opts.clone();
                     p.hash = legacy_password_hash(&d.password);
+                    p.modern = None;
                     self.push_undo(&[Scope::Sheet(si)]);
                     self.wb.sheets[si].protection = Some(p);
                     self.dirty = true;
                     keep = false;
                 } else {
-                    let hash = self.wb.sheets[si].protection.as_ref().map_or(0, |p| p.hash);
-                    if hash != 0 && legacy_password_hash(&d.password) != hash {
+                    if !self.wb.sheets[si].protection.as_ref().is_none_or(|p| p.password_ok(&d.password)) {
                         d.error = Some("The password you supplied is not correct.".into());
                         return;
                     }
