@@ -6,6 +6,8 @@ mod app;
 mod chart;
 mod cloud;
 mod condfmt;
+mod datatools;
+mod filter;
 mod formula;
 mod icon;
 mod io;
