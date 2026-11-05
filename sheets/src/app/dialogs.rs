@@ -369,7 +369,17 @@ impl App {
                 win("Remove Duplicates").show(ctx, |ui| {
                     ui.set_min_width(320.0);
                     ui.label("To delete duplicate values, select one or more columns that contain duplicates.");
-                    ui.checkbox(header, "My data has headers");
+                    ui.horizontal(|ui| {
+                        if ui.button("Select All").clicked() {
+                            cols.iter_mut().for_each(|c| c.1 = true);
+                        }
+                        if ui.button("Unselect All").clicked() {
+                            cols.iter_mut().for_each(|c| c.1 = false);
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.checkbox(header, "My data has headers");
+                        });
+                    });
                     let hdr = *header;
                     egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
                         for (c, on) in cols.iter_mut() {
@@ -382,10 +392,13 @@ impl App {
                         let cs: Vec<u32> = cols.iter().filter(|c| c.1).map(|c| c.0).collect();
                         if !cs.is_empty() {
                             let n = self.remove_duplicates(range, hdr, &cs);
-                            self.dialog = Some(Dialog::Message {
-                                title: "Remove Duplicates".into(),
-                                text: format!("{n} duplicate values found and removed."),
-                            });
+                            let left = range.rows() as usize - hdr as usize - n;
+                            let text = if n == 0 {
+                                "No duplicate values found.".to_string()
+                            } else {
+                                format!("{n} duplicate value{} found and removed; {left} unique value{} remain.", if n == 1 { "" } else { "s" }, if left == 1 { "" } else { "s" })
+                            };
+                            self.dialog = Some(Dialog::Message { title: "Remove Duplicates".into(), text });
                             return;
                         }
                         keep = false;
