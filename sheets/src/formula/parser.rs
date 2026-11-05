@@ -80,6 +80,14 @@ pub enum Expr {
     Paren(Box<Expr>),
     /// Omitted argument, e.g. the middle of `IF(A1,,2)`.
     Missing,
+    /// Range operator between general references: `A1:INDEX(B:B,5)`.
+    Range(Box<Expr>, Box<Expr>),
+    /// Intersection operator (a space): `A1:C3 B2:D4`.
+    Isect(Box<Expr>, Box<Expr>),
+    /// Union operator (commas inside brackets): the contents of `(A1:A3,C1:C3)`.
+    Union(Vec<Expr>),
+    /// Invocation of a computed function: `LAMBDA(x,x+1)(2)`.
+    Call(Box<Expr>, Vec<Expr>),
 }
 
 // ---------------------------------------------------------------------------
@@ -122,7 +130,19 @@ pub fn lex(src: &str) -> Result<Vec<Spanned>, String> {
         let c = at(i);
         let start = pos(i);
         if c.is_whitespace() {
-            i += 1;
+            while at(i).is_whitespace() {
+                i += 1;
+            }
+            // A space between two references is the intersection operator.
+            let nc = at(i);
+            let after_ref = match out.last().map(|t: &Spanned| &t.tok) {
+                Some(Tok::Ident(_) | Tok::Op("#")) => nc.is_alphabetic() || matches!(nc, '$' | '\'' | '_'),
+                Some(Tok::RParen) => nc.is_alphabetic() || matches!(nc, '$' | '\'' | '_' | '('),
+                _ => false,
+            };
+            if after_ref {
+                out.push(Spanned { tok: Tok::Op(" "), start, end: pos(i) });
+            }
             continue;
         }
         let tok = match c {
@@ -224,12 +244,39 @@ pub fn lex(src: &str) -> Result<Vec<Spanned>, String> {
                     i += 1;
                 }
                 let text = src[pos(s0)..pos(i)].to_string();
+                // 3-D reference prefix `Sheet1:Sheet3!` (not after a sheet: `S!A1:S!B2`).
+                let mut j = i + 1;
+                while at(i) == ':' && (at(j).is_alphanumeric() || matches!(at(j), '_' | '.')) {
+                    j += 1;
+                }
                 if at(i) == '!' {
                     i += 1;
                     Tok::Sheet(text)
+                } else if j > i + 1 && at(j) == '!' && !matches!(out.last().map(|t| &t.tok), Some(Tok::Sheet(_))) {
+                    let span = src[pos(s0)..pos(j)].to_string();
+                    i = j + 1;
+                    Tok::Sheet(span)
                 } else {
                     Tok::Ident(text)
                 }
+            }
+            // External workbook prefix `[Book.xlsx]Sheet1!` (or `[1]Sheet1!` as stored in files).
+            '[' => {
+                let mut j = i + 1;
+                while j < n && !matches!(at(j), ']' | '[') {
+                    j += 1;
+                }
+                let k0 = j + 1;
+                let mut k = k0;
+                while at(j) == ']' && (at(k).is_alphanumeric() || matches!(at(k), '_' | '.')) {
+                    k += 1;
+                }
+                if at(j) != ']' || j == i + 1 || k == k0 || at(k) != '!' {
+                    return Err("unexpected character '['".into());
+                }
+                let text = src[pos(i)..pos(k)].to_string();
+                i = k + 1;
+                Tok::Sheet(text)
             }
             '+' | '-' | '*' | '/' | '^' | '&' | '%' | '=' | '@' => {
                 i += 1;
