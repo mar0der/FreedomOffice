@@ -140,28 +140,50 @@ impl Config {
     }
 }
 
+/// A TOML basic string, quoted and escaped (backslashes in Windows paths, quotes, control characters).
+fn toml_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7F => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// The commented configuration written by `init`.
 pub fn template(listen: &str, data_dir: &Path, public_url: &str, tls_domain: Option<&str>, acme_email: Option<&str>) -> String {
     let domain_line = match tls_domain {
-        Some(d) => format!("tls_domain = \"{d}\""),
+        Some(d) => format!("tls_domain = {}", toml_str(d)),
         None => "# tls_domain = \"files.example.com\"".into(),
     };
     let email_line = match acme_email {
-        Some(e) => format!("acme_email = \"{e}\""),
+        Some(e) => format!("acme_email = {}", toml_str(e)),
         None => "# acme_email = \"admin@example.com\"".into(),
     };
+    let listen = toml_str(listen);
+    let data_dir = toml_str(&data_dir.display().to_string());
+    let public_url = toml_str(public_url);
     format!(
         r#"# FreedomOffice document server configuration.
 
 # Address and port. Use "127.0.0.1:8080" behind a reverse proxy (Caddy, nginx),
 # or "0.0.0.0:443" / "[::]:443" with tls_domain for built-in HTTPS.
-listen = "{listen}"
+listen = {listen}
 
 # Database and documents. Back this directory up (see `freedomoffice-server backup`).
-data_dir = "{}"
+data_dir = {data_dir}
 
 # The address people use to reach the server; used in share links.
-public_url = "{public_url}"
+public_url = {public_url}
 
 # Built-in HTTPS with automatic Let's Encrypt certificates (the listen port must be 443
 # and reachable from the internet; the domain's DNS A/AAAA record must point here).
@@ -188,8 +210,7 @@ versions_to_keep = 25
 
 # How long a share link stays usable after it was opened, in hours.
 link_access_hours = 12
-"#,
-        data_dir.display()
+"#
     )
 }
 
@@ -214,5 +235,14 @@ mod tests {
         assert!(Config::parse("tls_cert = \"/a\"").is_err());
         assert!(Config::parse("bogus = 1").is_err());
         assert!(Config::parse("listen = \"nope\"").is_err());
+    }
+
+    #[test]
+    fn template_escapes_windows_paths_and_quotes() {
+        let dir = Path::new(r"C:\Users\me\FreedomOffice\data");
+        let t = template("127.0.0.1:8765", dir, "http://127.0.0.1:8765", Some("files.example.com"), Some("a\"b@example.com"));
+        let c = Config::parse(&t).unwrap();
+        assert_eq!(c.data_dir, dir);
+        assert_eq!(c.public_url, "http://127.0.0.1:8765");
     }
 }
