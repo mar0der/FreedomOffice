@@ -75,7 +75,7 @@ impl App {
             }
             return;
         }
-        if self.chart_keys(ctx) {
+        if self.chart_keys(ctx) || self.picture_keys(ctx) {
             return;
         }
         let events = ctx.input(|i| i.events.clone());

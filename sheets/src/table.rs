@@ -68,36 +68,6 @@ impl TotalFn {
         })
     }
 
-    pub fn from_code(n: u32) -> TotalFn {
-        match n % 100 {
-            1 => TotalFn::Average,
-            2 => TotalFn::CountNums,
-            3 => TotalFn::Count,
-            4 => TotalFn::Max,
-            5 => TotalFn::Min,
-            7 => TotalFn::StdDev,
-            9 => TotalFn::Sum,
-            10 => TotalFn::Var,
-            _ => TotalFn::Custom,
-        }
-    }
-
-    /// `totalsRowFunction` attribute value.
-    pub fn xml(self) -> &'static str {
-        match self {
-            TotalFn::None => "none",
-            TotalFn::Average => "average",
-            TotalFn::Count => "count",
-            TotalFn::CountNums => "countNums",
-            TotalFn::Max => "max",
-            TotalFn::Min => "min",
-            TotalFn::Sum => "sum",
-            TotalFn::StdDev => "stdDev",
-            TotalFn::Var => "var",
-            TotalFn::Custom => "custom",
-        }
-    }
-
     pub fn from_xml(s: &str) -> TotalFn {
         match s {
             "average" => TotalFn::Average,
@@ -139,8 +109,6 @@ pub struct Table {
     pub filter: bool,
     pub columns: Vec<TableColumn>,
 }
-
-pub const DEFAULT_STYLE: &str = "TableStyleMedium2";
 
 impl Table {
     pub fn new(name: &str, range: Range, style: &str) -> Table {
@@ -839,6 +807,8 @@ pub fn sync_columns_from_cells(sh: &Sheet, t: &mut Table) {
 mod tests {
     use super::*;
     use crate::model::{cell_from_input, Sheet};
+
+    const DEFAULT_STYLE: &str = "TableStyleMedium2";
 
     fn book() -> Workbook {
         let mut wb = Workbook::empty_with(vec![Sheet::new("Sheet1")]);

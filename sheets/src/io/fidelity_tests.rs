@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use super::{load, save};
 use crate::model::{cell_from_input, legacy_password_hash, Picture, Protection, Range, RichRun, RichText, Sheet, Style, Value, Workbook};
-use crate::table::{Table, TotalFn, DEFAULT_STYLE};
+use crate::table::{Table, TotalFn};
 
 fn temp(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("freedom_sheets_fid_{}", std::process::id()));
@@ -218,5 +218,37 @@ fn threaded_comments_become_notes() {
 
 #[test]
 fn default_table_style_is_known() {
-    assert_eq!(crate::table::style_parts(DEFAULT_STYLE), Some((1, 1)));
+    assert_eq!(crate::table::style_parts("TableStyleMedium2"), Some((1, 1)));
+}
+
+/// Loads `FS_IN`, prints what was read and saves it to `FS_OUT` (manual check against real files).
+#[test]
+#[ignore]
+fn resave_file() {
+    let (Ok(src), Ok(dst)) = (std::env::var("FS_IN"), std::env::var("FS_OUT")) else { return };
+    let mut wb = load(std::path::Path::new(&src)).unwrap();
+    wb.recalc();
+    for s in &wb.sheets {
+        println!("sheet {} zoom={} names={:?} protected={:?}", s.name, s.zoom, s.names, s.protection.as_ref().map(|p| p.hash));
+        for t in &s.tables {
+            println!("  table {} {} style={} totals={} cols={:?}", t.name, t.range.to_a1(), t.style, t.totals, t.columns);
+        }
+        for p in &s.images {
+            println!("  picture {} at {:?}+{:?} size {:?} ({} bytes)", p.ext, p.anchor, p.offset, p.size, p.data.len());
+        }
+        for (k, rt) in &s.rich {
+            println!("  rich {k:?} {:?}", rt.runs);
+        }
+        for (k, n) in &s.notes {
+            println!("  note {k:?} {n:?} by {:?}", s.note_authors.get(k));
+        }
+        for (r, row) in &s.rows {
+            for (c, cell) in row {
+                let f = cell.formula.as_ref().map(|f| f.text.as_str());
+                println!("  {} = {:?} {f:?} unlocked={}", crate::model::cell_name(*r, *c), cell.value, wb.style(cell.style).unlocked);
+            }
+        }
+    }
+    println!("global names {:?}", wb.names);
+    save(&wb, std::path::Path::new(&dst)).unwrap();
 }

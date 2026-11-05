@@ -745,6 +745,7 @@ dependencies = [
  "csv",
  "eframe",
  "embed-resource",
+ "image",
  "quick-xml 0.42.0",
  "raw-window-handle",
  "rfd",
@@ -1039,6 +1040,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]

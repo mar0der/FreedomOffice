@@ -110,7 +110,17 @@ pub fn read<R: Read + Seek>(src: R) -> Result<Workbook, String> {
                         fidelity::parse_comments(&cx, &theme, &mut sheet);
                     }
                 } else if r.ty.ends_with("/table") {
-                    if let Some(t) = pkg.text(&part()).and_then(|x| fidelity::parse_table(&x)) {
+                    if let Some(mut t) = pkg.text(&part()).and_then(|x| fidelity::parse_table(&x)) {
+                        // The header cells are what users see (and what Excel keeps on repair).
+                        if let Some(hr) = t.header_row() {
+                            for (k, col) in t.columns.iter_mut().enumerate() {
+                                let txt = crate::table::header_text(sheet.value(hr, t.range.c1 + k as u32));
+                                if !txt.is_empty() {
+                                    col.name = txt;
+                                }
+                            }
+                            t.fix_column_names();
+                        }
                         sheet.tables.push(t);
                     }
                 }
