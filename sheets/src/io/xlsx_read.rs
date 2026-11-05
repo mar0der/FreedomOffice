@@ -2,6 +2,7 @@
 
 mod charts;
 mod extras;
+mod filter;
 mod page;
 
 use std::collections::HashMap;
@@ -75,6 +76,7 @@ pub fn read<R: Read + Seek>(src: R) -> Result<Workbook, String> {
             let ctx = SheetCtx { shared: &shared, xf: &xf, theme: &theme, date1904: info.date1904 };
             parse_sheet(&x, &ctx, &mut sheet);
             extras::parse_sheet_extras(&x, &theme, &dxfs, &mut sheet);
+            filter::parse_autofilter(&x, &dxfs, &mut sheet);
             page::parse_page_setup(&x, &mut sheet.page);
             charts::read(&mut pkg, &path, &mut sheet);
         }
@@ -1125,7 +1127,7 @@ fn parse_sheet(xml: &str, ctx: &SheetCtx, sheet: &mut Sheet) {
                     }
                     "autoFilter" => {
                         if let Some(rg) = attr(e, "ref").and_then(|v| Range::parse(&v)) {
-                            sheet.filter = Some(AutoFilter { range: rg, excluded: HashMap::new() });
+                            sheet.filter = Some(AutoFilter::new(rg));
                         }
                         if is_start {
                             skip(&mut rd, e);

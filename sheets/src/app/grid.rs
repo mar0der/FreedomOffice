@@ -5,7 +5,7 @@ use eframe::egui::{
 };
 
 use super::theme::{self, rgb};
-use super::{App, Drag, EditMode, FilterPopup, Scope};
+use super::{App, Drag, EditMode, Scope};
 use crate::model::{col_name, BorderLine, HAlign, Range, Style, VAlign, Value, MAX_COLS, MAX_ROWS};
 use crate::numfmt;
 
@@ -850,28 +850,6 @@ impl App {
         }
     }
 
-    fn open_filter_popup(&mut self, col: u32, pos: Pos2) {
-        let Some(f) = self.sheet().filter.clone() else { return };
-        let sh = self.sheet();
-        let mut vals: Vec<String> = Vec::new();
-        for r in f.range.r1 + 1..=f.range.r2 {
-            let t = sh.get(r, col).map(|c| numfmt::format_value(&c.value, &self.wb.style(c.style).num_fmt).text).unwrap_or_default();
-            if !vals.contains(&t) {
-                vals.push(t);
-            }
-        }
-        vals.sort_by_key(|a| a.to_lowercase());
-        let excluded = f.excluded.get(&col).cloned().unwrap_or_default();
-        let values = vals
-            .into_iter()
-            .map(|v| {
-                let on = !excluded.contains(&v);
-                (v, on)
-            })
-            .collect();
-        self.filter_popup = Some(FilterPopup { col, pos, values, search: String::new() });
-    }
-
     pub fn vthumb(&self, lay: &Layout) -> (Rect, f32) {
         let total = lay.total_rows.max(1) as f32;
         let vis = lay.rows.len().max(1) as f32;
@@ -1318,7 +1296,7 @@ impl App {
                 for c in f.range.c1..=f.range.c2 {
                     if let Some((_, rx)) = lay.col_span(c) {
                         let btn = Rect::from_min_max(Pos2::new(rx - 17.0, b - 17.0), Pos2::new(rx - 1.0, b - 1.0));
-                        let active = f.excluded.get(&c).is_some_and(|s| !s.is_empty());
+                        let active = f.is_filtered(c);
                         cp.rect_filled(btn, 2.0, Color32::from_gray(250));
                         cp.rect_stroke(btn, 2.0, Stroke::new(1.0, Color32::from_gray(170)), StrokeKind::Inside);
                         let (g, is_icon) = self.fonts.icons.get(if active { theme::ic::FILTER } else { theme::ic::DOWN }, "▾");
@@ -1589,6 +1567,14 @@ impl App {
                     self.filter_by_active_value();
                     ui.close();
                 }
+                if ui.button("Filter by Selected Cell's Color").clicked() {
+                    self.filter_by_cell_color();
+                    ui.close();
+                }
+                if ui.button("Filter by Selected Cell's Font Color").clicked() {
+                    self.filter_by_font_color();
+                    ui.close();
+                }
                 if ui.button("Clear Filter").clicked() {
                     self.clear_filter();
                     ui.close();
@@ -1601,6 +1587,14 @@ impl App {
                 }
                 if ui.button("Sort Z to A").clicked() {
                     self.sort_simple(true);
+                    ui.close();
+                }
+                if ui.button("Put Selected Cell Color On Top").clicked() {
+                    self.sort_by_cell_color();
+                    ui.close();
+                }
+                if ui.button("Put Selected Font Color On Top").clicked() {
+                    self.sort_by_font_color();
                     ui.close();
                 }
                 if ui.button("Custom Sort...").clicked() {

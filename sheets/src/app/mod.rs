@@ -4,8 +4,11 @@ mod actions;
 mod chart_view;
 mod chrome;
 mod condfmt_ui;
+mod data_ui;
 mod dialogs;
 mod editor;
+mod filter_ui;
+mod find_ui;
 mod grid;
 mod keys;
 mod keytips;
@@ -99,24 +102,8 @@ pub enum Pending {
     Exit,
 }
 
-pub struct FilterPopup {
-    pub col: u32,
-    pub pos: egui::Pos2,
-    pub values: Vec<(String, bool)>,
-    pub search: String,
-}
-
-#[derive(Default)]
-pub struct FindState {
-    pub what: String,
-    pub with: String,
-    pub match_case: bool,
-    pub whole: bool,
-    pub in_formulas: bool,
-    pub all_sheets: bool,
-    pub replace: bool,
-    pub focus: bool,
-}
+pub use filter_ui::FilterPopup;
+pub use find_ui::FindState;
 
 pub struct App {
     pub wb: Workbook,
@@ -189,15 +176,20 @@ const MAX_UNDO: usize = 100;
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, path: Option<PathBuf>) -> Self {
-        theme::set_dark(theme::system_dark());
-        theme::apply_style(&cc.egui_ctx);
-        let fonts = FontManager::new(&cc.egui_ctx);
         #[cfg(windows)]
         let hwnd = window_handle(cc);
-        #[cfg(windows)]
-        set_caption_color(hwnd);
         #[cfg(not(windows))]
         let hwnd = 0;
+        Self::with_context(&cc.egui_ctx, hwnd, path)
+    }
+
+    /// Builds the app on an egui context (also used headless by tests).
+    pub(crate) fn with_context(egui_ctx: &egui::Context, hwnd: isize, path: Option<PathBuf>) -> Self {
+        theme::set_dark(theme::system_dark());
+        theme::apply_style(egui_ctx);
+        let fonts = FontManager::new(egui_ctx);
+        #[cfg(windows)]
+        set_caption_color(hwnd);
         let mut app = App {
             wb: Workbook::new(),
             fonts,
@@ -228,7 +220,7 @@ impl App {
             pending: None,
             wheel_acc: egui::Vec2::ZERO,
             allow_close: false,
-            ctx: Some(cc.egui_ctx.clone()),
+            ctx: Some(egui_ctx.clone()),
             edit_rect: None,
             edit_bar_rect: None,
             tab_scroll: 0,

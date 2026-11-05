@@ -1173,7 +1173,7 @@ impl App {
         self.group(ui, "Data Tools", |app, ui| {
             let job = icon_job("⫼", false, "Text to\nColumns", 20.0, true, theme::text());
             if big_btn(ui, job, 60.0, false).clicked() {
-                app.dialog = Some(Dialog::TextToColumns { delim: 0, other: String::new() });
+                app.open_text_to_columns();
             }
             let job = icon_job("⧉", false, "Remove\nDuplicates", 20.0, true, theme::text());
             if big_btn(ui, job, 66.0, false).clicked() {
@@ -1193,6 +1193,10 @@ impl App {
             let job = icon_job("⊟", false, "Ungroup", 20.0, true, theme::text());
             if big_btn(ui, job, 54.0, false).on_hover_text("Ungroup (Alt+Shift+Left)").clicked() {
                 app.outline_group_cmd(true);
+            }
+            let job = icon_job("Σ", false, "Subtotal", 20.0, true, theme::text());
+            if big_btn(ui, job, 56.0, false).on_hover_text("Insert subtotals and totals for groups of rows").clicked() {
+                app.open_subtotal();
             }
         });
     }

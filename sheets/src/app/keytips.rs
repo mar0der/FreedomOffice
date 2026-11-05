@@ -131,6 +131,7 @@ pub const KEYTIPS: &[(&str, &str)] = &[
     ("ASD", "Sort Z to A"),
     ("ASS", "Sort..."),
     ("AT", "Filter"),
+    ("AB", "Subtotal"),
     ("AC", "Clear Filter"),
     ("AY", "Reapply Filter"),
     ("AE", "Text to Columns..."),
@@ -309,8 +310,9 @@ impl App {
             "HSF" | "AT" | "DFF" => self.toggle_filter(),
             "HSC" | "AC" => self.clear_filter(),
             "AY" => self.apply_filter(),
-            "AE" => self.dialog = Some(Dialog::TextToColumns { delim: 0, other: String::new() }),
+            "AE" => self.open_text_to_columns(),
             "AM" => self.open_remove_duplicates(),
+            "AB" => self.open_subtotal(),
             "AGG" => self.outline_group_cmd(false),
             "AUU" => self.outline_group_cmd(true),
             "HFDF" => {
