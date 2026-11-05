@@ -1365,6 +1365,9 @@ impl App {
         painter.rect_filled(lay.vbar, 0.0, theme::chrome());
         painter.rect_filled(lay.hbar, 0.0, theme::chrome());
         painter.rect_filled(Rect::from_min_max(Pos2::new(lay.vbar.left(), lay.hbar.top()), lay.rect.right_bottom()), 0.0, theme::chrome());
+        // gaps beside the headers (above the vertical bar, left of the horizontal bar)
+        painter.rect_filled(Rect::from_min_max(Pos2::new(lay.vbar.left(), lay.rect.top()), Pos2::new(lay.rect.right(), lay.vbar.top())), 0.0, theme::grid_gutter());
+        painter.rect_filled(Rect::from_min_max(Pos2::new(lay.rect.left(), lay.hbar.top()), Pos2::new(lay.hbar.left(), lay.rect.bottom())), 0.0, theme::grid_gutter());
         let (vt, _) = self.vthumb(lay);
         let (ht, _) = self.hthumb(lay);
         let thumb_col = if matches!(self.drag, Drag::VScroll(..)) { theme::scroll_thumb_active() } else { theme::scroll_thumb() };

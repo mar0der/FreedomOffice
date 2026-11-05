@@ -132,6 +132,16 @@ fn paint_launcher(p: &egui::Painter, c: Pos2, color: Color32) {
     p.line_segment([Pos2::new(r, b - 4.0), Pos2::new(r, b)], st);
 }
 
+/// Gives the following combo boxes an outlined field look; returns the flat ribbon visuals to restore.
+fn field_visuals(ui: &mut egui::Ui) -> egui::style::Widgets {
+    let flat = ui.visuals().widgets.clone();
+    let w = &mut ui.visuals_mut().widgets;
+    w.inactive.bg_stroke = Stroke::new(1.0, theme::field_edge());
+    w.hovered.bg_stroke = Stroke::new(1.0, theme::button_edge());
+    w.open.bg_stroke = Stroke::new(1.0, theme::accent());
+    flat
+}
+
 /// Small chevron (˅ or ˄) painted as two strokes.
 pub fn paint_chevron(p: &egui::Painter, c: Pos2, up: bool, color: Color32) {
     let (w, h) = (4.0, if up { -2.5 } else { 2.5 });
@@ -433,6 +443,8 @@ impl App {
             .inner_margin(egui::Margin { left: 6, right: 24, top: 4, bottom: 0 })
             .outer_margin(egui::Margin { left: 6, right: 6, top: 0, bottom: 6 });
         let panel = frame.show(ui, |ui| {
+            // the panel spans the window like the desktop ribbon, even when the groups are narrower
+            ui.set_min_width(ui.available_width());
             egui::ScrollArea::horizontal().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing = Vec2::new(2.0, 2.0);
@@ -515,6 +527,7 @@ impl App {
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
                     let cur_font = st.font.clone().unwrap_or_else(|| theme::DEFAULT_CELL_FONT.to_string());
+                    let flat = field_visuals(ui);
                     egui::ComboBox::from_id_salt("font_name").width(130.0).selected_text(&cur_font).height(400.0).show_ui(ui, |ui| {
                         for f in theme::FONT_CHOICES {
                             if ui.selectable_label(cur_font.eq_ignore_ascii_case(f), *f).clicked() {
@@ -532,6 +545,7 @@ impl App {
                             }
                         }
                     });
+                    ui.visuals_mut().widgets = flat;
                     if app.small(ui, ic::FONT_UP, "A▲", "", "Increase Font Size (Ctrl+Shift+>)", false).clicked() {
                         app.grow_font(true);
                     }
@@ -662,6 +676,7 @@ impl App {
                     .find(|(_, f)| (st.num_fmt.is_empty() && *f == "General") || st.num_fmt == *f)
                     .map(|(n, _)| n.to_string())
                     .unwrap_or_else(|| if st.num_fmt.is_empty() { "General".into() } else { "Custom".into() });
+                let flat = field_visuals(ui);
                 egui::ComboBox::from_id_salt("num_fmt").width(130.0).selected_text(cur).show_ui(ui, |ui| {
                     let (r, c) = app.active();
                     let v = app.sheet().value(r, c).clone();
@@ -677,6 +692,7 @@ impl App {
                         app.open_format_cells(0);
                     }
                 });
+                ui.visuals_mut().widgets = flat;
                 ui.horizontal(|ui| {
                     ui.menu_button(RichText::new("$").size(14.0), |ui| {
                         for (l, f) in [

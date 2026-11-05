@@ -105,6 +105,8 @@ palette! {
     /// Scrollbar thumb, idle and dragged.
     scroll_thumb = 0xB4B4B4, 0x6B6B6B;
     scroll_thumb_active = 0x787878, 0x9E9E9E;
+    /// Gaps beside the headers at the scrollbars (white sheet in light mode, window colour in dark).
+    grid_gutter = 0xFFFFFF, 0x121A1E;
     /// Select-all triangle in the header corner.
     select_all = 0xB9B9B9, 0x6E6E6E;
     /// KeyTips help panel and its key badges.
