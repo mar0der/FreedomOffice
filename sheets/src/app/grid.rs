@@ -233,7 +233,10 @@ impl App {
 
     pub fn grid_ui(&mut self, ui: &mut egui::Ui) {
         let full = ui.available_rect_before_wrap();
-        let (rl, cl) = {
+        // Ctrl+8 hides the outline symbols.
+        let (rl, cl) = if self.kb.outline_hidden {
+            (0, 0)
+        } else {
             let sh = self.sheet();
             (sh.row_levels.values().copied().max().unwrap_or(0), sh.col_levels.values().copied().max().unwrap_or(0))
         };
@@ -265,6 +268,7 @@ impl App {
             self.outline_ui(ui, full, &lay, rl, cl);
         }
         self.context_menu(&resp);
+        self.float_buttons_ui(ui);
     }
 
     // ------------------------------------------------------------------
@@ -323,6 +327,12 @@ impl App {
         }
 
         let Some(pos) = pos else { return };
+        // F8 / Shift+F8 selection modes act like holding Shift / Ctrl while clicking.
+        let mods = self.kb.apply(mods);
+        // Clicks on the floating Auto Fill / Paste Options buttons are theirs.
+        if self.drag == Drag::None && self.menu.float_rects.iter().any(|r| r.contains(pos)) {
+            return;
+        }
         self.hover_cell = if hovered && lay.cells.contains(pos) && self.drag == Drag::None {
             Some((lay.row_near(pos.y), lay.col_near(pos.x)))
         } else {
@@ -816,7 +826,9 @@ impl App {
             Drag::Fill(src) => {
                 let target = self.fill_target(lay, src, pos);
                 if target != src {
-                    self.autofill(src, target);
+                    // Ctrl+drag toggles between copying and filling a series.
+                    let ctrl = self.ctx.as_ref().is_some_and(|x| x.input(|i| i.modifiers.ctrl));
+                    self.autofill_kind(src, target, if ctrl { super::fill::FillKind::Toggle } else { super::fill::FillKind::Auto });
                 }
             }
             Drag::Cells => {
@@ -1513,135 +1525,6 @@ impl App {
         painter.ctx().request_repaint_after(std::time::Duration::from_millis(520));
     }
 
-    fn context_menu(&mut self, resp: &egui::Response) {
-        resp.context_menu(|ui| {
-            ui.set_min_width(190.0);
-            let sel = self.sel();
-            if ui.button("Cut").clicked() {
-                self.copy(ui.ctx(), true);
-                ui.close();
-            }
-            if ui.button("Copy").clicked() {
-                self.copy(ui.ctx(), false);
-                ui.close();
-            }
-            if ui.add_enabled(self.clip.is_some(), egui::Button::new("Paste")).clicked() {
-                self.paste_internal(super::actions::PasteMode::All);
-                ui.close();
-            }
-            ui.menu_button("Paste Special", |ui| {
-                for (label, m) in [
-                    ("Values", super::actions::PasteMode::Values),
-                    ("Formulas", super::actions::PasteMode::Formulas),
-                    ("Formatting", super::actions::PasteMode::Formats),
-                    ("Transpose", super::actions::PasteMode::Transpose),
-                ] {
-                    if ui.add_enabled(self.clip.is_some(), egui::Button::new(label)).clicked() {
-                        self.paste_internal(m);
-                        ui.close();
-                    }
-                }
-            });
-            ui.separator();
-            if ui.button("Insert...").clicked() {
-                self.insert_cells_prompt();
-                ui.close();
-            }
-            if ui.button("Delete...").clicked() {
-                self.delete_cells_prompt();
-                ui.close();
-            }
-            if ui.button("Clear Contents").clicked() {
-                self.clear(true, false);
-                ui.close();
-            }
-            ui.separator();
-            let (ar, ac) = self.active();
-            let has_link = self.sheet().links.contains_key(&(ar, ac));
-            if ui.button(if has_link { "Edit Hyperlink..." } else { "Link..." }).clicked() {
-                self.open_link_dialog();
-                ui.close();
-            }
-            if has_link {
-                if ui.button("Open Hyperlink").clicked() {
-                    if let Some(t) = self.sheet().links.get(&(ar, ac)).cloned() {
-                        self.follow_link(&t);
-                    }
-                    ui.close();
-                }
-                if ui.button("Remove Hyperlink").clicked() {
-                    self.set_link(ar, ac, "", None);
-                    ui.close();
-                }
-            }
-            let has_note = self.sheet().notes.contains_key(&(ar, ac));
-            if ui.button(if has_note { "Edit Note" } else { "New Note" }).clicked() {
-                self.edit_note();
-                ui.close();
-            }
-            if has_note && ui.button("Delete Note").clicked() {
-                self.delete_notes_in_selection();
-                ui.close();
-            }
-            ui.separator();
-            ui.menu_button("Filter", |ui| {
-                if ui.button("Filter by Selected Cell's Value").clicked() {
-                    self.filter_by_active_value();
-                    ui.close();
-                }
-                if ui.button("Clear Filter").clicked() {
-                    self.clear_filter();
-                    ui.close();
-                }
-            });
-            ui.menu_button("Sort", |ui| {
-                if ui.button("Sort A to Z").clicked() {
-                    self.sort_simple(false);
-                    ui.close();
-                }
-                if ui.button("Sort Z to A").clicked() {
-                    self.sort_simple(true);
-                    ui.close();
-                }
-                if ui.button("Custom Sort...").clicked() {
-                    self.open_sort_dialog();
-                    ui.close();
-                }
-            });
-            ui.separator();
-            if ui.button("Format Cells...").clicked() {
-                self.open_format_cells(0);
-                ui.close();
-            }
-            if sel.is_full_cols() {
-                if ui.button("Column Width...").clicked() {
-                    self.open_col_width();
-                    ui.close();
-                }
-                if ui.button("Hide").clicked() {
-                    self.hide_cols(true);
-                    ui.close();
-                }
-                if ui.button("Unhide").clicked() {
-                    self.hide_cols(false);
-                    ui.close();
-                }
-            } else if sel.is_full_rows() {
-                if ui.button("Row Height...").clicked() {
-                    self.open_row_height();
-                    ui.close();
-                }
-                if ui.button("Hide").clicked() {
-                    self.hide_rows(true);
-                    ui.close();
-                }
-                if ui.button("Unhide").clicked() {
-                    self.hide_rows(false);
-                    ui.close();
-                }
-            }
-        });
-    }
 }
 
 impl App {

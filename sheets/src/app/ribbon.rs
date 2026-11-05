@@ -1175,6 +1175,10 @@ impl App {
             if big_btn(ui, job, 60.0, false).clicked() {
                 app.dialog = Some(Dialog::TextToColumns { delim: 0, other: String::new() });
             }
+            let job = icon_job("⚡", false, "Flash\nFill", 20.0, true, theme::text());
+            if big_btn(ui, job, 50.0, false).on_hover_text("Flash Fill (Ctrl+E)\nAutomatically fill in values from examples typed next to your data.").clicked() {
+                app.flash_fill();
+            }
             let job = icon_job("⧉", false, "Remove\nDuplicates", 20.0, true, theme::text());
             if big_btn(ui, job, 66.0, false).clicked() {
                 app.open_remove_duplicates();

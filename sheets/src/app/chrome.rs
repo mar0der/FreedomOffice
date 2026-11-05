@@ -445,6 +445,10 @@ impl App {
         ui.horizontal_centered(|ui| {
             ui.add_space(10.0);
             ui.label(RichText::new(self.mode_label()).size(12.0).color(theme::text_dim()));
+            for m in self.kb.status() {
+                ui.add_space(16.0);
+                ui.label(RichText::new(m).size(12.0).color(theme::text_dim()));
+            }
             if let Some(s) = &self.status {
                 ui.add_space(16.0);
                 ui.label(RichText::new(s).size(12.0).color(theme::text_dim()));

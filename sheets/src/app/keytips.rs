@@ -135,6 +135,7 @@ pub const KEYTIPS: &[(&str, &str)] = &[
     ("AY", "Reapply Filter"),
     ("AE", "Text to Columns..."),
     ("AM", "Remove Duplicates..."),
+    ("AFF", "Flash Fill"),
     ("AGG", "Group"),
     ("AUU", "Ungroup"),
     // Page layout
@@ -226,7 +227,7 @@ impl App {
             "HVF" => self.paste_internal(PasteMode::Formulas),
             "HVR" => self.paste_internal(PasteMode::Formats),
             "HVT" => self.paste_internal(PasteMode::Transpose),
-            "HVS" | "ES" => self.dialog = Some(Dialog::PasteSpecial { mode: 0, transpose: false }),
+            "HVS" | "ES" => self.open_paste_special(),
             "HX" => self.copy(ctx, true),
             "HCC" => self.copy(ctx, false),
             "HFP" => self.start_format_painter(),
@@ -311,6 +312,7 @@ impl App {
             "AY" => self.apply_filter(),
             "AE" => self.dialog = Some(Dialog::TextToColumns { delim: 0, other: String::new() }),
             "AM" => self.open_remove_duplicates(),
+            "AFF" => self.flash_fill(),
             "AGG" => self.outline_group_cmd(false),
             "AUU" => self.outline_group_cmd(true),
             "HFDF" => {
