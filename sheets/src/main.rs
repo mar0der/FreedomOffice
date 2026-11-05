@@ -4,6 +4,7 @@
 
 mod app;
 mod chart;
+mod cloud;
 mod condfmt;
 mod formula;
 mod icon;
