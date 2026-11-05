@@ -122,6 +122,13 @@ impl App {
         if sel.is_single() { self.current_region() } else { sel }
     }
 
+    /// Inserts the first (default) subtype of a chart kind.
+    pub fn insert_chart(&mut self, kind: ChartKind) {
+        if let Some(st) = chart::subtypes_of(kind).next() {
+            self.insert_chart_sub(st);
+        }
+    }
+
     pub fn insert_chart_sub(&mut self, st: &Subtype) {
         if !self.commit_edit(false) {
             return;
@@ -848,7 +855,7 @@ pub(super) fn paint_kind_icon(p: &Painter, r: Rect, kind: ChartKind) {
 pub(super) fn paint_subtype_icon(p: &Painter, r: Rect, st: &Subtype) {
     let (c0, c1, c2) = (series_color(0), series_color(1), series_color(2));
     let at = |fx: f32, fy: f32| Pos2::new(r.left() + fx * r.width(), r.top() + fy * r.height());
-    let axis = Stroke::new(1.0, Color32::from_gray(120));
+    let axis = Stroke::new(1.0, theme::icon_line());
     let a = [0.5, 0.8, 0.35];
     let b = [0.3, 0.45, 0.6];
     let lw = (r.width() / 14.0).clamp(1.2, 2.5);

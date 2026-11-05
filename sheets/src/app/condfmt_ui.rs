@@ -1041,7 +1041,7 @@ impl App {
                 });
             });
             if let Some(e) = &m.error {
-                ui.colored_label(Color32::from_rgb(0xC0, 0, 0), e);
+                ui.colored_label(theme::error_text(), e);
             }
             match buttons(ui, &["OK", "Cancel", "Apply"]) {
                 Some(0) => result = Some(0),
@@ -1140,12 +1140,12 @@ fn rule_editor_ui(ctx: &egui::Context, e: &mut RuleEditor) -> Option<bool> {
             });
             ui.add_space(6.0);
             ui.label("Edit the Rule Description:");
-            egui::Frame::new().fill(Color32::from_gray(248)).stroke(Stroke::new(1.0, theme::border())).inner_margin(egui::Margin::same(8)).show(ui, |ui| {
+            egui::Frame::new().fill(theme::inset()).stroke(Stroke::new(1.0, theme::border())).inner_margin(egui::Margin::same(8)).show(ui, |ui| {
                 ui.set_width(440.0);
                 rule_description(ui, e);
             });
             if let Some(err) = &e.error {
-                ui.colored_label(Color32::from_rgb(0xC0, 0, 0), err);
+                ui.colored_label(theme::error_text(), err);
             }
             match buttons(ui, &["OK", "Cancel"]) {
                 Some(0) => out = Some(true),
@@ -1333,7 +1333,7 @@ pub fn ribbon_button(ui: &mut egui::Ui, size: Vec2, text: &str) -> egui::Respons
 
 /// Mini icon for the ribbon button: a table with highlighted cells and a bar.
 fn paint_cf_icon(p: &egui::Painter, r: Rect) {
-    let grid = Color32::from_gray(120);
+    let grid = theme::icon_line();
     let cw = r.width() / 3.0;
     let ch = r.height() / 3.0;
     let fills = [[None, Some(0xF8696B), None], [Some(0xFFEB84), None, Some(0x63BE7B)], [None, Some(0x638EC6), None]];

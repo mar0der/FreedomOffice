@@ -238,7 +238,7 @@ impl App {
                 }
             });
             if let Some(e) = &d.error {
-                ui.colored_label(Color32::from_rgb(0xC0, 0, 0), e);
+                ui.colored_label(theme::error_text(), e);
             }
             ui.add_space(4.0);
             ui.horizontal(|ui| {

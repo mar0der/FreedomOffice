@@ -38,7 +38,9 @@ pub enum Dialog {
     ConfirmDeleteSheet(usize),
     Stats,
     Shortcuts,
-    PasteSpecial { mode: u8, transpose: bool },
+    PasteSpecial(Box<super::paste::PasteSpecialDlg>),
+    InsertPaste { down: bool },
+    CreateNames(Box<super::menus::CreateNamesDlg>),
     Note { r: u32, c: u32, text: String, focus: bool },
     Link { r: u32, c: u32, text: String, address: String, focus: bool },
     Recover { files: Vec<std::path::PathBuf> },
@@ -611,7 +613,7 @@ impl App {
                         ui.end_row();
                     });
                     if let Some(e) = error {
-                        ui.colored_label(Color32::from_rgb(0xC0, 0, 0), e.as_str());
+                        ui.colored_label(theme::error_text(), e.as_str());
                     }
                     ui.horizontal(|ui| {
                         if ui.button("Add").clicked() {
@@ -635,6 +637,11 @@ impl App {
                 let yellow = Color32::from_rgb(0xFF, 0xFF, 0xE1);
                 win(&format!("Note - {}", crate::model::cell_name(r, c))).show(ctx, |ui| {
                     egui::Frame::new().fill(yellow).stroke(egui::Stroke::new(1.0, theme::border())).show(ui, |ui| {
+                        // notes stay yellow with dark text, as on the sheet
+                        ui.visuals_mut().override_text_color = Some(theme::PAPER_TEXT);
+                        if theme::is_dark() {
+                            ui.visuals_mut().text_cursor.stroke.color = theme::PAPER_TEXT;
+                        }
                         let te = ui.add(egui::TextEdit::multiline(text).desired_width(300.0).desired_rows(6).frame(false).background_color(yellow));
                         if *focus {
                             te.request_focus();
@@ -752,34 +759,9 @@ impl App {
                     }
                 });
             }
-            Dialog::PasteSpecial { mode, transpose } => {
-                win("Paste Special").show(ctx, |ui| {
-                    ui.set_min_width(260.0);
-                    ui.label(RichText::new("Paste").strong());
-                    for (i, l) in ["All", "Formulas", "Values", "Formats"].iter().enumerate() {
-                        ui.radio_value(mode, i as u8, *l);
-                    }
-                    ui.separator();
-                    ui.checkbox(transpose, "Transpose");
-                    let (ok, cancel) = ok_cancel(ui);
-                    if ok {
-                        use super::actions::PasteMode;
-                        let m = if *transpose {
-                            PasteMode::Transpose
-                        } else {
-                            [PasteMode::All, PasteMode::Formulas, PasteMode::Values, PasteMode::Formats][*mode as usize]
-                        };
-                        if self.clip.is_some() {
-                            self.paste_internal(m);
-                        } else {
-                            self.status = Some("Copy something first, then use Paste Special.".into());
-                        }
-                        keep = false;
-                    } else if cancel {
-                        keep = false;
-                    }
-                });
-            }
+            Dialog::PasteSpecial(ps) => keep = self.paste_special_ui(ctx, ps),
+            Dialog::InsertPaste { down } => keep = self.insert_paste_ui(ctx, down),
+            Dialog::CreateNames(cn) => keep = self.create_names_ui(ctx, cn),
             Dialog::Stats => {
                 win("Workbook Statistics").show(ctx, |ui| {
                     let sh = self.sheet();
@@ -1183,6 +1165,8 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Ctrl+Z / Ctrl+Y", "Undo / Redo"),
     ("Ctrl+B / I / U / 5", "Bold / Italic / Underline / Strikethrough"),
     ("Ctrl+1", "Format Cells"),
+    ("Ctrl+F1", "Show or hide the ribbon"),
+    ("Ctrl+Shift+U", "Expand or collapse the formula bar"),
     ("Ctrl+Shift+$ % # @ ! ^ ~", "Currency, Percent, Date, Time, Number, Scientific, General"),
     ("Ctrl+Shift+& / Ctrl+Shift+_", "Outline border / remove borders"),
     ("Ctrl+D / Ctrl+R", "Fill down / right"),

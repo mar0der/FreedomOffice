@@ -46,14 +46,7 @@ pub enum BorderKind {
     ThickBottom,
 }
 
-const MONTHS_SHORT: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-const MONTHS_LONG: [&str; 12] = [
-    "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December",
-];
-const DAYS_SHORT: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-const DAYS_LONG: [&str; 7] = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
-
-fn shift_cell(cell: &mut Cell, dr: i64, dc: i64) {
+pub(super) fn shift_cell(cell: &mut Cell, dr: i64, dc: i64) {
     if dr == 0 && dc == 0 {
         return;
     }
@@ -384,7 +377,9 @@ impl App {
         }
         ctx.copy_text(text.clone());
         let notes = sh.notes.iter().filter(|((r, c), _)| sel.contains(*r, *c)).map(|((r, c), t)| (r - sel.r1, c - sel.c1, t.clone())).collect();
-        self.clip = Some(Clip { sheet: self.wb.active, range: sel, cells, text, cut, notes });
+        let full = self.sel();
+        let whole = if full.is_full_rows() { Some(true) } else if full.is_full_cols() { Some(false) } else { None };
+        self.clip = Some(Clip { sheet: self.wb.active, range: sel, cells, text, cut, notes, whole });
     }
 
     fn normalize(s: &str) -> String {
@@ -426,114 +421,7 @@ impl App {
     }
 
     pub fn paste_internal(&mut self, mode: PasteMode) {
-        let Some(clip) = self.clip.clone() else { return };
-        let si = self.wb.active;
-        let (r0, c0) = self.active();
-        let (h, w) = if mode == PasteMode::Transpose { (clip.range.cols(), clip.range.rows()) } else { (clip.range.rows(), clip.range.cols()) };
-        // Tile the clip over a larger selection that is a multiple of its size.
-        let sel = self.sel();
-        let (tr, tc) = if !sel.is_single() && sel.rows() % h == 0 && sel.cols() % w == 0 && !sel.is_full_cols() && !sel.is_full_rows() {
-            (sel.rows() / h, sel.cols() / w)
-        } else {
-            (1, 1)
-        };
-        let (r0, c0) = if tr * tc > 1 { (sel.r1, sel.c1) } else { (r0, c0) };
-        let target = Range::new(r0, c0, (r0 + h * tr - 1).min(MAX_ROWS - 1), (c0 + w * tc - 1).min(MAX_COLS - 1));
-
-        if clip.cut && mode == PasteMode::All {
-            self.push_undo(&[Scope::All]);
-            // Move: take the cells out, fix references, put them back at the destination.
-            let src_sheet = clip.sheet;
-            let mut taken = Vec::new();
-            {
-                let sh = &mut self.wb.sheets[src_sheet];
-                let keys: Vec<(u32, u32)> = sh.iter_range(clip.range).map(|(r, c, _)| (r, c)).collect();
-                for (r, c) in keys {
-                    if let Some(cell) = sh.remove(r, c) {
-                        taken.push((r - clip.range.r1, c - clip.range.c1, cell));
-                    }
-                }
-            }
-            let dr = r0 as i64 - clip.range.r1 as i64;
-            let dc = c0 as i64 - clip.range.c1 as i64;
-            let src_name = self.wb.sheets[src_sheet].name.clone();
-            let src = clip.range;
-            self.transform_formulas(|e, fsi| formula::move_refs(e, &src_name, fsi == src_sheet, src, dr, dc));
-            for (_, _, cell) in taken.iter_mut() {
-                if let Some(f) = &mut cell.formula {
-                    if let Some(ast) = &mut f.ast {
-                        formula::move_refs(ast, &src_name, src_sheet == si, src, dr, dc);
-                        f.text = formula::print(ast);
-                    }
-                }
-            }
-            let dest = &mut self.wb.sheets[si];
-            let keys: Vec<(u32, u32)> = dest.iter_range(target).map(|(r, c, _)| (r, c)).collect();
-            for (r, c) in keys {
-                dest.remove(r, c);
-            }
-            for (dr0, dc0, cell) in taken {
-                dest.set(r0 + dr0, c0 + dc0, Some(cell));
-            }
-            let src_rg = clip.range;
-            self.wb.sheets[src_sheet].notes.retain(|(r, c), _| !src_rg.contains(*r, *c));
-            for (dr0, dc0, t) in &clip.notes {
-                self.wb.sheets[si].notes.insert((r0 + dr0, c0 + dc0), t.clone());
-            }
-            self.clip = None;
-            self.select_range(target);
-            self.changed();
-            return;
-        }
-
-        if matches!(mode, PasteMode::All | PasteMode::Transpose) && !clip.notes.is_empty() {
-            self.push_undo(&[Scope::Sheet(si)]);
-            for ti in 0..tr {
-                for tj in 0..tc {
-                    for (dr, dc, t) in &clip.notes {
-                        let (dr, dc) = if mode == PasteMode::Transpose { (*dc, *dr) } else { (*dr, *dc) };
-                        self.wb.sheets[si].notes.insert((r0 + ti * h + dr, c0 + tj * w + dc), t.clone());
-                    }
-                }
-            }
-        } else {
-            self.push_undo(&[Scope::Range(si, target)]);
-        }
-        for ti in 0..tr {
-            for tj in 0..tc {
-                let br = r0 + ti * h;
-                let bc = c0 + tj * w;
-                // clear destination block for full pastes
-                if matches!(mode, PasteMode::All | PasteMode::Transpose) {
-                    let blk = Range::new(br, bc, (br + h - 1).min(MAX_ROWS - 1), (bc + w - 1).min(MAX_COLS - 1));
-                    let keys: Vec<(u32, u32)> = self.wb.sheets[si].iter_range(blk).map(|(r, c, _)| (r, c)).collect();
-                    for (r, c) in keys {
-                        self.wb.sheets[si].remove(r, c);
-                    }
-                }
-                for cc in &clip.cells {
-                    let (dr, dc) = if mode == PasteMode::Transpose { (cc.dc, cc.dr) } else { (cc.dr, cc.dc) };
-                    let (r, c) = (br + dr, bc + dc);
-                    if r >= MAX_ROWS || c >= MAX_COLS {
-                        continue;
-                    }
-                    let style_id = self.wb.intern_style(cc.style.clone());
-                    let existing = self.wb.sheets[si].get(r, c).cloned().unwrap_or_default();
-                    let mut cell = cc.cell.clone();
-                    cell.style = style_id;
-                    shift_cell(&mut cell, r as i64 - (clip.range.r1 + cc.dr) as i64, c as i64 - (clip.range.c1 + cc.dc) as i64);
-                    let out = match mode {
-                        PasteMode::All | PasteMode::Transpose => cell,
-                        PasteMode::Values => Cell { value: cell.value, formula: None, style: existing.style },
-                        PasteMode::Formulas => Cell { value: cell.value, formula: cell.formula, style: existing.style },
-                        PasteMode::Formats => Cell { value: existing.value, formula: existing.formula, style: style_id },
-                    };
-                    self.wb.sheets[si].set(r, c, Some(out));
-                }
-            }
-        }
-        self.select_range(target);
-        self.changed_ranges(si, &[target]);
+        self.paste_special(mode.into());
     }
 
     // ------------------------------------------------------------------
@@ -1299,48 +1187,6 @@ impl App {
         }
     }
 
-    pub fn autofill(&mut self, src: Range, target: Range) {
-        let si = self.wb.active;
-        self.push_undo(&[Scope::Range(si, target)]);
-        let vertical = target.rows() != src.rows();
-        let (lines, len) = if vertical { (src.c1..=src.c2, src.rows()) } else { (src.r1..=src.r2, src.cols()) };
-        let forward = if vertical { target.r2 > src.r2 } else { target.c2 > src.c2 };
-        let count = if vertical { target.rows() - src.rows() } else { target.cols() - src.cols() };
-        for line in lines {
-            let seq: Vec<Option<Cell>> = (0..len)
-                .map(|k| {
-                    let (r, c) = if vertical { (src.r1 + k, line) } else { (line, src.c1 + k) };
-                    self.wb.sheets[si].get(r, c).cloned()
-                })
-                .collect();
-            let series = Series::detect(&seq, &self.wb);
-            for k in 0..count {
-                let (pos, step_index) = if forward { (len + k, len as i64 + k as i64) } else { (0, -(k as i64) - 1) };
-                let _ = pos;
-                let src_idx = (step_index.rem_euclid(len as i64)) as u32;
-                let (r, c) = if vertical {
-                    let r = if forward { src.r2 + 1 + k } else { src.r1 - 1 - k };
-                    (r, line)
-                } else {
-                    let c = if forward { src.c2 + 1 + k } else { src.c1 - 1 - k };
-                    (line, c)
-                };
-                let (sr, sc) = if vertical { (src.r1 + src_idx, line) } else { (line, src.c1 + src_idx) };
-                let mut cell = seq[src_idx as usize].clone();
-                if let Some(cell) = &mut cell {
-                    if cell.formula.is_some() {
-                        shift_cell(cell, r as i64 - sr as i64, c as i64 - sc as i64);
-                    } else if let Some(v) = series.value(step_index, src_idx as usize) {
-                        cell.value = v;
-                    }
-                }
-                self.wb.sheets[si].set(r, c, cell);
-            }
-        }
-        self.select_range(target);
-        self.changed();
-    }
-
     // ------------------------------------------------------------------
     // AutoSum and functions
     // ------------------------------------------------------------------
@@ -1429,7 +1275,7 @@ impl App {
     // Sort & filter
     // ------------------------------------------------------------------
 
-    fn sort_area(&self) -> (Range, bool) {
+    pub(super) fn sort_area(&self) -> (Range, bool) {
         let sel = self.sel();
         let rg = if sel.is_single() { self.current_region() } else { self.sel_clipped() };
         // header heuristic: first row all text, second row has non-text
@@ -2463,78 +2309,6 @@ pub fn adjust_decimals(fmt: &str, delta: i32, sample: &Value) -> String {
         i += 1;
     }
     out
-}
-
-/// Fill-series detection for drag-fill.
-enum Series {
-    Copy,
-    Linear { first: f64, step: f64 },
-    TextNum { prefix: String, first: i64, step: i64, width: usize },
-    Names { list: &'static [&'static str], start: usize, step: i64 },
-}
-
-impl Series {
-    fn detect(seq: &[Option<Cell>], wb: &crate::model::Workbook) -> Series {
-        if seq.iter().any(|c| c.as_ref().is_some_and(|c| c.formula.is_some())) {
-            return Series::Copy;
-        }
-        let vals: Vec<Value> = seq.iter().map(|c| c.as_ref().map(|c| c.value.clone()).unwrap_or_default()).collect();
-        if vals.iter().all(|v| matches!(v, Value::Number(_))) {
-            let nums: Vec<f64> = vals.iter().filter_map(|v| v.as_number()).collect();
-            if nums.len() >= 2 {
-                return Series::Linear { first: nums[0], step: (nums[nums.len() - 1] - nums[0]) / (nums.len() - 1) as f64 };
-            }
-            if nums.len() == 1 {
-                let is_date = seq[0].as_ref().is_some_and(|c| numfmt::is_date_format(&wb.style(c.style).num_fmt));
-                if is_date {
-                    return Series::Linear { first: nums[0], step: 1.0 };
-                }
-            }
-            return Series::Copy;
-        }
-        if let Some(texts) = vals.iter().map(|v| if let Value::Text(t) = v { Some(t.clone()) } else { None }).collect::<Option<Vec<_>>>() {
-            for list in [&MONTHS_SHORT[..], &MONTHS_LONG[..], &DAYS_SHORT[..], &DAYS_LONG[..]] {
-                let idx: Option<Vec<usize>> = texts.iter().map(|t| list.iter().position(|m| m.eq_ignore_ascii_case(t))).collect();
-                if let Some(idx) = idx {
-                    let step = if idx.len() >= 2 { idx[1] as i64 - idx[0] as i64 } else { 1 };
-                    return Series::Names { list, start: idx[0], step };
-                }
-            }
-            // "Item 1", "Q3"
-            let split = |t: &str| -> Option<(String, i64, usize)> {
-                let digits: String = t.chars().rev().take_while(|c| c.is_ascii_digit()).collect::<Vec<_>>().into_iter().rev().collect();
-                if digits.is_empty() || digits.len() == t.len() {
-                    return None;
-                }
-                Some((t[..t.len() - digits.len()].to_string(), digits.parse().ok()?, digits.len()))
-            };
-            let parts: Option<Vec<_>> = texts.iter().map(|t| split(t)).collect();
-            if let Some(p) = parts {
-                if p.iter().all(|x| x.0 == p[0].0) {
-                    let step = if p.len() >= 2 { (p[p.len() - 1].1 - p[0].1) / (p.len() as i64 - 1) } else { 1 };
-                    return Series::TextNum { prefix: p[0].0.clone(), first: p[0].1, step, width: p[0].2 };
-                }
-            }
-        }
-        Series::Copy
-    }
-
-    /// Value at absolute step index (0 = first source cell).
-    fn value(&self, k: i64, _src_idx: usize) -> Option<Value> {
-        match self {
-            Series::Copy => None,
-            Series::Linear { first, step } => Some(Value::Number(first + step * k as f64)),
-            Series::TextNum { prefix, first, step, width } => {
-                let n = first + step * k;
-                let w = if n >= 0 { *width } else { 0 };
-                Some(Value::Text(format!("{prefix}{:0w$}", n, w = w)))
-            }
-            Series::Names { list, start, step } => {
-                let i = (*start as i64 + step * k).rem_euclid(list.len() as i64) as usize;
-                Some(Value::Text(list[i].to_string()))
-            }
-        }
-    }
 }
 
 #[cfg(test)]

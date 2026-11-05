@@ -5,12 +5,17 @@ mod chart_draw;
 mod chart_pane;
 mod chart_view;
 mod chrome;
+mod cloud_ui;
 mod condfmt_ui;
 mod dialogs;
 mod editor;
+mod fill;
+mod flash;
 mod grid;
 mod keys;
 mod keytips;
+mod menus;
+mod paste;
 mod print_ui;
 mod ribbon;
 mod theme;
@@ -56,6 +61,8 @@ pub struct Clip {
     pub cut: bool,
     /// Notes inside the copied range: (row offset, col offset, text).
     pub notes: Vec<(u32, u32, String)>,
+    /// Copied whole rows (Some(true)) or whole columns (Some(false)).
+    pub whole: Option<bool>,
 }
 
 /// Undo snapshot of part of the workbook.
@@ -134,6 +141,8 @@ pub struct App {
     pub zoom: f32,
     pub show_formulas: bool,
     pub show_formula_bar: bool,
+    /// Formula bar expanded to three lines (Ctrl+Shift+U).
+    pub formula_bar_tall: bool,
     pub show_headings: bool,
     pub status: Option<String>,
     pub dirty: bool,
@@ -185,6 +194,16 @@ pub struct App {
     pub chart: chart_view::ChartUi,
     pub cf: condfmt_ui::CfState,
     pub dv: validation_ui::DvState,
+    /// Microsoft 365 sign-in and the open cloud document.
+    pub cloud: cloud_ui::CloudState,
+    /// Auto Fill Options button after a fill drag.
+    pub fill_button: Option<fill::FillButton>,
+    /// Paste Options button after a paste.
+    pub paste_button: Option<paste::PasteButton>,
+    /// Keyboard modes (F8 Extend / Shift+F8 Add / End) and key tracking.
+    pub kb: keys::KbState,
+    /// Context menu requested from the keyboard (Shift+F10 / Menu key), and which one.
+    pub menu: menus::MenuState,
 }
 
 const MAX_UNDO: usize = 100;
@@ -236,6 +255,7 @@ impl App {
             zoom: 1.0,
             show_formulas: false,
             show_formula_bar: true,
+            formula_bar_tall: false,
             show_headings: true,
             status: None,
             dirty: false,
@@ -279,6 +299,11 @@ impl App {
             chart: Default::default(),
             cf: Default::default(),
             dv: Default::default(),
+            cloud: Default::default(),
+            fill_button: None,
+            paste_button: None,
+            kb: Default::default(),
+            menu: Default::default(),
         }
     }
 
@@ -538,6 +563,21 @@ impl App {
     pub fn can_undo(&self) -> bool {
         !self.undo.is_empty()
     }
+    pub fn undo_len(&self) -> usize {
+        self.undo.len()
+    }
+
+    /// Merges every undo step recorded since start into one, so a compound command undoes at once.
+    pub fn squash_undo(&mut self, start: usize) {
+        if self.undo.len() <= start + 1 {
+            return;
+        }
+        let entries = self.undo.split_off(start);
+        let view = entries[0].view.clone();
+        let snaps = entries.into_iter().flat_map(|e| e.snaps).collect();
+        self.undo.push(UndoEntry { snaps, view });
+    }
+
     pub fn can_redo(&self) -> bool {
         !self.redo.is_empty()
     }
@@ -699,6 +739,15 @@ impl App {
         }
     }
 
+    /// Ctrl+W / Ctrl+F4: closes the workbook. With one workbook per window this closes the
+    /// window, after the same save prompt as the title-bar close button.
+    pub fn close_workbook(&mut self) {
+        self.confirm_then(Pending::Exit);
+        if let Some(ctx) = &self.ctx {
+            ctx.request_repaint();
+        }
+    }
+
     pub fn run_pending(&mut self, p: Pending) {
         match p {
             Pending::New => {
@@ -733,6 +782,9 @@ impl App {
         self.filter_popup = None;
         self.cf = Default::default();
         self.dv = Default::default();
+        // A cloud document stays attached only when its downloaded copy is what was opened.
+        self.cloud.doc = self.cloud.pending_open.take().filter(|d| Some(&d.local) == self.wb.path.as_ref());
+        self.cloud.upload_failed = false;
     }
 
     pub fn open_path(&mut self, p: PathBuf) {
@@ -760,6 +812,9 @@ impl App {
 
     pub fn save(&mut self) -> bool {
         self.commit_edit(false);
+        if self.cloud.doc.is_some() {
+            return self.cloud_save();
+        }
         match self.wb.path.clone() {
             Some(p) if is_native_format(&p) => self.save_to(p.clone()),
             _ => self.save_as(),
@@ -798,6 +853,8 @@ impl App {
     fn save_to(&mut self, p: PathBuf) -> bool {
         match crate::io::save(&self.wb, &p) {
             Ok(()) => {
+                // Saved to this PC: no longer linked to a cloud document.
+                self.cloud.doc = None;
                 let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
                 if ext == "xlsx" || ext == "xlsm" {
                     self.wb.path = Some(p.clone());
@@ -850,7 +907,7 @@ impl App {
     }
 
     fn update_title(&mut self, ctx: &egui::Context) {
-        let t = format!("{}{} - FreedomOffice Sheets", self.wb.file_name(), if self.dirty { " •" } else { "" });
+        let t = format!("{}{}{} - FreedomOffice Sheets", self.wb.file_name(), if self.dirty { " •" } else { "" }, self.cloud_title_suffix());
         if t != self.title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(t.clone()));
             self.title = t;
@@ -946,6 +1003,7 @@ impl eframe::App for App {
         self.handle_keys(ctx);
         self.update_title(ctx);
         self.poll_print();
+        self.poll_cloud(ctx);
         self.autosave(ctx);
 
         if self.backstage.is_some() {
@@ -978,5 +1036,6 @@ impl eframe::App for App {
         }
         self.dialogs_ui(ctx);
         self.chart_dialogs(ctx);
+        self.cloud_dialogs_ui(ctx);
     }
 }

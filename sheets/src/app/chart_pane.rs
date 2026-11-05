@@ -1051,7 +1051,7 @@ impl App {
                 }
             }
             if let Some(e) = &d.error {
-                ui.colored_label(Color32::from_rgb(0xC4, 0x2B, 0x1C), e);
+                ui.colored_label(theme::error_text(), e);
             }
             ui.separator();
             (ok, cancel) = Self::ok_cancel(ui);
