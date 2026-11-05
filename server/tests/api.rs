@@ -440,6 +440,7 @@ fn share_links() {
     // The access token reads this item only.
     assert_eq!(s.get(&format!("/api/items/{id}/content"), &access).body, b"link-data");
     assert_eq!(s.put(&access, &id, None, b"x").status, 403);
+    assert_eq!(s.get(&format!("/api/items/{id}/content?version=1"), &access).status, 404, "no history through links");
     assert_eq!(s.get(&format!("/api/items/{other}"), &access).status, 404);
     assert_eq!(s.get(&format!("/api/items/{root}/children"), &access).status, 404);
     assert_eq!(s.get("/api/me", &access).status, 401);

@@ -549,6 +549,10 @@ async fn get_content(State(app): State<App>, headers: HeaderMap, Path(id): Path<
             Some(v) => Some(v.parse::<i64>().map_err(|_| ApiError::bad("version must be a number."))?),
             None => None,
         };
+        // Share links give the current version only; the history is for people with access.
+        if version.is_some() && matches!(who, Principal::Link { .. }) {
+            return Err(ApiError::not_found());
+        }
         let (data, ver) = s.read_content(&it, version)?;
         if let (Principal::User { user, .. }, None) = (&who, version) {
             s.touch_recent(&user.id, &it.id)?;
