@@ -115,6 +115,15 @@ fn replace_autofilter(xml: &str, new: &str) -> Option<String> {
     Some(format!("{}{}{}", &xml[..a], new, &xml[end..]))
 }
 
+/// The worksheet part with the full `<autoFilter>`; its colour filters' dxfs are added to
+/// `dxfs` only when the sheet really has an autoFilter to replace.
+fn patch_sheet(xml: &str, f: &AutoFilter, base: usize, dxfs: &mut Vec<String>) -> Option<String> {
+    let mut mine = Vec::new();
+    let new = replace_autofilter(xml, &autofilter_xml(f, base + dxfs.len(), &mut mine))?;
+    dxfs.extend(mine);
+    Some(new)
+}
+
 /// Appends dxf entries to styles.xml; returns the patched text.
 fn add_dxfs(styles: &str, dxfs: &[String]) -> Option<String> {
     if dxfs.is_empty() {
@@ -169,8 +178,7 @@ pub(super) fn patch(wb: &Workbook, pkg: Vec<u8>) -> Result<Vec<u8>, String> {
     for (si, f) in filtered {
         let name = format!("xl/worksheets/sheet{}.xml", si + 1);
         if let Some(p) = parts.iter_mut().find(|p| p.0 == name) {
-            let xml = String::from_utf8_lossy(&p.1).to_string();
-            if let Some(new) = replace_autofilter(&xml, &autofilter_xml(f, base, &mut dxfs)) {
+            if let Some(new) = patch_sheet(&String::from_utf8_lossy(&p.1), f, base, &mut dxfs) {
                 p.1 = new.into_bytes();
             }
         }
@@ -205,6 +213,21 @@ mod tests {
         let s = add_dxfs("<x><dxfs count=\"1\"><dxf>a</dxf></dxfs></x>", &["<dxf/>".into()]).unwrap();
         assert_eq!(s, "<x><dxfs count=\"2\"><dxf>a</dxf><dxf/></dxfs></x>");
         assert_eq!(dxf_count(&s), 2);
+    }
+
+    #[test]
+    fn colour_filter_dxfs_only_for_sheets_with_an_autofilter() {
+        let mut f = AutoFilter::new(Range::new(0, 0, 5, 1));
+        f.columns.insert(1, ColumnFilter::Color { font: false, color: Some(0xFFFF00) });
+        let mut dxfs = Vec::new();
+        // The writer skipped this sheet's autoFilter: nothing to patch, no orphan dxf.
+        assert!(patch_sheet("<worksheet><sheetData/></worksheet>", &f, 3, &mut dxfs).is_none());
+        assert!(dxfs.is_empty());
+        let xml = patch_sheet("<worksheet><autoFilter ref=\"A1:B6\"/></worksheet>", &f, 3, &mut dxfs).unwrap();
+        assert!(xml.contains("<colorFilter dxfId=\"3\"/>"));
+        assert_eq!(dxfs.len(), 1);
+        let xml = patch_sheet("<worksheet><autoFilter ref=\"A1:B6\"/></worksheet>", &f, 3, &mut dxfs).unwrap();
+        assert!(xml.contains("<colorFilter dxfId=\"4\"/>"));
     }
 
     /// Criteria and hidden rows survive a save / load, and openpyxl (when installed) reads
