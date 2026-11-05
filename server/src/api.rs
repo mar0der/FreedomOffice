@@ -315,7 +315,7 @@ pub fn router(app: App) -> Router {
         .route("/api/items/{id}/live", get(live))
         .route("/api/links/{token}", get(open_link).post(open_link_password))
         .route("/l/{token}", get(link_page))
-        .route("/l/{token}/download", get(link_download))
+        .route("/l/{token}/download", get(link_download).post(link_download_form))
         .fallback(|| async { ApiError::not_found() })
         .layer(DefaultBodyLimit::max(JSON_LIMIT))
         .layer(middleware::from_fn(log_requests))
@@ -936,11 +936,13 @@ fn page(title: &str, body: &str) -> Response {
     res
 }
 
-/// What a browser shows for a share link.
+/// What a browser shows for a share link: the file name and a download (with the password
+/// form for protected links).
 async fn link_page(State(app): State<App>, Path(token): Path<String>) -> Response {
+    let tk = token.clone();
     let r = app
         .run(move |s| {
-            let l = live_link(s, &token)?;
+            let l = live_link(s, &tk)?;
             let it = s.item(&l.item_id)?.ok_or_else(ApiError::not_found)?;
             Ok((l, it))
         })
@@ -948,15 +950,21 @@ async fn link_page(State(app): State<App>, Path(token): Path<String>) -> Respons
     match r {
         Ok((l, it)) => {
             let mut body = format!(
-                "<p>'{}' was shared with you ({}).</p><p>To open it, start FreedomOffice Sheets, choose File &gt; Open &gt; FreedomOffice Server &gt; Open a link, and paste this page's address.</p>",
+                "<p>'{}' was shared with you ({}).</p>",
                 html_escape(&it.name),
-                if l.role == Role::Edit { "can edit" } else { "can view" }
+                if l.role == Role::Edit { "anyone with the link can edit" } else { "anyone with the link can view" }
             );
-            if l.pw_hash.is_none() && it.kind == Kind::File {
-                body.push_str("<p><a href=\"download\">Download a copy</a></p>");
+            let action = format!("{}/download", html_escape(&token));
+            if it.kind != Kind::File {
+                body.push_str("<p>Folders can't be downloaded from a link.</p>");
             } else if l.pw_hash.is_some() {
-                body.push_str("<p>The link is protected by a password.</p>");
+                body.push_str(&format!(
+                    "<form method=\"post\" action=\"{action}\"><p>This link is protected by a password.</p>                     <p><input type=\"password\" name=\"password\" autocomplete=\"current-password\" autofocus> <button type=\"submit\">Download</button></p></form>"
+                ));
+            } else {
+                body.push_str(&format!("<p><a href=\"{action}\">Download a copy</a></p>"));
             }
+            body.push_str("<p style=\"color:#666\">Open the downloaded workbook with FreedomOffice Sheets or any spreadsheet program.</p>");
             page("FreedomOffice", &body)
         }
         Err(_) => {
@@ -967,30 +975,95 @@ async fn link_page(State(app): State<App>, Path(token): Path<String>) -> Respons
     }
 }
 
-/// Direct download for links without a password (`/l/<token>/download`).
+fn file_response(s: &Store, l: &Link) -> ApiResult {
+    let it = s.item(&l.item_id)?.ok_or_else(ApiError::not_found)?;
+    if it.kind != Kind::File {
+        return Err(ApiError::bad("Folders can't be downloaded."));
+    }
+    let (data, ver) = s.read_content(&it, None)?;
+    let mut res = data.into_response();
+    let h = res.headers_mut();
+    h.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"));
+    h.insert(header::ETAG, quoted(&crate::store::etag(ver.version, &ver.hash)));
+    let encoded: String = it.name.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect();
+    if let Ok(v) = HeaderValue::from_str(&format!("attachment; filename*=UTF-8''{encoded}")) {
+        h.insert(header::CONTENT_DISPOSITION, v);
+    }
+    h.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(res)
+}
+
+/// Direct download for links without a password (`GET /l/<token>/download`).
 async fn link_download(State(app): State<App>, Path(token): Path<String>) -> ApiResult {
     app.run(move |s| {
         let l = live_link(s, &token)?;
         if l.pw_hash.is_some() {
             return Err(ApiError::new(StatusCode::UNAUTHORIZED, "This link needs a password."));
         }
-        let it = s.item(&l.item_id)?.ok_or_else(ApiError::not_found)?;
-        if it.kind != Kind::File {
-            return Err(ApiError::bad("Folders can't be downloaded."));
-        }
-        let (data, ver) = s.read_content(&it, None)?;
-        let mut res = data.into_response();
-        let h = res.headers_mut();
-        h.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"));
-        h.insert(header::ETAG, quoted(&crate::store::etag(ver.version, &ver.hash)));
-        let encoded: String = it.name.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect();
-        if let Ok(v) = HeaderValue::from_str(&format!("attachment; filename*=UTF-8''{encoded}")) {
-            h.insert(header::CONTENT_DISPOSITION, v);
-        }
-        h.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
-        Ok(res)
+        file_response(s, &l)
     })
     .await
+}
+
+/// `password=...` from an HTML form body.
+fn form_value(body: &[u8], key: &str) -> String {
+    let text = String::from_utf8_lossy(body);
+    for pair in text.split('&') {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        if k == key {
+            let b = v.as_bytes();
+            let mut out = Vec::with_capacity(b.len());
+            let mut i = 0;
+            while i < b.len() {
+                match b[i] {
+                    b'+' => out.push(b' '),
+                    b'%' if i + 2 < b.len() => match u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or("zz"), 16) {
+                        Ok(x) => {
+                            out.push(x);
+                            i += 2;
+                        }
+                        Err(_) => out.push(b'%'),
+                    },
+                    c => out.push(c),
+                }
+                i += 1;
+            }
+            return String::from_utf8_lossy(&out).into_owned();
+        }
+    }
+    String::new()
+}
+
+/// Download through the password form (`POST /l/<token>/download`).
+async fn link_download_form(State(app): State<App>, ConnectInfo(Peer(peer)): ConnectInfo<Peer>, headers: HeaderMap, Path(token): Path<String>, body: Bytes) -> ApiResult {
+    let password = form_value(&body, "password");
+    let ip_key = format!("ip:{}", client_ip(&app.cfg, peer, &headers));
+    if app.limited(std::slice::from_ref(&ip_key)) {
+        return Err(too_many());
+    }
+    let tk = token.clone();
+    let link = match app.run(move |s| live_link(s, &tk)).await {
+        Ok(l) => l,
+        Err(e) => {
+            app.fail(std::slice::from_ref(&ip_key));
+            return Err(e);
+        }
+    };
+    let link_key = format!("link:{}", link.id);
+    if app.limited(std::slice::from_ref(&link_key)) {
+        return Err(too_many());
+    }
+    if let Some(hash) = link.pw_hash.clone() {
+        let ok = tokio::task::spawn_blocking(move || util::verify_password(&password, &hash)).await.map_err(|_| ApiError::internal())?;
+        if !ok {
+            app.fail(&[ip_key, link_key]);
+            let mut res = page("FreedomOffice", "<p>The password is incorrect. Go back and try again.</p>");
+            *res.status_mut() = StatusCode::UNAUTHORIZED;
+            return Ok(res);
+        }
+    }
+    app.run(move |s| file_response(s, &link)).await
 }
 
 /// Reserved for live co-editing (WebSocket) in a later version.

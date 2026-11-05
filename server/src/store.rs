@@ -825,7 +825,9 @@ impl Store {
 
     pub fn touch_recent(&self, user_id: &str, item_id: &str) -> Res<()> {
         self.conn.execute(
-            "INSERT INTO recent (user_id, item_id, at) VALUES (?1, ?2, ?3) ON CONFLICT(user_id, item_id) DO UPDATE SET at = excluded.at",
+            // A sequence (newer than every earlier entry), so opens within one second keep their order.
+            "INSERT INTO recent (user_id, item_id, at) VALUES (?1, ?2, MAX(?3, COALESCE((SELECT MAX(at) FROM recent WHERE user_id = ?1), 0) + 1))
+             ON CONFLICT(user_id, item_id) DO UPDATE SET at = excluded.at",
             params![user_id, item_id, now()],
         )?;
         self.conn.execute(

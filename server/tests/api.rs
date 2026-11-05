@@ -444,8 +444,14 @@ fn share_links() {
     assert_eq!(s.get(&format!("/api/items/{root}/children"), &access).status, 404);
     assert_eq!(s.get("/api/me", &access).status, 401);
     assert_eq!(s.json("POST", &format!("/api/items/{id}/links"), Some(&access), json!({ "role": "edit" })).status, 401);
-    // Password links have no direct download.
+    // Password links have no direct download, only the password form.
     assert_eq!(s.send("GET", &format!("/l/{token}/download"), None, &[], None).status, 401);
+    let page = String::from_utf8(s.send("GET", &format!("/l/{token}"), None, &[], None).body).unwrap();
+    assert!(page.contains(&format!("action=\"{token}/download\"")) && page.contains("type=\"password\""));
+    let form = |pw: &str| s.send("POST", &format!("/l/{token}/download"), None, &[("Content-Type", "application/x-www-form-urlencoded")], Some(format!("password={pw}").into_bytes()));
+    assert_eq!(form("nope").status, 401);
+    let dl = form("link%2Dpass-1");
+    assert_eq!((dl.status, dl.body.as_slice()), (200, &b"link-data"[..]));
     // Edit link without a password.
     let edit = s.json("POST", &format!("/api/items/{id}/links"), Some(&a), json!({ "role": "edit" })).json();
     let etoken = edit["url"].as_str().unwrap().rsplit('/').next().unwrap().to_string();
