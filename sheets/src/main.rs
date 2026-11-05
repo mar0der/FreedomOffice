@@ -12,6 +12,7 @@ mod model;
 mod numfmt;
 mod page;
 mod print;
+mod table;
 mod validation;
 
 use eframe::egui;

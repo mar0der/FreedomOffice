@@ -107,6 +107,12 @@ impl App {
     pub fn transform_formulas(&mut self, mut f: impl FnMut(&mut Expr, usize)) {
         for (si, sh) in self.wb.sheets.iter_mut().enumerate() {
             crate::condfmt::map_sheet_formulas(sh, &mut |e| f(e, si));
+            for (_, t) in sh.names.iter_mut() {
+                if let Ok(mut e) = formula::parse(t.trim_start_matches('=')) {
+                    f(&mut e, si);
+                    *t = formula::print(&e);
+                }
+            }
             for row in sh.rows.values_mut() {
                 for cell in row.values_mut() {
                     if let Some(fm) = &mut cell.formula {
@@ -645,6 +651,14 @@ impl App {
                 k.map(|k| (k, t))
             })
             .collect();
+        let key = |(r, c): (u32, u32)| if rows { map(r).map(|nr| (nr, c)) } else { map(c).map(|nc| (r, nc)) };
+        sh.note_authors = sh.note_authors.drain().filter_map(|(k, a)| key(k).map(|k| (k, a))).collect();
+        sh.rich = sh.rich.drain().filter_map(|(k, t)| key(k).map(|k| (k, t))).collect();
+        for p in &mut sh.images {
+            if let Some(k) = key(p.anchor) {
+                p.anchor = k;
+            }
+        }
         let fix = |rg: Range| -> Option<Range> {
             let (a, b) = if rows { (rg.r1, rg.r2) } else { (rg.c1, rg.c2) };
             let (na, nb) = if n > 0 {
@@ -661,6 +675,19 @@ impl App {
             Some(if rows { Range { r1: na, r2: nb, ..rg } } else { Range { c1: na, c2: nb, ..rg } })
         };
         sh.merges = sh.merges.iter().filter_map(|m| fix(*m)).filter(|m| !m.is_single()).collect();
+        let mut tables = std::mem::take(&mut sh.tables);
+        tables.retain_mut(|t| match fix(t.range) {
+            Some(r) if r.rows() > t.header as u32 + t.totals as u32 => {
+                let resized = r.cols() != t.range.cols();
+                t.range = r;
+                if resized {
+                    crate::table::sync_columns_from_cells(sh, t);
+                }
+                true
+            }
+            _ => false,
+        });
+        sh.tables = tables;
         if let Some(f) = &mut sh.filter {
             match fix(f.range) {
                 Some(r) => f.range = r,

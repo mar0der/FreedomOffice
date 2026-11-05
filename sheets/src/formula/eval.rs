@@ -831,21 +831,30 @@ impl<'a> Evaluator<'a> {
                 v => Ok(v.clone()),
             };
         }
-        let key = n.to_ascii_uppercase();
+        if crate::table::is_structured(n) {
+            let (s, r, c) = self.cur;
+            return crate::table::resolve(self.wb, n, s, Some((r, c))).map(|(s, rg)| EV::R(s, rg));
+        }
+        // Sheet-scoped names win over workbook names (`Sheet1!Name` names the scope explicitly).
+        let local = defined_name(self.wb, n, self.cur.0);
+        let key = match &local {
+            Some((Some(s), _)) => format!("{s}|{}", n.to_ascii_uppercase()),
+            _ => n.to_ascii_uppercase(),
+        };
         let parsed = match self.names.get(&key) {
             Some(p) => p.clone(),
             None => {
-                let p = self
-                    .wb
-                    .names
-                    .iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case(n))
-                    .and_then(|(_, f)| super::parse(f.trim_start_matches('=')).ok())
-                    .map(Rc::new);
+                let p = local.and_then(|(_, f)| super::parse(f.trim_start_matches('=')).ok()).map(Rc::new);
                 self.names.insert(key, p.clone());
                 p
             }
         };
+        if parsed.is_none() {
+            if let Some((s, i)) = crate::table::find(self.wb, n) {
+                let t = &self.wb.sheets[s].tables[i];
+                return Ok(EV::R(s, t.data()));
+            }
+        }
         match parsed {
             Some(e) => {
                 if self.name_depth > 200 || self.too_deep() {
@@ -1413,4 +1422,18 @@ pub fn eval_array(wb: &Workbook, sheet: usize, r: u32, c: u32, src: &str) -> Vec
         Err(e) => vec![vec![Value::Error(e)]],
         Ok(v) => ev.grid(v),
     }
+}
+
+/// Looks up a defined name as seen from sheet `cur`: the sheet's own (local) names first, then
+/// workbook names. `Sheet1!Name` looks only at that sheet. Returns (scope sheet, formula).
+pub fn defined_name(wb: &Workbook, n: &str, cur: usize) -> Option<(Option<usize>, String)> {
+    if let Some((sh, name)) = n.rsplit_once('!') {
+        let sh = sh.trim_matches('\'').replace("''", "'");
+        let s = wb.sheet_index(&sh)?;
+        return wb.sheets[s].names.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, f)| (Some(s), f.clone()));
+    }
+    if let Some((_, f)) = wb.sheets.get(cur).and_then(|sh| sh.names.iter().find(|(k, _)| k.eq_ignore_ascii_case(n))) {
+        return Some((Some(cur), f.clone()));
+    }
+    wb.names.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, f)| (None, f.clone()))
 }

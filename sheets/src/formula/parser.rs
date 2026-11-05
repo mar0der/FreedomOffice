@@ -223,7 +223,13 @@ pub fn lex(src: &str) -> Result<Vec<Spanned>, String> {
                 } {
                     i += 1;
                 }
-                let text = src[pos(s0)..pos(i)].to_string();
+                let mut text = src[pos(s0)..pos(i)].to_string();
+                // Structured reference: `Table1[Col]`, `Table1[[#Headers],[Col]]`.
+                if at(i) == '[' {
+                    let end = structured_end(&chars, i).ok_or("missing ] in table reference")?;
+                    text = src[pos(s0)..pos(end)].to_string();
+                    i = end;
+                }
                 if at(i) == '!' {
                     i += 1;
                     Tok::Sheet(text)
@@ -266,6 +272,13 @@ pub fn lex(src: &str) -> Result<Vec<Spanned>, String> {
                     Tok::Op(">")
                 }
             }
+            // Unqualified structured reference inside a table: `[@Col]`, `[Col]`. A bracket
+            // followed by a name (`[Book.xlsx]Sheet1!A1`) is left to the external-reference lexer.
+            '[' if structured_end(&chars, i).is_some_and(|e| !(at(e).is_alphanumeric() || matches!(at(e), '_' | '\'' | '!'))) => {
+                let end = structured_end(&chars, i).unwrap_or(n);
+                i = end;
+                Tok::Ident(src[start..pos(i)].to_string())
+            }
             '(' => {
                 i += 1;
                 Tok::LParen
@@ -299,6 +312,28 @@ pub fn lex(src: &str) -> Result<Vec<Spanned>, String> {
         out.push(Spanned { tok, start, end: pos(i) });
     }
     Ok(out)
+}
+
+/// Index just past the `]` that closes the bracket group starting at `start` (`'` escapes the
+/// next character, as in table column names).
+fn structured_end(chars: &[(usize, char)], start: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut i = start;
+    while i < chars.len() {
+        match chars[i].1 {
+            '\'' => i += 1,
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Parses "A1" / "$A$1" (with optional $ markers).
@@ -521,7 +556,12 @@ impl Parser {
                         }
                     }
                 }
-                if sheet.is_some() {
+                if let Some(sh) = &sheet {
+                    // `Sheet1!Name`: a sheet-scoped defined name.
+                    if !id.contains('[') && !id.contains('$') && crate::model::parse_cell(&id).is_none() {
+                        self.i += 1;
+                        return Ok(Expr::Name(format!("{}!{}", quote_sheet(sh), id)));
+                    }
                     return Err(format!("bad reference {id}"));
                 }
                 Err("not a reference".into())
@@ -1033,6 +1073,19 @@ mod tests {
         assert_eq!(rt("_xlfn.ANCHORARRAY(B2)*2"), "B2#*2");
         let e = parse("SUM(A1#)+@B1:B3+LET(x,2,x*A1)").unwrap();
         assert_eq!(print_xlsx(&e), "SUM(ANCHORARRAY(A1))+SINGLE(B1:B3)+LET(_xlpm.x,2,_xlpm.x*A1)");
+    }
+
+    #[test]
+    fn structured_and_scoped_names() {
+        assert_eq!(rt("SUM(Table1[Sales])"), "SUM(Table1[Sales])");
+        assert_eq!(rt("Table1[[#Headers],[Unit Price]]&\"x\""), "Table1[[#Headers],[Unit Price]]&\"x\"");
+        assert_eq!(rt("[@Qty]*[@[Unit Price]]"), "[@Qty]*[@[Unit Price]]");
+        assert_eq!(rt("Table1[[Col'#1]:[Col']2]]"), "Table1[[Col'#1]:[Col']2]]");
+        assert_eq!(rt("SUM(Table1[#All])+Table1[#Totals]"), "SUM(Table1[#All])+Table1[#Totals]");
+        assert_eq!(parse("Table1[Sales]").unwrap(), Expr::Name("Table1[Sales]".into()));
+        assert_eq!(parse("Sheet2!Rate*2").unwrap(), Expr::Bin(BinOp::Mul, Box::new(Expr::Name("Sheet2!Rate".into())), Box::new(Expr::Num(2.0))));
+        assert_eq!(rt("'My Sheet'!Rate"), "'My Sheet'!Rate");
+        assert!(parse("Table1[Sales").is_err());
     }
 
     #[test]

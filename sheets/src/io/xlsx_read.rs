@@ -2,6 +2,7 @@
 
 mod charts;
 mod extras;
+mod fidelity;
 mod page;
 
 use std::collections::HashMap;
@@ -12,7 +13,7 @@ use quick_xml::Reader;
 
 use crate::formula;
 use crate::model::{
-    AutoFilter, Border, BorderLine, Cell, ErrorKind, Formula, HAlign, Range, Sheet, Style, VAlign, Value, Workbook,
+    AutoFilter, Border, BorderLine, Cell, ErrorKind, Formula, HAlign, Range, RichText, Sheet, Style, VAlign, Value, Workbook,
     DEFAULT_COL_W, DEFAULT_ROW_H, MAX_COLS, MAX_ROWS,
 };
 use crate::numfmt;
@@ -43,7 +44,13 @@ pub fn read<R: Read + Seek>(src: R) -> Result<Workbook, String> {
 
     let info = parse_workbook(&wb_xml);
     let theme = pkg.text(&rel_target("/theme", "theme/theme1.xml")).map(|x| parse_theme(&x)).unwrap_or_else(default_theme);
-    let shared = pkg.text(&rel_target("/sharedStrings", "sharedStrings.xml")).map(|x| parse_shared_strings(&x)).unwrap_or_default();
+    let (shared, shared_rich) = pkg.text(&rel_target("/sharedStrings", "sharedStrings.xml")).map(|x| parse_shared_strings(&x, &theme)).unwrap_or_default();
+    let persons = rels
+        .iter()
+        .find(|r| r.ty.ends_with("/person"))
+        .and_then(|r| pkg.text(&resolve(&wb_dir, &r.target)))
+        .map(|x| fidelity::parse_persons(&x))
+        .unwrap_or_default();
     let styles_xml = pkg.text(&rel_target("/styles", "styles.xml"));
 
     let mut wb = Workbook::empty_with(Vec::new());
@@ -71,8 +78,9 @@ pub fn read<R: Read + Seek>(src: R) -> Result<Workbook, String> {
         for (_, name, text) in info.print_names.iter().filter(|(idx, _, _)| *idx == i) {
             page::apply_defined_name(name, text, &mut sheet.page);
         }
+        sheet.names = info.local_names.iter().filter(|(idx, _, _)| *idx == i).map(|(_, n, t)| (n.clone(), t.clone())).collect();
         if let Some(x) = pkg.text(&path) {
-            let ctx = SheetCtx { shared: &shared, xf: &xf, theme: &theme, date1904: info.date1904 };
+            let ctx = SheetCtx { shared: &shared, shared_rich: &shared_rich, xf: &xf, theme: &theme, date1904: info.date1904 };
             parse_sheet(&x, &ctx, &mut sheet);
             extras::parse_sheet_extras(&x, &theme, &dxfs, &mut sheet);
             page::parse_page_setup(&x, &mut sheet.page);
@@ -94,12 +102,23 @@ pub fn read<R: Read + Seek>(src: R) -> Result<Workbook, String> {
                 }
             }
             sheet.links.retain(|_, v| !v.is_empty());
-            for r in parse_rels(&rx) {
+            let srel_list = parse_rels(&rx);
+            for r in &srel_list {
+                let part = || resolve(&dir_of(&path), &r.target);
                 if r.ty.ends_with("/comments") {
-                    let cp = resolve(&dir_of(&path), &r.target);
-                    if let Some(cx) = pkg.text(&cp) {
-                        parse_comments(&cx, &mut sheet);
+                    if let Some(cx) = pkg.text(&part()) {
+                        fidelity::parse_comments(&cx, &theme, &mut sheet);
                     }
+                } else if r.ty.ends_with("/table") {
+                    if let Some(t) = pkg.text(&part()).and_then(|x| fidelity::parse_table(&x)) {
+                        sheet.tables.push(t);
+                    }
+                }
+            }
+            // Threaded comments replace the placeholder text of their legacy notes.
+            for r in srel_list.iter().filter(|r| r.ty.ends_with("/threadedComment")) {
+                if let Some(cx) = pkg.text(&resolve(&dir_of(&path), &r.target)) {
+                    fidelity::parse_threaded(&cx, &persons, &mut sheet);
                 }
             }
         }
@@ -144,6 +163,18 @@ impl<'a, R: Read + Seek> Package<'a, R> {
             Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
         };
         Some(s.strip_prefix('\u{feff}').map(str::to_string).unwrap_or(s))
+    }
+}
+
+impl<R: Read + Seek> Package<'_, R> {
+    /// Raw bytes of a part (images).
+    fn bytes(&mut self, path: &str) -> Option<Vec<u8>> {
+        let key = path.trim_start_matches('/').replace('\\', "/").to_ascii_lowercase();
+        let name = self.names.get(&key)?.clone();
+        let mut f = self.zip.by_name(&name).ok()?;
+        let mut buf = Vec::with_capacity((f.size() as usize).min(64 << 20));
+        f.read_to_end(&mut buf).ok()?;
+        Some(buf)
     }
 }
 
@@ -360,6 +391,8 @@ struct SheetEntry {
 struct WorkbookInfo {
     sheets: Vec<SheetEntry>,
     names: Vec<(String, String)>,
+    /// Sheet-scoped names: (localSheetId, name, formula).
+    local_names: Vec<(usize, String, String)>,
     /// `_xlnm.Print_Area` / `_xlnm.Print_Titles`: (localSheetId, name, reference).
     print_names: Vec<(usize, String, String)>,
     active: usize,
@@ -392,12 +425,20 @@ fn parse_workbook(xml: &str) -> WorkbookInfo {
                     if let Some(idx) = attr(&e, "localSheetId").and_then(|v| v.parse().ok()).filter(|_| print) {
                         info.print_names.push((idx, name.clone(), text.clone()));
                     }
-                    if !name.is_empty()
-                        && !name.starts_with("_xlnm.")
-                        && !text.is_empty()
-                        && !info.names.iter().any(|(n, _)| n.eq_ignore_ascii_case(&name))
-                    {
-                        info.names.push((name, text));
+                    let local_id = attr(&e, "localSheetId").and_then(|v| v.parse::<usize>().ok());
+                    if !name.is_empty() && !name.starts_with("_xlnm.") && !text.is_empty() {
+                        match local_id {
+                            Some(idx) => {
+                                if !info.local_names.iter().any(|(i, n, _)| *i == idx && n.eq_ignore_ascii_case(&name)) {
+                                    info.local_names.push((idx, name, text));
+                                }
+                            }
+                            None => {
+                                if !info.names.iter().any(|(n, _)| n.eq_ignore_ascii_case(&name)) {
+                                    info.names.push((name, text));
+                                }
+                            }
+                        }
                     }
                 }
                 "extLst" | "AlternateContent" => skip(&mut rd, &e),
@@ -422,62 +463,29 @@ fn strip_future_prefixes(s: &str) -> String {
 // Comments (notes)
 // ---------------------------------------------------------------------------
 
-fn parse_comments(xml: &str, sheet: &mut Sheet) {
-    let mut rd = Reader::from_str(xml);
-    loop {
-        match rd.read_event() {
-            Ok(Event::Start(e)) if local(&e) == "comment" => {
-                let at = attr(&e, "ref").and_then(|s| parse_ref(&s));
-                let text = read_rich_text(&mut rd, "comment");
-                if let Some(rc) = at {
-                    sheet.notes.insert(rc, text);
-                }
-            }
-            Ok(Event::Eof) | Err(_) => break,
-            _ => {}
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Shared strings
 // ---------------------------------------------------------------------------
 
-fn parse_shared_strings(xml: &str) -> Vec<String> {
+fn parse_shared_strings(xml: &str, theme: &Theme) -> (Vec<String>, HashMap<usize, RichText>) {
     let mut out = Vec::new();
+    let mut rich = HashMap::new();
     let mut rd = Reader::from_str(xml);
     loop {
         match rd.read_event() {
-            Ok(Event::Start(e)) if local(&e) == "si" => out.push(read_rich_text(&mut rd, "si")),
+            Ok(Event::Start(e)) if local(&e) == "si" => {
+                let (text, runs) = fidelity::read_runs(&mut rd, "si", theme);
+                if let Some(runs) = runs {
+                    rich.insert(out.len(), runs);
+                }
+                out.push(text);
+            }
             Ok(Event::Empty(e)) if local(&e) == "si" => out.push(String::new()),
             Ok(Event::Eof) | Err(_) => break,
             _ => {}
         }
     }
-    out
-}
-
-/// Reads `<si>` / `<is>` content: plain `<t>` or rich-text runs, skipping phonetic runs.
-fn read_rich_text(rd: &mut XmlReader, end: &str) -> String {
-    let mut s = String::new();
-    loop {
-        match rd.read_event() {
-            Ok(Event::Start(e)) => match local(&e) {
-                "t" => s.push_str(&read_text(rd, "t")),
-                "rPh" | "phoneticPr" => skip(rd, &e),
-                _ => {}
-            },
-            Ok(Event::End(e)) => {
-                let n: &str = e.name().0;
-                if n.rsplit(':').next() == Some(end) {
-                    break;
-                }
-            }
-            Ok(Event::Eof) | Err(_) => break,
-            _ => {}
-        }
-    }
-    decode_ooxml_escapes(s)
+    (out, rich)
 }
 
 // ---------------------------------------------------------------------------
@@ -840,6 +848,10 @@ fn parse_styles(xml: &str, theme: &Theme, wb: &mut Workbook) -> XfMap {
                         if is_start {
                             loop {
                                 match rd.read_event() {
+                                    Ok(Event::Start(c)) | Ok(Event::Empty(c)) if local(&c) == "protection" => {
+                                        st.unlocked = attr_bool(&c, "locked") == Some(false);
+                                        st.hide_formula = attr_bool(&c, "hidden").unwrap_or(false);
+                                    }
                                     Ok(Event::Start(c)) | Ok(Event::Empty(c)) if local(&c) == "alignment" => {
                                         for (k, v) in attrs(&c) {
                                             match k.as_str() {
@@ -900,6 +912,7 @@ fn parse_styles(xml: &str, theme: &Theme, wb: &mut Workbook) -> XfMap {
 
 struct SheetCtx<'a> {
     shared: &'a [String],
+    shared_rich: &'a HashMap<usize, RichText>,
     xf: &'a XfMap,
     theme: &'a Theme,
     date1904: bool,
@@ -940,6 +953,7 @@ struct CellBuf {
     t: String,
     v: Option<String>,
     is: Option<String>,
+    is_rich: Option<RichText>,
     f_text: Option<String>,
     f_type: String,
     f_si: Option<String>,
@@ -1035,7 +1049,11 @@ fn parse_sheet(xml: &str, ctx: &SheetCtx, sheet: &mut Sheet) {
                                             }
                                             cb.f_text = Some(read_text(&mut rd, "f"));
                                         }
-                                        "is" => cb.is = Some(read_rich_text(&mut rd, "is")),
+                                        "is" => {
+                                            let (t, runs) = fidelity::read_runs(&mut rd, "is", ctx.theme);
+                                            cb.is = Some(t);
+                                            cb.is_rich = runs;
+                                        }
                                         _ => skip(&mut rd, &c),
                                     },
                                     Ok(Event::Empty(c)) => {
@@ -1065,6 +1083,9 @@ fn parse_sheet(xml: &str, ctx: &SheetCtx, sheet: &mut Sheet) {
                             if attr_bool(e, "showGridLines") == Some(false) {
                                 sheet.gridlines = false;
                             }
+                            if let Some(z) = attr(e, "zoomScale").and_then(|v| parse_f(&v)).filter(|z| *z >= 10.0 && *z <= 400.0) {
+                                sheet.zoom = (z / 100.0) as f32;
+                            }
                         }
                         seen_view = true;
                     }
@@ -1083,6 +1104,7 @@ fn parse_sheet(xml: &str, ctx: &SheetCtx, sheet: &mut Sheet) {
                             sheet.view.sel = Range::cell(r, c);
                         }
                     }
+                    "sheetProtection" => sheet.protection = fidelity::parse_protection(e),
                     "tabColor" => sheet.tab_color = parse_color(e, ctx.theme, &INDEXED),
                     "col" => {
                         let min = attr(e, "min").and_then(|v| v.parse::<u32>().ok()).unwrap_or(1).clamp(1, MAX_COLS);
@@ -1155,6 +1177,12 @@ fn parse_sheet(xml: &str, ctx: &SheetCtx, sheet: &mut Sheet) {
 /// A formula from a file; `ANCHORARRAY(A1)` / `SINGLE(x)` are shown as `A1#` / `@x` like Excel.
 fn file_formula(text: &str) -> Formula {
     let f = Formula::new(text);
+    if text.contains('[') && text.to_ascii_lowercase().contains("#this row") {
+        if let Some(mut ast) = f.ast.clone() {
+            crate::table::visit_names(&mut ast, &mut |n| *n = crate::table::display_form(n));
+            return Formula::from_ast(ast);
+        }
+    }
     match f.ast {
         Some(ast) if text.contains("ANCHORARRAY(") || text.contains("SINGLE(") => Formula::from_ast(ast),
         _ => f,
@@ -1178,6 +1206,14 @@ fn clear_array_results(sheet: &mut Sheet) {
 
 fn finish_cell(cb: CellBuf, ctx: &SheetCtx, shared_f: &mut HashMap<String, SharedMaster>, sheet: &mut Sheet) {
     let style = ctx.xf.ids.get(cb.style).copied().unwrap_or(0);
+    let rich = match cb.t.as_str() {
+        "s" => cb.v.as_deref().and_then(|v| v.trim().parse::<usize>().ok()).and_then(|i| ctx.shared_rich.get(&i)).cloned(),
+        "inlineStr" => cb.is_rich.clone(),
+        _ => None,
+    };
+    if let Some(rt) = rich.filter(|_| cb.f_text.is_none() && cb.row < MAX_ROWS && cb.col < MAX_COLS) {
+        sheet.rich.insert((cb.row, cb.col), rt);
+    }
     let is_date = ctx.xf.date.get(cb.style).copied().unwrap_or(false);
     let mut value = match cb.t.as_str() {
         "s" => cb
