@@ -13,23 +13,57 @@ use crate::numfmt;
 pub const FUNCS: &[(&str, &str, &str)] = &[
     ("ABS", "number", "Math & Trig"),
     ("ACOS", "number", "Math & Trig"),
+    ("ACOSH", "number", "Math & Trig"),
+    ("ACOT", "number", "Math & Trig"),
+    ("ACOTH", "number", "Math & Trig"),
     ("ADDRESS", "row_num, column_num, [abs_num], [a1], [sheet_text]", "Lookup & Reference"),
     ("AGGREGATE", "function_num, options, ref1, [ref2], ...", "Math & Trig"),
     ("AND", "logical1, [logical2], ...", "Logical"),
     ("ARABIC", "text", "Math & Trig"),
+    ("AREAS", "reference", "Lookup & Reference"),
+    ("ARRAYTOTEXT", "array, [format]", "Text"),
     ("ASIN", "number", "Math & Trig"),
+    ("ASINH", "number", "Math & Trig"),
     ("ATAN", "number", "Math & Trig"),
     ("ATAN2", "x_num, y_num", "Math & Trig"),
+    ("ATANH", "number", "Math & Trig"),
     ("AVEDEV", "number1, [number2], ...", "Statistical"),
     ("AVERAGE", "number1, [number2], ...", "Statistical"),
     ("AVERAGEA", "value1, [value2], ...", "Statistical"),
     ("AVERAGEIF", "range, criteria, [average_range]", "Statistical"),
     ("AVERAGEIFS", "average_range, criteria_range1, criteria1, ...", "Statistical"),
     ("BASE", "number, radix, [min_length]", "Math & Trig"),
+    ("BETA.DIST", "x, alpha, beta, cumulative, [A], [B]", "Statistical"),
+    ("BETA.INV", "probability, alpha, beta, [A], [B]", "Statistical"),
+    ("BETADIST", "x, alpha, beta, [A], [B]", "Statistical"),
+    ("BETAINV", "probability, alpha, beta, [A], [B]", "Statistical"),
     ("BIN2DEC", "number", "Engineering"),
+    ("BIN2HEX", "number, [places]", "Engineering"),
+    ("BIN2OCT", "number, [places]", "Engineering"),
+    ("BINOM.DIST", "number_s, trials, probability_s, cumulative", "Statistical"),
+    ("BINOM.DIST.RANGE", "trials, probability_s, number_s, [number_s2]", "Statistical"),
+    ("BINOM.INV", "trials, probability_s, alpha", "Statistical"),
+    ("BINOMDIST", "number_s, trials, probability_s, cumulative", "Statistical"),
+    ("BITAND", "number1, number2", "Engineering"),
+    ("BITLSHIFT", "number, shift_amount", "Engineering"),
+    ("BITOR", "number1, number2", "Engineering"),
+    ("BITRSHIFT", "number, shift_amount", "Engineering"),
+    ("BITXOR", "number1, number2", "Engineering"),
+    ("BYCOL", "array, lambda(column)", "Logical"),
+    ("BYROW", "array, lambda(row)", "Logical"),
     ("CEILING", "number, significance", "Math & Trig"),
     ("CEILING.MATH", "number, [significance], [mode]", "Math & Trig"),
+    ("CEILING.PRECISE", "number, [significance]", "Math & Trig"),
+    ("CELL", "info_type, [reference]", "Information"),
     ("CHAR", "number", "Text"),
+    ("CHIDIST", "x, deg_freedom", "Statistical"),
+    ("CHIINV", "probability, deg_freedom", "Statistical"),
+    ("CHISQ.DIST", "x, deg_freedom, cumulative", "Statistical"),
+    ("CHISQ.DIST.RT", "x, deg_freedom", "Statistical"),
+    ("CHISQ.INV", "probability, deg_freedom", "Statistical"),
+    ("CHISQ.INV.RT", "probability, deg_freedom", "Statistical"),
+    ("CHISQ.TEST", "actual_range, expected_range", "Statistical"),
+    ("CHITEST", "actual_range, expected_range", "Statistical"),
     ("CHOOSE", "index_num, value1, [value2], ...", "Lookup & Reference"),
     ("CHOOSECOLS", "array, col_num1, [col_num2], ...", "Lookup & Reference"),
     ("CHOOSEROWS", "array, row_num1, [row_num2], ...", "Lookup & Reference"),
@@ -47,6 +81,9 @@ pub const FUNCS: &[(&str, &str, &str)] = &[
     ("CONVERT", "number, from_unit, to_unit", "Engineering"),
     ("CORREL", "array1, array2", "Statistical"),
     ("COS", "number", "Math & Trig"),
+    ("COSH", "number", "Math & Trig"),
+    ("COT", "number", "Math & Trig"),
+    ("COTH", "number", "Math & Trig"),
     ("COUNT", "value1, [value2], ...", "Statistical"),
     ("COUNTA", "value1, [value2], ...", "Statistical"),
     ("COUNTBLANK", "range", "Statistical"),
@@ -55,59 +92,113 @@ pub const FUNCS: &[(&str, &str, &str)] = &[
     ("COVAR", "array1, array2", "Statistical"),
     ("COVARIANCE.P", "array1, array2", "Statistical"),
     ("COVARIANCE.S", "array1, array2", "Statistical"),
+    ("CRITBINOM", "trials, probability_s, alpha", "Statistical"),
+    ("CSC", "number", "Math & Trig"),
+    ("CSCH", "number", "Math & Trig"),
     ("CUMIPMT", "rate, nper, pv, start_period, end_period, type", "Financial"),
     ("CUMPRINC", "rate, nper, pv, start_period, end_period, type", "Financial"),
     ("DATE", "year, month, day", "Date & Time"),
     ("DATEDIF", "start_date, end_date, unit", "Date & Time"),
     ("DATEVALUE", "date_text", "Date & Time"),
+    ("DAVERAGE", "database, field, criteria", "Database"),
     ("DAY", "serial_number", "Date & Time"),
     ("DAYS", "end_date, start_date", "Date & Time"),
     ("DAYS360", "start_date, end_date, [method]", "Date & Time"),
     ("DB", "cost, salvage, life, period, [month]", "Financial"),
+    ("DCOUNT", "database, [field], criteria", "Database"),
+    ("DCOUNTA", "database, [field], criteria", "Database"),
     ("DDB", "cost, salvage, life, period, [factor]", "Financial"),
     ("DEC2BIN", "number, [places]", "Engineering"),
     ("DEC2HEX", "number, [places]", "Engineering"),
     ("DEC2OCT", "number, [places]", "Engineering"),
     ("DECIMAL", "text, radix", "Math & Trig"),
     ("DEGREES", "angle", "Math & Trig"),
+    ("DELTA", "number1, [number2]", "Engineering"),
     ("DEVSQ", "number1, [number2], ...", "Statistical"),
+    ("DGET", "database, field, criteria", "Database"),
+    ("DMAX", "database, field, criteria", "Database"),
+    ("DMIN", "database, field, criteria", "Database"),
     ("DOLLAR", "number, [decimals]", "Text"),
+    ("DOLLARDE", "fractional_dollar, fraction", "Financial"),
+    ("DOLLARFR", "decimal_dollar, fraction", "Financial"),
+    ("DPRODUCT", "database, field, criteria", "Database"),
     ("DROP", "array, rows, [columns]", "Lookup & Reference"),
+    ("DSTDEV", "database, field, criteria", "Database"),
+    ("DSTDEVP", "database, field, criteria", "Database"),
+    ("DSUM", "database, field, criteria", "Database"),
+    ("DVAR", "database, field, criteria", "Database"),
+    ("DVARP", "database, field, criteria", "Database"),
     ("EDATE", "start_date, months", "Date & Time"),
     ("EFFECT", "nominal_rate, npery", "Financial"),
+    ("ENCODEURL", "text", "Web"),
     ("EOMONTH", "start_date, months", "Date & Time"),
+    ("ERF", "lower_limit, [upper_limit]", "Engineering"),
+    ("ERF.PRECISE", "x", "Engineering"),
+    ("ERFC", "x", "Engineering"),
+    ("ERFC.PRECISE", "x", "Engineering"),
     ("ERROR.TYPE", "error_val", "Information"),
     ("EVEN", "number", "Math & Trig"),
     ("EXACT", "text1, text2", "Text"),
     ("EXP", "number", "Math & Trig"),
     ("EXPAND", "array, rows, [columns], [pad_with]", "Lookup & Reference"),
+    ("EXPON.DIST", "x, lambda, cumulative", "Statistical"),
+    ("EXPONDIST", "x, lambda, cumulative", "Statistical"),
+    ("F.DIST", "x, deg_freedom1, deg_freedom2, cumulative", "Statistical"),
+    ("F.DIST.RT", "x, deg_freedom1, deg_freedom2", "Statistical"),
+    ("F.INV", "probability, deg_freedom1, deg_freedom2", "Statistical"),
+    ("F.INV.RT", "probability, deg_freedom1, deg_freedom2", "Statistical"),
+    ("F.TEST", "array1, array2", "Statistical"),
     ("FACT", "number", "Math & Trig"),
+    ("FACTDOUBLE", "number", "Math & Trig"),
     ("FALSE", "", "Logical"),
+    ("FDIST", "x, deg_freedom1, deg_freedom2", "Statistical"),
     ("FILTER", "array, include, [if_empty]", "Lookup & Reference"),
     ("FIND", "find_text, within_text, [start_num]", "Text"),
+    ("FINDB", "find_text, within_text, [start_num]", "Text"),
+    ("FINV", "probability, deg_freedom1, deg_freedom2", "Statistical"),
+    ("FISHER", "x", "Statistical"),
+    ("FISHERINV", "y", "Statistical"),
     ("FIXED", "number, [decimals], [no_commas]", "Text"),
     ("FLOOR", "number, significance", "Math & Trig"),
     ("FLOOR.MATH", "number, [significance], [mode]", "Math & Trig"),
+    ("FLOOR.PRECISE", "number, [significance]", "Math & Trig"),
     ("FORECAST", "x, known_y's, known_x's", "Statistical"),
     ("FORECAST.LINEAR", "x, known_y's, known_x's", "Statistical"),
     ("FORMULATEXT", "reference", "Lookup & Reference"),
+    ("FREQUENCY", "data_array, bins_array", "Statistical"),
+    ("FTEST", "array1, array2", "Statistical"),
     ("FV", "rate, nper, pmt, [pv], [type]", "Financial"),
     ("FVSCHEDULE", "principal, schedule", "Financial"),
+    ("GAMMA", "x", "Statistical"),
+    ("GAMMA.DIST", "x, alpha, beta, cumulative", "Statistical"),
+    ("GAMMA.INV", "probability, alpha, beta", "Statistical"),
+    ("GAMMADIST", "x, alpha, beta, cumulative", "Statistical"),
+    ("GAMMAINV", "probability, alpha, beta", "Statistical"),
+    ("GAMMALN", "x", "Statistical"),
+    ("GAMMALN.PRECISE", "x", "Statistical"),
+    ("GAUSS", "z", "Statistical"),
     ("GCD", "number1, [number2], ...", "Math & Trig"),
     ("GEOMEAN", "number1, [number2], ...", "Statistical"),
+    ("GESTEP", "number, [step]", "Engineering"),
+    ("GROUPBY", "row_fields, values, function, [field_headers], [total_depth], [sort_order], [filter_array]", "Lookup & Reference"),
     ("GROWTH", "known_y's, [known_x's], [new_x's], [const]", "Statistical"),
     ("HARMEAN", "number1, [number2], ...", "Statistical"),
+    ("HEX2BIN", "number, [places]", "Engineering"),
     ("HEX2DEC", "number", "Engineering"),
+    ("HEX2OCT", "number, [places]", "Engineering"),
     ("HLOOKUP", "lookup_value, table_array, row_index_num, [range_lookup]", "Lookup & Reference"),
     ("HOUR", "serial_number", "Date & Time"),
     ("HSTACK", "array1, [array2], ...", "Lookup & Reference"),
     ("HYPERLINK", "link_location, [friendly_name]", "Lookup & Reference"),
+    ("HYPGEOM.DIST", "sample_s, number_sample, population_s, number_pop, cumulative", "Statistical"),
+    ("HYPGEOMDIST", "sample_s, number_sample, population_s, number_pop", "Statistical"),
     ("IF", "logical_test, [value_if_true], [value_if_false]", "Logical"),
     ("IFERROR", "value, value_if_error", "Logical"),
     ("IFNA", "value, value_if_na", "Logical"),
     ("IFS", "logical_test1, value_if_true1, ...", "Logical"),
     ("INDEX", "array, row_num, [column_num]", "Lookup & Reference"),
     ("INDIRECT", "ref_text, [a1]", "Lookup & Reference"),
+    ("INFO", "type_text", "Information"),
     ("INT", "number", "Math & Trig"),
     ("INTERCEPT", "known_y's, known_x's", "Statistical"),
     ("IPMT", "rate, per, nper, pv, [fv], [type]", "Financial"),
@@ -121,32 +212,49 @@ pub const FUNCS: &[(&str, &str, &str)] = &[
     ("ISNA", "value", "Information"),
     ("ISNONTEXT", "value", "Information"),
     ("ISNUMBER", "value", "Information"),
+    ("ISO.CEILING", "number, [significance]", "Math & Trig"),
     ("ISODD", "number", "Information"),
+    ("ISOMITTED", "argument", "Information"),
     ("ISOWEEKNUM", "date", "Date & Time"),
+    ("ISPMT", "rate, per, nper, pv", "Financial"),
     ("ISREF", "value", "Information"),
     ("ISTEXT", "value", "Information"),
     ("KURT", "number1, [number2], ...", "Statistical"),
+    ("LAMBDA", "[parameter1, ...], calculation", "Logical"),
     ("LARGE", "array, k", "Statistical"),
     ("LCM", "number1, [number2], ...", "Math & Trig"),
     ("LEFT", "text, [num_chars]", "Text"),
+    ("LEFTB", "text, [num_bytes]", "Text"),
     ("LEN", "text", "Text"),
+    ("LENB", "text", "Text"),
     ("LET", "name1, name_value1, calculation_or_name2, ...", "Logical"),
     ("LINEST", "known_y's, [known_x's], [const], [stats]", "Statistical"),
     ("LN", "number", "Math & Trig"),
     ("LOG", "number, [base]", "Math & Trig"),
     ("LOG10", "number", "Math & Trig"),
+    ("LOGINV", "probability, mean, standard_dev", "Statistical"),
+    ("LOGNORM.DIST", "x, mean, standard_dev, cumulative", "Statistical"),
+    ("LOGNORM.INV", "probability, mean, standard_dev", "Statistical"),
+    ("LOGNORMDIST", "x, mean, standard_dev", "Statistical"),
+    ("LOOKUP", "lookup_value, lookup_vector, [result_vector]", "Lookup & Reference"),
     ("LOWER", "text", "Text"),
+    ("MAKEARRAY", "rows, columns, lambda(row, column)", "Logical"),
+    ("MAP", "array1, [array2], ..., lambda", "Logical"),
     ("MATCH", "lookup_value, lookup_array, [match_type]", "Lookup & Reference"),
     ("MAX", "number1, [number2], ...", "Statistical"),
     ("MAXA", "value1, [value2], ...", "Statistical"),
     ("MAXIFS", "max_range, criteria_range1, criteria1, ...", "Statistical"),
+    ("MDETERM", "array", "Math & Trig"),
     ("MEDIAN", "number1, [number2], ...", "Statistical"),
     ("MID", "text, start_num, num_chars", "Text"),
+    ("MIDB", "text, start_num, num_bytes", "Text"),
     ("MIN", "number1, [number2], ...", "Statistical"),
     ("MINA", "value1, [value2], ...", "Statistical"),
     ("MINIFS", "min_range, criteria_range1, criteria1, ...", "Statistical"),
     ("MINUTE", "serial_number", "Date & Time"),
+    ("MINVERSE", "array", "Math & Trig"),
     ("MIRR", "values, finance_rate, reinvest_rate", "Financial"),
+    ("MMULT", "array1, array2", "Math & Trig"),
     ("MOD", "number, divisor", "Math & Trig"),
     ("MODE", "number1, [number2], ...", "Statistical"),
     ("MODE.MULT", "number1, [number2], ...", "Statistical"),
@@ -154,8 +262,11 @@ pub const FUNCS: &[(&str, &str, &str)] = &[
     ("MONTH", "serial_number", "Date & Time"),
     ("MROUND", "number, multiple", "Math & Trig"),
     ("MULTINOMIAL", "number1, [number2], ...", "Math & Trig"),
+    ("MUNIT", "dimension", "Math & Trig"),
     ("N", "value", "Information"),
     ("NA", "", "Information"),
+    ("NEGBINOM.DIST", "number_f, number_s, probability_s, cumulative", "Statistical"),
+    ("NEGBINOMDIST", "number_f, number_s, probability_s", "Statistical"),
     ("NETWORKDAYS", "start_date, end_date, [holidays]", "Date & Time"),
     ("NETWORKDAYS.INTL", "start_date, end_date, [weekend], [holidays]", "Date & Time"),
     ("NOMINAL", "effect_rate, npery", "Financial"),
@@ -172,7 +283,9 @@ pub const FUNCS: &[(&str, &str, &str)] = &[
     ("NPER", "rate, pmt, pv, [fv], [type]", "Financial"),
     ("NPV", "rate, value1, [value2], ...", "Financial"),
     ("NUMBERVALUE", "text, [decimal_separator], [group_separator]", "Text"),
+    ("OCT2BIN", "number, [places]", "Engineering"),
     ("OCT2DEC", "number", "Engineering"),
+    ("OCT2HEX", "number, [places]", "Engineering"),
     ("ODD", "number", "Math & Trig"),
     ("OFFSET", "reference, rows, cols, [height], [width]", "Lookup & Reference"),
     ("OR", "logical1, [logical2], ...", "Logical"),
@@ -181,14 +294,21 @@ pub const FUNCS: &[(&str, &str, &str)] = &[
     ("PERCENTILE", "array, k", "Statistical"),
     ("PERCENTILE.EXC", "array, k", "Statistical"),
     ("PERCENTILE.INC", "array, k", "Statistical"),
+    ("PERCENTOF", "data_subset, data_all", "Math & Trig"),
     ("PERCENTRANK", "array, x, [significance]", "Statistical"),
     ("PERCENTRANK.EXC", "array, x, [significance]", "Statistical"),
     ("PERCENTRANK.INC", "array, x, [significance]", "Statistical"),
     ("PERMUT", "number, number_chosen", "Statistical"),
+    ("PERMUTATIONA", "number, number_chosen", "Statistical"),
+    ("PHI", "x", "Statistical"),
     ("PI", "", "Math & Trig"),
+    ("PIVOTBY", "row_fields, col_fields, values, function, [field_headers], [row_total_depth], [row_sort_order], [col_total_depth], [col_sort_order], [filter_array]", "Lookup & Reference"),
     ("PMT", "rate, nper, pv, [fv], [type]", "Financial"),
+    ("POISSON", "x, mean, cumulative", "Statistical"),
+    ("POISSON.DIST", "x, mean, cumulative", "Statistical"),
     ("POWER", "number, power", "Math & Trig"),
     ("PPMT", "rate, per, nper, pv, [fv], [type]", "Financial"),
+    ("PROB", "x_range, prob_range, lower_limit, [upper_limit]", "Statistical"),
     ("PRODUCT", "number1, [number2], ...", "Math & Trig"),
     ("PROPER", "text", "Text"),
     ("PV", "rate, nper, pmt, [fv], [type]", "Financial"),
@@ -204,9 +324,15 @@ pub const FUNCS: &[(&str, &str, &str)] = &[
     ("RANK.AVG", "number, ref, [order]", "Statistical"),
     ("RANK.EQ", "number, ref, [order]", "Statistical"),
     ("RATE", "nper, pmt, pv, [fv], [type], [guess]", "Financial"),
+    ("REDUCE", "[initial_value], array, lambda(accumulator, value)", "Logical"),
+    ("REGEXEXTRACT", "text, pattern, [return_mode], [case_sensitivity]", "Text"),
+    ("REGEXREPLACE", "text, pattern, replacement, [occurrence], [case_sensitivity]", "Text"),
+    ("REGEXTEST", "text, pattern, [case_sensitivity]", "Text"),
     ("REPLACE", "old_text, start_num, num_chars, new_text", "Text"),
+    ("REPLACEB", "old_text, start_num, num_bytes, new_text", "Text"),
     ("REPT", "text, number_times", "Text"),
     ("RIGHT", "text, [num_chars]", "Text"),
+    ("RIGHTB", "text, [num_bytes]", "Text"),
     ("ROMAN", "number, [form]", "Math & Trig"),
     ("ROUND", "number, num_digits", "Math & Trig"),
     ("ROUNDDOWN", "number, num_digits", "Math & Trig"),
@@ -215,13 +341,19 @@ pub const FUNCS: &[(&str, &str, &str)] = &[
     ("ROWS", "array", "Lookup & Reference"),
     ("RRI", "nper, pv, fv", "Financial"),
     ("RSQ", "known_y's, known_x's", "Statistical"),
+    ("SCAN", "[initial_value], array, lambda(accumulator, value)", "Logical"),
     ("SEARCH", "find_text, within_text, [start_num]", "Text"),
+    ("SEARCHB", "find_text, within_text, [start_num]", "Text"),
+    ("SEC", "number", "Math & Trig"),
+    ("SECH", "number", "Math & Trig"),
     ("SECOND", "serial_number", "Date & Time"),
     ("SEQUENCE", "rows, [columns], [start], [step]", "Math & Trig"),
+    ("SERIESSUM", "x, n, m, coefficients", "Math & Trig"),
     ("SHEET", "[value]", "Information"),
     ("SHEETS", "[reference]", "Information"),
     ("SIGN", "number", "Math & Trig"),
     ("SIN", "number", "Math & Trig"),
+    ("SINH", "number", "Math & Trig"),
     ("SKEW", "number1, [number2], ...", "Statistical"),
     ("SKEW.P", "number1, [number2], ...", "Statistical"),
     ("SLN", "cost, salvage, life", "Financial"),
@@ -230,11 +362,14 @@ pub const FUNCS: &[(&str, &str, &str)] = &[
     ("SORT", "array, [sort_index], [sort_order], [by_col]", "Lookup & Reference"),
     ("SORTBY", "array, by_array1, [sort_order1], ...", "Lookup & Reference"),
     ("SQRT", "number", "Math & Trig"),
+    ("SQRTPI", "number", "Math & Trig"),
     ("STANDARDIZE", "x, mean, standard_dev", "Statistical"),
     ("STDEV", "number1, [number2], ...", "Statistical"),
     ("STDEV.P", "number1, [number2], ...", "Statistical"),
     ("STDEV.S", "number1, [number2], ...", "Statistical"),
+    ("STDEVA", "value1, [value2], ...", "Statistical"),
     ("STDEVP", "number1, [number2], ...", "Statistical"),
+    ("STDEVPA", "value1, [value2], ...", "Statistical"),
     ("STEYX", "known_y's, known_x's", "Statistical"),
     ("SUBSTITUTE", "text, old_text, new_text, [instance_num]", "Text"),
     ("SUBTOTAL", "function_num, ref1, [ref2], ...", "Math & Trig"),
@@ -254,8 +389,10 @@ pub const FUNCS: &[(&str, &str, &str)] = &[
     ("T.DIST.RT", "x, deg_freedom", "Statistical"),
     ("T.INV", "probability, deg_freedom", "Statistical"),
     ("T.INV.2T", "probability, deg_freedom", "Statistical"),
+    ("T.TEST", "array1, array2, tails, type", "Statistical"),
     ("TAKE", "array, rows, [columns]", "Lookup & Reference"),
     ("TAN", "number", "Math & Trig"),
+    ("TANH", "number", "Math & Trig"),
     ("TDIST", "x, deg_freedom, tails", "Statistical"),
     ("TEXT", "value, format_text", "Text"),
     ("TEXTAFTER", "text, delimiter, [instance_num]", "Text"),
@@ -271,22 +408,29 @@ pub const FUNCS: &[(&str, &str, &str)] = &[
     ("TRANSPOSE", "array", "Lookup & Reference"),
     ("TREND", "known_y's, [known_x's], [new_x's], [const]", "Statistical"),
     ("TRIM", "text", "Text"),
+    ("TRIMMEAN", "array, percent", "Statistical"),
     ("TRUE", "", "Logical"),
     ("TRUNC", "number, [num_digits]", "Math & Trig"),
+    ("TTEST", "array1, array2, tails, type", "Statistical"),
     ("TYPE", "value", "Information"),
     ("UNICHAR", "number", "Text"),
     ("UNICODE", "text", "Text"),
     ("UNIQUE", "array, [by_col], [exactly_once]", "Lookup & Reference"),
     ("UPPER", "text", "Text"),
     ("VALUE", "text", "Text"),
+    ("VALUETOTEXT", "value, [format]", "Text"),
     ("VAR", "number1, [number2], ...", "Statistical"),
     ("VAR.P", "number1, [number2], ...", "Statistical"),
     ("VAR.S", "number1, [number2], ...", "Statistical"),
+    ("VARA", "value1, [value2], ...", "Statistical"),
     ("VARP", "number1, [number2], ...", "Statistical"),
+    ("VARPA", "value1, [value2], ...", "Statistical"),
     ("VLOOKUP", "lookup_value, table_array, col_index_num, [range_lookup]", "Lookup & Reference"),
     ("VSTACK", "array1, [array2], ...", "Lookup & Reference"),
     ("WEEKDAY", "serial_number, [return_type]", "Date & Time"),
     ("WEEKNUM", "serial_number, [return_type]", "Date & Time"),
+    ("WEIBULL", "x, alpha, beta, cumulative", "Statistical"),
+    ("WEIBULL.DIST", "x, alpha, beta, cumulative", "Statistical"),
     ("WORKDAY", "start_date, days, [holidays]", "Date & Time"),
     ("WORKDAY.INTL", "start_date, days, [weekend], [holidays]", "Date & Time"),
     ("WRAPCOLS", "vector, wrap_count, [pad_with]", "Lookup & Reference"),
@@ -298,6 +442,8 @@ pub const FUNCS: &[(&str, &str, &str)] = &[
     ("XOR", "logical1, [logical2], ...", "Logical"),
     ("YEAR", "serial_number", "Date & Time"),
     ("YEARFRAC", "start_date, end_date, [basis]", "Date & Time"),
+    ("Z.TEST", "array, x, [sigma]", "Statistical"),
+    ("ZTEST", "array, x, [sigma]", "Statistical"),
 ];
 
 pub fn function_names() -> impl Iterator<Item = (&'static str, &'static str)> {
@@ -306,6 +452,19 @@ pub fn function_names() -> impl Iterator<Item = (&'static str, &'static str)> {
 
 pub fn signature(name: &str) -> Option<&'static str> {
     FUNCS.iter().find(|(n, _, _)| n.eq_ignore_ascii_case(name)).map(|(_, a, _)| *a)
+}
+
+/// The binary-searched name tables must stay sorted.
+#[cfg(test)]
+pub(super) fn check_lift_tables() {
+    for t in [LIFT_ALL, LIFT_MORE, SCALAR_ONLY] {
+        assert!(t.windows(2).all(|w| w[0] < w[1]), "unsorted near {:?}", t.windows(2).find(|w| w[0] >= w[1]));
+    }
+}
+
+/// Whether `name` (upper case) is a built-in function rather than a named LAMBDA.
+pub fn is_builtin(name: &str) -> bool {
+    FUNCS.binary_search_by(|f| f.0.cmp(name)).is_ok() || name == "SINGLE"
 }
 
 // ---------------------------------------------------------------------------
@@ -419,8 +578,8 @@ pub(super) enum CritOp {
 }
 
 pub(super) struct Criteria {
-    op: CritOp,
-    val: Value,
+    pub(super) op: CritOp,
+    pub(super) val: Value,
 }
 
 pub(super) fn parse_criteria(v: &Value) -> Criteria {
@@ -507,7 +666,7 @@ pub(super) fn cond_grids(ev: &mut Evaluator, args: Vec<EV>) -> (Vec<Vec<Vec<Valu
     let dims = |v: &EV| match v {
         EV::R(_, rg) => (rg.rows() as usize, rg.cols() as usize),
         EV::A(g) => (g.len(), g.first().map_or(0, |r| r.len())),
-        EV::V(_) => (1, 1),
+        _ => (1, 1),
     };
     let (rows, cols) = args.first().map_or((0, 0), dims);
     let (mut used_r, mut used_c) = (0, 0);
@@ -764,6 +923,19 @@ const LIFT_ALL: &[&str] = &[
     "UNICHAR", "UNICODE", "UPPER", "VALUE", "WEEKDAY", "WEEKNUM", "YEAR", "YEARFRAC",
 ];
 
+/// More scalar-argument functions (distributions, hyperbolic, engineering; sorted).
+const LIFT_MORE: &[&str] = &[
+    "ACOSH", "ACOT", "ACOTH", "ASINH", "ATANH", "BETA.DIST", "BETA.INV", "BETADIST", "BETAINV", "BINOM.DIST", "BINOM.INV",
+    "BINOMDIST", "BITAND", "BITLSHIFT", "BITOR", "BITRSHIFT", "BITXOR", "CEILING.PRECISE", "CHIDIST", "CHIINV", "CHISQ.DIST",
+    "CHISQ.DIST.RT", "CHISQ.INV", "CHISQ.INV.RT", "COSH", "COT", "COTH", "CRITBINOM", "CSC", "CSCH", "DELTA", "DOLLARDE",
+    "DOLLARFR", "ENCODEURL", "ERF", "ERF.PRECISE", "ERFC", "ERFC.PRECISE", "EXPON.DIST", "EXPONDIST", "F.DIST", "F.DIST.RT",
+    "F.INV", "F.INV.RT", "FACTDOUBLE", "FDIST", "FINV", "FISHER", "FISHERINV", "FLOOR.PRECISE", "GAMMA", "GAMMA.DIST",
+    "GAMMA.INV", "GAMMADIST", "GAMMAINV", "GAMMALN", "GAMMALN.PRECISE", "GAUSS", "GESTEP", "HYPGEOM.DIST", "HYPGEOMDIST",
+    "ISO.CEILING", "ISPMT", "LOGINV", "LOGNORM.DIST", "LOGNORM.INV", "LOGNORMDIST", "NEGBINOM.DIST", "NEGBINOMDIST",
+    "PERMUTATIONA", "PHI", "POISSON", "POISSON.DIST", "REGEXREPLACE", "REGEXTEST", "SEC", "SECH", "SINH", "SQRTPI", "TANH",
+    "VALUETOTEXT", "WEIBULL", "WEIBULL.DIST",
+];
+
 /// Functions that always return a single value regardless of their arguments (sorted).
 const SCALAR_ONLY: &[&str] = &[
     "AGGREGATE", "AND", "AVERAGE", "AVERAGEA", "COLUMNS", "CONCAT", "CONCATENATE", "CORREL", "COUNT", "COUNTA", "COUNTBLANK",
@@ -778,7 +950,7 @@ fn lift_spec(name: &str) -> Option<Lift> {
         "COUNTIF" | "SUMIF" | "AVERAGEIF" => Some(Lift::At(1)),
         "COUNTIFS" => Some(Lift::Pairs(1)),
         "SUMIFS" | "AVERAGEIFS" | "MAXIFS" | "MINIFS" => Some(Lift::Pairs(2)),
-        _ if LIFT_ALL.binary_search(&name).is_ok() => Some(Lift::All),
+        _ if LIFT_ALL.binary_search(&name).is_ok() || LIFT_MORE.binary_search(&name).is_ok() => Some(Lift::All),
         _ => None,
     }
 }
@@ -788,7 +960,7 @@ fn maybe_multi(e: &Expr) -> bool {
     match e {
         Expr::Ref(r) => r.kind != RefKind::Cell,
         Expr::Array(rows) => rows.len() > 1 || rows.first().is_some_and(|r| r.len() > 1),
-        Expr::Name(_) => true,
+        Expr::Name(_) | Expr::Range(..) | Expr::Isect(..) | Expr::Union(_) | Expr::Call(..) => true,
         Expr::Neg(a) | Expr::Plus(a) | Expr::Percent(a) | Expr::Paren(a) => maybe_multi(a),
         Expr::Bin(_, a, b) => maybe_multi(a) || maybe_multi(b),
         Expr::Func(n, args) => {
@@ -822,12 +994,27 @@ pub fn call(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
 fn lift(ev: &mut Evaluator, name: &str, a: &[Expr], spec: Lift) -> Res {
     let idx: Vec<usize> = (0..a.len()).filter(|&i| spec.lifts(i) && maybe_multi(&a[i])).collect();
     let mut vals = Vec::with_capacity(idx.len());
-    for &i in &idx {
-        let v = match ev.eval(&a[i]) {
-            Ok(EV::R(s, rg)) => EV::R(s, ev.clip(s, rg)),
-            Ok(v) => v,
-            Err(e) => EV::V(Value::Error(e)),
-        };
+    let lifted = |ev: &mut Evaluator, i: usize| match ev.eval(&a[i]) {
+        Ok(EV::R(s, rg)) => EV::R(s, ev.clip(s, rg)),
+        Ok(v) => v,
+        Err(e) => EV::V(Value::Error(e)),
+    };
+    // IF / IFERROR / IFNA with a single-valued first argument evaluate only the branch taken
+    // (recursive LAMBDAs rely on it).
+    if matches!(name, "IF" | "IFERROR" | "IFNA") && idx.first() == Some(&0) {
+        let first = lifted(ev, 0);
+        if !ev.is_multi(&first) {
+            let mut args = a.to_vec();
+            args[0] = Expr::Name("\u{1}0".into());
+            ev.bind("\u{1}0".into(), first);
+            let r = dispatch(ev, name, &args);
+            ev.unbind(1);
+            return r;
+        }
+        vals.push(first);
+    }
+    for &i in &idx[vals.len()..] {
+        let v = lifted(ev, i);
         vals.push(v);
     }
     let names: Vec<String> = idx.iter().map(|i| format!("\u{1}{i}")).collect();
@@ -846,7 +1033,7 @@ fn lift(ev: &mut Evaluator, name: &str, a: &[Expr], spec: Lift) -> Res {
     let dims = |v: &EV| match v {
         EV::R(_, rg) => (rg.rows() as usize, rg.cols() as usize),
         EV::A(g) => (g.len(), g.first().map_or(0, |r| r.len())),
-        EV::V(_) => (1, 1),
+        _ => (1, 1),
     };
     let rows = vals.iter().map(|v| dims(v).0).max().unwrap_or(1);
     let cols = vals.iter().map(|v| dims(v).1).max().unwrap_or(1);
@@ -872,7 +1059,7 @@ fn lift(ev: &mut Evaluator, name: &str, a: &[Expr], spec: Lift) -> Res {
 }
 
 /// Element (r, c) of an argument under array broadcasting.
-fn element(v: &EV, r: usize, c: usize) -> EV {
+pub(super) fn element(v: &EV, r: usize, c: usize) -> EV {
     let pick = |h: usize, w: usize| -> Option<(usize, usize)> {
         let rr = if h == 1 { 0 } else { r };
         let cc = if w == 1 { 0 } else { c };
@@ -887,7 +1074,8 @@ fn element(v: &EV, r: usize, c: usize) -> EV {
             Some(v) => EV::V(v.clone()),
             None => EV::V(Value::Error(E::NA)),
         },
-        EV::V(x) => EV::V(x.clone()),
+        EV::V(_) | EV::L(_) => v.clone(),
+        EV::M(_) => EV::V(Value::Error(E::Value)),
     }
 }
 
@@ -1953,6 +2141,7 @@ fn dispatch(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
             EV::R(_, rg) => num(if name == "ROWS" { rg.rows() } else { rg.cols() } as f64),
             EV::A(g) => num(if name == "ROWS" { g.len() } else { g.first().map_or(0, |r| r.len()) } as f64),
             EV::V(_) => num(1.0),
+            _ => Err(E::Value),
         },
         "CHOOSE" => {
             let i = ev.number(a, 0)?.trunc() as usize;
@@ -1966,6 +2155,16 @@ fn dispatch(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
             let v = ev.arg(a, 0)?;
             let mut r = ev.number_or(a, 1, 0.0)?.trunc() as i64;
             let mut c = ev.number_or(a, 2, 0.0)?.trunc() as i64;
+            // area_num picks one area of a multi-area reference `(A1:B2,D1:E2)`.
+            let area = ev.number_or(a, 3, 1.0)?.trunc() as i64;
+            let v = match v {
+                EV::M(m) => {
+                    let (s, rg) = *m.get((area - 1).max(0) as usize).filter(|_| area >= 1).ok_or(E::Ref)?;
+                    EV::R(s, rg)
+                }
+                _ if area != 1 => return Err(E::Ref),
+                v => v,
+            };
             match v {
                 EV::R(s, rg) => {
                     if rg.rows() == 1 && !ev.has(a, 2) {
@@ -2113,7 +2312,7 @@ fn dispatch(ev: &mut Evaluator, name: &str, a: &[Expr]) -> Res {
             let vertical = match &lv {
                 EV::R(_, rg) => rg.rows() > 1 || rg.cols() == 1,
                 EV::A(g) => g.len() > 1 || g.first().map_or(0, |r| r.len()) == 1,
-                EV::V(_) => true,
+                _ => true,
             };
             let col = match lv {
                 EV::R(s, rg) => ev.lookup_col(s, if vertical { Range::new(rg.r1, rg.c1, rg.r2, rg.c1) } else { Range::new(rg.r1, rg.c1, rg.r1, rg.c2) }),

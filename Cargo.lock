@@ -800,6 +800,7 @@ dependencies = [
  "embed-resource",
  "quick-xml 0.42.0",
  "raw-window-handle",
+ "regex-lite",
  "rfd",
  "rust_xlsxwriter",
  "serde_json",
@@ -1996,6 +1997,12 @@ checksum = "580c875845b41ecb1564ad1ae4703044cef774145e3d7a94dc2b3fa7c97868fd"
 dependencies = [
  "bitflags 2.13.2",
 ]
+
+[[package]]
+name = "regex-lite"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cab834c73d247e67f4fae452806d17d3c7501756d98c8808d7c9c7aa7d18f973"
 
 [[package]]
 name = "rfd"

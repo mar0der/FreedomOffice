@@ -417,7 +417,7 @@ fn strip_future_prefixes(s: &str) -> String {
     if !s.contains("_xl") {
         return s.to_string();
     }
-    s.replace("_xlfn.", "").replace("_xlws.", "").replace("_xlpm.", "")
+    s.replace("_xlfn.", "").replace("_xlws.", "").replace("_xlpm.", "").replace("_xleta.", "")
 }
 
 // ---------------------------------------------------------------------------

@@ -80,6 +80,14 @@ pub enum Expr {
     Paren(Box<Expr>),
     /// Omitted argument, e.g. the middle of `IF(A1,,2)`.
     Missing,
+    /// Range operator between general references: `A1:INDEX(B:B,5)`.
+    Range(Box<Expr>, Box<Expr>),
+    /// Intersection operator (a space): `A1:C3 B2:D4`.
+    Isect(Box<Expr>, Box<Expr>),
+    /// Union operator (commas inside brackets): the contents of `(A1:A3,C1:C3)`.
+    Union(Vec<Expr>),
+    /// Invocation of a computed function: `LAMBDA(x,x+1)(2)`.
+    Call(Box<Expr>, Vec<Expr>),
 }
 
 // ---------------------------------------------------------------------------
@@ -122,7 +130,19 @@ pub fn lex(src: &str) -> Result<Vec<Spanned>, String> {
         let c = at(i);
         let start = pos(i);
         if c.is_whitespace() {
-            i += 1;
+            while at(i).is_whitespace() {
+                i += 1;
+            }
+            // A space between two references is the intersection operator.
+            let nc = at(i);
+            let after_ref = match out.last().map(|t: &Spanned| &t.tok) {
+                Some(Tok::Ident(_) | Tok::Op("#")) => nc.is_alphabetic() || matches!(nc, '$' | '\'' | '_'),
+                Some(Tok::RParen) => nc.is_alphabetic() || matches!(nc, '$' | '\'' | '_' | '('),
+                _ => false,
+            };
+            if after_ref {
+                out.push(Spanned { tok: Tok::Op(" "), start, end: pos(i) });
+            }
             continue;
         }
         let tok = match c {
@@ -224,12 +244,39 @@ pub fn lex(src: &str) -> Result<Vec<Spanned>, String> {
                     i += 1;
                 }
                 let text = src[pos(s0)..pos(i)].to_string();
+                // 3-D reference prefix `Sheet1:Sheet3!` (not after a sheet: `S!A1:S!B2`).
+                let mut j = i + 1;
+                while at(i) == ':' && (at(j).is_alphanumeric() || matches!(at(j), '_' | '.')) {
+                    j += 1;
+                }
                 if at(i) == '!' {
                     i += 1;
                     Tok::Sheet(text)
+                } else if j > i + 1 && at(j) == '!' && !matches!(out.last().map(|t| &t.tok), Some(Tok::Sheet(_))) {
+                    let span = src[pos(s0)..pos(j)].to_string();
+                    i = j + 1;
+                    Tok::Sheet(span)
                 } else {
                     Tok::Ident(text)
                 }
+            }
+            // External workbook prefix `[Book.xlsx]Sheet1!` (or `[1]Sheet1!` as stored in files).
+            '[' => {
+                let mut j = i + 1;
+                while j < n && !matches!(at(j), ']' | '[') && !at(j).is_whitespace() {
+                    j += 1;
+                }
+                let k0 = j + 1;
+                let mut k = k0;
+                while at(j) == ']' && (at(k).is_alphanumeric() || matches!(at(k), '_' | '.')) {
+                    k += 1;
+                }
+                if at(j) != ']' || j == i + 1 || k == k0 || at(k) != '!' {
+                    return Err("unexpected character '['".into());
+                }
+                let text = src[pos(i)..pos(k)].to_string();
+                i = k + 1;
+                Tok::Sheet(text)
             }
             '+' | '-' | '*' | '/' | '^' | '&' | '%' | '=' | '@' => {
                 i += 1;
@@ -464,6 +511,29 @@ impl Parser {
             });
         }
         let mut e = self.primary()?;
+        // Reference operators bind tighter than any other: range `:`, intersection ` `,
+        // and invocation of a computed function `f(...)(args)`.
+        loop {
+            let d0 = self.d;
+            if self.peek() == Some(&Tok::Colon) {
+                self.i += 1;
+                let b = self.nested(Self::primary)?;
+                self.set_depth(d0.max(self.d) + 1)?;
+                e = Expr::Range(Box::new(e), Box::new(b));
+            } else if self.is_op(" ") {
+                self.i += 1;
+                let b = self.nested(Self::primary)?;
+                self.set_depth(d0.max(self.d) + 1)?;
+                e = Expr::Isect(Box::new(e), Box::new(b));
+            } else if self.peek() == Some(&Tok::LParen) && matches!(e, Expr::Func(..) | Expr::Call(..) | Expr::Paren(_)) {
+                self.i += 1;
+                let args = self.args()?;
+                self.set_depth(d0.max(self.d) + 1)?;
+                e = Expr::Call(Box::new(e), args);
+            } else {
+                break;
+            }
+        }
         while self.is_op("%") {
             self.i += 1;
             self.set_depth(self.d + 1)?;
@@ -576,11 +646,23 @@ impl Parser {
             }
             Tok::LParen => {
                 self.i += 1;
-                let e = self.expr()?;
+                let mut e = self.expr()?;
+                let mut deepest = self.d;
+                if self.peek() == Some(&Tok::Comma) {
+                    // Union: `(A1:A3,C1:C3)`.
+                    let mut items = vec![e];
+                    while self.peek() == Some(&Tok::Comma) {
+                        self.i += 1;
+                        items.push(self.expr()?);
+                        deepest = deepest.max(self.d);
+                    }
+                    deepest += 1;
+                    e = Expr::Union(items);
+                }
                 if self.next() != Some(Tok::RParen) {
                     return Err("missing )".into());
                 }
-                self.set_depth(self.d + 1)?;
+                self.set_depth(deepest + 1)?;
                 Ok(Expr::Paren(Box::new(e)))
             }
             Tok::LBrace => {
@@ -601,6 +683,13 @@ impl Parser {
                 }
                 if id.eq_ignore_ascii_case("FALSE") {
                     return Ok(Expr::Bool(false));
+                }
+                // LET / LAMBDA parameters (`_xlpm.x`) and built-ins passed as functions
+                // (`_xleta.SUM`) carry a prefix in files.
+                for p in ["_xlpm.", "_xleta."] {
+                    if id.len() > p.len() && id.get(..p.len()).is_some_and(|s| s.eq_ignore_ascii_case(p)) {
+                        return Ok(Expr::Name(id[p.len()..].to_string()));
+                    }
                 }
                 Ok(Expr::Name(id))
             }
@@ -647,17 +736,31 @@ impl Parser {
     /// Function call after `name(`.
     fn call(&mut self, id: &str) -> Result<Expr, String> {
         let mut name = id.to_ascii_uppercase();
-        for p in ["_XLFN._XLWS.", "_XLFN.", "_XLWS."] {
+        for p in ["_XLFN._XLWS.", "_XLFN.", "_XLWS.", "_XLPM."] {
             if let Some(rest) = name.strip_prefix(p) {
                 name = rest.to_string();
             }
         }
+        let args = self.args()?;
+        if let (true, [Expr::Ref(r)]) = (name == "ANCHORARRAY", args.as_slice()) {
+            if r.kind == RefKind::Cell {
+                self.d = 1;
+                return Ok(Expr::Ref(RefExpr { kind: RefKind::Spill, ..r.clone() }));
+            }
+        }
+        self.set_depth(self.d + 1)?;
+        Ok(Expr::Func(name, args))
+    }
+
+    /// Call arguments after `(` up to the closing `)`; `self.d` is set to the deepest one.
+    fn args(&mut self) -> Result<Vec<Expr>, String> {
         let mut args = Vec::new();
+        let mut deepest = 0;
         if self.peek() == Some(&Tok::RParen) {
             self.i += 1;
-            return Ok(Expr::Func(name, args));
+            self.d = 0;
+            return Ok(args);
         }
-        let mut deepest = 0;
         loop {
             if matches!(self.peek(), Some(Tok::Comma) | Some(Tok::RParen)) {
                 args.push(Expr::Missing);
@@ -668,17 +771,11 @@ impl Parser {
             match self.next() {
                 Some(Tok::Comma) => continue,
                 Some(Tok::RParen) => break,
-                _ => return Err(format!("missing ) in {name}")),
+                _ => return Err("missing )".into()),
             }
         }
-        if let (true, [Expr::Ref(r)]) = (name == "ANCHORARRAY", args.as_slice()) {
-            if r.kind == RefKind::Cell {
-                self.d = 1;
-                return Ok(Expr::Ref(RefExpr { kind: RefKind::Spill, ..r.clone() }));
-            }
-        }
-        self.set_depth(deepest + 1)?;
-        Ok(Expr::Func(name, args))
+        self.d = deepest;
+        Ok(args)
     }
 
     fn try_ref(&mut self, sheet: Option<String>) -> Result<Expr, String> {
@@ -732,8 +829,27 @@ fn part_str(p: &CellPart) -> String {
     format!("{}{}{}{}", if p.col_abs { "$" } else { "" }, col_name(p.col), if p.row_abs { "$" } else { "" }, p.row + 1)
 }
 
+/// `Sheet!` prefix of a reference. 3-D spans (`Jan:Dec`) and external books (`[Book.xlsx]Data`)
+/// are written unquoted when every part is a plain name, and quoted as a whole otherwise.
+fn sheet_prefix(name: &str) -> String {
+    let plain = |s: &str| quote_sheet(s) == s;
+    let (book, rest) = match name.strip_prefix('[').and_then(|r| r.split_once(']')) {
+        Some((b, r)) if !b.is_empty() && !b.contains(['\'', ' ', '[']) => (format!("[{b}]"), r),
+        _ => (String::new(), name),
+    };
+    let simple = match rest.split_once(':') {
+        Some((a, b)) => plain(a) && plain(b),
+        None => plain(rest),
+    };
+    if simple && !rest.is_empty() { format!("{book}{rest}!") } else { format!("{}!", quote_whole(name)) }
+}
+
+fn quote_whole(name: &str) -> String {
+    format!("'{}'", name.replace('\'', "''"))
+}
+
 pub fn ref_str(r: &RefExpr) -> String {
-    let prefix = r.sheet.as_ref().map(|s| format!("{}!", quote_sheet(s))).unwrap_or_default();
+    let prefix = r.sheet.as_deref().map(sheet_prefix).unwrap_or_default();
     let body = match r.kind {
         RefKind::Cell => part_str(&r.a),
         RefKind::Spill => format!("{}#", part_str(&r.a)),
@@ -766,8 +882,39 @@ pub fn print(e: &Expr) -> String {
     s
 }
 
+/// Functions newer than Excel 2007, stored with the `_xlfn.` prefix in files (sorted).
+const FUTURE: &[&str] = &[
+    "ACOT", "ACOTH", "AGGREGATE", "ANCHORARRAY", "ARABIC", "ARRAYTOTEXT", "BASE", "BETA.DIST", "BETA.INV", "BINOM.DIST",
+    "BINOM.DIST.RANGE", "BINOM.INV", "BITAND", "BITLSHIFT", "BITOR", "BITRSHIFT", "BITXOR", "BYCOL", "BYROW", "CEILING.MATH",
+    "CEILING.PRECISE", "CHISQ.DIST", "CHISQ.DIST.RT", "CHISQ.INV", "CHISQ.INV.RT", "CHISQ.TEST", "CHOOSECOLS", "CHOOSEROWS",
+    "COMBINA", "CONCAT", "CONFIDENCE.NORM", "CONFIDENCE.T", "COT", "COTH", "COVARIANCE.P", "COVARIANCE.S", "CSC", "CSCH",
+    "DAYS", "DECIMAL", "DROP", "ENCODEURL", "ERF.PRECISE", "ERFC.PRECISE", "EXPAND", "EXPON.DIST", "F.DIST", "F.DIST.RT",
+    "F.INV", "F.INV.RT", "F.TEST", "FIELDVALUE", "FILTER", "FILTERXML", "FLOOR.MATH", "FLOOR.PRECISE", "FORECAST.ETS",
+    "FORECAST.ETS.CONFINT", "FORECAST.ETS.SEASONALITY", "FORECAST.ETS.STAT", "FORECAST.LINEAR", "FORMULATEXT", "GAMMA",
+    "GAMMA.DIST", "GAMMA.INV", "GAMMALN.PRECISE", "GAUSS", "GROUPBY", "HSTACK", "HYPGEOM.DIST", "IFNA", "IFS", "IMAGE",
+    "IMCOSH", "IMCOT", "IMCSC", "IMCSCH", "IMSEC", "IMSECH", "IMSINH", "IMTAN", "ISFORMULA", "ISOMITTED", "ISOWEEKNUM",
+    "LAMBDA", "LET", "LOGNORM.DIST", "LOGNORM.INV", "MAKEARRAY", "MAP", "MAXIFS", "MINIFS", "MODE.MULT", "MODE.SNGL", "MUNIT",
+    "NEGBINOM.DIST", "NORM.DIST", "NORM.INV", "NORM.S.DIST", "NORM.S.INV", "NUMBERVALUE", "PDURATION", "PERCENTILE.EXC",
+    "PERCENTILE.INC", "PERCENTOF", "PERCENTRANK.EXC", "PERCENTRANK.INC", "PERMUTATIONA", "PHI", "PIVOTBY", "POISSON.DIST",
+    "QUARTILE.EXC", "QUARTILE.INC", "RANDARRAY", "RANK.AVG", "RANK.EQ", "REDUCE", "REGEXEXTRACT", "REGEXREPLACE", "REGEXTEST",
+    "RRI", "SCAN", "SEC", "SECH", "SEQUENCE", "SHEET", "SHEETS", "SINGLE", "SKEW.P", "SORT", "SORTBY", "STDEV.P", "STDEV.S",
+    "SWITCH", "T.DIST", "T.DIST.2T", "T.DIST.RT", "T.INV", "T.INV.2T", "T.TEST", "TAKE", "TEXTAFTER", "TEXTBEFORE", "TEXTJOIN",
+    "TEXTSPLIT", "TOCOL", "TOROW", "TRIMRANGE", "UNICHAR", "UNICODE", "UNIQUE", "VALUETOTEXT", "VAR.P", "VAR.S", "VSTACK",
+    "WEBSERVICE", "WEIBULL.DIST", "WRAPCOLS", "WRAPROWS", "XLOOKUP", "XMATCH", "XOR", "Z.TEST",
+];
+
+/// File prefix of a function name (`_xlfn.`, `_xlfn._xlws.` for FILTER and SORT, or none).
+fn future_prefix(name: &str) -> &'static str {
+    match name {
+        "FILTER" | "SORT" => "_xlfn._xlws.",
+        _ if FUTURE.binary_search(&name).is_ok() => "_xlfn.",
+        _ => "",
+    }
+}
+
 /// Prints a formula as stored in .xlsx files: `A1#` as `ANCHORARRAY(A1)`, `@x` as
-/// `SINGLE(x)` and LET parameters with the `_xlpm.` prefix.
+/// `SINGLE(x)`, newer functions with `_xlfn.`, LET / LAMBDA parameters with `_xlpm.` and
+/// built-ins passed as function values with `_xleta.`.
 pub fn print_xlsx(e: &Expr) -> String {
     let mut s = String::new();
     write_expr(e, &mut s, &mut Some(Vec::new()));
@@ -787,12 +934,17 @@ fn write_expr(e: &Expr, out: &mut String, xlsx: &mut Option<Vec<String>>) {
         Expr::Err(e) => out.push_str(e.as_str()),
         Expr::Ref(r) if r.kind == RefKind::Spill && xlsx.is_some() => {
             let cell = RefExpr { kind: RefKind::Cell, ..r.clone() };
-            out.push_str(&format!("ANCHORARRAY({})", ref_str(&cell)));
+            out.push_str(&format!("_xlfn.ANCHORARRAY({})", ref_str(&cell)));
         }
         Expr::Ref(r) => out.push_str(&ref_str(r)),
         Expr::Name(n) => {
-            if xlsx.as_ref().is_some_and(|lets| lets.iter().any(|l| l.eq_ignore_ascii_case(n))) {
-                out.push_str("_xlpm.");
+            if let Some(lets) = xlsx {
+                if lets.iter().any(|l| l.eq_ignore_ascii_case(n)) {
+                    out.push_str("_xlpm.");
+                } else if super::functions::is_builtin(&n.to_ascii_uppercase()) {
+                    // A built-in passed as a function value: `GROUPBY(A:A,B:B,SUM)`.
+                    out.push_str("_xleta.");
+                }
             }
             out.push_str(n)
         }
@@ -818,26 +970,49 @@ fn write_expr(e: &Expr, out: &mut String, xlsx: &mut Option<Vec<String>>) {
             write_expr(&args[0], out, xlsx);
         }
         Expr::Func(name, args) => {
+            // A call of a LET / LAMBDA variable holding a function: `_xlpm.f(2)` in files.
+            if xlsx.as_ref().is_some_and(|lets| lets.iter().any(|l| l.eq_ignore_ascii_case(name))) {
+                out.push_str("_xlpm.");
+            }
             let lets = match xlsx {
-                Some(l) if name == "LET" => {
-                    let names: Vec<String> = args.iter().step_by(2).filter_map(|a| if let Expr::Name(n) = a { Some(n.clone()) } else { None }).collect();
+                Some(l) if name == "LET" || name == "LAMBDA" => {
+                    let params = if name == "LET" { args.iter().step_by(2).collect::<Vec<_>>() } else { args.iter().take(args.len().saturating_sub(1)).collect() };
+                    let names: Vec<String> = params.into_iter().filter_map(|a| if let Expr::Name(n) = a { Some(n.clone()) } else { None }).collect();
                     let k = names.len();
                     l.extend(names);
                     k
                 }
                 _ => 0,
             };
+            if xlsx.is_some() {
+                out.push_str(future_prefix(name));
+            }
             out.push_str(name);
-            out.push('(');
-            for (i, a) in args.iter().enumerate() {
+            write_args(args, out, xlsx);
+            if let Some(l) = xlsx {
+                l.truncate(l.len() - lets);
+            }
+        }
+        Expr::Call(f, args) => {
+            write_expr(f, out, xlsx);
+            write_args(args, out, xlsx);
+        }
+        Expr::Range(a, b) => {
+            write_expr(a, out, xlsx);
+            out.push(':');
+            write_expr(b, out, xlsx);
+        }
+        Expr::Isect(a, b) => {
+            write_expr(a, out, xlsx);
+            out.push(' ');
+            write_expr(b, out, xlsx);
+        }
+        Expr::Union(items) => {
+            for (i, a) in items.iter().enumerate() {
                 if i > 0 {
                     out.push(',');
                 }
                 write_expr(a, out, xlsx);
-            }
-            out.push(')');
-            if let Some(l) = xlsx {
-                l.truncate(l.len() - lets);
             }
         }
         Expr::Array(rows) => {
@@ -864,6 +1039,17 @@ fn write_expr(e: &Expr, out: &mut String, xlsx: &mut Option<Vec<String>>) {
     }
 }
 
+fn write_args(args: &[Expr], out: &mut String, xlsx: &mut Option<Vec<String>>) {
+    out.push('(');
+    for (i, a) in args.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        write_expr(a, out, xlsx);
+    }
+    out.push(')');
+}
+
 // ---------------------------------------------------------------------------
 // Transforms
 // ---------------------------------------------------------------------------
@@ -877,11 +1063,15 @@ pub fn map_refs(e: &mut Expr, f: &mut dyn FnMut(&mut RefExpr) -> bool) {
             }
         }
         Expr::Neg(a) | Expr::Plus(a) | Expr::Percent(a) | Expr::Paren(a) => map_refs(a, f),
-        Expr::Bin(_, a, b) => {
+        Expr::Bin(_, a, b) | Expr::Range(a, b) | Expr::Isect(a, b) => {
             map_refs(a, f);
             map_refs(b, f);
         }
-        Expr::Func(_, args) => args.iter_mut().for_each(|a| map_refs(a, f)),
+        Expr::Func(_, args) | Expr::Union(args) => args.iter_mut().for_each(|a| map_refs(a, f)),
+        Expr::Call(g, args) => {
+            map_refs(g, f);
+            args.iter_mut().for_each(|a| map_refs(a, f));
+        }
         _ => {}
     }
 }
@@ -978,6 +1168,10 @@ pub fn rename_sheet(e: &mut Expr, old: &str, new: &str) {
         if let Some(s) = &mut r.sheet {
             if s.eq_ignore_ascii_case(old) {
                 *s = new.to_string();
+            } else if let Some((a, b)) = s.split_once(':') {
+                // Either end of a 3-D span.
+                let fix = |x: &str| if x.eq_ignore_ascii_case(old) { new.to_string() } else { x.to_string() };
+                *s = format!("{}:{}", fix(a), fix(b));
             }
         }
         true
@@ -1032,7 +1226,11 @@ mod tests {
         assert!(parse("#").is_err());
         assert_eq!(rt("_xlfn.ANCHORARRAY(B2)*2"), "B2#*2");
         let e = parse("SUM(A1#)+@B1:B3+LET(x,2,x*A1)").unwrap();
-        assert_eq!(print_xlsx(&e), "SUM(ANCHORARRAY(A1))+SINGLE(B1:B3)+LET(_xlpm.x,2,_xlpm.x*A1)");
+        assert_eq!(print_xlsx(&e), "SUM(_xlfn.ANCHORARRAY(A1))+_xlfn.SINGLE(B1:B3)+_xlfn.LET(_xlpm.x,2,_xlpm.x*A1)");
+        let e = parse("_xlfn._xlws.SORT(_xlfn.GROUPBY(A1:A9,B1:B9,_xleta.SUM))").unwrap();
+        assert_eq!(print(&e), "SORT(GROUPBY(A1:A9,B1:B9,SUM))");
+        assert_eq!(print_xlsx(&e), "_xlfn._xlws.SORT(_xlfn.GROUPBY(A1:A9,B1:B9,_xleta.SUM))");
+        assert!(FUTURE.windows(2).all(|w| w[0] < w[1]), "FUTURE must stay sorted");
     }
 
     #[test]
