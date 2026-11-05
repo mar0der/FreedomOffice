@@ -9,7 +9,7 @@ use super::dialogs::Dialog;
 use super::fill::float_button;
 use super::grid::Layout;
 use super::theme;
-use super::{App, Clip, ClipCell, Scope};
+use super::{App, Change, Clip, ClipCell, Scope};
 use crate::model::{cell_from_input, Border, Cell, ErrorKind, Range, Style, Value, Workbook, MAX_COLS, MAX_ROWS};
 
 /// What Paste Special pastes.
@@ -345,9 +345,6 @@ fn paste_option_list() -> Vec<(&'static str, &'static str, char, PasteOpts)> {
 impl App {
     /// Pastes the internal clipboard with the given options (Ctrl+V, Paste Special, Paste Options).
     pub fn paste_special(&mut self, o: PasteOpts) {
-        if self.locked_block(self.sel()) {
-            return;
-        }
         let Some(clip) = self.clip.clone() else { return };
         self.commit_edit(false);
         let si = self.wb.active;
@@ -360,9 +357,13 @@ impl App {
             (1, 1)
         };
         let (r0, c0) = if tr * tc > 1 { (sel.r1, sel.c1) } else { self.active() };
+        let target_est = Range::new(r0, c0, (r0 + h * tr - 1).min(MAX_ROWS - 1), (c0 + w * tc - 1).min(MAX_COLS - 1));
         if clip.cut {
             // Cut cells can only be moved (the familiar Paste Special is unavailable after Cut).
             self.move_clip(&clip, r0, c0);
+            return;
+        }
+        if self.locked_block(target_est) {
             return;
         }
         // Rules, notes and widths live on the sheet: snapshot the sheet for those pastes.
@@ -371,7 +372,6 @@ impl App {
                 || s.validations.iter().any(|v| v.ranges.iter().any(|x| x.intersects(&clip.range)))
         });
         let whole_sheet = !o.link && (!clip.notes.is_empty() || src_has_rules || !o.what.touches_cells() || o.what == PasteWhat::AllWithWidths);
-        let target_est = Range::new(r0, c0, (r0 + h * tr - 1).min(MAX_ROWS - 1), (c0 + w * tc - 1).min(MAX_COLS - 1));
         self.push_undo(&[if whole_sheet { Scope::Sheet(si) } else { Scope::Range(si, target_est) }]);
         let target = paste_cells(&mut self.wb, si, &clip, (r0, c0), (tr, tc), o);
         self.select_range(target);
@@ -388,6 +388,10 @@ impl App {
     fn move_clip(&mut self, clip: &Clip, r0: u32, c0: u32) {
         let si = self.wb.active;
         let target = Range::new(r0, c0, (r0 + clip.range.rows() - 1).min(MAX_ROWS - 1), (c0 + clip.range.cols() - 1).min(MAX_COLS - 1));
+        // Both the cut cells (emptied) and the destination change.
+        if self.locked_block(target) || self.protect_blocks_at(clip.sheet, Change::Cells(clip.range)) {
+            return;
+        }
         self.push_undo(&[Scope::All]);
         let src_sheet = clip.sheet;
         let mut taken = Vec::new();

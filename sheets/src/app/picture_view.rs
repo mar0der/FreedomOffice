@@ -109,6 +109,10 @@ impl App {
         if let Some(mut d) = self.pictures.drag {
             if down {
                 if !d.moved && (pos - d.start).length() > 3.0 {
+                    if self.protect_blocks(super::Change::Objects) {
+                        self.pictures.drag = None;
+                        return true;
+                    }
                     d.moved = true;
                     self.push_undo(&[Scope::Sheet(self.wb.active)]);
                 }
@@ -193,6 +197,9 @@ impl App {
 
     pub fn delete_picture(&mut self) {
         let Some(i) = self.selected_picture() else { return };
+        if self.protect_blocks(super::Change::Objects) {
+            return;
+        }
         self.push_undo(&[Scope::Sheet(self.wb.active)]);
         self.sheet_mut().images.remove(i);
         self.pictures.sel = None;

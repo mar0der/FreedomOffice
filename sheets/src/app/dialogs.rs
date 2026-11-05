@@ -143,6 +143,9 @@ fn ok_cancel(ui: &mut egui::Ui) -> (bool, bool) {
 impl App {
     pub fn open_format_cells(&mut self, tab: usize) {
         self.commit_edit(false);
+        if self.format_block() {
+            return;
+        }
         let st = self.active_style();
         let (cat, dec, th) = categorize(&st.num_fmt);
         let (r, c) = self.active();
@@ -162,18 +165,27 @@ impl App {
     }
 
     pub fn open_col_width(&mut self) {
+        if self.protect_blocks(super::Change::FormatCols) {
+            return;
+        }
         let c = self.sel().c1;
         let px = self.sheet().raw_col_width(c);
         self.dialog = Some(Dialog::ColWidth { text: format!("{:.2}", ((px - 5.0) / 7.0).max(0.0)) });
     }
 
     pub fn open_row_height(&mut self) {
+        if self.protect_blocks(super::Change::FormatRows) {
+            return;
+        }
         let r = self.sel().r1;
         let px = self.sheet().raw_row_height(r);
         self.dialog = Some(Dialog::RowHeight { text: format!("{:.2}", px * 0.75) });
     }
 
     pub fn open_remove_duplicates(&mut self) {
+        if self.protect_blocks(super::Change::Any) {
+            return;
+        }
         let rg = if self.sel().is_single() { self.current_region() } else { self.sel_clipped() };
         let header = matches!(self.sheet().value(rg.r1, rg.c1), Value::Text(_));
         self.dialog = Some(Dialog::RemoveDuplicates { range: rg, header, cols: (rg.c1..=rg.c2).map(|c| (c, true)).collect() });

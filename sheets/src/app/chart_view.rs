@@ -140,6 +140,9 @@ impl App {
 
     /// Adds a finished chart to the active sheet and selects it.
     pub(super) fn insert_chart_value(&mut self, mut ch: Chart) {
+        if self.protect_blocks(super::Change::Objects) {
+            return;
+        }
         let si = self.wb.active;
         let data = chart::resolve(&self.wb, &ch);
         if data.series.iter().all(|s| s.values.iter().all(Option::is_none)) {
@@ -169,7 +172,7 @@ impl App {
         let Some(old) = self.wb.sheets.get(si).and_then(|sh| sh.charts.get(i)) else { return };
         let mut ch = old.clone();
         f(&mut ch);
-        if &ch == old {
+        if &ch == old || self.protect_blocks_at(si, super::Change::Objects) {
             return;
         }
         self.push_undo(&[Scope::Sheet(si)]);
@@ -182,7 +185,7 @@ impl App {
     pub(super) fn set_chart_live(&mut self, now: f64, ch: Chart) {
         let Some(i) = self.selected_chart() else { return };
         let si = self.wb.active;
-        if self.wb.sheets[si].charts[i] == ch {
+        if self.wb.sheets[si].charts[i] == ch || self.protect_blocks(super::Change::Objects) {
             return;
         }
         if now - self.chart.live_at > 0.8 {
@@ -195,6 +198,9 @@ impl App {
 
     fn delete_chart(&mut self) {
         let Some(i) = self.selected_chart() else { return };
+        if self.protect_blocks(super::Change::Objects) {
+            return;
+        }
         self.push_undo(&[Scope::Sheet(self.wb.active)]);
         self.sheet_mut().charts.remove(i);
         self.deselect_chart();
@@ -284,6 +290,10 @@ impl App {
         if let Some(mut d) = self.chart.drag {
             if down {
                 if !d.moved && (pos - d.start).length() > 3.0 {
+                    if self.protect_blocks(super::Change::Objects) {
+                        self.chart.drag = None;
+                        return true;
+                    }
                     d.moved = true;
                     self.push_undo(&[Scope::Sheet(self.wb.active)]);
                 }

@@ -200,6 +200,31 @@ pub fn fill_cells(wb: &mut Workbook, si: usize, src: Range, target: Range, kind:
     }
 }
 
+/// The kept part of `src` when the fill handle is dragged back inside it to cell (r, c): rows
+/// (or columns, whichever more are given up) after the pointer are left out.
+pub fn shrink_target(src: Range, r: u32, c: u32) -> Range {
+    let rows = src.r2 - r.clamp(src.r1, src.r2);
+    let cols = src.c2 - c.clamp(src.c1, src.c2);
+    if rows == 0 && cols == 0 {
+        src
+    } else if rows >= cols {
+        Range { r2: src.r2 - rows, ..src }
+    } else {
+        Range { c2: src.c2 - cols, ..src }
+    }
+}
+
+/// The cells of `src` a shrinking fill drag leaves out (they are cleared on release).
+pub fn shrunk_part(src: Range, keep: Range) -> Option<Range> {
+    if keep.r2 < src.r2 && keep.r1 == src.r1 && keep.c1 == src.c1 && keep.c2 == src.c2 {
+        Some(Range { r1: keep.r2 + 1, ..src })
+    } else if keep.c2 < src.c2 && keep.r1 == src.r1 && keep.c1 == src.c1 && keep.r2 == src.r2 {
+        Some(Range { c1: keep.c2 + 1, ..src })
+    } else {
+        None
+    }
+}
+
 /// The Auto Fill Options button left at the bottom-right of a filled range.
 pub struct FillButton {
     pub sheet: usize,
@@ -217,6 +242,9 @@ impl App {
     }
 
     pub fn autofill_kind(&mut self, src: Range, target: Range, kind: FillKind) {
+        if self.locked_block(target) {
+            return;
+        }
         let si = self.wb.active;
         self.push_undo(&[Scope::Range(si, target)]);
         // The option the button shows as chosen: what the first line actually did.
@@ -236,6 +264,29 @@ impl App {
         self.changed();
         self.paste_button = None;
         self.fill_button = Some(FillButton { sheet: si, src, target, kind: shown, edits: self.edits, open: false });
+    }
+
+    /// Fill handle dragged back inside the selection: like Excel, clears the contents (not the
+    /// formats) of the cells left out and selects the rest.
+    pub fn fill_shrink(&mut self, src: Range, keep: Range) {
+        let Some(gone) = shrunk_part(src, keep) else { return };
+        if self.locked_block(gone) {
+            return;
+        }
+        let si = self.wb.active;
+        self.push_undo(&[Scope::Range(si, gone)]);
+        let keys: Vec<(u32, u32)> = self.wb.sheets[si].iter_range(gone).map(|(r, c, _)| (r, c)).collect();
+        for (r, c) in keys {
+            let sh = &mut self.wb.sheets[si];
+            if let Some(cell) = sh.get_mut(r, c) {
+                cell.value = Value::Empty;
+                cell.formula = None;
+            }
+            sh.tidy(r, c);
+        }
+        self.select_range(keep);
+        self.changed_ranges(si, &[gone]);
+        self.fill_button = None;
     }
 
     /// Re-does the last fill with another Auto Fill Options choice.
@@ -437,5 +488,32 @@ mod tests {
         fill_cells(&mut wb, 0, Range::cell(0, 0), Range::new(0, 0, 1, 0), FillKind::WithoutFormatting);
         assert_eq!(wb.sheets[0].value(1, 0), &Value::Number(5.0));
         assert_eq!(wb.sheets[0].get(1, 0).unwrap().style, 0);
+    }
+
+    #[test]
+    fn dragging_the_handle_back_inside_clears_the_cells_left_out() {
+        let src = Range::new(1, 2, 6, 3);
+        // Pointer back on row 3 (index 2): rows 4-7 are given up.
+        assert_eq!(shrink_target(src, 2, 3), Range::new(1, 2, 2, 3));
+        assert_eq!(shrunk_part(src, Range::new(1, 2, 2, 3)), Some(Range::new(3, 2, 6, 3)));
+        // Pointer in the first column on the last row: the second column is given up.
+        assert_eq!(shrink_target(src, 6, 2), Range::new(1, 2, 6, 2));
+        assert_eq!(shrink_target(src, 6, 3), src);
+        assert_eq!(shrunk_part(src, src), None);
+
+        let (_ctx, mut app) = super::super::data_ui::sample_app();
+        let date_style = app.sheet().get(5, 3).unwrap().style;
+        app.fill_shrink(src, Range::new(1, 2, 2, 3));
+        assert_eq!(app.sel(), Range::new(1, 2, 2, 3));
+        assert_eq!(app.sheet().value(2, 2), &Value::Number(340.0));
+        for r in 3..=6 {
+            assert_eq!(app.sheet().value(r, 2), &Value::Empty);
+            assert_eq!(app.sheet().value(r, 3), &Value::Empty);
+        }
+        // Contents go, formats stay; one undo brings the values back.
+        assert_eq!(app.sheet().get(5, 3).map(|c| c.style), Some(date_style));
+        assert_eq!(app.sheet().value(7, 2), &Value::Number(500.0));
+        app.undo();
+        assert_eq!(app.sheet().value(4, 2), &Value::Number(410.0));
     }
 }

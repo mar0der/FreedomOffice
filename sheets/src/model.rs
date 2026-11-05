@@ -600,6 +600,7 @@ impl Sheet {
     }
 
     /// True when the sheet is protected and the cell is locked.
+    #[cfg(test)]
     pub fn is_locked(&self, wb_styles: &Workbook, r: u32, c: u32) -> bool {
         self.protection.is_some() && !wb_styles.style(self.get(r, c).map_or(0, |x| x.style)).unlocked
     }

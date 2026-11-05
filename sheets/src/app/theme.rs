@@ -130,6 +130,12 @@ pub fn sel_fill() -> Color32 {
     Color32::from_rgba_unmultiplied(0x10, 0x10, 0x10, 22)
 }
 
+/// Grey wash over the cells a fill-handle drag back into the selection will clear
+/// (drawn on the always-white cell area).
+pub fn fill_shrink() -> Color32 {
+    Color32::from_rgba_unmultiplied(0x60, 0x60, 0x60, 90)
+}
+
 /// Colours used to highlight references while editing formulas.
 pub const REF_COLORS: [Color32; 8] = [
     Color32::from_rgb(0x41, 0x6F, 0xE6),

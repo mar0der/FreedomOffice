@@ -118,6 +118,7 @@ pub enum Pending {
 
 pub use filter_ui::FilterPopup;
 pub use find_ui::FindState;
+pub use review_ui::Change;
 
 pub struct App {
     pub wb: Workbook,
@@ -678,6 +679,10 @@ impl App {
                     return false;
                 }
             }
+        }
+        if fill_selection && self.locked_block(self.sel()) {
+            self.edit = Some(e);
+            return false;
         }
         if !self.dv_check_entry(&e, &text, fill_selection) {
             self.edit = Some(e);

@@ -12,7 +12,7 @@ use crate::datatools::{
     self, ColFormat, Converted, DateOrder, SortItem, SortKey, SortOn, SortOptions, SortOrder, BUILTIN_LISTS, SUBTOTAL_FUNCS,
 };
 use crate::filter::{self, ColumnKind};
-use crate::model::{cell_from_input, col_name, Cell, Range, Value, MAX_COLS};
+use crate::model::{cell_from_input, col_name, Cell, Range, Value, MAX_COLS, MAX_ROWS};
 use crate::numfmt;
 
 /// Dialogs owned by the data tools (one `Dialog::Data` variant keeps dialogs.rs small).
@@ -112,6 +112,9 @@ impl App {
     pub fn open_sort_dialog(&mut self) {
         self.commit_edit(false);
         let (rg, header) = self.sort_area();
+        if self.protect_blocks(super::Change::Sort(rg)) {
+            return;
+        }
         let c = self.active().1.clamp(rg.c1, rg.c2);
         self.dialog = Some(Dialog::Data(Box::new(DataDlg::Sort(SortDlg {
             range: rg,
@@ -132,7 +135,7 @@ impl App {
     /// Sorts the rows (or, left to right, the columns) of a range by several keys.
     /// Hidden rows/columns (e.g. filtered out) stay where they are.
     pub fn sort_range_by(&mut self, rg: Range, header: bool, keys: &[SortKey], opts: SortOptions) {
-        if keys.is_empty() {
+        if keys.is_empty() || self.protect_blocks(super::Change::Sort(rg)) {
             return;
         }
         let si = self.wb.active;
@@ -556,6 +559,9 @@ impl App {
     pub fn open_text_to_columns(&mut self) {
         self.commit_edit(false);
         let sel = self.sel_clipped();
+        if self.locked_block(sel) {
+            return;
+        }
         if sel.cols() > 1 {
             self.dialog = Some(Dialog::Message {
                 title: "Convert Text to Columns Wizard".into(),
@@ -614,12 +620,14 @@ impl App {
         let first = d.lines.first().map(|l| l.0).unwrap_or(d.src.r1);
         let last = d.lines.last().map(|l| l.0).unwrap_or(d.src.r2);
         let r_off = r0 as i64 - first as i64;
-        let target = Range::new(
-            (first as i64 + r_off).max(0) as u32,
-            c0,
-            (last as i64 + r_off).max(0) as u32,
-            (c0 + out_cols - 1).min(MAX_COLS - 1),
-        );
+        // The converted data must fit on the sheet.
+        if last as i64 + r_off >= MAX_ROWS as i64 || c0 as u64 + out_cols as u64 > MAX_COLS as u64 {
+            return false;
+        }
+        let target = Range::new((first as i64 + r_off).max(0) as u32, c0, (last as i64 + r_off).max(0) as u32, c0 + out_cols - 1);
+        if self.locked_block(target) {
+            return true;
+        }
         self.push_undo(&[Scope::Range(si, target.union(&d.src))]);
         for ((r, _), parts) in d.lines.iter().zip(fields) {
             let rr = (*r as i64 + r_off).max(0) as u32;
@@ -977,6 +985,9 @@ impl App {
     /// Data > Subtotal.
     pub fn open_subtotal(&mut self) {
         self.commit_edit(false);
+        if self.protect_blocks(super::Change::Any) {
+            return;
+        }
         let (rg, _) = self.sort_area();
         if rg.rows() < 2 {
             self.dialog = Some(Dialog::Message {
@@ -1029,6 +1040,9 @@ impl App {
     /// Inserts a subtotal row at each change in `at_change` plus a grand total, and outlines them
     /// (detail rows at level 2, subtotal rows at level 1).
     pub fn insert_subtotals(&mut self, rg: Range, at_change: u32, func: usize, cols: &[u32], replace: bool, below: bool, page_breaks: bool) {
+        if self.protect_blocks(super::Change::Any) {
+            return;
+        }
         let si = self.wb.active;
         self.push_undo(&[Scope::All]);
         let rg = if replace { self.remove_subtotals(rg) } else { rg };
@@ -1094,6 +1108,9 @@ impl App {
 
     /// Data > Subtotal > Remove All.
     pub fn remove_all_subtotals(&mut self, rg: Range) {
+        if self.protect_blocks(super::Change::Any) {
+            return;
+        }
         self.push_undo(&[Scope::All]);
         self.remove_subtotals(rg);
         self.changed();
@@ -1287,6 +1304,30 @@ mod tests {
         assert_eq!(txt(&app, "G4"), "one");
         assert_eq!(txt(&app, "H4"), "three");
         assert_eq!(txt(&app, "E4"), "one,two,three");
+    }
+
+    #[test]
+    fn text_to_columns_destination_must_fit_on_the_sheet() {
+        let (_ctx, mut app) = sample_app();
+        app.select_range(Range::new(1, 4, 7, 4));
+        app.open_text_to_columns();
+        let Some(Dialog::Data(d)) = app.dialog.take() else { panic!("no wizard") };
+        let DataDlg::TextToColumns(mut t) = *d else { panic!("not the wizard") };
+        t.fixed = false;
+        t.comma = true;
+        t.tab = false;
+        t.sync_formats();
+        let cells = app.sheet().rows.values().map(|r| r.len()).sum::<usize>();
+        // Seven lines starting two rows above the bottom, three columns starting at XFC.
+        for dest in ["A1048575", "XFC2"] {
+            t.dest = dest.into();
+            assert!(!app.text_to_columns_apply(&t), "{dest} accepted");
+            assert_eq!(app.sheet().rows.values().map(|r| r.len()).sum::<usize>(), cells);
+        }
+        t.dest = "A1048570".into();
+        assert!(app.text_to_columns_apply(&t));
+        assert_eq!(txt(&app, "A1048576"), "z");
+        assert_eq!(txt(&app, "C1048572"), "three");
     }
 
     #[test]

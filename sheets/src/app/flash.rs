@@ -326,6 +326,9 @@ impl App {
             return;
         }
         let rg = crate::model::Range::new(top, c, bottom, c);
+        if fills.iter().any(|(r, _)| self.locked_block(crate::model::Range::cell(*r, c))) {
+            return;
+        }
         self.push_undo(&[super::Scope::Range(si, rg)]);
         for (r, v) in &fills {
             let style = self.wb.sheets[si].get(*r, c).map_or(0, |x| x.style);

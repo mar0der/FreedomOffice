@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use eframe::egui;
 
 use super::dialogs::Dialog;
-use super::{App, Clip, ClipCell, EditMode, Editor, Scope};
+use super::{App, Change, Clip, ClipCell, EditMode, Editor, Scope};
 use crate::formula::{self, Expr};
 use crate::model::{
     cell_from_input, Border, BorderLine, Cell, HAlign, Range, Sheet, Style, VAlign, Value, MAX_COLS, MAX_ROWS,
@@ -393,16 +393,12 @@ impl App {
 
     /// Handles a paste event carrying system clipboard text.
     pub fn paste_text(&mut self, text: &str) {
-        if self.locked_block(self.sel()) {
-            return;
-        }
         if let Some(clip) = &self.clip {
             if Self::normalize(&clip.text) == Self::normalize(text) {
                 self.paste_internal(PasteMode::All);
                 return;
             }
         }
-        self.clip = None;
         let rows = parse_tsv(text);
         if rows.is_empty() {
             return;
@@ -411,6 +407,10 @@ impl App {
         let h = rows.len() as u32;
         let w = rows.iter().map(|r| r.len()).max().unwrap_or(1) as u32;
         let target = Range::new(r0, c0, (r0 + h - 1).min(MAX_ROWS - 1), (c0 + w - 1).min(MAX_COLS - 1));
+        if self.locked_block(target) {
+            return;
+        }
+        self.clip = None;
         self.push_undo(&[Scope::Range(self.wb.active, target)]);
         let si = self.wb.active;
         for (i, row) in rows.iter().enumerate() {
@@ -437,7 +437,7 @@ impl App {
     // ------------------------------------------------------------------
 
     pub fn clear(&mut self, contents: bool, formats: bool) {
-        if self.areas().into_iter().any(|a| self.locked_block(a)) {
+        if self.areas().into_iter().any(|a| self.locked_block(a)) || (formats && self.format_block()) {
             return;
         }
         let areas = self.areas();
@@ -555,7 +555,11 @@ impl App {
         let fix = |rg: Range| -> Option<Range> {
             let (a, b) = if rows { (rg.r1, rg.r2) } else { (rg.c1, rg.c2) };
             let (na, nb) = if n > 0 {
-                (if a >= at { a + n as u32 } else { a }, if b >= at { (b as i64 + n).min(max - 1) as u32 } else { b })
+                let na = if a >= at { a as i64 + n } else { a as i64 };
+                if na >= max {
+                    return None; // pushed off the end of the sheet
+                }
+                (na as u32, if b >= at { (b as i64 + n).min(max - 1) as u32 } else { b })
             } else {
                 let end = at as i64 - n;
                 let na = if (a as i64) >= end { (a as i64 + n) as u32 } else if a >= at { at } else { a };
@@ -617,23 +621,44 @@ impl App {
 
     fn structure(&mut self, rows: bool, at: u32, n: i64) {
         self.commit_edit(false);
+        let change = match (rows, n > 0) {
+            (true, true) => Change::InsertRows,
+            (false, true) => Change::InsertCols,
+            (true, false) => Change::DeleteRows(Range::new(at, 0, (at as i64 - n - 1) as u32, MAX_COLS - 1)),
+            (false, false) => Change::DeleteCols(Range::new(0, at, MAX_ROWS - 1, (at as i64 - n - 1) as u32)),
+        };
+        if self.protect_blocks(change) {
+            return;
+        }
         if n > 0 {
-            let limit = if rows { MAX_ROWS } else { MAX_COLS } as i64;
-            let last = match self.sheet().extent() {
-                Some((er, ec)) => (if rows { er } else { ec }) as i64,
-                None => -1,
-            };
-            if last >= at as i64 && last + n >= limit {
-                self.dialog = Some(Dialog::Message {
-                    title: "Insert".into(),
-                    text: "To prevent possible loss of data, FreedomOffice Sheets can't shift nonblank cells off of the worksheet.\n\nSelect fewer rows or columns to insert, or delete data at the end of the sheet.".into(),
-                });
+            let band = if rows { Range::new(at, 0, MAX_ROWS - 1, MAX_COLS - 1) } else { Range::new(0, at, MAX_ROWS - 1, MAX_COLS - 1) };
+            if self.refuse_shift_off(band, rows, n) {
                 return;
             }
         }
         self.push_undo(&[Scope::All]);
         self.shift_structure(rows, at, n);
         self.changed();
+    }
+
+    /// Like Excel, refuses (after telling the user) to shift the band down (`down`) or right by
+    /// `n` when that would push a nonblank cell, merge or table off the end of the sheet.
+    fn refuse_shift_off(&mut self, band: Range, down: bool, n: i64) -> bool {
+        let sh = self.sheet();
+        let end = |rg: &Range| if down { rg.r2 } else { rg.c2 } as i64;
+        let mut last = sh.iter_range(band).map(|(r, c, _)| if down { r } else { c } as i64).max().unwrap_or(-1);
+        for rg in sh.merges.iter().chain(sh.tables.iter().map(|t| &t.range)).filter(|rg| rg.intersects(&band)) {
+            last = last.max(end(rg));
+        }
+        let limit = if down { MAX_ROWS } else { MAX_COLS } as i64;
+        if last < 0 || last + n < limit {
+            return false;
+        }
+        self.dialog = Some(Dialog::Message {
+            title: "FreedomOffice Sheets".into(),
+            text: "To prevent possible loss of data, FreedomOffice Sheets cannot shift nonblank cells off of the worksheet. Select another location in which to insert new cells, or delete data from the end of your worksheet.".into(),
+        });
+        true
     }
 
     /// Inserts (n > 0) or deletes rows/columns of the active sheet without an undo step.
@@ -661,11 +686,18 @@ impl App {
         if sel.is_full_cols() {
             return self.insert_cols();
         }
-        self.push_undo(&[Scope::All]);
-        let si = self.wb.active;
+        if self.protect_blocks(Change::Any) {
+            return;
+        }
         let (er, ec) = self.sheet().extent().unwrap_or((0, 0));
         let block = if shift_down { Range::new(sel.r1, sel.c1, er.max(sel.r1), sel.c2) } else { Range::new(sel.r1, sel.c1, sel.r2, ec.max(sel.c1)) };
         let (dr, dc) = if shift_down { (sel.rows() as i64, 0) } else { (0, sel.cols() as i64) };
+        let band = if shift_down { Range::new(sel.r1, sel.c1, MAX_ROWS - 1, sel.c2) } else { Range::new(sel.r1, sel.c1, sel.r2, MAX_COLS - 1) };
+        if self.refuse_shift_off(band, shift_down, dr + dc) {
+            return;
+        }
+        self.push_undo(&[Scope::All]);
+        let si = self.wb.active;
         self.move_block(si, block, dr, dc);
         self.changed();
     }
@@ -677,6 +709,9 @@ impl App {
         }
         if sel.is_full_cols() {
             return self.delete_cols();
+        }
+        if self.protect_blocks(Change::Any) {
+            return;
         }
         self.push_undo(&[Scope::All]);
         let si = self.wb.active;
@@ -746,6 +781,9 @@ impl App {
     }
 
     pub fn hide_rows(&mut self, hide: bool) {
+        if self.protect_blocks(Change::FormatRows) {
+            return;
+        }
         let sel = self.sel_clipped();
         self.push_undo(&[Scope::Sheet(self.wb.active)]);
         let sel_full = self.sel();
@@ -757,6 +795,9 @@ impl App {
     }
 
     pub fn hide_cols(&mut self, hide: bool) {
+        if self.protect_blocks(Change::FormatCols) {
+            return;
+        }
         self.push_undo(&[Scope::Sheet(self.wb.active)]);
         let sel = self.sel();
         let sh = self.sheet_mut();
@@ -767,6 +808,9 @@ impl App {
     }
 
     pub fn set_col_width(&mut self, px: f32) {
+        if self.protect_blocks(Change::FormatCols) {
+            return;
+        }
         self.push_undo(&[Scope::Sheet(self.wb.active)]);
         let sel = self.sel();
         let sh = self.sheet_mut();
@@ -782,6 +826,9 @@ impl App {
     }
 
     pub fn set_row_height(&mut self, px: f32) {
+        if self.protect_blocks(Change::FormatRows) {
+            return;
+        }
         self.push_undo(&[Scope::Sheet(self.wb.active)]);
         let sel = self.sel();
         let (er, _) = self.sheet().extent().unwrap_or((0, 0));
@@ -814,6 +861,9 @@ impl App {
 
     pub fn autofit_cols(&mut self, cols: &[u32]) {
         let Some(ctx) = self.ctx.clone() else { return };
+        if self.protect_blocks(Change::FormatCols) {
+            return;
+        }
         self.push_undo(&[Scope::Sheet(self.wb.active)]);
         for &c in cols {
             let cells: Vec<Cell> = self
@@ -839,6 +889,9 @@ impl App {
     }
 
     pub fn autofit_rows(&mut self, rows: &[u32]) {
+        if self.protect_blocks(Change::FormatRows) {
+            return;
+        }
         self.push_undo(&[Scope::Sheet(self.wb.active)]);
         self.fit_rows(rows);
     }
@@ -974,6 +1027,9 @@ impl App {
         self.apply_style(move |s| s.strike = v);
     }
     pub fn toggle_wrap(&mut self) {
+        if self.format_block() {
+            return;
+        }
         let v = !self.active_style().wrap;
         self.apply_style(move |s| s.wrap = v);
         // Like the desktop app, rows grow (or shrink back) to fit wrapped text.
@@ -1025,6 +1081,9 @@ impl App {
     }
 
     pub fn borders(&mut self, kind: BorderKind) {
+        if self.format_block() {
+            return;
+        }
         let sel = self.sel_clipped();
         self.commit_edit(false);
         let si = self.wb.active;
@@ -1077,12 +1136,12 @@ impl App {
     pub fn merge(&mut self, mode: u8) {
         // 0 = merge & center, 1 = merge across, 2 = merge cells, 3 = unmerge
         let sel = self.sel();
-        if sel.is_full_cols() || sel.is_full_rows() {
+        if sel.is_full_cols() || sel.is_full_rows() || self.protect_blocks(Change::Any) {
             return;
         }
         let si = self.wb.active;
         self.push_undo(&[Scope::Sheet(si)]);
-        let had = self.sheet().merges.iter().any(|m| m.intersects(&sel));
+        let had =self.sheet().merges.iter().any(|m| m.intersects(&sel));
         self.sheet_mut().merges.retain(|m| !m.intersects(&sel));
         if mode == 3 || (mode == 0 && had) {
             self.dirty = true;
@@ -1144,6 +1203,10 @@ impl App {
         } else {
             sel
         };
+        if self.format_block() {
+            self.format_painter = None;
+            return;
+        }
         self.push_undo(&[Scope::Range(si, target)]);
         for r in target.r1..=target.r2 {
             for c in target.c1..=target.c2 {
@@ -1169,7 +1232,7 @@ impl App {
     pub fn fill_down(&mut self) {
         let sel = self.sel_clipped();
         let src_row = if sel.rows() == 1 { sel.r1.saturating_sub(1) } else { sel.r1 };
-        if sel.rows() == 1 && sel.r1 == 0 {
+        if (sel.rows() == 1 && sel.r1 == 0) || self.locked_block(sel) {
             return;
         }
         let si = self.wb.active;
@@ -1193,7 +1256,7 @@ impl App {
     pub fn fill_right(&mut self) {
         let sel = self.sel_clipped();
         let src_col = if sel.cols() == 1 { sel.c1.saturating_sub(1) } else { sel.c1 };
-        if sel.cols() == 1 && sel.c1 == 0 {
+        if (sel.cols() == 1 && sel.c1 == 0) || self.locked_block(sel) {
             return;
         }
         let si = self.wb.active;
@@ -1277,6 +1340,9 @@ impl App {
         let si = self.wb.active;
         let last_empty = (sel.c1..=sel.c2).all(|c| !self.sheet().is_populated(sel.r2, c));
         let (data_end, out_row) = if last_empty && sel.rows() > 1 { (sel.r2 - 1, sel.r2) } else { (sel.r2, sel.r2 + 1) };
+        if out_row >= MAX_ROWS || self.locked_block(Range::new(out_row, sel.c1, out_row, sel.c2)) {
+            return;
+        }
         self.push_undo(&[Scope::Range(si, Range::new(out_row, sel.c1, out_row, sel.c2))]);
         for c in sel.c1..=sel.c2 {
             let f = format!("={func}({})", Range::new(sel.r1, c, data_end, c).to_a1());
@@ -1332,6 +1398,9 @@ impl App {
             return 0;
         }
         let data = Range::new(r1, rg.c1, rg.r2, rg.c2);
+        if self.protect_blocks(Change::Any) {
+            return 0;
+        }
         self.push_undo(&[Scope::Range(si, data)]);
         let sh = &self.wb.sheets[si];
         let mut seen = HashSet::new();
@@ -1589,12 +1658,18 @@ impl App {
 
     pub fn edit_note(&mut self) {
         self.commit_edit(false);
+        if self.protect_blocks(Change::Objects) {
+            return;
+        }
         let (r, c) = self.active();
         let text = self.sheet().notes.get(&(r, c)).cloned().unwrap_or_default();
         self.dialog = Some(Dialog::Note { r, c, text, focus: true });
     }
 
     pub fn set_note(&mut self, r: u32, c: u32, text: Option<String>) {
+        if self.protect_blocks(Change::Objects) {
+            return;
+        }
         let si = self.wb.active;
         self.push_undo(&[Scope::Sheet(si)]);
         match text {
@@ -1611,7 +1686,7 @@ impl App {
     pub fn delete_notes_in_selection(&mut self) {
         let sel = self.sel();
         let si = self.wb.active;
-        if !self.wb.sheets[si].notes.keys().any(|(r, c)| sel.contains(*r, *c)) {
+        if !self.wb.sheets[si].notes.keys().any(|(r, c)| sel.contains(*r, *c)) || self.protect_blocks(Change::Objects) {
             return;
         }
         self.push_undo(&[Scope::Sheet(si)]);
@@ -1626,6 +1701,11 @@ impl App {
     pub fn drop_selection(&mut self, ctx: &egui::Context, r: u32, c: u32, copy: bool) {
         let sel = self.sel();
         if (r, c) == (sel.r1, sel.c1) {
+            return;
+        }
+        // Moving empties the source; both ends must be editable.
+        let dest = Range::new(r, c, (r + sel.rows() - 1).min(MAX_ROWS - 1), (c + sel.cols() - 1).min(MAX_COLS - 1));
+        if self.locked_block(dest) || (!copy && self.locked_block(sel)) {
             return;
         }
         self.copy(ctx, !copy);
@@ -1645,6 +1725,9 @@ impl App {
     pub fn open_link_dialog(&mut self) {
         self.commit_edit(false);
         let (r, c) = self.active();
+        if self.protect_blocks(Change::Link(Range::cell(r, c))) {
+            return;
+        }
         let sh = self.sheet();
         let text = sh.get(r, c).map(|x| crate::numfmt::value_to_text(&x.value)).unwrap_or_default();
         let address = sh.links.get(&(r, c)).cloned().unwrap_or_default();
@@ -1652,6 +1735,9 @@ impl App {
     }
 
     pub fn set_link(&mut self, r: u32, c: u32, text: &str, address: Option<&str>) {
+        if self.protect_blocks(Change::Link(Range::cell(r, c))) {
+            return;
+        }
         let si = self.wb.active;
         self.push_undo(&[Scope::Sheet(si)]);
         match address.map(str::trim).filter(|a| !a.is_empty()) {
@@ -1731,13 +1817,13 @@ impl App {
         } else {
             (sel.r1, sel.r2)
         };
-        if b - a > 100_000 {
+        if b - a > 100_000 || self.protect_blocks(Change::Any) {
             return;
         }
         let si = self.wb.active;
         self.push_undo(&[Scope::Sheet(si)]);
         let sh = &mut self.wb.sheets[si];
-        let map = if cols { &mut sh.col_levels } else { &mut sh.row_levels };
+        let map =if cols { &mut sh.col_levels } else { &mut sh.row_levels };
         for i in a..=b {
             let l = map.entry(i).or_insert(0);
             if ungroup {
@@ -1762,6 +1848,9 @@ impl App {
 
     /// Expands or collapses one outline group.
     pub fn toggle_outline(&mut self, cols: bool, a: u32, b: u32) {
+        if self.protect_blocks(Change::Any) {
+            return;
+        }
         let si = self.wb.active;
         self.push_undo(&[Scope::Sheet(si)]);
         let sh = &mut self.wb.sheets[si];
@@ -1779,6 +1868,9 @@ impl App {
 
     /// Outline level buttons (1, 2, 3...): show only groups above `level`.
     pub fn show_outline_level(&mut self, cols: bool, level: u8) {
+        if self.protect_blocks(Change::Any) {
+            return;
+        }
         let si = self.wb.active;
         self.push_undo(&[Scope::Sheet(si)]);
         let sh = &mut self.wb.sheets[si];
@@ -1983,6 +2075,41 @@ mod tests {
         assert_eq!(adjust_decimals("#,##0", 1, &Value::Empty), "#,##0.0");
         assert_eq!(adjust_decimals("", 1, &Value::Number(1.5)), "0.00");
         assert_eq!(adjust_decimals("0%", 1, &Value::Empty), "0.0%");
+    }
+
+    #[test]
+    fn inserting_never_pushes_content_off_the_sheet() {
+        let (_ctx, mut app) = super::super::data_ui::sample_app();
+        // A table filling the last rows of the sheet.
+        let rg = Range::new(MAX_ROWS - 3, 0, MAX_ROWS - 1, 1);
+        for r in rg.r1..=rg.r2 {
+            for c in 0..2 {
+                app.wb.sheets[0].set(r, c, Some(Cell { value: Value::Text(format!("v{r}{c}")), ..Default::default() }));
+            }
+        }
+        app.wb.sheets[0].tables.push(crate::table::Table::new("Bottom", rg, "TableStyleMedium2"));
+        let rows_before = app.sheet().rows.clone();
+        app.select_range(Range::new(0, 0, 4, MAX_COLS - 1));
+        app.insert_rows();
+        assert!(matches!(app.dialog.take(), Some(Dialog::Message { text, .. }) if text.starts_with("To prevent possible loss of data")));
+        assert_eq!(format!("{:?}", app.sheet().rows), format!("{rows_before:?}"));
+        assert_eq!(app.sheet().tables[0].range, rg);
+        // Shifting cells down in those columns is refused too; elsewhere it works.
+        app.select(0, 0, false);
+        app.insert_cells(true);
+        assert!(app.dialog.take().is_some());
+        app.select(0, 5, false);
+        app.insert_cells(true);
+        assert!(app.dialog.is_none());
+
+        // Ranges pushed past the end are dropped instead of ending up inverted.
+        let mut sh = Sheet::new("S");
+        sh.merges.push(Range::new(MAX_ROWS - 2, 0, MAX_ROWS - 1, 1));
+        sh.merges.push(Range::new(MAX_ROWS - 9, 0, MAX_ROWS - 1, 0));
+        sh.tables.push(crate::table::Table::new("T", Range::new(MAX_ROWS - 4, 2, MAX_ROWS - 1, 3), "TableStyleMedium2"));
+        App::shift_sheet(&mut sh, true, 0, 5);
+        assert_eq!(sh.merges, vec![Range::new(MAX_ROWS - 4, 0, MAX_ROWS - 1, 0)]);
+        assert!(sh.tables.is_empty());
     }
 
     #[test]

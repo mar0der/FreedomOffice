@@ -224,12 +224,19 @@ impl App {
 
     /// Data > Filter (Ctrl+Shift+L): turns the AutoFilter on for the current region, or off.
     pub fn toggle_filter(&mut self) {
+        if self.protect_blocks(super::Change::Any) {
+            return;
+        }
         let si = self.wb.active;
         self.push_undo(&[Scope::Sheet(si)]);
-        if self.sheet().filter.is_some() {
+        if let Some(mut f) = self.sheet().filter.clone() {
+            // Show the rows the criteria hid; rows hidden by hand stay hidden.
+            f.range.r2 = filter::data_end(self.sheet(), f.range);
+            let vis = filter::row_visibility(&self.wb, self.sheet(), &f, numfmt::now_serial());
             let sh = self.sheet_mut();
-            if let Some(f) = sh.filter.take() {
-                for r in f.range.r1..=f.range.r2 {
+            sh.filter = None;
+            for (r, shown) in vis {
+                if !shown {
                     sh.hidden_rows.remove(&r);
                 }
             }
@@ -267,7 +274,7 @@ impl App {
     /// Data > Reapply.
     pub fn apply_filter(&mut self) {
         let si = self.wb.active;
-        if self.wb.sheets[si].filter.is_none() {
+        if self.wb.sheets[si].filter.is_none() || self.protect_blocks(super::Change::Filter) {
             return;
         }
         self.push_undo(&[Scope::Sheet(si)]);
@@ -277,7 +284,7 @@ impl App {
     /// Data > Clear: removes all criteria, keeping the dropdowns.
     pub fn clear_filter(&mut self) {
         let si = self.wb.active;
-        if self.wb.sheets[si].filter.is_none() {
+        if self.wb.sheets[si].filter.is_none() || self.protect_blocks(super::Change::Filter) {
             return;
         }
         self.push_undo(&[Scope::Sheet(si)]);
@@ -290,7 +297,7 @@ impl App {
     /// Sets (or with `None` clears) the criteria of one column and refilters.
     pub fn set_column_filter(&mut self, col: u32, cf: Option<ColumnFilter>) {
         let si = self.wb.active;
-        if self.wb.sheets[si].filter.is_none() {
+        if self.wb.sheets[si].filter.is_none() || self.protect_blocks(super::Change::Filter) {
             return;
         }
         self.push_undo(&[Scope::Sheet(si)]);
@@ -1016,6 +1023,19 @@ mod tests {
         app.dialog = None;
         app.toggle_filter();
         assert!(app.sheet().filter.is_none() && hidden(&app).is_empty());
+    }
+
+    #[test]
+    fn filter_off_keeps_rows_hidden_by_hand() {
+        let (_ctx, mut app) = sample_app();
+        app.toggle_filter();
+        app.set_column_filter(0, Some(ColumnFilter::Values { items: ["east".to_string()].into(), blanks: false, dates: Default::default() }));
+        assert_eq!(hidden(&app), vec![3, 5, 6, 7]);
+        app.select(3, 0, false);
+        app.hide_rows(true); // row 4 (shown by the filter) hidden by hand
+        app.toggle_filter();
+        assert!(app.sheet().filter.is_none());
+        assert_eq!(hidden(&app), vec![4]);
     }
 
     #[test]

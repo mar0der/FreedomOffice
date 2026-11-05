@@ -50,7 +50,7 @@ impl App {
     /// Format as Table: turns the current region (or selection) into a real table whose first
     /// row holds the headers. `kind`: 0 = Light, 1 = Medium, 2 = Dark.
     pub fn format_as_table(&mut self, accent: u32, kind: u8) {
-        if !self.commit_edit(false) {
+        if !self.commit_edit(false) || self.protect_blocks(super::Change::Any) {
             return;
         }
         let ai = table::ACCENTS.iter().position(|a| *a == accent).unwrap_or(1);
@@ -91,6 +91,9 @@ impl App {
 
     /// Applies an undoable change to a table and keeps its cells in step.
     fn edit_table(&mut self, s: usize, i: usize, f: impl FnOnce(&mut Table)) {
+        if self.protect_blocks_at(s, super::Change::Any) {
+            return;
+        }
         self.push_undo(&[Scope::Sheet(s)]);
         let before = self.wb.sheets[s].tables[i].clone();
         f(&mut self.wb.sheets[s].tables[i]);
@@ -217,6 +220,9 @@ impl App {
     }
 
     pub fn convert_table_to_range(&mut self, s: usize, i: usize) {
+        if self.protect_blocks_at(s, super::Change::Any) {
+            return;
+        }
         self.push_undo(&[Scope::All]);
         table::unstructure(&mut self.wb, s, i);
         // The table's look stays on the cells, like Excel.
@@ -272,6 +278,9 @@ impl App {
             });
             return;
         }
+        if self.protect_blocks_at(s, super::Change::Any) {
+            return;
+        }
         self.push_undo(&[Scope::Sheet(s)]);
         let sh = &mut self.wb.sheets[s];
         let tb = &mut sh.tables[i];
@@ -307,6 +316,9 @@ impl App {
     }
 
     fn set_total_fn(&mut self, s: usize, i: usize, k: u32, f: TotalFn) {
+        if self.protect_blocks_at(s, super::Change::Any) {
+            return;
+        }
         self.push_undo(&[Scope::Sheet(s)]);
         {
             let col = &mut self.wb.sheets[s].tables[i].columns[k as usize];

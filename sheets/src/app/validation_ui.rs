@@ -179,6 +179,9 @@ impl App {
 
     pub fn dv_open_dialog(&mut self) {
         self.commit_edit(false);
+        if self.protect_blocks(super::Change::Any) {
+            return;
+        }
         let (r, c) = self.active();
         let v = validation::at(self.sheet(), r, c).cloned().unwrap_or_default();
         self.dialog = Some(Dialog::Validation(Box::new(DvDialog::new(v, self.sel()))));
@@ -264,10 +267,12 @@ impl App {
         match result {
             Some(true) => match d.build() {
                 Ok(v) => {
-                    let si = self.wb.active;
-                    self.push_undo(&[Scope::Sheet(si)]);
-                    validation::set_for_range(&mut self.wb.sheets[si], d.range, Some(v));
-                    self.changed();
+                    if !self.protect_blocks(super::Change::Any) {
+                        let si = self.wb.active;
+                        self.push_undo(&[Scope::Sheet(si)]);
+                        validation::set_for_range(&mut self.wb.sheets[si], d.range, Some(v));
+                        self.changed();
+                    }
                     false
                 }
                 Err(e) => {
@@ -470,6 +475,9 @@ impl App {
     }
 
     fn dv_pick(&mut self, si: usize, r: u32, c: u32, text: &str, v: Value) {
+        if self.protect_blocks_at(si, super::Change::Cells(Range::cell(r, c))) {
+            return;
+        }
         self.push_undo(&[Scope::Range(si, Range::cell(r, c))]);
         let style = self.wb.sheets[si].get(r, c).map(|c| c.style).unwrap_or(0);
         let cell = match v {
