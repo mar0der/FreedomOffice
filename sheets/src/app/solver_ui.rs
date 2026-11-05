@@ -20,15 +20,15 @@ pub struct ConstraintEdit {
 
 pub struct SolverDlg {
     sheet: usize,
-    objective: String,
+    pub(super) objective: String,
     /// 0 Max, 1 Min, 2 Value Of.
     goal: usize,
     value: String,
-    vars: String,
-    constraints: Vec<Constraint>,
+    pub(super) vars: String,
+    pub(super) constraints: Vec<Constraint>,
     selected: Option<usize>,
     nonneg: bool,
-    method: Method,
+    pub(super) method: Method,
     focus: usize,
     seen: Seen,
     edit: Option<ConstraintEdit>,
@@ -41,7 +41,7 @@ pub struct ResultsDlg {
     out: Outcome,
     original: Vec<((u32, u32), Option<Cell>)>,
     keep: bool,
-    answer: bool,
+    pub(super) answer: bool,
     back: bool,
 }
 
@@ -71,6 +71,13 @@ impl SolverDlg {
             }
         }
         Ok(SolverModel { objective, goal, vars, constraints: self.constraints.clone(), nonneg: self.nonneg, method: self.method })
+    }
+}
+
+#[cfg(test)]
+impl SolverDlg {
+    pub(super) fn model_for_test(&self, app: &App) -> SolverModel {
+        self.model(app).unwrap()
     }
 }
 
@@ -340,7 +347,7 @@ impl App {
         }
     }
 
-    fn run_solver(&mut self, si: usize, m: SolverModel) {
+    pub(super) fn run_solver(&mut self, si: usize, m: SolverModel) {
         // The undo step covers the model names and the variable cells.
         self.push_undo(&[Scope::Sheet(si)]);
         self.save_solver_model(si, &m);

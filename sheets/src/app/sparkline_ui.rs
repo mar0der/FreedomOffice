@@ -16,7 +16,7 @@ pub struct CreateDlg {
     sheet: usize,
     kind: SparkKind,
     data: String,
-    loc: String,
+    pub(super) loc: String,
     /// Editing: the group, and the single sparkline when only its data is edited.
     edit: Option<(usize, Option<usize>)>,
     focus: usize,

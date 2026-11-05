@@ -1272,7 +1272,7 @@ impl App {
                     if act_cf.as_ref().is_some_and(|o| o.color.is_some()) {
                         s.color = None;
                     }
-                    if !s.text.is_empty() {
+                    if !s.text.is_empty() && !act_cf.as_ref().is_some_and(|o| o.icon.is_some_and(|i| i.icon_only)) {
                         let font = self.cell_font(&style);
                         let color = s.color.or(style.color.map(rgb)).unwrap_or(Color32::BLACK);
                         let g = painter.layout_no_wrap(s.text.clone(), font, color);

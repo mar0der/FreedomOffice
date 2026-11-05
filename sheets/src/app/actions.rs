@@ -437,7 +437,7 @@ impl App {
     // ------------------------------------------------------------------
 
     pub fn clear(&mut self, contents: bool, formats: bool) {
-        if self.areas().into_iter().any(|a| self.locked_block(a)) {
+        if self.areas().into_iter().any(|a| self.locked_block(a) || (contents && self.data_table_blocks(self.wb.active, a))) {
             return;
         }
         let areas = self.areas();
@@ -454,10 +454,16 @@ impl App {
         }
         let sel = self.sel_clipped();
         let si = self.wb.active;
-        if formats {
+        // Clearing a whole data table removes it.
+        let covered = |t: &crate::whatif::DataTable| sel.r1 <= t.range.r1 && sel.c1 <= t.range.c1 && sel.r2 >= t.range.r2 && sel.c2 >= t.range.c2;
+        let drops_table = contents && self.wb.sheets[si].data_tables.iter().any(covered);
+        if formats || drops_table {
             self.push_undo(&[Scope::Sheet(si)]);
         } else {
             self.push_undo(&[Scope::Range(si, sel)]);
+        }
+        if drops_table {
+            self.wb.sheets[si].data_tables.retain(|t| !covered(t));
         }
         let keys: Vec<(u32, u32)> = self.wb.sheets[si].iter_range(sel).map(|(r, c, _)| (r, c)).collect();
         for (r, c) in keys {

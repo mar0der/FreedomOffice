@@ -821,3 +821,188 @@ impl App {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{cell_from_input, parse_cell};
+
+    fn put(app: &mut App, a1: &str, text: &str) {
+        let (r, c) = parse_cell(a1).unwrap();
+        let cell = cell_from_input(&mut app.wb, text, 0);
+        app.wb.sheets[0].set(r, c, cell);
+    }
+
+    fn num(app: &App, a1: &str) -> f64 {
+        let (r, c) = parse_cell(a1).unwrap();
+        app.wb.sheets[0].value(r, c).as_number().unwrap_or(f64::NAN)
+    }
+
+    fn key(ctx: &egui::Context, app: &mut App, k: egui::Key) {
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() });
+        let _ = ctx.run(input, |ctx| app.dialogs_ui(ctx));
+        super::super::data_ui::frames(ctx, app, 1);
+    }
+
+    /// Paints the grid and every ribbon tab (incl. the Sparkline tab) with icon sets and sparklines.
+    fn paint(ctx: &egui::Context, app: &mut App) {
+        for tab in [RibbonTabRef::Data, RibbonTabRef::Insert, RibbonTabRef::Spark, RibbonTabRef::Home] {
+            app.tab = tab.tab();
+            let _ = ctx.run(egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1400.0, 900.0))), ..Default::default() }, |ctx| {
+                egui::TopBottomPanel::top("ribbon").show(ctx, |ui| app.ribbon_ui(ui));
+                egui::CentralPanel::default().show(ctx, |ui| app.grid_ui(ui));
+                app.dialogs_ui(ctx);
+            });
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum RibbonTabRef {
+        Data,
+        Insert,
+        Spark,
+        Home,
+    }
+
+    impl RibbonTabRef {
+        fn tab(self) -> super::super::RibbonTab {
+            match self {
+                RibbonTabRef::Data => super::super::RibbonTab::Data,
+                RibbonTabRef::Insert => super::super::RibbonTab::Insert,
+                RibbonTabRef::Spark => super::super::RibbonTab::Sparkline,
+                RibbonTabRef::Home => super::super::RibbonTab::Home,
+            }
+        }
+    }
+
+    #[test]
+    fn what_if_dialogs_headless() {
+        let ctx = egui::Context::default();
+        let mut app = App::with_context(&ctx, 0, None);
+        app.dialog = None;
+        put(&mut app, "A1", "10000");
+        put(&mut app, "A2", "=PMT(5%/12,60,-A1)");
+        for r in 1..=5 {
+            for c in 2..7 {
+                put(&mut app, &format!("{}{}", col_name(c), r), &format!("{}", (r as i64 * 5 + c as i64 * 3) % 9 - 3));
+            }
+        }
+        app.wb.recalc();
+        // Goal Seek: OK keeps the solution, undo brings the original back.
+        app.open_goal_seek();
+        if let Some(Dialog::WhatIf(w)) = &mut app.dialog {
+            if let WhatIfDlg::GoalSeek(g) = w.as_mut() {
+                g.set = "A2".into();
+                g.to = "500".into();
+                g.changing = "$A$1".into();
+                g.focus = 1;
+            }
+        }
+        key(&ctx, &mut app, egui::Key::Enter);
+        assert!(matches!(&app.dialog, Some(Dialog::WhatIf(w)) if matches!(w.as_ref(), WhatIfDlg::GoalStatus(_))));
+        assert!((num(&app, "A2") - 500.0).abs() < 0.001);
+        key(&ctx, &mut app, egui::Key::Enter);
+        assert!(app.dialog.is_none());
+        assert!((num(&app, "A2") - 500.0).abs() < 0.001);
+        app.undo();
+        assert_eq!(num(&app, "A1"), 10000.0);
+        // Data Table over G1:H4 with column input A1.
+        put(&mut app, "H1", "=A2");
+        put(&mut app, "G2", "20000");
+        put(&mut app, "G3", "30000");
+        app.select_range(Range::parse("G1:H3").unwrap());
+        app.open_data_table();
+        if let Some(Dialog::WhatIf(w)) = &mut app.dialog {
+            if let WhatIfDlg::DataTable(t) = w.as_mut() {
+                t.col = "A1".into();
+            }
+        }
+        key(&ctx, &mut app, egui::Key::Enter);
+        assert!(app.dialog.is_none(), "data table dialog closed");
+        assert!((num(&app, "H3") - 3.0 * num(&app, "A2")).abs() < 1e-6, "{} {}", num(&app, "H3"), num(&app, "A2"));
+        // Editing inside it is refused.
+        app.select(2, 7, false);
+        app.begin_edit(Some("5".into()), super::super::EditMode::Enter);
+        assert!(!app.commit_edit(false));
+        app.cancel_edit();
+        app.dialog = None;
+        // Sparklines from C1:G5 into I1:I5.
+        app.select_range(Range::parse("C1:G5").unwrap());
+        app.open_create_sparklines(crate::sparkline::SparkKind::Column);
+        if let Some(Dialog::WhatIf(w)) = &mut app.dialog {
+            if let WhatIfDlg::Sparklines(s) = w.as_mut() {
+                s.loc = "$I$1:$I$5".into();
+            }
+        }
+        key(&ctx, &mut app, egui::Key::Enter);
+        assert!(app.dialog.is_none());
+        assert_eq!(app.wb.sheets[0].sparklines.len(), 1);
+        assert_eq!(app.wb.sheets[0].sparklines[0].items.len(), 5);
+        app.wb.sheets[0].sparklines[0].high = true;
+        let mut line = app.wb.sheets[0].sparklines[0].clone();
+        line.kind = crate::sparkline::SparkKind::Line;
+        line.markers = true;
+        line.items = vec![crate::sparkline::Sparkline { loc: (6, 8), data: "Sheet1!C1:G1".into() }];
+        let mut win = line.clone();
+        win.kind = crate::sparkline::SparkKind::WinLoss;
+        win.items = vec![crate::sparkline::Sparkline { loc: (7, 8), data: "Sheet1!C2:G2".into() }];
+        app.wb.sheets[0].sparklines.extend([line, win]);
+        // Every icon set painted.
+        for (k, style) in crate::iconset::IconStyle::ALL.into_iter().enumerate() {
+            let rg = Range::new(0, 2 + (k as u32 % 5), 4, 2 + (k as u32 % 5));
+            let rule = crate::condfmt::CondFormat::new(vec![rg], crate::condfmt::RuleKind::IconSet(crate::iconset::IconSetRule::new(style)), Default::default());
+            app.wb.sheets[0].cond_formats.push(rule);
+        }
+        app.changed();
+        app.select(0, 8, false);
+        paint(&ctx, &mut app);
+        // Solver on a small LP.
+        put(&mut app, "K1", "0");
+        put(&mut app, "K2", "0");
+        put(&mut app, "K3", "=3*K1+5*K2");
+        put(&mut app, "K4", "=3*K1+2*K2");
+        app.wb.recalc();
+        app.open_solver();
+        if let Some(Dialog::WhatIf(w)) = &mut app.dialog {
+            if let WhatIfDlg::Solver(s) = w.as_mut() {
+                s.objective = "$K$3".into();
+                s.vars = "$K$1:$K$2".into();
+                s.method = crate::solver::Method::Simplex;
+                s.constraints = vec![
+                    crate::solver::Constraint { lhs: Range::parse("K4").unwrap(), rel: crate::solver::Rel::Le, rhs: "18".into() },
+                    crate::solver::Constraint { lhs: Range::parse("K1").unwrap(), rel: crate::solver::Rel::Le, rhs: "4".into() },
+                    crate::solver::Constraint { lhs: Range::parse("K2").unwrap(), rel: crate::solver::Rel::Le, rhs: "6".into() },
+                ];
+            }
+        }
+        paint(&ctx, &mut app);
+        let si = app.wb.active;
+        let m = match &app.dialog {
+            Some(Dialog::WhatIf(w)) => match w.as_ref() {
+                WhatIfDlg::Solver(s) => s.model_for_test(&app),
+                _ => panic!(),
+            },
+            _ => panic!(),
+        };
+        app.dialog = None;
+        app.run_solver(si, m);
+        if let Some(Dialog::WhatIf(w)) = &mut app.dialog {
+            if let WhatIfDlg::SolverResults(r) = w.as_mut() {
+                r.answer = true;
+            }
+        }
+        key(&ctx, &mut app, egui::Key::Enter);
+        assert!(app.dialog.is_none());
+        assert_eq!(app.wb.sheets[app.wb.active].name, "Answer Report 1");
+        let model = app.wb.sheet_index("Sheet1").unwrap();
+        assert!((app.wb.sheets[model].value(2, 10).as_number().unwrap() - 36.0).abs() < 1e-6);
+        // Scenario Manager renders with and without scenarios.
+        app.wb.active = model;
+        app.open_scenarios();
+        paint(&ctx, &mut app);
+        app.wb.sheets[model].scenarios.list.push(Scenario { name: "One".into(), cells: vec![((0, 10), "1".into())], ..Default::default() });
+        app.open_scenarios();
+        paint(&ctx, &mut app);
+    }
+}
