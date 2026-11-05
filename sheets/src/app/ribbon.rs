@@ -281,6 +281,7 @@ impl App {
                 }
             }
             self.chart_tab_button(ui);
+            self.cloud_tab_strip_ui(ui);
         });
         let _ = strip;
         if self.ribbon_collapsed {

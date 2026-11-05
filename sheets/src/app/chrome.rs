@@ -14,6 +14,7 @@ pub enum Backstage {
     SaveAs,
     Print,
     Export,
+    Account,
     About,
 }
 
@@ -555,6 +556,9 @@ impl App {
                     if item(ui, "About", page == Backstage::About) {
                         self.backstage = Some(Backstage::About);
                     }
+                    if item(ui, "Account", page == Backstage::Account) {
+                        self.backstage = Some(Backstage::Account);
+                    }
                 });
             });
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(theme::window()).inner_margin(egui::Margin::same(36))).show(ctx, |ui| {
@@ -593,29 +597,44 @@ impl App {
                 Backstage::Open => {
                     ui.label(RichText::new("Open").size(28.0));
                     ui.add_space(14.0);
-                    let (f, fi) = self.icon(ic::FOLDER, "📂");
-                    let t = if fi { format!("{f}") } else { f };
-                    ui.horizontal(|ui| {
-                        if ui.add(egui::Button::new(RichText::new(t).font(if fi { theme::icon_font(20.0) } else { theme::ui_font(20.0) })).min_size(Vec2::new(44.0, 44.0))).clicked()
-                            || ui.add(egui::Button::new(RichText::new("Browse").size(15.0)).frame(false)).clicked()
-                        {
-                            self.backstage = None;
-                            self.confirm_then(Pending::Open(None));
+                    ui.horizontal_top(|ui| {
+                        if !self.cloud_places_ui(ui, false) {
+                            return;
                         }
+                        ui.vertical(|ui| {
+                            let (f, fi) = self.icon(ic::FOLDER, "📂");
+                            let t = if fi { format!("{f}") } else { f };
+                            ui.horizontal(|ui| {
+                                if ui.add(egui::Button::new(RichText::new(t).font(if fi { theme::icon_font(20.0) } else { theme::ui_font(20.0) })).min_size(Vec2::new(44.0, 44.0))).clicked()
+                                    || ui.add(egui::Button::new(RichText::new("Browse").size(15.0)).frame(false)).clicked()
+                                {
+                                    self.backstage = None;
+                                    self.confirm_then(Pending::Open(None));
+                                }
+                            });
+                            ui.add_space(18.0);
+                            self.recent_list(ui);
+                        });
                     });
-                    ui.add_space(18.0);
-                    self.recent_list(ui);
                 }
                 Backstage::SaveAs => {
                     ui.label(RichText::new("Save As").size(28.0));
                     ui.add_space(14.0);
-                    ui.label("Workbook (*.xlsx), CSV UTF-8 (*.csv), Text (Tab delimited) (*.txt)");
-                    ui.add_space(8.0);
-                    if ui.add(egui::Button::new(RichText::new("Browse...").size(15.0)).min_size(Vec2::new(120.0, 34.0))).clicked() {
-                        self.backstage = None;
-                        self.save_as();
-                    }
+                    ui.horizontal_top(|ui| {
+                        if !self.cloud_places_ui(ui, true) {
+                            return;
+                        }
+                        ui.vertical(|ui| {
+                            ui.label("Workbook (*.xlsx), CSV UTF-8 (*.csv), Text (Tab delimited) (*.txt)");
+                            ui.add_space(8.0);
+                            if ui.add(egui::Button::new(RichText::new("Browse...").size(15.0)).min_size(Vec2::new(120.0, 34.0))).clicked() {
+                                self.backstage = None;
+                                self.save_as();
+                            }
+                        });
+                    });
                 }
+                Backstage::Account => self.account_page_ui(ui),
                 Backstage::Print => self.print_page_ui(ui),
                 Backstage::Export => {
                     ui.label(RichText::new("Export").size(28.0));

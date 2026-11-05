@@ -50,6 +50,7 @@ impl Request {
         self
     }
 
+    #[cfg(test)]
     pub fn get_header(&self, name: &str) -> Option<&str> {
         self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
     }

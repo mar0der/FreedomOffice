@@ -3,6 +3,7 @@
 mod actions;
 mod chart_view;
 mod chrome;
+mod cloud_ui;
 mod condfmt_ui;
 mod dialogs;
 mod editor;
@@ -183,6 +184,8 @@ pub struct App {
     pub chart: chart_view::ChartUi,
     pub cf: condfmt_ui::CfState,
     pub dv: validation_ui::DvState,
+    /// Microsoft 365 sign-in and the open cloud document.
+    pub cloud: cloud_ui::CloudState,
 }
 
 const MAX_UNDO: usize = 100;
@@ -255,6 +258,7 @@ impl App {
             chart: Default::default(),
             cf: Default::default(),
             dv: Default::default(),
+            cloud: Default::default(),
         };
         if let Some(p) = path {
             app.open_path(p);
@@ -726,6 +730,9 @@ impl App {
         self.filter_popup = None;
         self.cf = Default::default();
         self.dv = Default::default();
+        // A cloud document stays attached only when its downloaded copy is what was opened.
+        self.cloud.doc = self.cloud.pending_open.take().filter(|d| Some(&d.local) == self.wb.path.as_ref());
+        self.cloud.upload_failed = false;
     }
 
     pub fn open_path(&mut self, p: PathBuf) {
@@ -753,6 +760,9 @@ impl App {
 
     pub fn save(&mut self) -> bool {
         self.commit_edit(false);
+        if self.cloud.doc.is_some() {
+            return self.cloud_save();
+        }
         match self.wb.path.clone() {
             Some(p) if is_native_format(&p) => self.save_to(p.clone()),
             _ => self.save_as(),
@@ -791,6 +801,8 @@ impl App {
     fn save_to(&mut self, p: PathBuf) -> bool {
         match crate::io::save(&self.wb, &p) {
             Ok(()) => {
+                // Saved to this PC: no longer linked to a cloud document.
+                self.cloud.doc = None;
                 let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
                 if ext == "xlsx" || ext == "xlsm" {
                     self.wb.path = Some(p.clone());
@@ -843,7 +855,7 @@ impl App {
     }
 
     fn update_title(&mut self, ctx: &egui::Context) {
-        let t = format!("{}{} - FreedomOffice Sheets", self.wb.file_name(), if self.dirty { " •" } else { "" });
+        let t = format!("{}{}{} - FreedomOffice Sheets", self.wb.file_name(), if self.dirty { " •" } else { "" }, self.cloud_title_suffix());
         if t != self.title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(t.clone()));
             self.title = t;
@@ -939,6 +951,7 @@ impl eframe::App for App {
         self.handle_keys(ctx);
         self.update_title(ctx);
         self.poll_print();
+        self.poll_cloud(ctx);
         self.autosave(ctx);
 
         if self.backstage.is_some() {
@@ -969,5 +982,6 @@ impl eframe::App for App {
             self.keytips_ui(ctx);
         }
         self.dialogs_ui(ctx);
+        self.cloud_dialogs_ui(ctx);
     }
 }
