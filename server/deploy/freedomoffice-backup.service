@@ -1,0 +1,29 @@
+# Nightly consistent copy of the database and all document versions into
+# /var/backups/freedomoffice (pull that directory to the NAS, see nas/).
+[Unit]
+Description=FreedomOffice document server backup
+After=freedomoffice.service
+
+[Service]
+Type=oneshot
+User=freedomoffice
+Group=freedomoffice
+ExecStart=/usr/local/bin/freedomoffice-server --config /etc/freedomoffice/server.toml backup /var/backups/freedomoffice
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=true
+CapabilityBoundingSet=
+ProtectSystem=strict
+ReadWritePaths=/var/lib/freedomoffice /var/backups/freedomoffice
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+PrivateNetwork=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+UMask=0027

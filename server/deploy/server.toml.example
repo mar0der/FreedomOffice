@@ -1,0 +1,42 @@
+# FreedomOffice document server configuration: /etc/freedomoffice/server.toml
+# `freedomoffice-server init` writes a file like this one.
+
+# --- Option A: built-in HTTPS with Let's Encrypt -------------------------------------
+# The server answers on port 443 itself and fetches and renews its certificate.
+# Needs: a DNS A (and/or AAAA) record for tls_domain pointing at this server, and
+# port 443/tcp open in the firewall (Let's Encrypt validates over TLS-ALPN-01 on 443).
+listen = "0.0.0.0:443"
+tls_domain = "files.example.com"
+acme_email = "admin@example.com"
+# acme_staging = true      # try against the Let's Encrypt staging directory first
+
+# --- Option B: behind a reverse proxy (Caddy, nginx) ---------------------------------
+# listen = "127.0.0.1:8080"
+# (remove tls_domain / acme_email; the proxy terminates HTTPS, see Caddyfile.example)
+
+# --- Option C: your own certificate files --------------------------------------------
+# listen = "0.0.0.0:443"
+# tls_cert = "/etc/freedomoffice/fullchain.pem"
+# tls_key = "/etc/freedomoffice/privkey.pem"
+
+# The address people use; share links are built from it.
+public_url = "https://files.example.com"
+
+# Database and documents (files/<item-id>/<version>.xlsx).
+data_dir = "/var/lib/freedomoffice"
+
+# Plain HTTP on a non-loopback address is refused unless this is true. Don't.
+allow_insecure_http = false
+
+# Behind a reverse proxy on this machine, take the client address from X-Forwarded-For
+# (only for requests from 127.0.0.1 / ::1). Used for sign-in rate limiting.
+trust_proxy = true
+
+# Largest upload in megabytes (keep the proxy's request body limit above this).
+max_upload_mb = 100
+
+# Versions kept per document; the first version of each day is kept in addition.
+versions_to_keep = 25
+
+# How long a share link stays usable after it was opened, in hours.
+link_access_hours = 12

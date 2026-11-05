@@ -1,0 +1,10 @@
+[Unit]
+Description=Nightly FreedomOffice document server backup
+
+[Timer]
+OnCalendar=*-*-* 02:30:00
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

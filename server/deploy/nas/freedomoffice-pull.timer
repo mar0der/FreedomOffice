@@ -1,0 +1,10 @@
+[Unit]
+Description=Pull the FreedomOffice backup every night (after the server's 02:30 backup)
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

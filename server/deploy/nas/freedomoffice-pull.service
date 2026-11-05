@@ -1,0 +1,27 @@
+# On the home NAS: pull the server's nightly backup over SSH.
+# Install to /etc/systemd/system/ on the NAS together with freedomoffice-pull.timer.
+#
+# One-time setup on the NAS (as root):
+#   ssh-keygen -t ed25519 -N "" -f /root/.ssh/freedomoffice_backup
+#   install -d -m 0750 /srv/backup/freedomoffice
+# On the server, create a read-only account for the NAS and authorize the key:
+#   useradd --system --create-home --shell /bin/sh fobackup
+#   usermod -aG freedomoffice fobackup        # read access to /var/backups/freedomoffice
+#   install -d -o fobackup -m 0700 ~fobackup/.ssh
+#   echo 'restrict,command="rrsync -ro /var/backups/freedomoffice" ssh-ed25519 AAAA... nas' >> ~fobackup/.ssh/authorized_keys
+#   (rrsync ships with rsync: /usr/bin/rrsync)
+# Replace files.example.com below with the server's name, then:
+#   systemctl daemon-reload && systemctl enable --now freedomoffice-pull.timer
+
+[Unit]
+Description=Pull the FreedomOffice backup from the server
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Document versions never change once written, so plain rsync is incremental.
+# No --delete: older versions stay on the NAS even after the server prunes them.
+ExecStart=/usr/bin/rsync -a --partial -e "ssh -i /root/.ssh/freedomoffice_backup -o BatchMode=yes" fobackup@files.example.com:/ /srv/backup/freedomoffice/
+Nice=10
+IOSchedulingClass=idle

@@ -1,0 +1,50 @@
+# FreedomOffice document server.
+# Installed to /etc/systemd/system/freedomoffice.service by install.sh.
+# Binding a port below 1024 (built-in HTTPS on 443) needs the drop-in
+# freedomoffice.service.d/bind-privileged-port.conf, which install.sh adds when needed.
+
+[Unit]
+Description=FreedomOffice document server
+Documentation=https://github.com/mar0der/FreedomOffice
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=freedomoffice
+Group=freedomoffice
+ExecStart=/usr/local/bin/freedomoffice-server --config /etc/freedomoffice/server.toml serve
+Restart=on-failure
+RestartSec=5
+Environment=RUST_LOG=info
+
+# Hardening
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ReadWritePaths=/var/lib/freedomoffice
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+UMask=0027
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

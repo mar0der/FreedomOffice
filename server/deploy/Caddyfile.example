@@ -1,0 +1,22 @@
+# Caddy in front of freedomoffice-server (Option B in server.toml.example).
+# Caddy gets and renews the Let's Encrypt certificate; the server listens on
+# 127.0.0.1:8080 only. Put this in /etc/caddy/Caddyfile and run `systemctl reload caddy`.
+
+files.example.com {
+	request_body {
+		# A little above max_upload_mb in server.toml.
+		max_size 110MB
+	}
+	reverse_proxy 127.0.0.1:8080
+	log {
+		output file /var/log/caddy/freedomoffice.log
+		# Share-link tokens are part of /l/... and /api/links/... paths.
+		format filter {
+			wrap json
+			fields {
+				request>uri delete
+				request>headers>Authorization delete
+			}
+		}
+	}
+}
