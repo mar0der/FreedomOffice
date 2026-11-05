@@ -25,6 +25,30 @@ pub(super) fn read<R: Read + Seek>(pkg: &mut Package<'_, R>, sheet_path: &str, s
         let ddir = dir_of(&dpath);
         let drels = pkg.text(&format!("{ddir}_rels/{}.rels", file_of(&dpath))).map(|x| parse_rels(&x)).unwrap_or_default();
         for a in parse_drawing(&dxml) {
+            if !a.pic_rid.is_empty() {
+                let Some(target) = drels.iter().find(|r| r.id == a.pic_rid) else { continue };
+                let Some(data) = pkg.bytes(&resolve(&ddir, &target.target)) else { continue };
+                let Some(ext) = crate::model::Picture::sniff(&data) else { continue };
+                let (x, y, w, h) = anchor_rect(&a, sheet, (96.0, 96.0));
+                let from = a.from.unwrap_or_default();
+                let mut pic = crate::model::Picture {
+                    data: std::sync::Arc::new(data),
+                    ext: ext.to_string(),
+                    anchor: (from.row, from.col),
+                    offset: (from.col_off, from.row_off),
+                    size: (w.max(1.0), h.max(1.0)),
+                    name: a.name.clone(),
+                    descr: a.descr.clone(),
+                };
+                if a.from.is_none() {
+                    let (c, ox) = crate::chart::col_at_x(sheet, x);
+                    let (r, oy) = crate::chart::row_at_y(sheet, y);
+                    pic.anchor = (r, c);
+                    pic.offset = (ox, oy);
+                }
+                sheet.images.push(pic);
+                continue;
+            }
             let Some(target) = drels.iter().find(|r| r.id == a.rid) else { continue };
             let Some(cxml) = pkg.text(&resolve(&ddir, &target.target)) else { continue };
             if let Some(ch) = parse_chart(&cxml, &a, sheet) {
@@ -53,6 +77,25 @@ struct Anchor {
     ext: Option<(f32, f32)>,
     pos: Option<(f32, f32)>,
     rid: String,
+    /// Picture: relationship id of the embedded image, and its name / alt text.
+    pic_rid: String,
+    name: String,
+    descr: String,
+}
+
+/// Sheet-pixel rectangle (x, y, w, h) of an anchor; `def` is the size used without an extent.
+fn anchor_rect(anchor: &Anchor, sheet: &Sheet, def: (f32, f32)) -> (f32, f32, f32, f32) {
+    let from = anchor.from.unwrap_or_default();
+    let (x, y) = match anchor.pos {
+        Some(p) if anchor.from.is_none() => p,
+        _ => (col_x(sheet, from.col) + from.col_off, row_y(sheet, from.row) + from.row_off),
+    };
+    let (w, h) = match (anchor.to, anchor.ext) {
+        (Some(to), _) => (col_x(sheet, to.col) + to.col_off - x, row_y(sheet, to.row) + to.row_off - y),
+        (None, Some(ext)) => ext,
+        _ => def,
+    };
+    (x, y, w, h)
 }
 
 fn num(s: &str) -> f32 {
@@ -106,6 +149,17 @@ fn parse_drawing(xml: &str) -> Vec<Anchor> {
                             a.rid = id;
                         }
                     }
+                    "blip" => {
+                        if let (Some(a), Some(id)) = (&mut cur, attr(e, "embed")) {
+                            a.pic_rid = id;
+                        }
+                    }
+                    "cNvPr" if stack.iter().any(|s| s == "pic") => {
+                        if let Some(a) = &mut cur {
+                            a.name = attr(e, "name").unwrap_or_default();
+                            a.descr = attr(e, "descr").unwrap_or_default();
+                        }
+                    }
                     _ => {}
                 }
                 if is_start {
@@ -115,7 +169,7 @@ fn parse_drawing(xml: &str) -> Vec<Anchor> {
             Ok(Event::End(_)) => {
                 let name = stack.pop().unwrap_or_default();
                 if name.ends_with("Anchor") {
-                    if let Some(a) = cur.take().filter(|a| !a.rid.is_empty()) {
+                    if let Some(a) = cur.take().filter(|a| !a.rid.is_empty() || !a.pic_rid.is_empty()) {
                         out.push(a);
                     }
                 }

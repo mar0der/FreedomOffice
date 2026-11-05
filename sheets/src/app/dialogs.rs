@@ -474,31 +474,15 @@ impl App {
             Dialog::NameManager { name, refers, error } => {
                 win("Name Manager").show(ctx, |ui| {
                     ui.set_min_width(460.0);
-                    let mut del = None;
-                    egui::Grid::new("names").striped(true).num_columns(3).show(ui, |ui| {
-                        ui.label(RichText::new("Name").strong());
-                        ui.label(RichText::new("Refers To").strong());
-                        ui.label("");
-                        ui.end_row();
-                        for (i, (n, f)) in self.wb.names.iter().enumerate() {
-                            ui.label(n);
-                            ui.label(format!("={f}"));
-                            if ui.small_button("Delete").clicked() {
-                                del = Some(i);
-                            }
-                            ui.end_row();
-                        }
-                    });
-                    if let Some(i) = del {
-                        self.push_undo(&[super::Scope::All]);
-                        self.wb.names.remove(i);
-                        self.changed();
-                    }
+                    self.name_list_ui(ui);
                     ui.separator();
                     ui.label(RichText::new("New name").strong());
                     egui::Grid::new("newname").num_columns(2).show(ui, |ui| {
                         ui.label("Name:");
                         ui.add(egui::TextEdit::singleline(name).desired_width(300.0));
+                        ui.end_row();
+                        ui.label("Scope:");
+                        self.name_scope_ui(ui);
                         ui.end_row();
                         ui.label("Refers to:");
                         ui.add(egui::TextEdit::singleline(refers).desired_width(300.0));
@@ -510,7 +494,7 @@ impl App {
                     ui.horizontal(|ui| {
                         if ui.button("Add").clicked() {
                             let (n, r) = (name.clone(), refers.clone());
-                            match self.new_name(&n, &r) {
+                            match self.new_scoped_name(&n, &r) {
                                 Ok(()) => {
                                     name.clear();
                                     *error = None;
@@ -636,6 +620,7 @@ impl App {
                                 wb.path = None;
                                 wb.recalc();
                                 self.wb = wb;
+                                self.zoom_for = None;
                                 self.dirty = true;
                                 self.status = Some(format!("Recovered '{name}'. Save it to keep the changes."));
                                 let _ = std::fs::remove_file(&f);
@@ -704,7 +689,7 @@ impl App {
                     ui.set_min_width(520.0);
                     ui.set_min_height(360.0);
                     ui.horizontal(|ui| {
-                        for (i, t) in ["Number", "Alignment", "Font", "Border", "Fill"].iter().enumerate() {
+                        for (i, t) in ["Number", "Alignment", "Font", "Border", "Fill", "Protection"].iter().enumerate() {
                             if ui.selectable_label(fc.tab == i, *t).clicked() {
                                 fc.tab = i;
                             }
@@ -716,7 +701,8 @@ impl App {
                         1 => alignment_tab(ui, fc),
                         2 => font_tab(ui, fc),
                         3 => border_tab(ui, fc),
-                        _ => fill_tab(ui, fc),
+                        4 => fill_tab(ui, fc),
+                        _ => super::review_ui::protection_tab(ui, &mut fc.style),
                     }
                     ui.add_space(8.0);
                     let (ok, cancel) = ok_cancel(ui);
@@ -771,6 +757,12 @@ impl App {
                             }
                             if o.border != n.border {
                                 s.border = n.border;
+                            }
+                            if o.unlocked != n.unlocked {
+                                s.unlocked = n.unlocked;
+                            }
+                            if o.hide_formula != n.hide_formula {
+                                s.hide_formula = n.hide_formula;
                             }
                         });
                         keep = false;

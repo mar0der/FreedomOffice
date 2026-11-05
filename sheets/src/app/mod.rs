@@ -17,10 +17,13 @@ mod find_ui;
 mod grid;
 mod keys;
 mod keytips;
+mod picture_view;
 mod menus;
 mod paste;
 mod print_ui;
+mod review_ui;
 mod ribbon;
+mod table_view;
 mod theme;
 mod validation_ui;
 
@@ -45,6 +48,8 @@ pub enum RibbonTab {
     Help,
     /// Contextual tab shown while a chart is selected.
     ChartDesign,
+    /// Contextual tab shown while the active cell is in a table.
+    TableDesign,
 }
 
 #[derive(Clone)]
@@ -179,6 +184,11 @@ pub struct App {
     /// Sheet tab being dragged to a new position.
     pub tab_drag: Option<usize>,
     pub chart: chart_view::ChartUi,
+    pub tables: table_view::TableUi,
+    pub pictures: picture_view::PictureUi,
+    pub review: review_ui::ReviewUi,
+    /// Sheet whose zoom `zoom` currently shows (zoom is kept per sheet, like Excel).
+    zoom_for: Option<usize>,
     pub cf: condfmt_ui::CfState,
     pub dv: validation_ui::DvState,
     /// Microsoft 365 sign-in and the open cloud document.
@@ -267,6 +277,10 @@ impl App {
             last_action: None,
             tab_drag: None,
             chart: Default::default(),
+            tables: Default::default(),
+            pictures: Default::default(),
+            review: Default::default(),
+            zoom_for: None,
             cf: Default::default(),
             dv: Default::default(),
             cloud: Default::default(),
@@ -602,6 +616,9 @@ impl App {
             return;
         }
         let (r, c) = self.active();
+        if self.locked_block(Range::cell(r, c)) {
+            return;
+        }
         let text = match initial {
             Some(t) => t,
             None => self.edit_text(r, c),
@@ -615,6 +632,10 @@ impl App {
     /// What the formula bar / editor shows for a cell (dates edit as dates).
     pub fn edit_text(&self, r: u32, c: u32) -> String {
         let Some(cell) = self.sheet().get(r, c) else { return String::new() };
+        // Hidden formulas of a protected sheet don't show.
+        if cell.formula.is_some() && self.sheet().protection.is_some() && self.wb.style(cell.style).hide_formula {
+            return String::new();
+        }
         if cell.formula.is_none() {
             if let crate::model::Value::Number(n) = cell.value {
                 if crate::numfmt::is_date_format(&self.wb.style(cell.style).num_fmt) && n >= 0.0 {
@@ -674,7 +695,8 @@ impl App {
             vec![(e.row, e.col)]
         };
         let rg = if fill_selection { self.sel() } else { Range::cell(e.row, e.col) };
-        self.push_undo(&[Scope::Range(e.sheet, rg)]);
+        let scope = if self.table_edit_affects(e.sheet, e.row, e.col) { Scope::Sheet(e.sheet) } else { Scope::Range(e.sheet, rg) };
+        self.push_undo(&[scope]);
         let base = self.sheet().get(e.row, e.col).cloned();
         for (r, c) in targets {
             let style = self.wb.sheets[e.sheet].get(r, c).map(|c| c.style).unwrap_or(0);
@@ -709,7 +731,11 @@ impl App {
                 sh.row_h.insert(e.row, need);
             }
         }
-        self.changed_ranges(e.sheet, &[rg]);
+        if self.table_after_edit(e.sheet, e.row, e.col) {
+            self.changed();
+        } else {
+            self.changed_ranges(e.sheet, &[rg]);
+        }
         true
     }
 
@@ -769,6 +795,9 @@ impl App {
         self.filter_popup = None;
         self.cf = Default::default();
         self.dv = Default::default();
+        self.tables = Default::default();
+        self.pictures = Default::default();
+        self.zoom_for = None;
         // A cloud document stays attached only when its downloaded copy is what was opened.
         self.cloud.doc = self.cloud.pending_open.take().filter(|d| Some(&d.local) == self.wb.path.as_ref());
         self.cloud.upload_failed = false;
@@ -960,6 +989,20 @@ fn set_caption_color(hwnd: isize) {
         DwmSetWindowAttribute(h, 36, &text as *const u32 as *const _, 4);
     }
 }
+impl App {
+    /// Keeps `zoom` per sheet: stores it on the sheet it belongs to and loads the zoom of a
+    /// newly active sheet (or of a newly opened workbook).
+    fn sync_sheet_zoom(&mut self) {
+        let a = self.wb.active.min(self.wb.sheets.len().saturating_sub(1));
+        if self.zoom_for == Some(a) {
+            self.wb.sheets[a].zoom = self.zoom;
+        } else {
+            self.zoom = self.wb.sheets[a].zoom.clamp(0.1, 4.0);
+            self.zoom_for = Some(a);
+        }
+    }
+}
+
 impl eframe::App for App {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // Normal exit (after the save prompt): the recovery copy is no longer needed.
@@ -987,6 +1030,7 @@ impl eframe::App for App {
         }
 
         self.follow_system_theme(ctx);
+        self.sync_sheet_zoom();
         self.handle_keys(ctx);
         self.update_title(ctx);
         self.poll_print();
@@ -1023,6 +1067,7 @@ impl eframe::App for App {
         }
         self.dialogs_ui(ctx);
         self.chart_dialogs(ctx);
+        self.protect_dialog_ui(ctx);
         self.cloud_dialogs_ui(ctx);
     }
 }

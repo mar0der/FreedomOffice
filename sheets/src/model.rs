@@ -293,6 +293,10 @@ pub struct Style {
     /// Number format code; empty = "General".
     pub num_fmt: String,
     pub border: Border,
+    /// Protection: the cell can be edited while the sheet is protected (Excel's default is locked).
+    pub unlocked: bool,
+    /// Protection: the formula is hidden while the sheet is protected.
+    pub hide_formula: bool,
 }
 
 impl Style {
@@ -407,6 +411,139 @@ pub struct Sheet {
     pub validations: Vec<crate::validation::Validation>,
     /// Dynamic-array spill overlay, rebuilt by recalculation.
     pub spill: Spill,
+    /// Sheet-scoped defined names: (name, formula text without '=').
+    pub names: Vec<(String, String)>,
+    /// Excel Tables (ListObjects) on this sheet.
+    pub tables: Vec<crate::table::Table>,
+    /// Rich-text runs of text cells; used only while the cell still holds the same text.
+    pub rich: HashMap<(u32, u32), RichText>,
+    /// Sheet protection (None = unprotected).
+    pub protection: Option<Protection>,
+    /// Zoom factor of this sheet's view (1.0 = 100%).
+    pub zoom: f32,
+    /// Authors of cell notes (threaded comments are kept as notes with their author).
+    pub note_authors: HashMap<(u32, u32), String>,
+    /// Pictures floating over the cells.
+    pub images: Vec<Picture>,
+}
+
+/// One run of a rich-text cell.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct RichRun {
+    pub text: String,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub strike: bool,
+    /// 0xRRGGBB, None = the cell's colour.
+    pub color: Option<u32>,
+    /// Size in points, None = the cell's size.
+    pub size: Option<f32>,
+    pub font: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct RichText {
+    pub runs: Vec<RichRun>,
+}
+
+impl RichText {
+    pub fn plain(&self) -> String {
+        self.runs.iter().map(|r| r.text.as_str()).collect()
+    }
+}
+
+/// Sheet protection settings (what users may still do, and the legacy password hash).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Protection {
+    /// Excel's legacy 16-bit password hash, 0 = no password.
+    pub hash: u16,
+    pub select_locked: bool,
+    pub select_unlocked: bool,
+    pub format_cells: bool,
+    pub format_columns: bool,
+    pub format_rows: bool,
+    pub insert_columns: bool,
+    pub insert_rows: bool,
+    pub insert_links: bool,
+    pub delete_columns: bool,
+    pub delete_rows: bool,
+    pub sort: bool,
+    pub autofilter: bool,
+    pub pivot_tables: bool,
+    pub edit_objects: bool,
+    pub edit_scenarios: bool,
+}
+
+impl Default for Protection {
+    fn default() -> Self {
+        Protection {
+            hash: 0,
+            select_locked: true,
+            select_unlocked: true,
+            format_cells: false,
+            format_columns: false,
+            format_rows: false,
+            insert_columns: false,
+            insert_rows: false,
+            insert_links: false,
+            delete_columns: false,
+            delete_rows: false,
+            sort: false,
+            autofilter: false,
+            pivot_tables: false,
+            edit_objects: false,
+            edit_scenarios: false,
+        }
+    }
+}
+
+/// Excel's legacy sheet/workbook password hash (the `password` attribute of `sheetProtection`).
+pub fn legacy_password_hash(pw: &str) -> u16 {
+    if pw.is_empty() {
+        return 0;
+    }
+    let bytes: Vec<u8> = pw.chars().map(|c| (c as u32 & 0xFF) as u8).collect();
+    let mut h: u16 = 0;
+    for &b in bytes.iter().rev() {
+        h = ((h >> 14) & 1) | ((h << 1) & 0x7FFF);
+        h ^= b as u16;
+    }
+    h = ((h >> 14) & 1) | ((h << 1) & 0x7FFF);
+    h ^= bytes.len() as u16;
+    h ^ 0xCE4B
+}
+
+/// A picture placed over the grid, anchored at a cell plus a pixel offset (at 100% zoom).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Picture {
+    /// Encoded image bytes (PNG, JPEG, GIF, BMP).
+    pub data: std::sync::Arc<Vec<u8>>,
+    /// Lower-case file extension of the encoded data.
+    pub ext: String,
+    pub anchor: (u32, u32),
+    pub offset: (f32, f32),
+    /// Displayed size in pixels at 100% zoom.
+    pub size: (f32, f32),
+    pub name: String,
+    pub descr: String,
+}
+
+impl Picture {
+    /// Image format from the file signature.
+    pub fn sniff(data: &[u8]) -> Option<&'static str> {
+        if data.starts_with(&[0x89, b'P', b'N', b'G']) {
+            Some("png")
+        } else if data.starts_with(&[0xFF, 0xD8]) {
+            Some("jpeg")
+        } else if data.starts_with(b"GIF8") {
+            Some("gif")
+        } else if data.starts_with(b"BM") {
+            Some("bmp")
+        } else {
+            None
+        }
+    }
 }
 
 /// Values spilled by dynamic-array formulas. Spilled cells are not stored as real cells.
@@ -443,7 +580,28 @@ impl Sheet {
             cond_formats: Vec::new(),
             validations: Vec::new(),
             spill: Spill::default(),
+            names: Vec::new(),
+            tables: Vec::new(),
+            rich: HashMap::new(),
+            protection: None,
+            zoom: 1.0,
+            note_authors: HashMap::new(),
+            images: Vec::new(),
         }
+    }
+
+    /// Rich-text runs of a cell, if it still holds the text they were made for.
+    pub fn rich_at(&self, r: u32, c: u32) -> Option<&RichText> {
+        let rt = self.rich.get(&(r, c))?;
+        match self.get(r, c) {
+            Some(cell) if cell.formula.is_none() && matches!(&cell.value, Value::Text(t) if *t == rt.plain()) => Some(rt),
+            _ => None,
+        }
+    }
+
+    /// True when the sheet is protected and the cell is locked.
+    pub fn is_locked(&self, wb_styles: &Workbook, r: u32, c: u32) -> bool {
+        self.protection.is_some() && !wb_styles.style(self.get(r, c).map_or(0, |x| x.style)).unlocked
     }
 
     pub fn get(&self, r: u32, c: u32) -> Option<&Cell> {

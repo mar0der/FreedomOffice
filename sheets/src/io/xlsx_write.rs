@@ -2,6 +2,7 @@
 
 mod charts;
 mod extras;
+mod fidelity;
 mod filter;
 mod page;
 
@@ -48,6 +49,12 @@ fn build(wb: &Workbook, explosions: &mut Vec<charts::Explosions>) -> Result<XWor
         let text = formula::parse(text).map(|e| formula::print_xlsx(&e)).unwrap_or_else(|_| text.to_string());
         let _ = book.define_name(name, &format!("={text}"));
     }
+    // Sheet-scoped names are written as `Sheet!Name`.
+    for (sh, written) in wb.sheets.iter().zip(&used) {
+        for (name, text) in &sh.names {
+            let _ = book.define_name(format!("{}!{}", formula::quote_sheet(written), name), &format!("={}", text.trim_start_matches('=')));
+        }
+    }
     Ok(book)
 }
 
@@ -91,8 +98,15 @@ fn write_sheet(wb: &Workbook, sh: &Sheet, ws: &mut Worksheet, formats: &mut Hash
     let mut notes: Vec<_> = sh.notes.iter().filter(|((r, c), _)| *r < MAX_ROWS && *c < MAX_COLS).collect();
     notes.sort_by_key(|(k, _)| **k);
     for (&(r, c), text) in notes {
-        ws.insert_note(r, c as u16, &rust_xlsxwriter::Note::new(text).add_author_prefix(false))?;
+        let note = match sh.note_authors.get(&(r, c)) {
+            Some(a) if !a.is_empty() => rust_xlsxwriter::Note::new(text).set_author(a.as_str()),
+            _ => rust_xlsxwriter::Note::new(text).add_author_prefix(false),
+        };
+        ws.insert_note(r, c as u16, &note)?;
     }
+    // Tables go in before the cells, whose values and formats then replace the defaults.
+    fidelity::write_tables(sh, ws);
+    let headers = fidelity::header_cells(sh);
 
     // Merges first: merge_range writes the top-left cell and blank-fills the rest,
     // the real cell contents are written over them below.
@@ -114,8 +128,20 @@ fn write_sheet(wb: &Workbook, sh: &Sheet, ws: &mut Worksheet, formats: &mut Hash
                 continue;
             }
             let fmt = format_for(wb, formats, cell.style);
+            if let Some(name) = headers.get(&(r, c)) {
+                ws.write_string_with_format(r, c as u16, name, fmt)?;
+                continue;
+            }
+            if let Some(rt) = sh.rich_at(r, c) {
+                if fidelity::write_rich(ws, r, c as u16, rt, wb.style(cell.style), fmt)? {
+                    continue;
+                }
+            }
             let spill = sh.spill_range(r, c).filter(|(_, blocked)| !blocked).map(|(rg, _)| rg);
-            write_cell(ws, r, c as u16, cell, fmt, spill)?;
+            match file_cell(sh, r, c, cell) {
+                Some(fc) => write_cell(ws, r, c as u16, &fc, fmt, spill)?,
+                None => write_cell(ws, r, c as u16, cell, fmt, spill)?,
+            }
         }
     }
     // Cached values of dynamic-array spills (not stored as real cells).
@@ -152,11 +178,36 @@ fn write_sheet(wb: &Workbook, sh: &Sheet, ws: &mut Worksheet, formats: &mut Hash
     if let Some(c) = sh.tab_color {
         ws.set_tab_color(Color::RGB(c & 0xFFFFFF));
     }
-    filter::write_range(sh, ws)?;
+    // A sheet AutoFilter may not overlap a table (tables carry their own).
+    if !sh.filter.as_ref().is_some_and(|f| fidelity::writable_tables(sh).iter().any(|t| t.range.intersects(&f.range))) {
+        filter::write_range(sh, ws)?;
+    }
+    if (sh.zoom - 1.0).abs() > 0.004 {
+        ws.set_zoom((sh.zoom * 100.0).round().clamp(10.0, 400.0) as u16);
+    }
+    fidelity::write_protection(sh, ws);
+    fidelity::write_images(sh, ws);
     charts::write(wb, sh, ws, explosions)?;
     extras::write_sheet_extras(sh, ws);
     page::write(&sh.page, ws);
     Ok(())
+}
+
+/// A copy of a formula cell with its structured references in file form (`Table1[[#This Row],[Col]]`),
+/// or None when nothing needs rewriting.
+fn file_cell(sh: &Sheet, r: u32, c: u32, cell: &Cell) -> Option<Cell> {
+    let f = cell.formula.as_ref()?;
+    if !f.text.contains('[') {
+        return None;
+    }
+    let mut ast = f.ast.clone()?;
+    let table = crate::table::at(sh, r, c).map(|i| sh.tables[i].name.clone());
+    crate::table::visit_names(&mut ast, &mut |n| {
+        if crate::table::is_structured(n) {
+            *n = crate::table::file_form(n, table.as_deref());
+        }
+    });
+    Some(Cell { value: cell.value.clone(), formula: Some(Box::new(crate::model::Formula::from_ast(ast))), style: cell.style })
 }
 
 fn result_text(v: &Value) -> String {
@@ -279,6 +330,12 @@ fn to_format(s: &Style) -> Format {
     }
     if !s.num_fmt.is_empty() && !s.num_fmt.eq_ignore_ascii_case("general") {
         f = f.set_num_format(&s.num_fmt);
+    }
+    if s.unlocked {
+        f = f.set_unlocked();
+    }
+    if s.hide_formula {
+        f = f.set_hidden();
     }
     let b = s.border;
     if b.left != BorderLine::None {

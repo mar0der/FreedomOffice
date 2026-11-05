@@ -137,7 +137,7 @@ impl App {    pub fn handle_keys(&mut self, ctx: &egui::Context) {
             }
             return;
         }
-        if self.chart_keys(ctx) {
+        if self.chart_keys(ctx) || self.picture_keys(ctx) {
             return;
         }
         #[cfg(windows)]

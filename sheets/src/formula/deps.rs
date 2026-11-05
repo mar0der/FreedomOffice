@@ -194,7 +194,9 @@ impl CalcState {
     fn add(&mut self, wb: &Workbook, key: Key, ast: &Expr, out: &mut Vec<Entry>) {
         let mut precs = Vec::new();
         let mut vol = false;
+        CUR_CELL.set(Some((key.1, key.2)));
         collect(ast, wb, key.0, &mut precs, &mut vol, 0, &mut self.names);
+        CUR_CELL.set(None);
         self.next_ver = self.next_ver.wrapping_add(1);
         let ver = self.next_ver;
         self.formulas.insert(key, FInfo { ver, nprecs: precs.len() as u32 });
@@ -292,6 +294,11 @@ impl CalcState {
     }
 }
 
+thread_local! {
+    /// Cell whose precedents are being collected (resolves unqualified table references).
+    static CUR_CELL: std::cell::Cell<Option<(u32, u32)>> = const { std::cell::Cell::new(None) };
+}
+
 /// Collects static precedents of an expression evaluated on sheet `cur`.
 fn collect(
     e: &Expr,
@@ -329,13 +336,29 @@ fn collect(
             if depth > 16 {
                 return;
             }
-            let key = n.to_ascii_uppercase();
-            let parsed = names
-                .entry(key)
-                .or_insert_with(|| {
-                    wb.names.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).and_then(|(_, f)| super::parse(f.trim_start_matches('=')).ok())
-                })
-                .clone();
+            if crate::table::is_structured(n) || crate::table::find(wb, n).is_some() {
+                // `#This Row` is tracked as the whole column (the formula's row isn't known here).
+                if let Ok(x) = crate::table::resolve(wb, n, cur, CUR_CELL.get()) {
+                    out.push(x);
+                } else if let Ok(x) = crate::table::resolve(wb, n, cur, None) {
+                    out.push(x);
+                }
+                if crate::table::is_structured(n) {
+                    return;
+                }
+            }
+            let parsed = match super::eval::defined_name(wb, n, cur) {
+                Some((Some(_), f)) => super::parse(f.trim_start_matches('=')).ok(),
+                _ => {
+                    let key = n.to_ascii_uppercase();
+                    names
+                        .entry(key)
+                        .or_insert_with(|| {
+                            wb.names.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).and_then(|(_, f)| super::parse(f.trim_start_matches('=')).ok())
+                        })
+                        .clone()
+                }
+            };
             if let Some(x) = parsed {
                 collect(&x, wb, cur, out, vol, depth + 1, names);
             }

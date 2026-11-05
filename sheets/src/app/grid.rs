@@ -151,6 +151,35 @@ impl App {
         FontId::new(font_px(style.font_size(), self.zoom), fam)
     }
 
+    /// Layout of a rich-text cell: one section per run, on top of the cell's style.
+    pub fn rich_job(&mut self, rt: &crate::model::RichText, base: &Style, base_color: Color32) -> LayoutJob {
+        let mut job = LayoutJob::default();
+        for run in &rt.runs {
+            let mut st = base.clone();
+            st.bold |= run.bold;
+            st.italic |= run.italic;
+            if let Some(f) = &run.font {
+                st.font = Some(f.clone());
+            }
+            if let Some(sz) = run.size {
+                st.set_font_size(sz);
+            }
+            let color = run.color.map(rgb).unwrap_or(base_color);
+            let font_id = self.cell_font(&st);
+            let line = |on: bool| if on { Stroke::new(1.0, color) } else { Stroke::NONE };
+            let fmt = TextFormat {
+                font_id,
+                color,
+                underline: line(run.underline || base.underline),
+                strikethrough: line(run.strike || base.strike),
+                valign: egui::Align::BOTTOM,
+                ..Default::default()
+            };
+            job.append(&run.text, 0.0, fmt);
+        }
+        job
+    }
+
     pub fn compute_layout(&self, rect: Rect) -> Layout {
         let sh = self.sheet();
         let z: f32 = self.zoom;
@@ -339,7 +368,10 @@ impl App {
             None
         };
 
-        if self.chart_pointer(ui, lay, pos, hovered, pressed, down) {
+        if self.chart_pointer(ui, lay, pos, hovered, pressed, down) || self.picture_pointer(ui, lay, pos, hovered, pressed, down) {
+            return;
+        }
+        if hovered && self.table_pointer(lay, pos, pressed) {
             return;
         }
 
@@ -919,6 +951,7 @@ impl App {
             shown: Shown,
             fill: Option<Color32>,
             cf: Option<crate::condfmt::CfOverride>,
+            rich: Option<crate::model::RichText>,
         }
         let mut items: Vec<Item> = Vec::new();
         let mut merge_done: Vec<Range> = Vec::new();
@@ -942,17 +975,26 @@ impl App {
                 let sh = &self.wb.sheets[si];
                 let ov = cf.eval(&self.wb, si, anchor.0, anchor.1);
                 let cell = sh.get(anchor.0, anchor.1);
+                let look = if sh.tables.is_empty() { None } else { self.table_look(si, anchor.0, anchor.1) };
                 if cell.is_none() && sh.spill_anchor_of(anchor.0, anchor.1).is_none() {
-                    // Conditional formats can also mark empty cells (e.g. "Blanks").
-                    if let Some(o) = ov {
+                    // Conditional formats and table styles can also mark empty cells.
+                    if ov.is_some() || look.is_some() {
                         let mut style = Style::default();
-                        super::condfmt_ui::apply_override(&mut style, &o);
+                        if let Some(l) = &look {
+                            super::table_view::apply_look(&mut style, l);
+                        }
+                        if let Some(o) = &ov {
+                            super::condfmt_ui::apply_override(&mut style, o);
+                        }
                         let shown = Shown { text: String::new(), color: None, align: HAlign::General, is_number: false };
-                        items.push(Item { rect, clip: rect, fill: style.fill.map(rgb), style, shown, cf: Some(o) });
+                        items.push(Item { rect, clip: rect, fill: style.fill.map(rgb), style, shown, cf: ov, rich: None });
                     }
                     continue;
                 }
                 let mut style = self.wb.style(cell.map_or(0, |c| c.style)).clone();
+                if let Some(l) = &look {
+                    super::table_view::apply_look(&mut style, l);
+                }
                 if let Some(o) = &ov {
                     super::condfmt_ui::apply_override(&mut style, o);
                 }
@@ -967,7 +1009,8 @@ impl App {
                 if ov.as_ref().is_some_and(|o| o.color.is_some()) {
                     s.color = None;
                 }
-                items.push(Item { rect, clip: rect, style, shown: s, fill, cf: ov });
+                let rich = if show_formulas { None } else { sh.rich_at(anchor.0, anchor.1).cloned() };
+                items.push(Item { rect, clip: rect, style, shown: s, fill, cf: ov, rich });
             }
         }
 
@@ -994,7 +1037,10 @@ impl App {
             let fmt = TextFormat { font_id: font.clone(), color, underline, strikethrough: strike, ..Default::default() };
             let indent = it.style.indent as f32 * 9.0 * z;
             let avail = (it.rect.width() - 2.0 * pad - indent).max(1.0);
-            let mut job = LayoutJob::single_section(it.shown.text.clone(), fmt.clone());
+            let mut job = match &it.rich {
+                Some(rt) => self.rich_job(rt, &it.style, color),
+                None => LayoutJob::single_section(it.shown.text.clone(), fmt.clone()),
+            };
             if it.style.wrap {
                 job.wrap.max_width = avail;
             } else {
@@ -1146,6 +1192,7 @@ impl App {
                 draw_border(&cp, rect, b.top, b.bottom, b.left, b.right);
             }
         }
+        self.paint_table_borders(&cp, lay);
         for it in &items {
             if let Some(c) = it.cf.as_ref().and_then(|o| o.border) {
                 cp.rect_stroke(it.rect.translate(Vec2::splat(-0.5)), 0.0, Stroke::new(1.0, rgb(c)), StrokeKind::Middle);
@@ -1319,6 +1366,8 @@ impl App {
             }
         }
 
+        self.paint_table_extras(ui, lay);
+        self.paint_pictures(ui, lay);
         self.paint_charts(ui, lay);
         // Validation list arrow
         self.dv_paint_arrow(&cp, lay, ui.input(|i| i.pointer.hover_pos()));
@@ -1334,7 +1383,11 @@ impl App {
             for (r, c) in shown_notes {
                 let (Some((t, _)), Some((_, rx))) = (lay.row_span(r), lay.col_span(c)) else { continue };
                 let text = self.wb.sheets[si].notes.get(&(r, c)).cloned().unwrap_or_default();
-                let mut job = LayoutJob::single_section(text, TextFormat { font_id: theme::ui_font(12.0), color: Color32::BLACK, ..Default::default() });
+                let mut job = LayoutJob::default();
+                if let Some(a) = self.wb.sheets[si].note_authors.get(&(r, c)) {
+                    job.append(&format!("{a}:\n"), 0.0, TextFormat { font_id: theme::ui_bold(12.0), color: Color32::BLACK, ..Default::default() });
+                }
+                job.append(&text, 0.0, TextFormat { font_id: theme::ui_font(12.0), color: Color32::BLACK, ..Default::default() });
                 job.wrap.max_width = 200.0;
                 let g = lp.layout_job(job);
                 let origin = Pos2::new(rx + 14.0, t - 4.0);

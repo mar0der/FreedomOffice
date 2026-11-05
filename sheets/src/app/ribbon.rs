@@ -77,7 +77,7 @@ pub fn color_grid(ui: &mut egui::Ui, allow_none: bool) -> Option<Option<u32>> {
     out
 }
 
-fn icon_job(icon: &str, is_icon: bool, label: &str, size: f32, vertical: bool, color: Color32) -> LayoutJob {
+pub(super) fn icon_job(icon: &str, is_icon: bool, label: &str, size: f32, vertical: bool, color: Color32) -> LayoutJob {
     let mut job = LayoutJob::default();
     let icon_fmt = TextFormat {
         font_id: if is_icon { theme::icon_font(size) } else { theme::ui_font(size) },
@@ -431,6 +431,7 @@ impl App {
                 }
             }
             self.chart_tab_button(ui);
+            self.table_tab_button(ui);
             self.cloud_tab_strip_ui(ui);
         });
         let _ = strip;
@@ -459,6 +460,7 @@ impl App {
                         RibbonTab::View => self.view_tab(ui),
                         RibbonTab::Help => self.help_tab(ui),
                         RibbonTab::ChartDesign => self.chart_design_tab(ui),
+                        RibbonTab::TableDesign => self.table_design_tab(ui),
                     }
                 });
             });
@@ -1346,6 +1348,7 @@ impl App {
                 }
             });
         });
+        self.protect_group(ui);
         self.group(ui, "Proofing", |app, ui| {
             let job = icon_job("📊", false, "Workbook\nStatistics", 20.0, true, theme::text());
             if big_btn(ui, job, 66.0, false).clicked() {

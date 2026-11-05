@@ -99,6 +99,12 @@ impl App {
     pub fn transform_formulas(&mut self, mut f: impl FnMut(&mut Expr, usize)) {
         for (si, sh) in self.wb.sheets.iter_mut().enumerate() {
             crate::condfmt::map_sheet_formulas(sh, &mut |e| f(e, si));
+            for (_, t) in sh.names.iter_mut() {
+                if let Ok(mut e) = formula::parse(t.trim_start_matches('=')) {
+                    f(&mut e, si);
+                    *t = formula::print(&e);
+                }
+            }
             for row in sh.rows.values_mut() {
                 for cell in row.values_mut() {
                     if let Some(fm) = &mut cell.formula {
@@ -387,6 +393,9 @@ impl App {
 
     /// Handles a paste event carrying system clipboard text.
     pub fn paste_text(&mut self, text: &str) {
+        if self.locked_block(self.sel()) {
+            return;
+        }
         if let Some(clip) = &self.clip {
             if Self::normalize(&clip.text) == Self::normalize(text) {
                 self.paste_internal(PasteMode::All);
@@ -428,6 +437,9 @@ impl App {
     // ------------------------------------------------------------------
 
     pub fn clear(&mut self, contents: bool, formats: bool) {
+        if self.areas().into_iter().any(|a| self.locked_block(a)) {
+            return;
+        }
         let areas = self.areas();
         if areas.len() > 1 {
             // Multi-area: clear each area (one undo step per area keeps this simple and exact).
@@ -532,6 +544,14 @@ impl App {
                 k.map(|k| (k, t))
             })
             .collect();
+        let key = |(r, c): (u32, u32)| if rows { map(r).map(|nr| (nr, c)) } else { map(c).map(|nc| (r, nc)) };
+        sh.note_authors = sh.note_authors.drain().filter_map(|(k, a)| key(k).map(|k| (k, a))).collect();
+        sh.rich = sh.rich.drain().filter_map(|(k, t)| key(k).map(|k| (k, t))).collect();
+        for p in &mut sh.images {
+            if let Some(k) = key(p.anchor) {
+                p.anchor = k;
+            }
+        }
         let fix = |rg: Range| -> Option<Range> {
             let (a, b) = if rows { (rg.r1, rg.r2) } else { (rg.c1, rg.c2) };
             let (na, nb) = if n > 0 {
@@ -548,6 +568,19 @@ impl App {
             Some(if rows { Range { r1: na, r2: nb, ..rg } } else { Range { c1: na, c2: nb, ..rg } })
         };
         sh.merges = sh.merges.iter().filter_map(|m| fix(*m)).filter(|m| !m.is_single()).collect();
+        let mut tables = std::mem::take(&mut sh.tables);
+        tables.retain_mut(|t| match fix(t.range) {
+            Some(r) if r.rows() > t.header as u32 + t.totals as u32 => {
+                let resized = r.cols() != t.range.cols();
+                t.range = r;
+                if resized {
+                    crate::table::sync_columns_from_cells(sh, t);
+                }
+                true
+            }
+            _ => false,
+        });
+        sh.tables = tables;
         if let Some(f) = &mut sh.filter {
             match fix(f.range) {
                 Some(r) => {
@@ -877,6 +910,9 @@ impl App {
     }
 
     pub fn apply_style_rc(&mut self, f: std::rc::Rc<dyn Fn(&mut Style)>) {
+        if self.format_block() {
+            return;
+        }
         self.commit_edit(false);
         self.last_action = Some(Repeat::Style(f.clone()));
         let si = self.wb.active;
@@ -1675,55 +1711,6 @@ impl App {
         } else {
             self.status = Some(format!("Links of this type aren't opened automatically: {target}"));
         }
-    }
-}
-
-impl App {
-    /// Format as Table: banded rows, styled header and AutoFilter on the current region.
-    /// `kind`: 0 = Light, 1 = Medium, 2 = Dark.
-    pub fn format_as_table(&mut self, accent: u32, kind: u8) {
-        self.commit_edit(false);
-        let rg = if self.sel().is_single() { self.current_region() } else { self.sel_clipped() };
-        if rg.rows() < 2 {
-            self.status = Some("Select a range with a header row and data to format as a table.".into());
-            return;
-        }
-        let si = self.wb.active;
-        self.push_undo(&[Scope::Sheet(si)]);
-        let tint = super::theme::tint;
-        let (head_fill, head_color, band, bottom) = match kind {
-            0 => (None, Some(accent), Some(tint(accent, 0.8)), BorderLine::Thin),
-            1 => (Some(accent), Some(0xFFFFFF), Some(tint(accent, 0.8)), BorderLine::None),
-            _ => (Some(0x000000), Some(0xFFFFFF), Some(tint(accent, -0.25)), BorderLine::Medium),
-        };
-        let dark = kind == 2;
-        for r in rg.r1..=rg.r2 {
-            for c in rg.c1..=rg.c2 {
-                let old = self.wb.sheets[si].get(r, c).map(|x| x.style).unwrap_or(0);
-                let mut st = self.wb.style(old).clone();
-                if r == rg.r1 {
-                    st.bold = true;
-                    st.fill = head_fill;
-                    st.color = head_color;
-                    st.border.bottom = bottom;
-                } else {
-                    let banded = (r - rg.r1) % 2 == 1;
-                    st.fill = if banded { band } else if dark { Some(tint(accent, -0.5)) } else { None };
-                    if dark {
-                        st.color = Some(0xFFFFFF);
-                    }
-                    if kind == 0 && r == rg.r2 {
-                        st.border.bottom = BorderLine::Thin;
-                    }
-                }
-                let id = self.wb.intern_style(st);
-                self.wb.sheets[si].cell_mut(r, c).style = id;
-                self.wb.sheets[si].tidy(r, c);
-            }
-        }
-        self.wb.sheets[si].filter = Some(crate::model::AutoFilter::new(rg));
-        self.select_range(Range::new(rg.r1, rg.c1, rg.r2, rg.c2));
-        self.dirty = true;
     }
 }
 

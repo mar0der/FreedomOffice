@@ -345,6 +345,9 @@ fn paste_option_list() -> Vec<(&'static str, &'static str, char, PasteOpts)> {
 impl App {
     /// Pastes the internal clipboard with the given options (Ctrl+V, Paste Special, Paste Options).
     pub fn paste_special(&mut self, o: PasteOpts) {
+        if self.locked_block(self.sel()) {
+            return;
+        }
         let Some(clip) = self.clip.clone() else { return };
         self.commit_edit(false);
         let si = self.wb.active;

@@ -288,8 +288,9 @@ fn external_references() {
 
 #[test]
 fn unparsed_formulas_survive_save_and_load() {
-    // Syntax the engine does not understand (structured references, external names) is kept
-    // verbatim: not rewritten, not turned into text.
+    // Syntax the engine does not understand (external names) is kept verbatim: not rewritten,
+    // not turned into text. Structured references parse and keep their text too (the file's
+    // `[#This Row],` comes back in Excel's `@` form).
     let texts = ["Table1[Sales]*2", "SUM(Table1[[#This Row],[Qty]:[Price]])", "[Book.xlsx]!Name+1", "[@Qty]*2", "SUM([Budget 2026.xlsx]Data!B2:B9)"];
     let mut wb = Workbook::new();
     for (i, f) in texts.iter().enumerate() {
@@ -297,7 +298,8 @@ fn unparsed_formulas_survive_save_and_load() {
         wb.sheets[0].set(i as u32, 0, cell);
         let cell = wb.sheets[0].get(i as u32, 0).unwrap();
         let fm = cell.formula.as_ref().expect("still a formula");
-        assert!(fm.ast.is_none(), "{f} should not parse");
+        let structured = !f.contains(".xlsx]");
+        assert_eq!(fm.ast.is_some(), structured, "{f}");
         assert_eq!(fm.text, *f);
     }
     recalc(&mut wb);
@@ -307,7 +309,8 @@ fn unparsed_formulas_survive_save_and_load() {
     let _ = std::fs::remove_file(&path);
     for (i, f) in texts.iter().enumerate() {
         let cell = back.sheets[0].get(i as u32, 0).expect("cell kept");
-        assert_eq!(cell.formula.as_ref().map(|x| x.text.as_str()), Some(*f));
+        let want = if i == 1 { "SUM(Table1[@[Qty]:[Price]])" } else { f };
+        assert_eq!(cell.formula.as_ref().map(|x| x.text.as_str()), Some(want));
     }
 }
 

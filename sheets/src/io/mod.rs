@@ -2,6 +2,8 @@
 
 mod calamine_read;
 mod delimited;
+#[cfg(test)]
+mod fidelity_tests;
 mod xlsx_read;
 mod xlsx_write;
 
