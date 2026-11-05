@@ -249,7 +249,7 @@ impl App {
                     if ui.add(egui::Button::new("Cancel").min_size(Vec2::new(76.0, 24.0))).clicked() {
                         result = Some(false);
                     }
-                    if ui.add(egui::Button::new("OK").min_size(Vec2::new(76.0, 24.0)).fill(theme::ACCENT_LIGHT)).clicked() {
+                    if ui.add(egui::Button::new("OK").min_size(Vec2::new(76.0, 24.0)).fill(theme::accent_light())).clicked() {
                         result = Some(true);
                     }
                 });
@@ -355,7 +355,7 @@ impl App {
                     for (l, code) in labels.iter().rev() {
                         let mut b = egui::Button::new(*l).min_size(Vec2::new(76.0, 24.0));
                         if *code == default {
-                            b = b.fill(theme::ACCENT_LIGHT);
+                            b = b.fill(theme::accent_light());
                         }
                         if ui.add(b).clicked() {
                             act = Some(*code);
@@ -533,7 +533,7 @@ impl App {
                     egui::ScrollArea::vertical().max_height(row_h * 8.0).show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 0.0;
                         if n == 0 {
-                            ui.label(RichText::new("(no items)").color(theme::TEXT_DIM));
+                            ui.label(RichText::new("(no items)").color(theme::text_dim()));
                         }
                         for (i, (t, _)) in dl.items.iter().enumerate() {
                             let (rect, resp) = ui.allocate_exact_size(Vec2::new(width - 2.0, row_h), Sense::click());
@@ -541,12 +541,12 @@ impl App {
                                 dl.hover = i;
                             }
                             if i == dl.hover {
-                                ui.painter().rect_filled(rect, 0.0, theme::ACCENT_LIGHT);
+                                ui.painter().rect_filled(rect, 0.0, theme::accent_light());
                                 if dl.scroll {
                                     resp.scroll_to_me(None);
                                 }
                             }
-                            ui.painter().text(Pos2::new(rect.left() + 4.0, rect.center().y), Align2::LEFT_CENTER, t, theme::ui_font(12.5), theme::TEXT);
+                            ui.painter().text(Pos2::new(rect.left() + 4.0, rect.center().y), Align2::LEFT_CENTER, t, theme::ui_font(12.5), theme::text());
                             if resp.clicked() {
                                 pick = Some(i);
                             }
@@ -666,5 +666,5 @@ fn settings_tab(ui: &mut egui::Ui, d: &mut DvDialog) {
         Allow::Any => "Any value can be entered.",
         _ => "Enter a number, or a formula such as =$B$1.",
     };
-    ui.label(RichText::new(hint).size(11.0).color(theme::TEXT_DIM));
+    ui.label(RichText::new(hint).size(11.0).color(theme::text_dim()));
 }

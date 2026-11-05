@@ -3,26 +3,95 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use eframe::egui::{self, Color32, FontData, FontDefinitions, FontFamily, FontId, Stroke};
 
-pub const ACCENT: Color32 = Color32::from_rgb(0x21, 0x73, 0x46);
-pub const ACCENT_DARK: Color32 = Color32::from_rgb(0x18, 0x5C, 0x37);
-pub const ACCENT_LIGHT: Color32 = Color32::from_rgb(0xD5, 0xEA, 0xDD);
-pub const CHROME: Color32 = Color32::from_rgb(0xF3, 0xF3, 0xF3);
-pub const RIBBON: Color32 = Color32::from_rgb(0xFA, 0xFA, 0xFA);
-pub const BORDER: Color32 = Color32::from_rgb(0xD4, 0xD4, 0xD4);
-pub const HEADER_BG: Color32 = Color32::from_rgb(0xF5, 0xF5, 0xF5);
-pub const HEADER_SEL_BG: Color32 = Color32::from_rgb(0xDE, 0xDE, 0xDE);
-pub const HEADER_FULL_BG: Color32 = Color32::from_rgb(0xC9, 0xE3, 0xD2);
-pub const HEADER_TEXT: Color32 = Color32::from_rgb(0x44, 0x44, 0x44);
-pub const HEADER_LINE: Color32 = Color32::from_rgb(0xD0, 0xD0, 0xD0);
+// ---------------------------------------------------------------------------
+// Light / dark palette. Like desktop Office's default "Use system setting", the
+// chrome follows the Windows app mode; the cell area stays white in both.
+// ---------------------------------------------------------------------------
+
+static DARK: AtomicBool = AtomicBool::new(false);
+
+pub fn is_dark() -> bool {
+    DARK.load(Ordering::Relaxed)
+}
+
+pub fn set_dark(dark: bool) {
+    DARK.store(dark, Ordering::Relaxed);
+}
+
+/// Windows Settings > Personalization > Colors > "Choose your default app mode".
+#[cfg(windows)]
+pub fn system_dark() -> bool {
+    use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
+    let key: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize\0".encode_utf16().collect();
+    let val: Vec<u16> = "AppsUseLightTheme\0".encode_utf16().collect();
+    let mut data: u32 = 1;
+    let mut size = 4u32;
+    let rc = unsafe {
+        RegGetValueW(HKEY_CURRENT_USER, key.as_ptr(), val.as_ptr(), RRF_RT_REG_DWORD, std::ptr::null_mut(), &mut data as *mut u32 as *mut _, &mut size)
+    };
+    rc == 0 && data == 0
+}
+
+#[cfg(not(windows))]
+pub fn system_dark() -> bool {
+    false
+}
+
+macro_rules! palette {
+    ($($(#[$m:meta])* $name:ident = $light:literal, $dark:literal;)*) => {
+        $($(#[$m])* pub fn $name() -> Color32 {
+            rgb(if is_dark() { $dark } else { $light })
+        })*
+    };
+}
+
+palette! {
+    /// Accent for chrome (tab underline, links, focused outlines).
+    accent = 0x217346, 0x60BD82;
+    /// Accent used for text and strong fills.
+    accent_dark = 0x185C37, 0x6FCB91;
+    /// Soft accent for selected list items and default buttons.
+    accent_light = 0xD5EADD, 0x2B4F3A;
+    /// Window background behind the ribbon, formula bar, sheet tabs and status bar.
+    chrome = 0xF3F3F3, 0x161B1E;
+    /// Ribbon body.
+    ribbon = 0xFAFAFA, 0x292929;
+    /// Popups, dialogs, backstage pages and input fields.
+    window = 0xFFFFFF, 0x292929;
+    border = 0xD4D4D4, 0x5C5C5C;
+    header_bg = 0xF5F5F5, 0x2B2B2B;
+    header_sel_bg = 0xDEDEDE, 0x424242;
+    header_full_bg = 0xC9E3D2, 0x2C5A3E;
+    header_text = 0x444444, 0xD0D0D0;
+    header_line = 0xD0D0D0, 0x474747;
+    text = 0x202020, 0xFFFFFF;
+    text_dim = 0x606060, 0xADADAD;
+    hover = 0xE6E6E6, 0x3D3D3D;
+    pressed = 0xD0D0D0, 0x4F4F4F;
+    checked = 0xC8D8CF, 0x4A4A4A;
+    /// Outline of hovered or pressed ribbon buttons.
+    button_edge = 0xC8C8C8, 0x8A8A8A;
+    /// Outline of the name box and formula field.
+    field_edge = 0xD4D4D4, 0x666666;
+    /// File backstage navigation pane.
+    backstage_nav = 0x185C37, 0x1F3D2B;
+    backstage_sel = 0x217346, 0x2F5E42;
+    backstage_hover = 0x206B45, 0x2A4F3A;
+    /// Formula autocomplete / argument tooltip.
+    tooltip = 0xFFFFF4, 0x333333;
+}
+
+/// Accent drawn on the (always white) cell area: selection border, fill handle, copy marquee.
+pub const GRID_ACCENT: Color32 = Color32::from_rgb(0x21, 0x73, 0x46);
 pub const GRID_LINE: Color32 = Color32::from_rgb(0xDD, 0xDD, 0xDD);
-pub const TEXT: Color32 = Color32::from_rgb(0x20, 0x20, 0x20);
-pub const TEXT_DIM: Color32 = Color32::from_rgb(0x60, 0x60, 0x60);
-pub const HOVER: Color32 = Color32::from_rgb(0xE6, 0xE6, 0xE6);
-pub const PRESSED: Color32 = Color32::from_rgb(0xD0, 0xD0, 0xD0);
-pub const CHECKED: Color32 = Color32::from_rgb(0xC8, 0xD8, 0xCF);
+
+pub fn grid_line() -> Color32 {
+    GRID_LINE
+}
 
 pub fn sel_fill() -> Color32 {
     Color32::from_rgba_unmultiplied(0x10, 0x10, 0x10, 22)
@@ -390,47 +459,52 @@ pub fn ui_bold(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name("ui-bold".into()))
 }
 
-/// Flat, light visuals similar to desktop office ribbons.
+/// Flat visuals similar to desktop office ribbons, in the current light or dark palette.
 pub fn apply_style(ctx: &egui::Context) {
     ctx.options_mut(|o| o.zoom_with_keyboard = false);
+    let dark = is_dark();
     let mut style = (*ctx.style()).clone();
-    let mut v = egui::Visuals::light();
-    v.window_fill = Color32::WHITE;
-    v.panel_fill = CHROME;
-    v.extreme_bg_color = Color32::WHITE;
-    v.faint_bg_color = Color32::from_rgb(0xF7, 0xF7, 0xF7);
-    v.selection.bg_fill = ACCENT_LIGHT;
-    v.selection.stroke = Stroke::new(1.0, ACCENT);
-    v.hyperlink_color = ACCENT;
+    let mut v = if dark { egui::Visuals::dark() } else { egui::Visuals::light() };
+    v.window_fill = window();
+    v.panel_fill = chrome();
+    v.extreme_bg_color = window();
+    v.faint_bg_color = if dark { rgb(0x262626) } else { rgb(0xF7F7F7) };
+    v.code_bg_color = v.faint_bg_color;
+    v.selection.bg_fill = accent_light();
+    v.selection.stroke = Stroke::new(1.0, accent());
+    v.hyperlink_color = accent();
     v.window_corner_radius = egui::CornerRadius::same(6);
     v.menu_corner_radius = egui::CornerRadius::same(4);
-    v.window_stroke = Stroke::new(1.0, BORDER);
-    v.window_shadow = egui::Shadow { offset: [0, 4], blur: 16, spread: 0, color: Color32::from_black_alpha(40) };
-    v.popup_shadow = egui::Shadow { offset: [0, 3], blur: 10, spread: 0, color: Color32::from_black_alpha(35) };
+    v.window_stroke = Stroke::new(1.0, border());
+    let shadow = if dark { 110 } else { 40 };
+    v.window_shadow = egui::Shadow { offset: [0, 4], blur: 16, spread: 0, color: Color32::from_black_alpha(shadow) };
+    v.popup_shadow = egui::Shadow { offset: [0, 3], blur: 10, spread: 0, color: Color32::from_black_alpha(shadow - 5) };
     let w = &mut v.widgets;
-    w.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
-    w.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
+    w.noninteractive.fg_stroke = Stroke::new(1.0, text());
+    w.noninteractive.bg_stroke = Stroke::new(1.0, border());
+    w.noninteractive.bg_fill = window();
+    w.noninteractive.weak_bg_fill = window();
     w.inactive.weak_bg_fill = Color32::TRANSPARENT;
-    w.inactive.bg_fill = Color32::WHITE;
+    w.inactive.bg_fill = if dark { rgb(0x333333) } else { Color32::WHITE };
     // visible outlines for checkboxes, number boxes, combo boxes and dialog buttons
-    w.inactive.bg_stroke = Stroke::new(1.0, Color32::from_gray(170));
-    w.inactive.fg_stroke = Stroke::new(1.0, TEXT);
+    w.inactive.bg_stroke = Stroke::new(1.0, if dark { rgb(0x707070) } else { Color32::from_gray(170) });
+    w.inactive.fg_stroke = Stroke::new(1.0, text());
     w.inactive.corner_radius = egui::CornerRadius::same(3);
-    w.hovered.weak_bg_fill = HOVER;
-    w.hovered.bg_fill = HOVER;
-    w.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0xC8, 0xC8, 0xC8));
-    w.hovered.fg_stroke = Stroke::new(1.0, TEXT);
+    w.hovered.weak_bg_fill = hover();
+    w.hovered.bg_fill = hover();
+    w.hovered.bg_stroke = Stroke::new(1.0, button_edge());
+    w.hovered.fg_stroke = Stroke::new(1.0, text());
     w.hovered.corner_radius = egui::CornerRadius::same(3);
     w.hovered.expansion = 0.0;
-    w.active.weak_bg_fill = PRESSED;
-    w.active.bg_fill = PRESSED;
-    w.active.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0xB0, 0xB0, 0xB0));
-    w.active.fg_stroke = Stroke::new(1.0, TEXT);
+    w.active.weak_bg_fill = pressed();
+    w.active.bg_fill = pressed();
+    w.active.bg_stroke = Stroke::new(1.0, if dark { rgb(0xA0A0A0) } else { rgb(0xB0B0B0) });
+    w.active.fg_stroke = Stroke::new(1.0, text());
     w.active.corner_radius = egui::CornerRadius::same(3);
     w.active.expansion = 0.0;
-    w.open.weak_bg_fill = PRESSED;
-    w.open.bg_fill = PRESSED;
-    w.open.fg_stroke = Stroke::new(1.0, TEXT);
+    w.open.weak_bg_fill = pressed();
+    w.open.bg_fill = pressed();
+    w.open.fg_stroke = Stroke::new(1.0, text());
     style.visuals = v;
     style.spacing.item_spacing = egui::vec2(4.0, 3.0);
     style.spacing.button_padding = egui::vec2(5.0, 2.0);

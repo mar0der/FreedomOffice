@@ -905,7 +905,7 @@ impl App {
 
         // Gridlines
         if show_grid {
-            let gs = Stroke::new(1.0, theme::GRID_LINE);
+            let gs = Stroke::new(1.0, theme::grid_line());
             for &(_, x, w) in &lay.cols {
                 let xx = (x + w).round() - 0.5;
                 cp.line_segment([Pos2::new(xx, lay.cells.top()), Pos2::new(xx, lay.cells.bottom())], gs);
@@ -1192,7 +1192,7 @@ impl App {
             if clip.sheet == si {
                 let r = self.range_rect(lay, clip.range).shrink(0.5);
                 let t = ui.input(|i| i.time) as f32;
-                dashed_rect(&cp, r, theme::ACCENT, t);
+                dashed_rect(&cp, r, theme::GRID_ACCENT, t);
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(120));
             }
         }
@@ -1262,13 +1262,13 @@ impl App {
         for a in self.sheet().view.extra.clone() {
             let r = self.range_rect(lay, a);
             cp.rect_filled(r, 0.0, theme::sel_fill());
-            cp.rect_stroke(r.shrink(0.5), 0.0, Stroke::new(1.0, theme::ACCENT), StrokeKind::Middle);
+            cp.rect_stroke(r.shrink(0.5), 0.0, Stroke::new(1.0, theme::GRID_ACCENT), StrokeKind::Middle);
         }
-        let sel_stroke = Stroke::new(2.0, theme::ACCENT);
+        let sel_stroke = Stroke::new(2.0, theme::GRID_ACCENT);
         cp.rect_stroke(sel_rect.expand(0.0), 0.0, sel_stroke, StrokeKind::Middle);
         if let Some(fh) = self.fill_handle_rect(lay) {
             cp.rect_filled(fh.expand(1.0), 0.0, Color32::WHITE);
-            cp.rect_filled(fh, 0.0, theme::ACCENT);
+            cp.rect_filled(fh, 0.0, theme::GRID_ACCENT);
         }
         // Move preview
         if let Drag::Move(dr, dc) = self.drag {
@@ -1323,7 +1323,7 @@ impl App {
                         cp.rect_stroke(btn, 2.0, Stroke::new(1.0, Color32::from_gray(170)), StrokeKind::Inside);
                         let (g, is_icon) = self.fonts.icons.get(if active { theme::ic::FILTER } else { theme::ic::DOWN }, "▾");
                         let font = if is_icon { theme::icon_font(9.0) } else { theme::ui_font(11.0) };
-                        cp.text(btn.center(), Align2::CENTER_CENTER, g, font, theme::TEXT);
+                        cp.text(btn.center(), Align2::CENTER_CENTER, g, font, theme::text());
                     }
                 }
             }
@@ -1362,9 +1362,9 @@ impl App {
         }
 
         // Scrollbars
-        painter.rect_filled(lay.vbar, 0.0, theme::CHROME);
-        painter.rect_filled(lay.hbar, 0.0, theme::CHROME);
-        painter.rect_filled(Rect::from_min_max(Pos2::new(lay.vbar.left(), lay.hbar.top()), lay.rect.right_bottom()), 0.0, theme::CHROME);
+        painter.rect_filled(lay.vbar, 0.0, theme::chrome());
+        painter.rect_filled(lay.hbar, 0.0, theme::chrome());
+        painter.rect_filled(Rect::from_min_max(Pos2::new(lay.vbar.left(), lay.hbar.top()), lay.rect.right_bottom()), 0.0, theme::chrome());
         let (vt, _) = self.vthumb(lay);
         let (ht, _) = self.hthumb(lay);
         let thumb_col = if matches!(self.drag, Drag::VScroll(..)) { Color32::from_gray(120) } else { Color32::from_gray(180) };
@@ -1377,23 +1377,23 @@ impl App {
     fn paint_headers(&mut self, painter: &egui::Painter, lay: &Layout) {
         let sel = self.sel();
         let font = theme::ui_font((11.0_f32 * self.zoom).clamp(7.0, 22.0));
-        let line = Stroke::new(1.0, theme::HEADER_LINE);
+        let line = Stroke::new(1.0, theme::header_line());
         let col_hdr = Rect::from_min_max(Pos2::new(lay.cells.left(), lay.rect.top()), Pos2::new(lay.cells.right(), lay.cells.top()));
         let row_hdr = Rect::from_min_max(Pos2::new(lay.rect.left(), lay.cells.top()), Pos2::new(lay.cells.left(), lay.cells.bottom()));
         let cp = painter.with_clip_rect(col_hdr);
         let rp = painter.with_clip_rect(row_hdr);
-        cp.rect_filled(col_hdr, 0.0, theme::HEADER_BG);
-        rp.rect_filled(row_hdr, 0.0, theme::HEADER_BG);
+        cp.rect_filled(col_hdr, 0.0, theme::header_bg());
+        rp.rect_filled(row_hdr, 0.0, theme::header_bg());
         let full_cols = sel.is_full_cols();
         let full_rows = sel.is_full_rows();
         for &(c, x, w) in &lay.cols {
             let r = Rect::from_min_size(Pos2::new(x, col_hdr.top()), Vec2::new(w, col_hdr.height()));
             let in_sel = c >= sel.c1 && c <= sel.c2;
             if in_sel {
-                cp.rect_filled(r, 0.0, if full_cols { theme::HEADER_FULL_BG } else { theme::HEADER_SEL_BG });
-                cp.line_segment([Pos2::new(r.left(), r.bottom() - 1.0), Pos2::new(r.right(), r.bottom() - 1.0)], Stroke::new(2.0, theme::ACCENT));
+                cp.rect_filled(r, 0.0, if full_cols { theme::header_full_bg() } else { theme::header_sel_bg() });
+                cp.line_segment([Pos2::new(r.left(), r.bottom() - 1.0), Pos2::new(r.right(), r.bottom() - 1.0)], Stroke::new(2.0, theme::accent()));
             }
-            let col = if in_sel { theme::ACCENT_DARK } else { theme::HEADER_TEXT };
+            let col = if in_sel { theme::accent_dark() } else { theme::header_text() };
             cp.text(r.center(), Align2::CENTER_CENTER, col_name(c), font.clone(), col);
             let xx = (x + w).round() - 0.5;
             cp.line_segment([Pos2::new(xx, r.top() + 2.0), Pos2::new(xx, r.bottom())], line);
@@ -1402,10 +1402,10 @@ impl App {
             let r = Rect::from_min_size(Pos2::new(row_hdr.left(), y), Vec2::new(row_hdr.width(), h));
             let in_sel = rw >= sel.r1 && rw <= sel.r2;
             if in_sel {
-                rp.rect_filled(r, 0.0, if full_rows { theme::HEADER_FULL_BG } else { theme::HEADER_SEL_BG });
-                rp.line_segment([Pos2::new(r.right() - 1.0, r.top()), Pos2::new(r.right() - 1.0, r.bottom())], Stroke::new(2.0, theme::ACCENT));
+                rp.rect_filled(r, 0.0, if full_rows { theme::header_full_bg() } else { theme::header_sel_bg() });
+                rp.line_segment([Pos2::new(r.right() - 1.0, r.top()), Pos2::new(r.right() - 1.0, r.bottom())], Stroke::new(2.0, theme::accent()));
             }
-            let col = if in_sel { theme::ACCENT_DARK } else { theme::HEADER_TEXT };
+            let col = if in_sel { theme::accent_dark() } else { theme::header_text() };
             if h > 6.0 {
                 rp.text(r.center(), Align2::CENTER_CENTER, (rw + 1).to_string(), font.clone(), col);
             }
@@ -1417,7 +1417,7 @@ impl App {
         painter.line_segment([Pos2::new(lay.cells.left() - 0.5, lay.rect.top()), Pos2::new(lay.cells.left() - 0.5, lay.cells.bottom())], line);
         // corner with the select-all triangle
         let corner = Rect::from_min_max(lay.rect.min, Pos2::new(lay.cells.left(), lay.cells.top()));
-        painter.rect_filled(corner, 0.0, theme::HEADER_BG);
+        painter.rect_filled(corner, 0.0, theme::header_bg());
         let p = corner.right_bottom() - Vec2::new(3.0, 3.0);
         let s = (corner.height() * 0.55).min(corner.width() * 0.55);
         painter.add(egui::Shape::convex_polygon(
@@ -1457,7 +1457,7 @@ impl App {
         }
         let fill = style.fill.map(rgb).unwrap_or(Color32::WHITE);
         painter.rect_filled(rect, 0.0, fill);
-        painter.rect_stroke(rect, 0.0, Stroke::new(2.0, theme::ACCENT), StrokeKind::Middle);
+        painter.rect_stroke(rect, 0.0, Stroke::new(2.0, theme::GRID_ACCENT), StrokeKind::Middle);
         let text_pos = Pos2::new(rect.left() + pad, rect.bottom() - galley.size().y - 1.0);
         self.paint_caret_and_selection(&painter, &e, &galley, text_pos, ui.input(|i| i.time), !e.in_bar);
         painter.galley(text_pos, galley, Color32::BLACK);
@@ -1653,7 +1653,7 @@ impl App {
         let corner = Rect::from_min_max(full.min, Pos2::new(lay.rect.left(), lay.rect.top()));
         for r in [left, top, corner] {
             if r.width() > 0.0 && r.height() > 0.0 {
-                p.rect_filled(r, 0.0, theme::CHROME);
+                p.rect_filled(r, 0.0, theme::chrome());
             }
         }
         let line = Stroke::new(1.0, Color32::from_gray(110));
@@ -1663,7 +1663,7 @@ impl App {
         let button = |p: &egui::Painter, r: Rect, text: &str| {
             p.rect_filled(r, 1.0, Color32::WHITE);
             p.rect_stroke(r, 1.0, Stroke::new(1.0, Color32::from_gray(120)), StrokeKind::Inside);
-            p.text(r.center(), Align2::CENTER_CENTER, text, font.clone(), theme::TEXT);
+            p.text(r.center(), Align2::CENTER_CENTER, text, font.clone(), theme::text());
         };
         let sh = self.sheet();
         if rl > 0 {

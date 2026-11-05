@@ -60,7 +60,7 @@ impl App {
                 .vertical_align(egui::Align::Center)
                 .font(theme::ui_font(13.0))
                 .margin(egui::Margin::symmetric(5, 2));
-            let resp = egui::Frame::new().fill(Color32::WHITE).stroke(Stroke::new(1.0, theme::BORDER)).show(ui, |ui| ui.add(nb)).inner;
+            let resp = egui::Frame::new().fill(theme::window()).stroke(Stroke::new(1.0, theme::field_edge())).corner_radius(4).show(ui, |ui| ui.add(nb)).inner;
             if resp.gained_focus() {
                 self.name_box_editing = true;
                 if let Some(mut st) = egui::TextEdit::load_state(ui.ctx(), resp.id) {
@@ -90,7 +90,7 @@ impl App {
             // dots separator
             let (r, _) = ui.allocate_exact_size(Vec2::new(8.0, h), Sense::hover());
             for k in 0..3 {
-                ui.painter().circle_filled(Pos2::new(r.center().x, r.top() + 7.0 + k as f32 * 5.0), 1.0, theme::TEXT_DIM);
+                ui.painter().circle_filled(Pos2::new(r.center().x, r.top() + 7.0 + k as f32 * 5.0), 1.0, theme::text_dim());
             }
             ui.add_space(4.0);
             let editing = self.edit.is_some();
@@ -121,8 +121,8 @@ impl App {
         let hh = if lines > 1.0 { lines * 17.0 + 6.0 } else { h };
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, hh), Sense::click_and_drag());
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 0.0, Color32::WHITE);
-        painter.rect_stroke(rect, 0.0, Stroke::new(1.0, theme::BORDER), StrokeKind::Inside);
+        painter.rect_filled(rect, 4.0, theme::window());
+        painter.rect_stroke(rect, 4.0, Stroke::new(1.0, theme::field_edge()), StrokeKind::Inside);
         if resp.hovered() {
             ui.ctx().set_cursor_icon(CursorIcon::Text);
         }
@@ -130,7 +130,7 @@ impl App {
         let origin = Pos2::new(rect.left() + 6.0, rect.top() + 4.0);
         let galley = match &self.edit {
             Some(e) => {
-                let job = self.editor_job(e, font.clone(), Color32::BLACK, None);
+                let job = self.editor_job(e, font.clone(), theme::text(), None);
                 painter.layout_job(job)
             }
             None => {
@@ -139,8 +139,8 @@ impl App {
                 let sh = self.sheet();
                 let own = sh.get(r, c).filter(|x| !x.value.is_empty() || x.formula.is_some());
                 let (t, color) = match own.is_none().then(|| sh.spill_anchor_of(r, c)).flatten().and_then(|(ar, ac)| sh.get(ar, ac)) {
-                    Some(anchor) => (anchor.input_text(), Color32::from_gray(150)),
-                    None => (if sh.get(r, c).is_some() { self.edit_text(r, c) } else { String::new() }, Color32::BLACK),
+                    Some(anchor) => (anchor.input_text(), theme::text_dim()),
+                    None => (if sh.get(r, c).is_some() { self.edit_text(r, c) } else { String::new() }, theme::text()),
                 };
                 let first = t.lines().next().unwrap_or("").to_string();
                 let more = t.lines().count() > 1;
@@ -152,7 +152,7 @@ impl App {
                 self.paint_caret_and_selection(&painter, e, &galley, origin, ui.input(|i| i.time), true);
             }
         }
-        painter.galley(origin, galley.clone(), Color32::BLACK);
+        painter.galley(origin, galley.clone(), theme::text());
 
         let char_at = |p: Pos2, e: &Editor| -> usize {
             let cc = galley.cursor_from_pos(p - origin);
@@ -211,7 +211,7 @@ impl App {
 
     pub fn sheet_tabs_ui(&mut self, ui: &mut egui::Ui) {
         let full = ui.max_rect();
-        ui.painter().line_segment([full.left_top(), full.right_top()], Stroke::new(1.0, theme::BORDER));
+        ui.painter().line_segment([full.left_top(), full.right_top()], Stroke::new(1.0, theme::border()));
         ui.horizontal_centered(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
             ui.add_space(6.0);
@@ -261,7 +261,7 @@ impl App {
                     }
                 }
                 let name = self.wb.sheets[i].name.clone();
-                let galley = ui.painter().layout_no_wrap(name.clone(), if active { bold.clone() } else { font.clone() }, theme::TEXT);
+                let galley = ui.painter().layout_no_wrap(name.clone(), if active { bold.clone() } else { font.clone() }, theme::text());
                 let w = galley.size().x + 26.0;
                 let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 26.0), Sense::click_and_drag());
                 tab_rects.push((i, rect));
@@ -270,20 +270,20 @@ impl App {
                 }
                 let p = ui.painter();
                 if active {
-                    p.rect_filled(rect.shrink2(Vec2::new(0.0, 1.0)), 0.0, Color32::WHITE);
+                    p.rect_filled(rect.shrink2(Vec2::new(0.0, 1.0)), 0.0, theme::window());
                     p.line_segment(
                         [Pos2::new(rect.left() + 6.0, rect.bottom() - 2.5), Pos2::new(rect.right() - 6.0, rect.bottom() - 2.5)],
-                        Stroke::new(3.0, theme::ACCENT),
+                        Stroke::new(3.0, theme::accent()),
                     );
                 } else if resp.hovered() {
-                    p.rect_filled(rect.shrink2(Vec2::new(0.0, 1.0)), 0.0, theme::HOVER);
+                    p.rect_filled(rect.shrink2(Vec2::new(0.0, 1.0)), 0.0, theme::hover());
                 }
                 if let Some(c) = self.wb.sheets[i].tab_color {
                     p.line_segment([Pos2::new(rect.left() + 2.0, rect.top() + 2.0), Pos2::new(rect.right() - 2.0, rect.top() + 2.0)], Stroke::new(3.0, theme::rgb(c)));
                 }
-                let col = if active { theme::ACCENT_DARK } else { theme::TEXT_DIM };
+                let col = if active { theme::accent_dark() } else { theme::text_dim() };
                 p.text(rect.center(), Align2::CENTER_CENTER, name, if active { bold.clone() } else { font.clone() }, col);
-                p.line_segment([Pos2::new(rect.right(), rect.top() + 6.0), Pos2::new(rect.right(), rect.bottom() - 6.0)], Stroke::new(1.0, theme::BORDER));
+                p.line_segment([Pos2::new(rect.right(), rect.top() + 6.0), Pos2::new(rect.right(), rect.bottom() - 6.0)], Stroke::new(1.0, theme::border()));
                 if resp.clicked() {
                     action = Some((i, 0));
                 }
@@ -364,7 +364,7 @@ impl App {
                         let y = full.top() + 3.0;
                         ui.painter().add(egui::Shape::convex_polygon(
                             vec![Pos2::new(x - 5.0, y), Pos2::new(x + 5.0, y), Pos2::new(x, y + 6.0)],
-                            theme::ACCENT_DARK,
+                            theme::accent_dark(),
                             Stroke::NONE,
                         ));
                     }
@@ -441,17 +441,17 @@ impl App {
 
     pub fn status_bar_ui(&mut self, ui: &mut egui::Ui) {
         let rect = ui.max_rect();
-        ui.painter().line_segment([rect.left_top(), rect.right_top()], Stroke::new(1.0, theme::BORDER));
+        ui.painter().line_segment([rect.left_top(), rect.right_top()], Stroke::new(1.0, theme::border()));
         ui.horizontal_centered(|ui| {
             ui.add_space(10.0);
-            ui.label(RichText::new(self.mode_label()).size(12.0).color(theme::TEXT_DIM));
+            ui.label(RichText::new(self.mode_label()).size(12.0).color(theme::text_dim()));
             if let Some(s) = &self.status {
                 ui.add_space(16.0);
-                ui.label(RichText::new(s).size(12.0).color(theme::TEXT_DIM));
+                ui.label(RichText::new(s).size(12.0).color(theme::text_dim()));
             }
             if self.format_painter.is_some() {
                 ui.add_space(16.0);
-                ui.label(RichText::new("Click a cell or drag to paste the format. Esc to cancel.").size(12.0).color(theme::TEXT_DIM));
+                ui.label(RichText::new("Click a cell or drag to paste the format. Esc to cancel.").size(12.0).color(theme::text_dim()));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(8.0);
@@ -497,15 +497,15 @@ impl App {
         egui::SidePanel::left("backstage_nav")
             .exact_width(210.0)
             .resizable(false)
-            .frame(egui::Frame::NONE.fill(theme::ACCENT_DARK).inner_margin(egui::Margin { left: 0, right: 0, top: 10, bottom: 10 }))
+            .frame(egui::Frame::NONE.fill(theme::backstage_nav()).inner_margin(egui::Margin { left: 0, right: 0, top: 10, bottom: 10 }))
             .show(ctx, |ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
                 let item = |ui: &mut egui::Ui, text: &str, selected: bool| -> bool {
                     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 38.0), Sense::click());
                     if selected {
-                        ui.painter().rect_filled(rect, 0.0, theme::ACCENT);
+                        ui.painter().rect_filled(rect, 0.0, theme::backstage_sel());
                     } else if resp.hovered() {
-                        ui.painter().rect_filled(rect, 0.0, Color32::from_rgb(0x20, 0x6B, 0x45));
+                        ui.painter().rect_filled(rect, 0.0, theme::backstage_hover());
                     }
                     ui.painter().text(Pos2::new(rect.left() + 26.0, rect.center().y), Align2::LEFT_CENTER, text, theme::ui_font(14.0), Color32::WHITE);
                     resp.clicked()
@@ -557,26 +557,26 @@ impl App {
                     }
                 });
             });
-        egui::CentralPanel::default().frame(egui::Frame::NONE.fill(Color32::WHITE).inner_margin(egui::Margin::same(36))).show(ctx, |ui| {
+        egui::CentralPanel::default().frame(egui::Frame::NONE.fill(theme::window()).inner_margin(egui::Margin::same(36))).show(ctx, |ui| {
             match page {
                 Backstage::Home => {
-                    ui.label(RichText::new("Good to see you").size(28.0).color(theme::TEXT));
+                    ui.label(RichText::new("Good to see you").size(28.0).color(theme::text()));
                     ui.add_space(18.0);
                     ui.label(RichText::new("New").size(16.0));
                     ui.add_space(6.0);
                     let (rect, resp) = ui.allocate_exact_size(Vec2::new(150.0, 120.0), Sense::click());
                     let p = ui.painter();
                     p.rect_filled(rect, 4.0, Color32::WHITE);
-                    p.rect_stroke(rect, 4.0, Stroke::new(if resp.hovered() { 2.0 } else { 1.0 }, if resp.hovered() { theme::ACCENT } else { theme::BORDER }), StrokeKind::Inside);
+                    p.rect_stroke(rect, 4.0, Stroke::new(if resp.hovered() { 2.0 } else { 1.0 }, if resp.hovered() { theme::accent() } else { theme::border() }), StrokeKind::Inside);
                     for k in 1..5 {
                         let y = rect.top() + k as f32 * 18.0;
-                        p.line_segment([Pos2::new(rect.left() + 10.0, y), Pos2::new(rect.right() - 10.0, y)], Stroke::new(1.0, theme::GRID_LINE));
+                        p.line_segment([Pos2::new(rect.left() + 10.0, y), Pos2::new(rect.right() - 10.0, y)], Stroke::new(1.0, theme::grid_line()));
                     }
                     for k in 1..4 {
                         let x = rect.left() + 10.0 + k as f32 * 32.5;
-                        p.line_segment([Pos2::new(x, rect.top() + 18.0), Pos2::new(x, rect.top() + 72.0)], Stroke::new(1.0, theme::GRID_LINE));
+                        p.line_segment([Pos2::new(x, rect.top() + 18.0), Pos2::new(x, rect.top() + 72.0)], Stroke::new(1.0, theme::grid_line()));
                     }
-                    p.text(Pos2::new(rect.center().x, rect.bottom() - 18.0), Align2::CENTER_CENTER, "Blank workbook", theme::ui_font(12.5), theme::TEXT);
+                    p.text(Pos2::new(rect.center().x, rect.bottom() - 18.0), Align2::CENTER_CENTER, "Blank workbook", theme::ui_font(12.5), theme::text());
                     if resp.clicked() {
                         self.backstage = None;
                         self.confirm_then(Pending::New);
@@ -630,7 +630,7 @@ impl App {
                     }
                 }
                 Backstage::About => {
-                    ui.label(RichText::new("FreedomOffice Sheets").size(28.0).color(theme::ACCENT_DARK));
+                    ui.label(RichText::new("FreedomOffice Sheets").size(28.0).color(theme::accent_dark()));
                     ui.add_space(6.0);
                     ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
                     ui.add_space(10.0);
@@ -649,7 +649,7 @@ impl App {
         ui.label(RichText::new("Recent").size(16.0));
         ui.add_space(6.0);
         if self.recent.is_empty() {
-            ui.label(RichText::new("Files you open will appear here.").color(theme::TEXT_DIM));
+            ui.label(RichText::new("Files you open will appear here.").color(theme::text_dim()));
             return;
         }
         let mut open = None;
@@ -658,10 +658,10 @@ impl App {
             let dir = p.parent().map(|d| d.display().to_string()).unwrap_or_default();
             let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width().min(700.0), 44.0), Sense::click());
             if resp.hovered() {
-                ui.painter().rect_filled(rect, 3.0, theme::HOVER);
+                ui.painter().rect_filled(rect, 3.0, theme::hover());
             }
-            ui.painter().text(Pos2::new(rect.left() + 10.0, rect.top() + 13.0), Align2::LEFT_CENTER, name, theme::ui_font(14.0), theme::TEXT);
-            ui.painter().text(Pos2::new(rect.left() + 10.0, rect.top() + 31.0), Align2::LEFT_CENTER, dir, theme::ui_font(11.5), theme::TEXT_DIM);
+            ui.painter().text(Pos2::new(rect.left() + 10.0, rect.top() + 13.0), Align2::LEFT_CENTER, name, theme::ui_font(14.0), theme::text());
+            ui.painter().text(Pos2::new(rect.left() + 10.0, rect.top() + 31.0), Align2::LEFT_CENTER, dir, theme::ui_font(11.5), theme::text_dim());
             if resp.clicked() {
                 open = Some(p.clone());
             }
@@ -693,18 +693,18 @@ impl App {
                         for (i, n) in list.iter().enumerate() {
                             let (rect, resp) = ui.allocate_exact_size(Vec2::new(226.0, 20.0), Sense::click());
                             if i == sel {
-                                ui.painter().rect_filled(rect, 2.0, theme::ACCENT_LIGHT);
+                                ui.painter().rect_filled(rect, 2.0, theme::accent_light());
                             } else if resp.hovered() {
-                                ui.painter().rect_filled(rect, 2.0, theme::HOVER);
+                                ui.painter().rect_filled(rect, 2.0, theme::hover());
                             }
-                            ui.painter().text(Pos2::new(rect.left() + 6.0, rect.center().y), Align2::LEFT_CENTER, *n, theme::ui_font(12.5), theme::TEXT);
+                            ui.painter().text(Pos2::new(rect.left() + 6.0, rect.center().y), Align2::LEFT_CENTER, *n, theme::ui_font(12.5), theme::text());
                             if resp.double_clicked() || resp.clicked() {
                                 pick = Some(*n);
                             }
                         }
                         if let Some(sig) = crate::formula::signature(list[sel]) {
                             ui.separator();
-                            ui.label(RichText::new(format!("{}({})", list[sel], sig)).size(11.0).color(theme::TEXT_DIM));
+                            ui.label(RichText::new(format!("{}({})", list[sel], sig)).size(11.0).color(theme::text_dim()));
                         }
                     });
                 });
@@ -714,7 +714,7 @@ impl App {
             } else if let Some((name, arg)) = self.edit.as_ref().and_then(|e| e.func_context()) {
                 if let Some(sig) = crate::formula::signature(&name) {
                     egui::Area::new(egui::Id::new("func_hint")).fixed_pos(pos).order(egui::Order::Foreground).interactable(false).show(ctx, |ui| {
-                        egui::Frame::popup(ui.style()).fill(Color32::from_rgb(0xFF, 0xFF, 0xF4)).inner_margin(egui::Margin::symmetric(6, 3)).show(ui, |ui| {
+                        egui::Frame::popup(ui.style()).fill(theme::tooltip()).inner_margin(egui::Margin::symmetric(6, 3)).show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 0.0;
                                 ui.label(RichText::new(format!("{name}(")).size(12.0));
@@ -760,7 +760,7 @@ impl App {
                     apply = true;
                 }
                 ui.add(egui::TextEdit::singleline(&mut fp.search).hint_text("Search").desired_width(218.0));
-                egui::Frame::new().stroke(Stroke::new(1.0, theme::BORDER)).inner_margin(egui::Margin::same(4)).show(ui, |ui| {
+                egui::Frame::new().stroke(Stroke::new(1.0, theme::border())).inner_margin(egui::Margin::same(4)).show(ui, |ui| {
                     egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
                         ui.set_width(210.0);
                         let mut all = fp.values.iter().all(|v| v.1);
