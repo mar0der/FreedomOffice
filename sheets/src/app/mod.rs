@@ -7,9 +7,13 @@ mod cloud_ui;
 mod condfmt_ui;
 mod dialogs;
 mod editor;
+mod fill;
+mod flash;
 mod grid;
 mod keys;
 mod keytips;
+mod menus;
+mod paste;
 mod print_ui;
 mod ribbon;
 mod theme;
@@ -55,6 +59,8 @@ pub struct Clip {
     pub cut: bool,
     /// Notes inside the copied range: (row offset, col offset, text).
     pub notes: Vec<(u32, u32, String)>,
+    /// Copied whole rows (Some(true)) or whole columns (Some(false)).
+    pub whole: Option<bool>,
 }
 
 /// Undo snapshot of part of the workbook.
@@ -186,6 +192,14 @@ pub struct App {
     pub dv: validation_ui::DvState,
     /// Microsoft 365 sign-in and the open cloud document.
     pub cloud: cloud_ui::CloudState,
+    /// Auto Fill Options button after a fill drag.
+    pub fill_button: Option<fill::FillButton>,
+    /// Paste Options button after a paste.
+    pub paste_button: Option<paste::PasteButton>,
+    /// Keyboard modes (F8 Extend / Shift+F8 Add / End) and key tracking.
+    pub kb: keys::KbState,
+    /// Context menu requested from the keyboard (Shift+F10 / Menu key), and which one.
+    pub menu: menus::MenuState,
 }
 
 const MAX_UNDO: usize = 100;
@@ -259,6 +273,10 @@ impl App {
             cf: Default::default(),
             dv: Default::default(),
             cloud: Default::default(),
+            fill_button: None,
+            paste_button: None,
+            kb: Default::default(),
+            menu: Default::default(),
         };
         if let Some(p) = path {
             app.open_path(p);
@@ -535,6 +553,21 @@ impl App {
     pub fn can_undo(&self) -> bool {
         !self.undo.is_empty()
     }
+    pub fn undo_len(&self) -> usize {
+        self.undo.len()
+    }
+
+    /// Merges every undo step recorded since start into one, so a compound command undoes at once.
+    pub fn squash_undo(&mut self, start: usize) {
+        if self.undo.len() <= start + 1 {
+            return;
+        }
+        let entries = self.undo.split_off(start);
+        let view = entries[0].view.clone();
+        let snaps = entries.into_iter().flat_map(|e| e.snaps).collect();
+        self.undo.push(UndoEntry { snaps, view });
+    }
+
     pub fn can_redo(&self) -> bool {
         !self.redo.is_empty()
     }
@@ -693,6 +726,15 @@ impl App {
             self.dialog = Some(dialogs::Dialog::SavePrompt);
         } else {
             self.run_pending(p);
+        }
+    }
+
+    /// Ctrl+W / Ctrl+F4: closes the workbook. With one workbook per window this closes the
+    /// window, after the same save prompt as the title-bar close button.
+    pub fn close_workbook(&mut self) {
+        self.confirm_then(Pending::Exit);
+        if let Some(ctx) = &self.ctx {
+            ctx.request_repaint();
         }
     }
 

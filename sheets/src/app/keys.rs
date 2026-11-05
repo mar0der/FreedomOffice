@@ -7,8 +7,70 @@ use super::dialogs::Dialog;
 use super::{App, EditMode, Pending};
 use crate::model::{Range, MAX_COLS, MAX_ROWS};
 
-impl App {
-    pub fn handle_keys(&mut self, ctx: &egui::Context) {
+/// Keyboard modes shown on the status bar, and key-state tracking.
+#[derive(Default)]
+pub struct KbState {
+    /// F8: arrows and clicks extend the selection.
+    pub extend: bool,
+    /// Shift+F8: the next selection is added to the existing ones.
+    pub add: bool,
+    add_base: Option<Vec<Range>>,
+    /// End pressed: the next arrow jumps to the edge of the data like Ctrl+Arrow.
+    pub end: bool,
+    /// Ctrl+8: outline symbols hidden.
+    pub outline_hidden: bool,
+    ctrl_clean: bool,
+    prev_ctrl: bool,
+    menu_key: bool,
+}
+
+impl KbState {
+    /// Status bar indicators, like "Extend Selection" and "End Mode".
+    pub fn status(&self) -> Vec<&'static str> {
+        let mut v = Vec::new();
+        if self.extend {
+            v.push("Extend Selection");
+        }
+        if self.add {
+            v.push("Add to Selection");
+        }
+        if self.end {
+            v.push("End Mode");
+        }
+        v
+    }
+
+    fn clear_modes(&mut self) {
+        self.extend = false;
+        self.add = false;
+        self.add_base = None;
+        self.end = false;
+    }
+
+    /// Mouse modifiers as the selection modes imply (F8 = Shift, Shift+F8 = Ctrl).
+    pub fn apply(&self, mut m: Modifiers) -> Modifiers {
+        if self.extend {
+            m.shift = true;
+        }
+        if self.add && !m.shift {
+            m.ctrl = true;
+        }
+        m
+    }
+}
+
+/// The Menu (Apps) key, which egui does not report.
+#[cfg(windows)]
+fn menu_key_down() -> bool {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetKeyState(vk: i32) -> i16;
+    }
+    const VK_APPS: i32 = 0x5D;
+    unsafe { GetKeyState(VK_APPS) < 0 }
+}
+
+impl App {    pub fn handle_keys(&mut self, ctx: &egui::Context) {
         self.ctx = Some(ctx.clone());
         if self.backstage.is_some() {
             if ctx.input(|i| i.key_pressed(Key::Escape)) {
@@ -78,7 +140,31 @@ impl App {
         if self.chart_keys(ctx) {
             return;
         }
+        #[cfg(windows)]
+        {
+            let down = menu_key_down();
+            if down && !self.kb.menu_key && self.edit.is_none() {
+                self.open_context_menu_kb();
+            }
+            self.kb.menu_key = down;
+        }
+        // Ctrl pressed and released on its own opens the Paste Options menu after a paste.
+        let (ctrl_now, other) = ctx.input(|i| {
+            (i.modifiers.ctrl, i.events.iter().any(|e| !matches!(e, Event::PointerMoved(_) | Event::MouseMoved(_))))
+        });
+        if ctrl_now && !self.kb.prev_ctrl {
+            self.kb.ctrl_clean = true;
+        }
+        if ctrl_now && other {
+            self.kb.ctrl_clean = false;
+        }
+        if !ctrl_now && self.kb.prev_ctrl && self.kb.ctrl_clean && self.edit.is_none() {
+            self.toggle_paste_menu();
+        }
+        self.kb.prev_ctrl = ctrl_now;
         let events = ctx.input(|i| i.events.clone());
+        // A letter that picked a Paste Options entry must not also start typing.
+        let mut eat_text = false;
         for ev in events {
             if self.dialog.is_some() || self.backstage.is_some() {
                 break;
@@ -102,7 +188,7 @@ impl App {
                     None => self.copy(ctx, true),
                 },
                 Event::Paste(_) if self.edit.is_none() && ctx.input(|i| i.modifiers.alt) => {
-                    self.dialog = Some(Dialog::PasteSpecial { mode: 0, transpose: false });
+                    self.open_paste_special();
                 }
                 Event::Paste(s) => match &mut self.edit {
                     Some(e) => e.insert(s.trim_end_matches(['\r', '\n'])),
@@ -113,10 +199,17 @@ impl App {
                     if ((m.ctrl || m.command) && !m.alt) || (m.alt && !m.ctrl) {
                         continue;
                     }
-                    if t.chars().any(|c| c.is_control()) {
+                    if eat_text || t.chars().any(|c| c.is_control()) {
                         continue;
                     }
                     self.on_text(&t);
+                }
+                Event::Key { key: Key::Escape, pressed: true, .. } if self.paste_menu_open() => {
+                    self.dismiss_paste_button();
+                }
+                Event::Key { key, pressed: true, modifiers, .. } if self.paste_menu_open() && !modifiers.ctrl && key_char(key).is_some() => {
+                    self.paste_menu_key(key_char(key).unwrap());
+                    eat_text = true;
                 }
                 Event::Key { key, pressed: true, modifiers, .. } => self.on_key(ctx, key, modifiers),
                 _ => {}
@@ -225,6 +318,9 @@ impl App {
             return;
         }
         let sel = self.sel();
+        // End mode lasts for one key; F8 Extend mode makes movement extend the selection.
+        let end_mode = std::mem::take(&mut self.kb.end);
+        let extend = m.shift || self.kb.extend;
         match key {
             Key::ArrowUp | Key::ArrowDown | Key::ArrowLeft | Key::ArrowRight => {
                 if m.alt && m.shift && matches!(key, Key::ArrowRight | Key::ArrowLeft) {
@@ -244,7 +340,12 @@ impl App {
                     _ => (0, 1),
                 };
                 self.tab_origin = None;
-                if ctrl { self.jump(dr, dc, m.shift) } else { self.move_active(dr, dc, m.shift) }
+                if ctrl || end_mode { self.jump(dr, dc, extend) } else { self.move_active(dr, dc, extend) }
+                // Add to Selection: earlier areas stay selected while the new one moves.
+                if let (true, Some(base)) = (self.kb.add, self.kb.add_base.clone()) {
+                    let a = self.sel();
+                    self.sheet_mut().view.extra = base.into_iter().filter(|x| *x != a).collect();
+                }
             }
             Key::Enter => {
                 if m.alt {
@@ -256,17 +357,40 @@ impl App {
             Key::Tab => self.move_in_selection(0, if m.shift { -1 } else { 1 }),
             Key::Home => {
                 let (fr, fc) = self.sheet().freeze;
-                if ctrl {
-                    self.select(fr, fc, m.shift);
+                if end_mode {
+                    // End, Home: the last used cell, like Ctrl+End.
+                    let (er, ec) = self.sheet().extent().unwrap_or((0, 0));
+                    self.select(er, ec, extend);
+                } else if ctrl {
+                    self.select(fr, fc, extend);
                 } else {
                     let r = self.active().0;
-                    self.select(r, 0, m.shift);
+                    self.select(r, 0, extend);
                 }
             }
             Key::End if ctrl => {
                 let (er, ec) = self.sheet().extent().unwrap_or((0, 0));
                 self.select(er, ec, m.shift);
             }
+            Key::End if !m.alt => self.kb.end = !end_mode,
+            Key::F8 if !ctrl && !m.alt => {
+                if m.shift {
+                    let on = !self.kb.add;
+                    self.kb.clear_modes();
+                    self.kb.add = on;
+                    self.kb.add_base = on.then(|| self.areas());
+                } else {
+                    let on = !self.kb.extend;
+                    self.kb.clear_modes();
+                    self.kb.extend = on;
+                }
+            }
+            Key::F10 if m.shift && !ctrl => self.open_context_menu_kb(),
+            Key::F7 if !m.shift && !ctrl && !m.alt => {
+                self.dialog = Some(Dialog::Message { title: "Spelling".into(), text: "Spelling isn't available in FreedomOffice Sheets yet.".into() });
+            }
+            // Alt+F1: a default (clustered column) chart of the selection on this sheet.
+            Key::F1 if m.alt => self.insert_chart(crate::chart::ChartKind::Column),
             Key::PageDown | Key::PageUp => {
                 let down = key == Key::PageDown;
                 if ctrl {
@@ -284,6 +408,7 @@ impl App {
             }
             Key::F2 if !m.shift => self.begin_edit(None, EditMode::Edit),
             Key::F2 => self.edit_note(),
+            Key::F3 if m.shift && ctrl => self.open_create_names(),
             Key::F3 if m.shift => self.dialog = Some(Dialog::insert_function()),
             Key::F3 if ctrl => self.dialog = Some(Dialog::NameManager { name: String::new(), refers: self.sel_abs_ref(), error: None }),
             Key::F5 => self.dialog = Some(Dialog::GoTo { text: String::new(), focus: true }),
@@ -303,6 +428,8 @@ impl App {
                 self.begin_edit(Some(String::new()), EditMode::Enter);
             }
             Key::Escape => {
+                self.kb.clear_modes();
+                self.dismiss_paste_button();
                 self.clip = None;
                 self.format_painter = None;
                 self.status = None;
@@ -341,6 +468,8 @@ impl App {
                     self.repeat_last()
                 }
             }
+            Key::E => self.flash_fill(),
+            Key::Quote => self.copy_from_above(shift),
             Key::B => self.toggle_bold(),
             Key::I => self.toggle_italic(),
             Key::U => self.toggle_underline(),
@@ -353,7 +482,8 @@ impl App {
             }
             Key::O => self.confirm_then(Pending::Open(None)),
             Key::N => self.confirm_then(Pending::New),
-            Key::W => self.confirm_then(Pending::New),
+            // Closes the workbook (single-document window: close it, after the save prompt).
+            Key::W | Key::F4 => self.close_workbook(),
             Key::F if shift => self.open_format_cells(2),
             Key::F => {
                 self.find.replace = false;
@@ -400,10 +530,28 @@ impl App {
                 let rg = self.current_region();
                 self.select_range(rg);
             }
+            Key::Num8 => self.kb.outline_hidden = !self.kb.outline_hidden,
             Key::Num9 => self.hide_rows(!shift),
             Key::Num0 => self.hide_cols(!shift),
             _ => {}
         }
+    }
+
+    /// Ctrl+' copies the formula from the cell above (references unchanged) into the editor;
+    /// Ctrl+Shift+" copies the value shown in the cell above.
+    fn copy_from_above(&mut self, value: bool) {
+        let (r, c) = self.active();
+        if r == 0 {
+            return;
+        }
+        let text = if value {
+            let sh = self.sheet();
+            let style = sh.get(r - 1, c).map_or(0, |x| x.style);
+            crate::numfmt::format_value(sh.display_value(r - 1, c), &self.wb.style(style).num_fmt).text
+        } else {
+            self.edit_text(r - 1, c)
+        };
+        self.begin_edit(Some(text), EditMode::Edit);
     }
 
     fn on_key_editing(&mut self, ctx: &egui::Context, key: Key, m: Modifiers) {
@@ -496,7 +644,10 @@ impl App {
                 let j = self.next_visible_sheet(key == Key::PageDown);
                 self.switch_sheet(j);
             }
-            Key::Z if ctrl => self.cancel_edit(),
+            // Undoes the last typing step and stays in the editor.
+            Key::Z if ctrl => ed!(|e: &mut super::Editor| {
+                e.undo();
+            }),
             _ => {}
         }
         let _ = ctx;
