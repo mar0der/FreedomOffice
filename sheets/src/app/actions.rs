@@ -644,6 +644,7 @@ impl App {
         let name = self.wb.sheets[si].name.clone();
         self.transform_formulas(|e, fsi| formula::shift_for_structure(e, &name, fsi == si, rows, at, n));
         crate::chart::shift_for_structure(&mut self.wb, si, rows, at, n);
+        crate::pivot::shift_for_structure(&mut self.wb.sheets[si], rows, at, n);
         self.clip = None;
     }
 

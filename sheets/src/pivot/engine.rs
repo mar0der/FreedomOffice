@@ -50,6 +50,11 @@ fn plain_item(v: &Value, fmt: &str) -> Item {
     }
 }
 
+/// Label of a value as a PivotTable item ("(blank)", dates in the field's format).
+pub fn label_of(v: &Value, fmt: &str) -> String {
+    plain_item(v, fmt).label
+}
+
 fn text_item(label: String, order: f64) -> Item {
     Item { value: Value::Text(label.clone()), label, key: Key::Num(order) }
 }
@@ -62,6 +67,12 @@ pub fn num_group_label(start: f64, by: f64, k: f64, ints: bool) -> String {
     } else {
         format!("{}-{}", crate::numfmt::general(a), crate::numfmt::general(a + by))
     }
+}
+
+/// Label of the group above a numeric grouping's end: the end of its last range (">300").
+pub fn num_group_above(start: f64, end: f64, by: f64) -> String {
+    let n = ((end - start) / by).floor().max(0.0) + 1.0;
+    format!(">{}", crate::numfmt::general(start + n * by))
 }
 
 /// The item of field `f` for a record (`ints`: the column holds whole numbers only).
@@ -77,7 +88,7 @@ pub fn item_of(pt: &PivotTable, f: usize, rec: &[Value], ints: bool) -> Item {
                         return text_item(format!("<{}", crate::numfmt::general(start)), f64::MIN);
                     }
                     if *n > end {
-                        return text_item(format!(">{}", crate::numfmt::general(end)), f64::MAX);
+                        return text_item(num_group_above(start, end, by), f64::MAX);
                     }
                     let k = ((n - start) / by).floor();
                     return text_item(num_group_label(start, by, k, ints), k);
@@ -704,13 +715,6 @@ impl Output {
             },
             _ => 0,
         }
-    }
-
-    /// Cell of a value: (row, column) of row line `li` and column line `cj`.
-    pub fn value_cell(&self, li: usize, cj: usize) -> Option<(u32, u32)> {
-        let i = self.row_at.iter().position(|x| *x == li)?;
-        let j = self.col_at.iter().position(|x| *x == cj)?;
-        Some((self.range.r1 + self.header_rows + i as u32, self.range.c1 + self.label_cols + j as u32))
     }
 }
 

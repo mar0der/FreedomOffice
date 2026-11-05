@@ -32,6 +32,9 @@ impl App {
 
     /// True (after telling the user) when the range holds a locked cell of a protected sheet.
     pub fn locked_block(&mut self, rg: Range) -> bool {
+        if self.pivot_block(rg) {
+            return true;
+        }
         let sh = self.sheet();
         if sh.protection.is_none() {
             return false;

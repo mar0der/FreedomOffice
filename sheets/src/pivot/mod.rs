@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use crate::model::{Range, Value, Workbook};
 
-pub use engine::{Item, Line, LineKind, Output, Role};
+pub use engine::Output;
 
 /// Stands for the Σ Values pseudo-field in the row or column fields.
 pub const VALUES: usize = usize::MAX;
@@ -460,8 +460,6 @@ pub enum Area {
 }
 
 impl Area {
-    pub const ALL: [Area; 4] = [Area::Filters, Area::Columns, Area::Rows, Area::Values];
-
     pub fn label(self) -> &'static str {
         match self {
             Area::Filters => "Filters",
@@ -704,14 +702,14 @@ impl PivotTable {
         }
         let list = self.list(from);
         let Some(&f) = list.get(idx) else { return };
-        if f == VALUES && to == Area::Filters || f == VALUES && to == Area::Values {
+        if f == VALUES && (to == Area::Filters || to == Area::Values) {
             return;
         }
         if to == Area::Values {
+            self.remove_at(from, idx);
             self.add_field(f, Area::Values, Some(pos));
             return;
         }
-        let pos = if from == to && pos > idx { pos } else { pos };
         self.add_field(f, to, Some(pos));
     }
 
@@ -875,15 +873,6 @@ impl PivotTable {
         }
     }
 
-    /// The table range (without report filters) of the last update.
-    pub fn range(&self) -> Range {
-        self.out.range
-    }
-
-    /// The whole report including report filters.
-    pub fn full_range(&self) -> Range {
-        self.out.full
-    }
 }
 
 /// A name for a new PivotTable that no other PivotTable of the workbook uses.
@@ -892,6 +881,38 @@ pub fn unique_name(wb: &Workbook) -> String {
         .map(|i| format!("PivotTable{i}"))
         .find(|n| !wb.sheets.iter().any(|s| s.pivots.iter().any(|p| p.name.eq_ignore_ascii_case(n))))
         .unwrap()
+}
+
+/// Moves the reports of a sheet when rows (`rows`) or columns are inserted (n > 0) or deleted
+/// at `at`. The cells themselves were moved by the caller.
+pub fn shift_for_structure(sh: &mut crate::model::Sheet, rows: bool, at: u32, n: i64) {
+    let mv = |v: u32| -> u32 {
+        if v < at {
+            v
+        } else if n < 0 && (v as i64) < at as i64 - n {
+            at
+        } else {
+            (v as i64 + n).max(0) as u32
+        }
+    };
+    for p in sh.pivots.iter_mut() {
+        let shift = |rg: &mut Range| {
+            if rows {
+                rg.r1 = mv(rg.r1);
+                rg.r2 = mv(rg.r2).max(rg.r1);
+            } else {
+                rg.c1 = mv(rg.c1);
+                rg.c2 = mv(rg.c2).max(rg.c1);
+            }
+        };
+        shift(&mut p.out.range);
+        shift(&mut p.out.full);
+        if rows {
+            p.anchor.0 = mv(p.anchor.0);
+        } else {
+            p.anchor.1 = mv(p.anchor.1);
+        }
+    }
 }
 
 /// (sheet, pivot index) of the PivotTable whose report covers a cell.

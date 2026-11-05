@@ -432,6 +432,7 @@ impl App {
             }
             self.chart_tab_button(ui);
             self.table_tab_button(ui);
+            self.pivot_tab_buttons(ui);
             self.cloud_tab_strip_ui(ui);
         });
         let _ = strip;
@@ -461,6 +462,8 @@ impl App {
                         RibbonTab::Help => self.help_tab(ui),
                         RibbonTab::ChartDesign => self.chart_design_tab(ui),
                         RibbonTab::TableDesign => self.table_design_tab(ui),
+                        RibbonTab::PivotAnalyze => self.pivot_analyze_tab(ui),
+                        RibbonTab::PivotDesign => self.pivot_design_tab(ui),
                     }
                 });
             });
@@ -995,6 +998,12 @@ impl App {
             }
             if app.big(ui, ic::NEW, "▤", "Sheet", "Insert Sheet (Shift+F11)").clicked() {
                 app.add_sheet();
+            }
+        });
+        self.group(ui, "Tables", |app, ui| {
+            let job = icon_job("▦", false, "PivotTable", 22.0, true, theme::text());
+            if big_btn(ui, job, 58.0, false).on_hover_text("PivotTable (Alt, N, V, T)\nSummarize data in a PivotTable").clicked() {
+                app.open_create_pivot();
             }
         });
         self.group(ui, "Charts", |app, ui| app.chart_insert_buttons(ui));
