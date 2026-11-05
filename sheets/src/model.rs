@@ -425,6 +425,8 @@ pub struct Sheet {
     pub note_authors: HashMap<(u32, u32), String>,
     /// Pictures floating over the cells.
     pub images: Vec<Picture>,
+    /// PivotTable reports on this sheet.
+    pub pivots: Vec<crate::pivot::PivotTable>,
 }
 
 /// One run of a rich-text cell.
@@ -587,6 +589,7 @@ impl Sheet {
             zoom: 1.0,
             note_authors: HashMap::new(),
             images: Vec::new(),
+            pivots: Vec::new(),
         }
     }
 
