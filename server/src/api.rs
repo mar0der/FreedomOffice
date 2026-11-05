@@ -1,0 +1,1035 @@
+//! The REST API. Every handler authenticates, then checks the caller's role on the item;
+//! items the caller can't see answer 404, never 403.
+
+use std::collections::{HashMap, VecDeque};
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use axum::body::Bytes;
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::Router;
+use serde::de::DeserializeOwned;
+use serde::Deserialize;
+use serde_json::{json, Value};
+
+use crate::config::Config;
+use crate::store::{Grant, Item, Kind, Link, OnConflict, Principal, Role, Store, StoreError, User};
+use crate::util::{self, iso, now};
+
+const JSON_LIMIT: usize = 64 * 1024;
+const LOGIN_FAILURES: usize = 10;
+const LOGIN_WINDOW: Duration = Duration::from_secs(15 * 60);
+
+// ---------------------------------------------------------------------------
+// State and errors
+// ---------------------------------------------------------------------------
+
+/// The TCP peer address, for plain and TLS listeners alike.
+#[derive(Clone, Copy, Debug)]
+pub struct Peer(pub SocketAddr);
+
+impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, tokio::net::TcpListener>> for Peer {
+    fn connect_info(s: axum::serve::IncomingStream<'_, tokio::net::TcpListener>) -> Self {
+        Peer(*s.remote_addr())
+    }
+}
+
+impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, crate::tls::TlsListener>> for Peer {
+    fn connect_info(s: axum::serve::IncomingStream<'_, crate::tls::TlsListener>) -> Self {
+        Peer(*s.remote_addr())
+    }
+}
+
+#[derive(Clone)]
+pub struct App {
+    store: Arc<Mutex<Store>>,
+    cfg: Arc<Config>,
+    limiter: Arc<Mutex<Limiter>>,
+}
+
+impl App {
+    pub fn new(store: Store, cfg: Config) -> App {
+        App { store: Arc::new(Mutex::new(store)), cfg: Arc::new(cfg), limiter: Arc::new(Mutex::new(Limiter::default())) }
+    }
+
+    /// Runs blocking store work (SQLite, disk) on the blocking pool, one request at a time.
+    async fn run<T: Send + 'static>(&self, f: impl FnOnce(&Store) -> Result<T, ApiError> + Send + 'static) -> Result<T, ApiError> {
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || {
+            let s = store.lock().unwrap_or_else(|e| e.into_inner());
+            f(&s)
+        })
+        .await
+        .map_err(|_| ApiError::internal())?
+    }
+
+    fn limited(&self, keys: &[String]) -> bool {
+        let mut l = self.limiter.lock().unwrap_or_else(|e| e.into_inner());
+        keys.iter().any(|k| l.blocked(k))
+    }
+
+    fn fail(&self, keys: &[String]) {
+        let mut l = self.limiter.lock().unwrap_or_else(|e| e.into_inner());
+        for k in keys {
+            l.fail(k);
+        }
+    }
+
+    fn clear(&self, key: &str) {
+        self.limiter.lock().unwrap_or_else(|e| e.into_inner()).map.remove(key);
+    }
+}
+
+#[derive(Default)]
+struct Limiter {
+    map: HashMap<String, VecDeque<Instant>>,
+}
+
+impl Limiter {
+    fn prune(&mut self, key: &str) -> usize {
+        let Some(q) = self.map.get_mut(key) else { return 0 };
+        while q.front().is_some_and(|t| t.elapsed() > LOGIN_WINDOW) {
+            q.pop_front();
+        }
+        let n = q.len();
+        if n == 0 {
+            self.map.remove(key);
+        }
+        n
+    }
+
+    fn blocked(&mut self, key: &str) -> bool {
+        self.prune(key) >= LOGIN_FAILURES
+    }
+
+    fn fail(&mut self, key: &str) {
+        if self.map.len() > 100_000 {
+            self.map.retain(|_, q| q.back().is_some_and(|t| t.elapsed() < LOGIN_WINDOW));
+        }
+        self.map.entry(key.to_string()).or_default().push_back(Instant::now());
+    }
+}
+
+#[derive(Debug)]
+pub struct ApiError {
+    status: StatusCode,
+    body: Value,
+}
+
+impl ApiError {
+    fn new(status: StatusCode, msg: impl Into<String>) -> Self {
+        ApiError { status, body: json!({ "error": msg.into() }) }
+    }
+
+    fn not_found() -> Self {
+        Self::new(StatusCode::NOT_FOUND, "Not found.")
+    }
+
+    fn unauthorized() -> Self {
+        Self::new(StatusCode::UNAUTHORIZED, "Sign in to continue.")
+    }
+
+    fn bad(msg: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, msg)
+    }
+
+    fn internal() -> Self {
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong on the server.")
+    }
+}
+
+impl From<StoreError> for ApiError {
+    fn from(e: StoreError) -> Self {
+        match e {
+            StoreError::NotFound => ApiError::not_found(),
+            StoreError::Conflict(m) => ApiError::new(StatusCode::CONFLICT, m),
+            StoreError::Invalid(m) => ApiError::bad(m),
+            StoreError::Forbidden(m) => ApiError::new(StatusCode::FORBIDDEN, m),
+            StoreError::Internal(m) => {
+                tracing::error!("{m}");
+                ApiError::internal()
+            }
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (self.status, axum::Json(self.body)).into_response()
+    }
+}
+
+type ApiResult = Result<Response, ApiError>;
+
+fn ok_json(v: Value) -> ApiResult {
+    Ok(axum::Json(v).into_response())
+}
+
+fn parse_body<T: DeserializeOwned>(b: &Bytes) -> Result<T, ApiError> {
+    serde_json::from_slice(b).map_err(|e| ApiError::bad(format!("Invalid request: {e}")))
+}
+
+// ---------------------------------------------------------------------------
+// Authentication and access helpers
+// ---------------------------------------------------------------------------
+
+fn bearer(headers: &HeaderMap) -> Option<String> {
+    let v = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let (scheme, token) = v.split_once(' ')?;
+    scheme.eq_ignore_ascii_case("bearer").then(|| token.trim().to_string())
+}
+
+fn auth(s: &Store, headers: &HeaderMap) -> Result<Principal, ApiError> {
+    let token = bearer(headers).ok_or_else(ApiError::unauthorized)?;
+    s.authenticate(&token)?.ok_or_else(ApiError::unauthorized)
+}
+
+/// Endpoints for accounts only (share-link tokens can't use them).
+fn user_of(p: &Principal) -> Result<&User, ApiError> {
+    match p {
+        Principal::User { user, .. } => Ok(user),
+        Principal::Link { .. } => Err(ApiError::unauthorized()),
+    }
+}
+
+/// Who a change is recorded as: a user id or `link:<id>`.
+fn actor(p: &Principal) -> String {
+    match p {
+        Principal::User { user, .. } => user.id.clone(),
+        Principal::Link { link } => format!("link:{}", link.id),
+    }
+}
+
+/// The item and the caller's role, or 404 when the caller can't see it.
+fn visible(s: &Store, who: &Principal, id: &str, include_deleted: bool) -> Result<(Item, Role), ApiError> {
+    let item = s.item(id)?.ok_or_else(ApiError::not_found)?;
+    let role = s.role(who, &item, include_deleted)?.ok_or_else(ApiError::not_found)?;
+    Ok((item, role))
+}
+
+fn need_edit(role: Role) -> Result<(), ApiError> {
+    if role >= Role::Edit { Ok(()) } else { Err(ApiError::new(StatusCode::FORBIDDEN, "You have view-only access to this item.")) }
+}
+
+fn display_of(s: &Store, actor: &str) -> String {
+    if actor.starts_with("link:") { "Someone with a link".into() } else { s.display_name(actor) }
+}
+
+fn username_of(s: &Store, actor: &str) -> String {
+    s.user_by_id(actor).ok().flatten().map(|u| u.username).unwrap_or_default()
+}
+
+fn person(u: &User) -> Value {
+    json!({ "username": u.username, "display_name": u.display_name })
+}
+
+fn item_json(s: &Store, it: &Item, role: Role) -> Value {
+    let owner = s.user_by_id(&it.owner_id).ok().flatten();
+    let mut v = json!({
+        "id": it.id,
+        "parent": it.parent_id,
+        "name": it.name,
+        "kind": if it.kind == Kind::Folder { "folder" } else { "file" },
+        "size": it.size,
+        "version": it.version,
+        "etag": if it.kind == Kind::File { it.etag() } else { String::new() },
+        "modified": iso(it.modified),
+        "modified_by": display_of(s, &it.modified_by),
+        "modified_by_username": username_of(s, &it.modified_by),
+        "created": iso(it.created),
+        "owner": owner.as_ref().map(person),
+        "role": role.as_str(),
+    });
+    if it.deleted != 0 {
+        v["deleted"] = json!(iso(it.deleted));
+    }
+    v
+}
+
+fn items_json(s: &Store, who: &Principal, items: &[Item]) -> Result<Value, ApiError> {
+    let mut out = Vec::with_capacity(items.len());
+    for it in items {
+        if let Some(r) = s.role(who, it, it.deleted != 0)? {
+            out.push(item_json(s, it, r));
+        }
+    }
+    Ok(json!({ "items": out }))
+}
+
+fn user_json(u: &User) -> Value {
+    json!({ "id": u.id, "username": u.username, "display_name": u.display_name, "email": u.email, "is_admin": u.is_admin, "root": u.root_id })
+}
+
+/// The client address; behind a loopback reverse proxy, the last X-Forwarded-For entry.
+fn client_ip(cfg: &Config, peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
+    if cfg.trust_proxy && peer.ip().is_loopback() {
+        if let Some(ip) = headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.rsplit(',').next())
+            .and_then(|v| v.trim().parse::<IpAddr>().ok())
+        {
+            return ip;
+        }
+    }
+    peer.ip()
+}
+
+fn too_many() -> ApiError {
+    ApiError::new(StatusCode::TOO_MANY_REQUESTS, "Too many failed attempts. Try again in 15 minutes.")
+}
+
+// ---------------------------------------------------------------------------
+// Router
+// ---------------------------------------------------------------------------
+
+pub fn router(app: App) -> Router {
+    let upload_limit = DefaultBodyLimit::max(app.cfg.max_upload_bytes());
+    Router::new()
+        .route("/api/health", get(health))
+        .route("/api/login", post(login))
+        .route("/api/logout", post(logout))
+        .route("/api/me", get(me))
+        .route("/api/root", get(root))
+        .route("/api/shared-with-me", get(shared_with_me))
+        .route("/api/recent", get(recent))
+        .route("/api/trash", get(trash))
+        .route("/api/users", get(users))
+        .route("/api/folders", post(create_folder))
+        .route("/api/files", post(upload_file).layer(upload_limit))
+        .route("/api/items/{id}", get(get_item).patch(patch_item).delete(delete_item))
+        .route("/api/items/{id}/children", get(children))
+        .route("/api/items/{id}/content", get(get_content).put(put_content).layer(upload_limit))
+        .route("/api/items/{id}/restore", post(restore_item))
+        .route("/api/items/{id}/versions", get(versions))
+        .route("/api/items/{id}/versions/{n}/restore", post(restore_version))
+        .route("/api/items/{id}/permissions", get(permissions).post(grant).delete(revoke_body))
+        .route("/api/items/{id}/permissions/{username}", axum::routing::delete(revoke_path))
+        .route("/api/items/{id}/links", get(list_links).post(create_link))
+        .route("/api/items/{id}/links/{link}", axum::routing::delete(delete_link))
+        .route("/api/items/{id}/live", get(live))
+        .route("/api/links/{token}", get(open_link).post(open_link_password))
+        .route("/l/{token}", get(link_page))
+        .route("/l/{token}/download", get(link_download))
+        .fallback(|| async { ApiError::not_found() })
+        .layer(DefaultBodyLimit::max(JSON_LIMIT))
+        .layer(middleware::from_fn(log_requests))
+        .with_state(app)
+}
+
+/// Logs method, path (secrets in link paths redacted), status and time. Never bodies or headers.
+async fn log_requests(req: Request, next: Next) -> Response {
+    let method = req.method().clone();
+    let path = redact(req.uri().path());
+    let start = Instant::now();
+    let res = next.run(req).await;
+    tracing::info!("{method} {path} {} {}ms", res.status().as_u16(), start.elapsed().as_millis());
+    res
+}
+
+fn redact(path: &str) -> String {
+    for prefix in ["/api/links/", "/l/"] {
+        if let Some(rest) = path.strip_prefix(prefix) {
+            let tail = rest.split_once('/').map(|(_, t)| format!("/{t}")).unwrap_or_default();
+            return format!("{prefix}<redacted>{tail}");
+        }
+    }
+    path.to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Accounts
+// ---------------------------------------------------------------------------
+
+async fn health() -> ApiResult {
+    ok_json(json!({ "status": "ok", "service": "freedomoffice-server", "version": env!("CARGO_PKG_VERSION") }))
+}
+
+#[derive(Deserialize)]
+struct LoginBody {
+    username: String,
+    password: String,
+    #[serde(default)]
+    device: String,
+}
+
+async fn login(State(app): State<App>, ConnectInfo(Peer(peer)): ConnectInfo<Peer>, headers: HeaderMap, body: Bytes) -> ApiResult {
+    let b: LoginBody = parse_body(&body)?;
+    let ip_key = format!("ip:{}", client_ip(&app.cfg, peer, &headers));
+    let user_key = format!("user:{}", b.username.trim().to_lowercase());
+    let keys = [ip_key, user_key.clone()];
+    if app.limited(&keys) {
+        return Err(too_many());
+    }
+    let name = b.username.clone();
+    let found = app.run(move |s| Ok(s.user_by_name(&name)?.map(|u| (s.password_hash(&u.id), u)))).await?;
+    let pw = b.password;
+    let user = tokio::task::spawn_blocking(move || match found {
+        Some((Ok(hash), u)) if util::verify_password(&pw, &hash) && !u.disabled => Some(u),
+        Some(_) => None,
+        None => {
+            util::dummy_verify(&pw);
+            None
+        }
+    })
+    .await
+    .map_err(|_| ApiError::internal())?;
+    let Some(user) = user else {
+        app.fail(&keys);
+        tracing::warn!("failed sign-in for a user from {}", keys[0]);
+        return Err(ApiError::new(StatusCode::UNAUTHORIZED, "The username or password is incorrect."));
+    };
+    app.clear(&user_key);
+    let device = b.device;
+    app.run(move |s| {
+        let token = s.create_token(&user.id, &device)?;
+        ok_json(json!({ "token": token, "user": user_json(&user) }))
+    })
+    .await
+}
+
+async fn logout(State(app): State<App>, headers: HeaderMap) -> ApiResult {
+    app.run(move |s| {
+        let who = auth(s, &headers)?;
+        if let Principal::User { token_id, .. } = who {
+            s.revoke_token(token_id)?;
+        }
+        Ok(StatusCode::NO_CONTENT.into_response())
+    })
+    .await
+}
+
+async fn me(State(app): State<App>, headers: HeaderMap) -> ApiResult {
+    app.run(move |s| {
+        let who = auth(s, &headers)?;
+        ok_json(user_json(user_of(&who)?))
+    })
+    .await
+}
+
+async fn users(State(app): State<App>, headers: HeaderMap, Query(q): Query<HashMap<String, String>>) -> ApiResult {
+    app.run(move |s| {
+        let who = auth(s, &headers)?;
+        let me = user_of(&who)?;
+        let list: Vec<Value> = s.search_users(q.get("query").map(String::as_str).unwrap_or(""), 21)?.iter().filter(|u| u.id != me.id).take(20).map(person).collect();
+        ok_json(json!({ "users": list }))
+    })
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// Browsing
+// ---------------------------------------------------------------------------
+
+async fn root(State(app): State<App>, headers: HeaderMap) -> ApiResult {
+    app.run(move |s| {
+        let who = auth(s, &headers)?;
+        let root = user_of(&who)?.root_id.clone();
+        let (it, role) = visible(s, &who, &root, false)?;
+        ok_json(item_json(s, &it, role))
+    })
+    .await
+}
+
+async fn get_item(State(app): State<App>, headers: HeaderMap, Path(id): Path<String>) -> ApiResult {
+    app.run(move |s| {
+        let who = auth(s, &headers)?;
+        let (it, role) = visible(s, &who, &id, false)?;
+        ok_json(item_json(s, &it, role))
+    })
+    .await
+}
+
+async fn children(State(app): State<App>, headers: HeaderMap, Path(id): Path<String>) -> ApiResult {
+    app.run(move |s| {
+        let who = auth(s, &headers)?;
+        let (it, _) = visible(s, &who, &id, false)?;
+        if it.kind != Kind::Folder {
+            return Err(ApiError::bad("That isn't a folder."));
+        }
+        ok_json(items_json(s, &who, &s.children(&it.id)?)?)
+    })
+    .await
+}
+
+async fn shared_with_me(State(app): State<App>, headers: HeaderMap) -> ApiResult {
+    app.run(move |s| {
+        let who = auth(s, &headers)?;
+        user_of(&who)?;
+        ok_json(items_json(s, &who, &s.shared_with(&who)?)?)
+    })
+    .await
+}
+
+async fn recent(State(app): State<App>, headers: HeaderMap) -> ApiResult {
+    app.run(move |s| {
+        let who = auth(s, &headers)?;
+        user_of(&who)?;
+        ok_json(items_json(s, &who, &s.recent(&who, 50)?)?)
+    })
+    .await
+}
+
+async fn trash(State(app): State<App>, headers: HeaderMap) -> ApiResult {
+    app.run(move |s| {
+        let who = auth(s, &headers)?;
+        let items = s.trash_of(&user_of(&who)?.id)?;
+        ok_json(items_json(s, &who, &items)?)
+    })
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// Creating, reading and saving
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct FolderBody {
+    #[serde(default)]
+    parent: Option<String>,
+    name: String,
+}
+
+async fn create_folder(State(app): State<App>, headers: HeaderMap, body: Bytes) -> ApiResult {
+    app.run(move |s| {
+        let who = auth(s, &headers)?;
+        let b: FolderBody = parse_body(&body)?;
+        let parent = match b.parent.filter(|p| !p.is_empty()) {
+            Some(p) => p,
+            None => user_of(&who)?.root_id.clone(),
+        };
+        let (p, role) = visible(s, &who, &parent, false)?;
+        need_edit(role)?;
+        let it = s.create_folder(&p.id, &b.name, &actor(&who))?;
+        let role = s.role(&who, &it, false)?.unwrap_or(role);
+        Ok((StatusCode::CREATED, axum::Json(item_json(s, &it, role))).into_response())
+    })
+    .await
+}
+
+async fn upload_file(State(app): State<App>, headers: HeaderMap, Query(q): Query<HashMap<String, String>>, body: Bytes) -> ApiResult {
+    app.run(move |s| {
+        let who = auth(s, &headers)?;
+        let on_conflict = OnConflict::parse(q.get("conflict").map(String::as_str).unwrap_or("")).ok_or_else(|| ApiError::bad("conflict must be fail, rename or replace."))?;
+        let name = q.get("name").cloned().unwrap_or_default();
+        let parent = match q.get("parent").filter(|p| !p.is_empty() && p.as_str() != "root") {
+            Some(p) => p.clone(),
+            None => user_of(&who)?.root_id.clone(),
+        };
+        let (p, role) = visible(s, &who, &parent, false)?;
+        need_edit(role)?;
+        let (it, created) = s.create_file(&p.id, &name, &body, &actor(&who), on_conflict)?;
+        if let Principal::User { user, .. } = &who {
+            s.touch_recent(&user.id, &it.id)?;
+        }
+        let role = s.role(&who, &it, false)?.unwrap_or(role);
+        let status = if created { StatusCode::CREATED } else { StatusCode::OK };
+        Ok((status, axum::Json(item_json(s, &it, role))).into_response())
+    })
+    .await
+}
+
+fn quoted(etag: &str) -> HeaderValue {
+    HeaderValue::from_str(&format!("\"{etag}\"")).unwrap_or(HeaderValue::from_static("\"\""))
+}
+
+async fn get_content(State(app): State<App>, headers: HeaderMap, Path(id): Path<String>, Query(q): Query<HashMap<String, String>>) -> ApiResult {
+    app.run(move |s| {
+        let who = auth(s, &headers)?;
+        let (it, _) = visible(s, &who, &id, false)?;
+        if it.kind != Kind::File {
+            return Err(ApiError::bad("Folders have no content."));
+        }
+        let version = match q.get("version") {
+            Some(v) => Some(v.parse::<i64>().map_err(|_| ApiError::bad("version must be a number."))?),
+            None => None,
+        };
+        let (data, ver) = s.read_content(&it, version)?;
+        if let (Principal::User { user, .. }, None) = (&who, version) {
+            s.touch_recent(&user.id, &it.id)?;
+        }
+        let mut res = data.into_response();
+        let h = res.headers_mut();
+        h.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
+        h.insert(header::ETAG, quoted(&crate::store::etag(ver.version, &ver.hash)));
+        h.insert("x-version", HeaderValue::from(ver.version));
+        h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        Ok(res)
+    })
+    .await
+}
+
+/// `"v3-abc"`, `W/"v3-abc"` and `v3-abc` all mean `v3-abc`.
+fn norm_etag(s: &str) -> String {
+    s.trim().trim_start_matches("W/").trim_matches('"').to_string()
+}
+
+async fn put_content(State(app): State<App>, headers: HeaderMap, Path(id): Path<String>, body: Bytes) -> ApiResult {
+    app.run(move |s| {
+        let who = auth(s, &headers)?;
+        let (it, role) = visible(s, &who, &id, false)?;
+        if it.kind != Kind::File {
+            return Err(ApiError::bad("Folders have no content."));
+        }
+        need_edit(role)?;
+        if let Some(want) = headers.get(header::IF_MATCH).and_then(|v| v.to_str().ok()).map(norm_etag) {
+            if want != "*" && want != it.etag() {
+                let body = json!({
+                    "error": "Someone else saved changes to this file.",
+                    "etag": it.etag(),
+                    "version": it.version,
+                    "modified_by": display_of(s, &it.modified_by),
+                    "modified": iso(it.modified),
+                });
+                return Ok((StatusCode::PRECONDITION_FAILED, axum::Json(body)).into_response());
+            }
+        }
+        let saved = s.write_content(&it, &body, &actor(&who))?;
+        if let Principal::User { user, .. } = &who {
+            s.touch_recent(&user.id, &saved.id)?;
+        }
+        let mut res = axum::Json(item_json(s, &saved, role)).into_response();
+        res.headers_mut().insert(header::ETAG, quoted(&saved.etag()));
+        Ok(res)
+    })
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// Rename, move, trash, versions
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct PatchBody {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    parent: Option<String>,
+}
+
+async fn patch_item(State(app): State<App>, headers: HeaderMap, Path(id): Path<String>, body: Bytes) -> ApiResult {
+    app.run(move |s| {
+        let who = auth(s, &headers)?;
+        let b: PatchBody = parse_body(&body)?;
+        let (it, role) = visible(s, &who, &id, false)?;
+        need_edit(role)?;
+        let parent = match b.parent.filter(|p| !p.is_empty()) {
+            Some(p) => {
+                let (pi, prole) = visible(s, &who, &p, false)?;
+                need_edit(prole)?;
+                Some(pi)
+            }
+            None => None,
+        };
+        let updated = s.update_item(&it, b.name.as_deref(), parent.as_ref(), &actor(&who))?;
+        let role = s.role(&who, &updated, false)?.unwrap_or(role);
+        ok_json(item_json(s, &updated, role))
+    })
+    .await
+}
+
+async fn delete_item(State(app): State<App>, headers: HeaderMap, Path(id): Path<String>) -> ApiResult {
+    app.run(move |s| {
+        let who = auth(s, &headers)?;
+        user_of(&who)?;
+        let (it, role) = visible(s, &who, &id, false)?;
+        need_edit(role)?;
+        s.trash(&it, &actor(&who))?;
+        Ok(StatusCode::NO_CONTENT.into_response())
+    })
+    .await
+}
+
+async fn restore_item(State(app): State<App>, headers: HeaderMap, Path(id): Path<String>) -> ApiResult {
+    app.run(move |s| {
+        let who = auth(s, &headers)?;
+        user_of(&who)?;
+        let (it, role) = visible(s, &who, &id, true)?;
+        need_edit(role)?;
+        let restored = s.restore(&it)?;
+        let role = s.role(&who, &restored, false)?.unwrap_or(role);
+        ok_json(item_json(s, &restored, role))
+    })
+    .await
+}
+
+async fn versions(State(app): State<App>, headers: HeaderMap, Path(id): Path<String>) -> ApiResult {
+    app.run(move |s| {
+        let who = auth(s, &headers)?;
+        user_of(&who)?;
+        let (it, _) = visible(s, &who, &id, false)?;
+        let list: Vec<Value> = s
+            .versions(&it.id)?
+            .iter()
+            .map(|v| {
+                json!({
+                    "version": v.version,
+                    "size": v.size,
+                    "etag": crate::store::etag(v.version, &v.hash),
+                    "modified": iso(v.modified),
+                    "modified_by": display_of(s, &v.modified_by),
+                    "current": v.version == it.version,
+                })
+            })
+            .collect();
+        ok_json(json!({ "versions": list }))
+    })
+    .await
+}
+
+async fn restore_version(State(app): State<App>, headers: HeaderMap, Path((id, n)): Path<(String, i64)>) -> ApiResult {
+    app.run(move |s| {
+        let who = auth(s, &headers)?;
+        user_of(&who)?;
+        let (it, role) = visible(s, &who, &id, false)?;
+        need_edit(role)?;
+        let saved = s.restore_version(&it, n, &actor(&who))?;
+        ok_json(item_json(s, &saved, role))
+    })
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// Permissions
+// ---------------------------------------------------------------------------
+
+fn grant_json(g: &Grant) -> Value {
+    json!({
+        "username": g.user.username,
+        "display_name": g.user.display_name,
+        "role": g.role.as_str(),
+        "inherited": g.inherited_from.is_some(),
+        "inherited_from": g.inherited_from.as_ref().map(|f| json!({ "id": f.id, "name": f.name })),
+    })
+}
+
+async fn permissions(State(app): State<App>, headers: HeaderMap, Path(id): Path<String>) -> ApiResult {
+    app.run(move |s| {
+        let who = auth(s, &headers)?;
+        user_of(&who)?;
+        let (it, role) = visible(s, &who, &id, false)?;
+        let owner = s.user_by_id(&it.owner_id)?.map(|u| person(&u));
+        let list: Vec<Value> = s.grants(&it)?.iter().map(grant_json).collect();
+        ok_json(json!({ "owner": owner, "role": role.as_str(), "permissions": list }))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct GrantBody {
+    username: String,
+    #[serde(default)]
+    role: String,
+}
+
+async fn grant(State(app): State<App>, headers: HeaderMap, Path(id): Path<String>, body: Bytes) -> ApiResult {
+    app.run(move |s| {
+        let who = auth(s, &headers)?;
+        let me = user_of(&who)?.clone();
+        let b: GrantBody = parse_body(&body)?;
+        let (it, role) = visible(s, &who, &id, false)?;
+        need_edit(role)?;
+        let r = Role::parse(&b.role).ok_or_else(|| ApiError::bad("role must be view or edit."))?;
+        let target = s.user_by_name(&b.username)?.filter(|u| !u.disabled).ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, format!("There's no user named '{}'.", b.username.trim())))?;
+        s.grant(&it, &target, r, &me.id)?;
+        let list: Vec<Value> = s.grants(&it)?.iter().map(grant_json).collect();
+        ok_json(json!({ "permissions": list }))
+    })
+    .await
+}
+
+fn revoke_user(s: &Store, headers: &HeaderMap, id: &str, username: &str) -> ApiResult {
+    let who = auth(s, headers)?;
+    let me = user_of(&who)?.clone();
+    let (it, role) = visible(s, &who, id, false)?;
+    let target = s.user_by_name(username)?.ok_or_else(ApiError::not_found)?;
+    // Anyone may leave something shared with them; removing others needs edit access.
+    if target.id != me.id {
+        need_edit(role)?;
+    }
+    if !s.revoke(&it, &target.id)? {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "That person has no access granted on this item (it may come from a parent folder)."));
+    }
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+async fn revoke_path(State(app): State<App>, headers: HeaderMap, Path((id, username)): Path<(String, String)>) -> ApiResult {
+    app.run(move |s| revoke_user(s, &headers, &id, &username)).await
+}
+
+async fn revoke_body(State(app): State<App>, headers: HeaderMap, Path(id): Path<String>, body: Bytes) -> ApiResult {
+    app.run(move |s| {
+        let b: GrantBody = parse_body(&body)?;
+        revoke_user(s, &headers, &id, &b.username)
+    })
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// Share links
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct LinkBody {
+    #[serde(default)]
+    role: String,
+    #[serde(default)]
+    expires_days: Option<u32>,
+    #[serde(default)]
+    password: Option<String>,
+}
+
+fn link_json(s: &Store, l: &Link) -> Value {
+    json!({
+        "id": l.id,
+        "role": l.role.as_str(),
+        "expires": l.expires.map(iso),
+        "expired": l.expires.is_some_and(|e| e <= now()),
+        "has_password": l.pw_hash.is_some(),
+        "created": iso(l.created),
+        "created_by": s.display_name(&l.created_by),
+    })
+}
+
+async fn create_link(State(app): State<App>, headers: HeaderMap, Path(id): Path<String>, body: Bytes) -> ApiResult {
+    let base = app.cfg.base_url();
+    app.run(move |s| {
+        let who = auth(s, &headers)?;
+        let me = user_of(&who)?.clone();
+        let b: LinkBody = parse_body(&body)?;
+        let (it, role) = visible(s, &who, &id, false)?;
+        need_edit(role)?;
+        let r = Role::parse(if b.role.is_empty() { "view" } else { &b.role }).ok_or_else(|| ApiError::bad("role must be view or edit."))?;
+        let expires = match b.expires_days {
+            Some(0) | None => None,
+            Some(d) if d <= 3650 => Some(now() + d as i64 * 86400),
+            Some(_) => return Err(ApiError::bad("expires_days must be 3650 or less.")),
+        };
+        let (link, token) = s.create_link(&it, r, expires, b.password.as_deref(), &me.id)?;
+        let mut v = link_json(s, &link);
+        v["url"] = json!(format!("{base}/l/{token}"));
+        Ok((StatusCode::CREATED, axum::Json(v)).into_response())
+    })
+    .await
+}
+
+async fn list_links(State(app): State<App>, headers: HeaderMap, Path(id): Path<String>) -> ApiResult {
+    app.run(move |s| {
+        let who = auth(s, &headers)?;
+        user_of(&who)?;
+        let (it, role) = visible(s, &who, &id, false)?;
+        need_edit(role)?;
+        let list: Vec<Value> = s.links_of(&it.id)?.iter().map(|l| link_json(s, l)).collect();
+        ok_json(json!({ "links": list }))
+    })
+    .await
+}
+
+async fn delete_link(State(app): State<App>, headers: HeaderMap, Path((id, link)): Path<(String, String)>) -> ApiResult {
+    app.run(move |s| {
+        let who = auth(s, &headers)?;
+        user_of(&who)?;
+        let (it, role) = visible(s, &who, &id, false)?;
+        need_edit(role)?;
+        match s.link(&link)? {
+            Some(l) if l.item_id == it.id => {
+                s.delete_link(&l.id)?;
+                Ok(StatusCode::NO_CONTENT.into_response())
+            }
+            _ => Err(ApiError::not_found()),
+        }
+    })
+    .await
+}
+
+#[derive(Deserialize, Default)]
+struct LinkPassword {
+    #[serde(default)]
+    password: String,
+}
+
+async fn open_link(State(app): State<App>, ConnectInfo(Peer(peer)): ConnectInfo<Peer>, headers: HeaderMap, Path(token): Path<String>) -> ApiResult {
+    resolve_link(app, peer, headers, token, String::new()).await
+}
+
+async fn open_link_password(State(app): State<App>, ConnectInfo(Peer(peer)): ConnectInfo<Peer>, headers: HeaderMap, Path(token): Path<String>, body: Bytes) -> ApiResult {
+    let b: LinkPassword = if body.is_empty() { LinkPassword::default() } else { parse_body(&body)? };
+    resolve_link(app, peer, headers, token, b.password).await
+}
+
+/// Checks a link (and its password) and hands out a short-lived access token for its item.
+async fn resolve_link(app: App, peer: SocketAddr, headers: HeaderMap, token: String, password: String) -> ApiResult {
+    let ip_key = format!("ip:{}", client_ip(&app.cfg, peer, &headers));
+    if app.limited(std::slice::from_ref(&ip_key)) {
+        return Err(too_many());
+    }
+    let tk = token.clone();
+    let link = app.run(move |s| live_link(s, &tk)).await;
+    let link = match link {
+        Ok(l) => l,
+        Err(e) => {
+            app.fail(std::slice::from_ref(&ip_key));
+            return Err(e);
+        }
+    };
+    let link_key = format!("link:{}", link.id);
+    if app.limited(std::slice::from_ref(&link_key)) {
+        return Err(too_many());
+    }
+    if let Some(hash) = link.pw_hash.clone() {
+        if password.is_empty() {
+            let body = json!({ "error": "This link needs a password.", "password_required": true });
+            return Ok((StatusCode::UNAUTHORIZED, axum::Json(body)).into_response());
+        }
+        let ok = tokio::task::spawn_blocking(move || util::verify_password(&password, &hash)).await.map_err(|_| ApiError::internal())?;
+        if !ok {
+            app.fail(&[ip_key, link_key]);
+            let body = json!({ "error": "The password is incorrect.", "password_required": true });
+            return Ok((StatusCode::UNAUTHORIZED, axum::Json(body)).into_response());
+        }
+    }
+    let hours = app.cfg.link_access_hours;
+    app.run(move |s| {
+        let it = s.item(&link.item_id)?.ok_or_else(ApiError::not_found)?;
+        let who = Principal::Link { link: link.clone() };
+        let role = s.role(&who, &it, false)?.ok_or_else(ApiError::not_found)?;
+        let (access, expires) = s.link_access_token(&link, hours)?;
+        ok_json(json!({ "item": item_json(s, &it, role), "role": role.as_str(), "access_token": access, "expires": iso(expires) }))
+    })
+    .await
+}
+
+fn live_link(s: &Store, token: &str) -> Result<Link, ApiError> {
+    let link = s.link_by_token(token)?.ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "This link doesn't exist or was removed."))?;
+    if link.expires.is_some_and(|e| e <= now()) {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "This link has expired."));
+    }
+    let it = s.item(&link.item_id)?.ok_or_else(ApiError::not_found)?;
+    if s.role(&Principal::Link { link: link.clone() }, &it, false)?.is_none() {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "This link doesn't exist or was removed."));
+    }
+    Ok(link)
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&#39;")
+}
+
+fn page(title: &str, body: &str) -> Response {
+    let html = format!(
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><meta name=\"robots\" content=\"noindex\">\
+         <title>{t}</title></head><body style=\"font-family:Segoe UI,sans-serif;margin:60px auto;max-width:640px;color:#202020\">\
+         <h2 style=\"color:#217346\">{t}</h2>{body}</body></html>",
+        t = html_escape(title)
+    );
+    let mut res = (StatusCode::OK, html).into_response();
+    let h = res.headers_mut();
+    h.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
+    h.insert("content-security-policy", HeaderValue::from_static("default-src 'none'; style-src 'unsafe-inline'"));
+    h.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    res
+}
+
+/// What a browser shows for a share link.
+async fn link_page(State(app): State<App>, Path(token): Path<String>) -> Response {
+    let r = app
+        .run(move |s| {
+            let l = live_link(s, &token)?;
+            let it = s.item(&l.item_id)?.ok_or_else(ApiError::not_found)?;
+            Ok((l, it))
+        })
+        .await;
+    match r {
+        Ok((l, it)) => {
+            let mut body = format!(
+                "<p>'{}' was shared with you ({}).</p><p>To open it, start FreedomOffice Sheets, choose File &gt; Open &gt; FreedomOffice Server &gt; Open a link, and paste this page's address.</p>",
+                html_escape(&it.name),
+                if l.role == Role::Edit { "can edit" } else { "can view" }
+            );
+            if l.pw_hash.is_none() && it.kind == Kind::File {
+                body.push_str("<p><a href=\"download\">Download a copy</a></p>");
+            } else if l.pw_hash.is_some() {
+                body.push_str("<p>The link is protected by a password.</p>");
+            }
+            page("FreedomOffice", &body)
+        }
+        Err(_) => {
+            let mut res = page("FreedomOffice", "<p>This link doesn't exist, has expired or was removed.</p>");
+            *res.status_mut() = StatusCode::NOT_FOUND;
+            res
+        }
+    }
+}
+
+/// Direct download for links without a password (`/l/<token>/download`).
+async fn link_download(State(app): State<App>, Path(token): Path<String>) -> ApiResult {
+    app.run(move |s| {
+        let l = live_link(s, &token)?;
+        if l.pw_hash.is_some() {
+            return Err(ApiError::new(StatusCode::UNAUTHORIZED, "This link needs a password."));
+        }
+        let it = s.item(&l.item_id)?.ok_or_else(ApiError::not_found)?;
+        if it.kind != Kind::File {
+            return Err(ApiError::bad("Folders can't be downloaded."));
+        }
+        let (data, ver) = s.read_content(&it, None)?;
+        let mut res = data.into_response();
+        let h = res.headers_mut();
+        h.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"));
+        h.insert(header::ETAG, quoted(&crate::store::etag(ver.version, &ver.hash)));
+        let encoded: String = it.name.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect();
+        if let Ok(v) = HeaderValue::from_str(&format!("attachment; filename*=UTF-8''{encoded}")) {
+            h.insert(header::CONTENT_DISPOSITION, v);
+        }
+        h.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+        Ok(res)
+    })
+    .await
+}
+
+/// Reserved for live co-editing (WebSocket) in a later version.
+async fn live(State(app): State<App>, headers: HeaderMap, Path(id): Path<String>) -> ApiResult {
+    app.run(move |s| {
+        let who = auth(s, &headers)?;
+        visible(s, &who, &id, false)?;
+        Err(ApiError::new(StatusCode::NOT_IMPLEMENTED, "Live co-editing isn't available on this server yet."))
+    })
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redacts_link_tokens() {
+        assert_eq!(redact("/api/links/SECRET"), "/api/links/<redacted>");
+        assert_eq!(redact("/l/SECRET/download"), "/l/<redacted>/download");
+        assert_eq!(redact("/api/items/abc"), "/api/items/abc");
+    }
+
+    #[test]
+    fn etag_forms() {
+        assert_eq!(norm_etag("\"v3-abc\""), "v3-abc");
+        assert_eq!(norm_etag("W/\"v3-abc\""), "v3-abc");
+        assert_eq!(norm_etag(" v3-abc "), "v3-abc");
+    }
+
+    #[test]
+    fn limiter_blocks_after_ten() {
+        let mut l = Limiter::default();
+        for _ in 0..9 {
+            l.fail("k");
+        }
+        assert!(!l.blocked("k"));
+        l.fail("k");
+        assert!(l.blocked("k"));
+        assert!(!l.blocked("other"));
+    }
+}

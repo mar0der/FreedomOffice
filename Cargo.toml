@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["sheets"]
+members = ["sheets", "server"]
 
 [profile.release]
 opt-level = 3
@@ -8,3 +8,10 @@ lto = true
 codegen-units = 1
 strip = true
 panic = "abort"
+
+# Password hashing is deliberately slow; keep it optimized in test builds.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
