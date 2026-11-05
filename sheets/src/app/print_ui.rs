@@ -160,12 +160,41 @@ fn shape_to_ops(shape: &egui::Shape, out: &mut Vec<Op>) {
             }));
         }
         Shape::Mesh(m) => {
-            // Filled areas (pie slices, areas): one polygon per triangle.
-            for t in m.indices.chunks_exact(3) {
-                let v = |i: u32| &m.vertices[i as usize];
-                if let Some(c) = col32(v(t[0]).color) {
-                    let pts = vec![(v(t[0]).pos.x, v(t[0]).pos.y), (v(t[1]).pos.x, v(t[1]).pos.y), (v(t[2]).pos.x, v(t[2]).pos.y)];
-                    out.push(Op::Poly { pts, color: c });
+            // Filled areas (pie slices, areas) are strips of quads: print each strip as one
+            // polygon so no seams show between the pieces.
+            let v = &m.vertices;
+            let nq = v.len() / 4;
+            let quads = v.len() % 4 == 0
+                && m.indices.len() == nq * 6
+                && m.indices.chunks_exact(6).enumerate().all(|(q, t)| {
+                    let b = q as u32 * 4;
+                    t == [b, b + 1, b + 2, b, b + 2, b + 3]
+                });
+            let at = |i: usize| (v[i].pos.x, v[i].pos.y);
+            let near = |a: usize, b: usize| (v[a].pos - v[b].pos).length() < 0.01;
+            if quads {
+                let mut q = 0;
+                while q < nq {
+                    let col = v[q * 4].color;
+                    let (mut top, mut bottom) = (vec![at(q * 4 + 1), at(q * 4 + 2)], vec![at(q * 4), at(q * 4 + 3)]);
+                    let mut k = q + 1;
+                    while k < nq && v[k * 4].color == col && near(k * 4 + 1, (k - 1) * 4 + 2) && near(k * 4, (k - 1) * 4 + 3) {
+                        top.push(at(k * 4 + 2));
+                        bottom.push(at(k * 4 + 3));
+                        k += 1;
+                    }
+                    if let Some(c) = col32(col) {
+                        top.extend(bottom.into_iter().rev());
+                        out.push(Op::Poly { pts: top, color: c });
+                    }
+                    q = k;
+                }
+            } else {
+                for t in m.indices.chunks_exact(3) {
+                    if let Some(c) = col32(v[t[0] as usize].color) {
+                        let pts = vec![at(t[0] as usize), at(t[1] as usize), at(t[2] as usize)];
+                        out.push(Op::Poly { pts, color: c });
+                    }
                 }
             }
         }
@@ -174,7 +203,7 @@ fn shape_to_ops(shape: &egui::Shape, out: &mut Vec<Op>) {
 }
 
 /// Draws a chart with the on-screen chart painter and records the result as print operations.
-fn chart_ops(ctx: &egui::Context, wb: &crate::model::Workbook, si: usize, k: usize, r: PRect) -> Vec<Op> {
+pub(super) fn chart_ops(ctx: &egui::Context, wb: &crate::model::Workbook, si: usize, k: usize, r: PRect) -> Vec<Op> {
     let Some(ch) = wb.sheets.get(si).and_then(|s| s.charts.get(k)) else { return Vec::new() };
     let data = crate::chart::resolve(wb, ch);
     let layer = egui::LayerId::new(egui::Order::Background, egui::Id::new("print_chart_recorder"));

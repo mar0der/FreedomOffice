@@ -176,6 +176,9 @@ pub fn fit(kind: TrendKind, order: u8, xs: &[f64], ys: &[f64], intercept: Option
         }
         TrendKind::MovingAverage => return None,
     };
+    // Rounding noise (1e-13x³ on a straight line) reads as zero.
+    let big = coef.iter().fold(0.0f64, |m, c| m.max(c.abs()));
+    let coef: Vec<f64> = coef.into_iter().map(|c| if c.abs() < big * 1e-10 { 0.0 } else { c }).collect();
     coef.iter().all(|c| c.is_finite()).then_some(Fit { kind, coef, r2 })
 }
 

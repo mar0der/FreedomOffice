@@ -192,15 +192,37 @@ const MAX_UNDO: usize = 100;
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, path: Option<PathBuf>) -> Self {
         theme::set_dark(theme::system_dark());
-        theme::apply_style(&cc.egui_ctx);
-        let fonts = FontManager::new(&cc.egui_ctx);
         #[cfg(windows)]
         let hwnd = window_handle(cc);
         #[cfg(windows)]
         set_caption_color(hwnd);
         #[cfg(not(windows))]
         let hwnd = 0;
-        let mut app = App {
+        let mut app = Self::with_context(&cc.egui_ctx, hwnd);
+        if let Some(p) = path {
+            app.open_path(p);
+        }
+        // Offer files left behind by a session that ended unexpectedly.
+        if let Some(dir) = recovery_dir() {
+            if let Ok(rd) = std::fs::read_dir(&dir) {
+                let files: Vec<PathBuf> = rd
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("xlsx")) && Some(p) != app.recovery_path.as_ref())
+                    .collect();
+                if !files.is_empty() {
+                    app.dialog = Some(dialogs::Dialog::Recover { files });
+                }
+            }
+        }
+        app
+    }
+
+    /// Fresh application state on an egui context (also used by UI tests).
+    fn with_context(egui_ctx: &egui::Context, hwnd: isize) -> Self {
+        theme::apply_style(egui_ctx);
+        let fonts = FontManager::new(egui_ctx);
+        App {
             wb: Workbook::new(),
             fonts,
             undo: Vec::new(),
@@ -230,7 +252,7 @@ impl App {
             pending: None,
             wheel_acc: egui::Vec2::ZERO,
             allow_close: false,
-            ctx: Some(cc.egui_ctx.clone()),
+            ctx: Some(egui_ctx.clone()),
             edit_rect: None,
             edit_bar_rect: None,
             tab_scroll: 0,
@@ -257,24 +279,7 @@ impl App {
             chart: Default::default(),
             cf: Default::default(),
             dv: Default::default(),
-        };
-        if let Some(p) = path {
-            app.open_path(p);
         }
-        // Offer files left behind by a session that ended unexpectedly.
-        if let Some(dir) = recovery_dir() {
-            if let Ok(rd) = std::fs::read_dir(&dir) {
-                let files: Vec<PathBuf> = rd
-                    .flatten()
-                    .map(|e| e.path())
-                    .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("xlsx")) && Some(p) != app.recovery_path.as_ref())
-                    .collect();
-                if !files.is_empty() {
-                    app.dialog = Some(dialogs::Dialog::Recover { files });
-                }
-            }
-        }
-        app
     }
 
     /// Writes a recovery copy every few minutes while there are unsaved changes.

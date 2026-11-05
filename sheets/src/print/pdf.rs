@@ -109,7 +109,8 @@ fn draw_text(s: &mut Vec<u8>, t: &TextOp, ph: f32) {
         // anchor so the rotated text sits centred horizontally and at the bottom of the cell
         let cx = t.rect.x + t.rect.w / 2.0;
         let bx = cx - (w * cs) / 2.0 + size * 0.35 * sn;
-        let by = t.rect.bottom() - pad - (w * sn).max(0.0);
+        // counter-clockwise text runs up from the bottom; clockwise text starts high and runs down
+        let by = t.rect.bottom() - pad - (-w * sn).max(0.0);
         s.extend(format!("BT /{font} {size:.2} Tf {cs:.4} {sn:.4} {:.4} {cs:.4} {bx:.2} {:.2} Tm ", -sn, ph - by).bytes());
         s.extend(pdf_str(&lines[0]));
         s.extend(b" Tj ET Q\n");

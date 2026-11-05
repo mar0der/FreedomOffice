@@ -1760,4 +1760,25 @@ mod tests {
             }
         }
     }
+
+    /// Writes a gallery of every subtype to FS_GALLERY (for looking at the app and Excel).
+    #[test]
+    #[ignore]
+    fn write_gallery() {
+        let (mut wb, mut charts) = formatted_charts();
+        let rg = Range::new(0, 0, 4, 2);
+        for st in SUBTYPES {
+            let src = if st.kind == ChartKind::Pie { Range::new(0, 0, 4, 1) } else if st.kind == ChartKind::Scatter { Range::new(1, 1, 4, 2) } else { rg };
+            let mut ch = Chart::with_subtype(&wb, 0, src, st);
+            ch.title = Some(st.name.to_string());
+            charts.push(ch);
+        }
+        for (i, ch) in charts.iter_mut().enumerate() {
+            ch.anchor = ((i / 3) as u32 * 16, 4 + (i % 3) as u32 * 8);
+            ch.size = (480.0, 300.0);
+        }
+        wb.sheets[0].charts = charts;
+        let path = std::env::var("FS_GALLERY").expect("FS_GALLERY");
+        crate::io::save(&wb, std::path::Path::new(&path)).unwrap();
+    }
 }

@@ -502,7 +502,7 @@ impl App {
         }
         if row(ui, "Data Labels", c.any_labels(), Some(Elem::DataLabels)) {
             let on = !c.any_labels();
-            c.labels = if on { Labels { value: !c.kind.is_round() || true, ..Labels::default() } } else { Labels { pos: c.labels.pos, num_fmt: c.labels.num_fmt.clone(), ..Labels::default() } };
+            c.labels = if on { Labels { value: true, ..Labels::default() } } else { Labels { pos: c.labels.pos, num_fmt: c.labels.num_fmt.clone(), ..Labels::default() } };
             for f in &mut c.series_fmt {
                 f.labels = None;
             }
@@ -1151,5 +1151,88 @@ mod tests {
                 }
             });
         });
+    }
+
+    /// Prints the workbook in FS_GALLERY to FS_GALLERY_PDF through the print pipeline
+    /// (charts recorded from the screen painter), for checking chart output by eye.
+    #[test]
+    #[ignore]
+    fn gallery_pdf() {
+        let src = std::env::var("FS_GALLERY").expect("FS_GALLERY");
+        let out = std::env::var("FS_GALLERY_PDF").expect("FS_GALLERY_PDF");
+        let wb = crate::io::load(std::path::Path::new(&src)).unwrap();
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let opts = crate::print::LayoutOptions { what: crate::print::PrintWhat::ActiveSheet, selection: None, ignore_print_area: true, file_name: "", file_path: "" };
+            let pages = crate::print::layout(&wb, &opts, &|si, k, r| super::super::print_ui::chart_ops(ctx, &wb, si, k, r));
+            crate::print::pdf::export(&pages, std::path::Path::new(&out)).unwrap();
+        });
+    }
+
+    /// Runs the Chart Design tab, Insert menus, Format pane (every element) and every chart
+    /// dialog for each chart subtype over a few frames: nothing may panic.
+    #[test]
+    fn chart_ui_smoke() {
+        let ctx = egui::Context::default();
+        let mut app = App::with_context(&ctx, 0);
+        let mut sh = Sheet::new("S");
+        let text = |t: &str| Some(Cell { value: Value::Text(t.into()), ..Default::default() });
+        sh.set(0, 1, text("A"));
+        sh.set(0, 2, text("B"));
+        for r in 1..5u32 {
+            sh.set(r, 0, text(&format!("c{r}")));
+            sh.set(r, 1, Some(Cell { value: Value::Number(r as f64 * 3.0), ..Default::default() }));
+            sh.set(r, 2, Some(Cell { value: Value::Number(10.0 - r as f64), ..Default::default() }));
+        }
+        let mut wb = Workbook::empty_with(vec![sh]);
+        let rg = Range::new(0, 0, 4, 2);
+        for st in chart::SUBTYPES {
+            let ch = Chart::with_subtype(&wb, 0, rg, st);
+            wb.sheets[0].charts.push(ch);
+        }
+        app.wb = wb;
+        app.sheet_mut().view.sel = rg;
+        let elems = [
+            Elem::ChartArea,
+            Elem::PlotArea,
+            Elem::Title,
+            Elem::Legend,
+            Elem::XAxis,
+            Elem::YAxis,
+            Elem::Y2Axis,
+            Elem::XTitle,
+            Elem::Series(0),
+            Elem::Series(1),
+            Elem::DataLabels,
+            Elem::DataTable,
+        ];
+        let n = chart::SUBTYPES.len();
+        for frame in 0..n * 2 {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                app.chart.sel = Some((0, frame % n));
+                app.chart.elem = Some(elems[frame % elems.len()]);
+                app.chart.pane = true;
+                match frame % 4 {
+                    0 => app.open_change_type_dialog(),
+                    1 => app.open_select_data_dialog(),
+                    2 => app.open_move_chart_dialog(),
+                    _ => app.open_insert_chart_dialog(Some(ChartKind::Line)),
+                }
+                if let Some(ChartDialog::Type(t)) = &mut app.chart.dialog {
+                    t.combo = frame % 8 == 0;
+                }
+                app.chart_format_pane(ctx);
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        app.chart_design_tab(ui);
+                        app.chart_insert_buttons(ui);
+                    });
+                    app.chart_elements_menu(ui);
+                    app.chart_styles_menu(ui, true);
+                });
+                app.chart_dialogs(ctx);
+            });
+        }
+        assert_eq!(app.sheet().charts.len(), n);
     }
 }

@@ -527,6 +527,14 @@ fn draw_radar(d: &mut D, area: Rect, ch: &Chart, data: &ChartData) {
     let r = ((area.width() / 2.0 - cat_w - 6.0 * s).min(area.height() / 2.0 - lab_h - 4.0 * s)).max(8.0);
     let c = area.center();
     let ang = |i: usize| -PI / 2.0 + TAU * i as f32 / n as f32;
+    // Keep the value labels on the spoke from running into each other.
+    let mut sc = sc;
+    if ch.y_axis.major.is_none() {
+        while ((sc.hi - sc.lo) / sc.major) as f32 * lab_h * 1.1 > r && sc.major < (sc.hi - sc.lo) {
+            sc.major = chart::nice_step(sc.major * 8.0 * 2.0);
+        }
+        sc.hi = sc.lo + ((sc.hi - sc.lo) / sc.major).ceil() * sc.major;
+    }
     let at = |i: usize, v: f64| c + Vec2::new(ang(i).cos(), ang(i).sin()) * r * sc.frac(sc.clamp(v)).clamp(0.0, 1.0) as f32;
     d.hit(Rect::from_center_size(c, Vec2::splat(r * 2.0)), Elem::PlotArea);
     let gs = Stroke::new(1.0, d.grid);
@@ -1199,9 +1207,15 @@ fn draw_xy(d: &mut D, area: Rect, ch: &Chart, data: &ChartData) {
                     if !txt.is_empty() {
                         if let Some(end) = line.last() {
                             let at = Pos2::new(end.x.min(plot.right() - 2.0 * s), end.y.clamp(plot.top() + 2.0 * s, plot.bottom() - 2.0 * s));
-                            let g = d.p.layout(txt.join("\n"), d.font(font), d.text, f32::INFINITY);
-                            let pos = Pos2::new((at.x - g.size().x).max(plot.left()), (at.y - g.size().y - 4.0 * s).max(plot.top()));
-                            d.p.galley(pos, g, d.text);
+                            // One text per line: printing lays out single lines.
+                            let lh = d.size("Ag", font).y;
+                            let w = txt.iter().map(|t| d.size(t, font).x).fold(0.0, f32::max);
+                            let x = (at.x - w).max(plot.left());
+                            let mut y = (at.y - lh * txt.len() as f32 - 4.0 * s).max(plot.top());
+                            for t in &txt {
+                                d.text(Pos2::new(x, y), Align2::LEFT_TOP, t, font);
+                                y += lh;
+                            }
                         }
                     }
                 }
