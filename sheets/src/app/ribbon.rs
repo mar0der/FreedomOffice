@@ -109,15 +109,35 @@ pub fn big_btn(ui: &mut egui::Ui, job: LayoutJob, min_w: f32, checked: bool) -> 
     if !ui.is_enabled() {
         // nothing
     } else if resp.is_pointer_button_down_on() {
-        p.rect(rect, 3.0, theme::pressed(), Stroke::new(1.0, theme::button_edge()), egui::StrokeKind::Inside);
+        p.rect_filled(rect, 4.0, theme::pressed());
     } else if checked {
-        p.rect(rect, 3.0, theme::checked(), Stroke::NONE, egui::StrokeKind::Inside);
+        p.rect_filled(rect, 4.0, theme::checked());
     } else if resp.hovered() {
-        p.rect(rect, 3.0, theme::hover(), Stroke::new(1.0, theme::button_edge()), egui::StrokeKind::Inside);
+        p.rect_filled(rect, 4.0, theme::hover());
     }
     let pos = Pos2::new(rect.center().x - galley.rect.center().x, rect.top() + 6.0 - galley.rect.top());
     p.galley(pos, galley, theme::text());
     resp
+}
+
+/// The dialog launcher glyph: an open box corner with an arrow pointing down-right.
+fn paint_launcher(p: &egui::Painter, c: Pos2, color: Color32) {
+    let s = 4.5;
+    let (l, t, r, b) = (c.x - s, c.y - s, c.x + s, c.y + s);
+    let st = Stroke::new(1.0, color);
+    p.line_segment([Pos2::new(l, t), Pos2::new(c.x + 1.0, t)], st);
+    p.line_segment([Pos2::new(l, t), Pos2::new(l, c.y + 1.0)], st);
+    p.line_segment([Pos2::new(l + 2.5, t + 2.5), Pos2::new(r, b)], st);
+    p.line_segment([Pos2::new(r - 4.0, b), Pos2::new(r, b)], st);
+    p.line_segment([Pos2::new(r, b - 4.0), Pos2::new(r, b)], st);
+}
+
+/// Small chevron (˅ or ˄) painted as two strokes.
+pub fn paint_chevron(p: &egui::Painter, c: Pos2, up: bool, color: Color32) {
+    let (w, h) = (4.0, if up { -2.5 } else { 2.5 });
+    let st = Stroke::new(1.2, color);
+    p.line_segment([Pos2::new(c.x - w, c.y - h), Pos2::new(c.x, c.y + h)], st);
+    p.line_segment([Pos2::new(c.x, c.y + h), Pos2::new(c.x + w, c.y - h)], st);
 }
 
 /// Large ribbon button that opens a dropdown menu.
@@ -127,7 +147,104 @@ fn big_menu(ui: &mut egui::Ui, job: LayoutJob, add: impl FnOnce(&mut egui::Ui)) 
     r
 }
 
+type StyleFn = fn(&mut crate::model::Style);
+
+/// Built-in cell styles: name, (fill, font colour) for the gallery preview, and the formatting they apply.
+const CELL_STYLES: [(&str, (u32, u32), StyleFn); 10] = [
+    ("Normal", (0xFFFFFF, 0x000000), |s| *s = Default::default()),
+    ("Bad", (0xFFC7CE, 0x9C0006), |s| {
+        s.fill = Some(0xFFC7CE);
+        s.color = Some(0x9C0006);
+    }),
+    ("Good", (0xC6EFCE, 0x006100), |s| {
+        s.fill = Some(0xC6EFCE);
+        s.color = Some(0x006100);
+    }),
+    ("Neutral", (0xFFEB9C, 0x9C5700), |s| {
+        s.fill = Some(0xFFEB9C);
+        s.color = Some(0x9C5700);
+    }),
+    ("Title", (0xFFFFFF, 0x44546A), |s| {
+        s.set_font_size(18.0);
+        s.color = Some(0x44546A);
+        s.font = Some("Calibri Light".into());
+    }),
+    ("Heading 1", (0xFFFFFF, 0x44546A), |s| {
+        s.set_font_size(15.0);
+        s.bold = true;
+        s.color = Some(0x44546A);
+        s.border.bottom = crate::model::BorderLine::Thick;
+    }),
+    ("Heading 2", (0xFFFFFF, 0x44546A), |s| {
+        s.set_font_size(13.0);
+        s.bold = true;
+        s.color = Some(0x44546A);
+        s.border.bottom = crate::model::BorderLine::Medium;
+    }),
+    ("Total", (0xFFFFFF, 0x000000), |s| {
+        s.bold = true;
+        s.border.top = crate::model::BorderLine::Thin;
+        s.border.bottom = crate::model::BorderLine::Double;
+    }),
+    ("Note", (0xFFFFCC, 0x000000), |s| {
+        s.fill = Some(0xFFFFCC);
+        s.border = crate::model::Border {
+            left: crate::model::BorderLine::Thin,
+            right: crate::model::BorderLine::Thin,
+            top: crate::model::BorderLine::Thin,
+            bottom: crate::model::BorderLine::Thin,
+        };
+    }),
+    ("Accent 1", (0x4472C4, 0xFFFFFF), |s| {
+        s.fill = Some(0x4472C4);
+        s.color = Some(0xFFFFFF);
+    }),
+];
+
 impl App {
+    fn cell_styles_menu(&mut self, ui: &mut egui::Ui) {
+        ui.set_min_width(170.0);
+        for (name, _, f) in CELL_STYLES {
+            if ui.button(name).clicked() {
+                self.apply_style(f);
+                ui.close();
+            }
+        }
+    }
+
+    /// Inline Cell Styles gallery: Normal / Bad over Good / Neutral, with a button for the full list.
+    fn cell_styles_gallery(&mut self, ui: &mut egui::Ui) {
+        let (cw, ch, more_w) = (100.0, 24.0, 18.0);
+        let size = Vec2::new(cw * 2.0 + 9.0 + more_w, ch * 2.0 + 10.0);
+        let (outer, _) = ui.allocate_exact_size(size, Sense::hover());
+        let p = ui.painter().clone();
+        p.rect_stroke(outer, 4.0, Stroke::new(1.0, theme::field_edge()), egui::StrokeKind::Inside);
+        for (i, (name, (fill, color), f)) in CELL_STYLES.iter().take(4).enumerate() {
+            let (col, row) = ((i % 2) as f32, (i / 2) as f32);
+            let cell = Rect::from_min_size(Pos2::new(outer.left() + 4.0 + col * (cw + 1.0), outer.top() + 4.0 + row * (ch + 2.0)), Vec2::new(cw, ch));
+            let resp = ui.interact(cell, ui.id().with(("cell_style", i)), Sense::click());
+            p.rect_filled(cell, 0.0, rgb(*fill));
+            let edge = if resp.hovered() { Stroke::new(2.0, theme::accent()) } else { Stroke::new(1.0, theme::gallery_edge()) };
+            p.rect_stroke(cell, 0.0, edge, egui::StrokeKind::Inside);
+            p.text(Pos2::new(cell.left() + 5.0, cell.center().y), Align2::LEFT_CENTER, *name, theme::ui_font(13.0), rgb(*color));
+            if resp.on_hover_text(*name).clicked() {
+                self.apply_style(*f);
+            }
+        }
+        // the "more" button opens the full list
+        let more = Rect::from_min_max(Pos2::new(outer.right() - more_w - 1.0, outer.top() + 1.0), outer.right_bottom() - Vec2::splat(1.0));
+        let resp = ui.interact(more, ui.id().with("cell_styles_more"), Sense::click());
+        if resp.hovered() {
+            p.rect_filled(more, 3.0, if resp.is_pointer_button_down_on() { theme::pressed() } else { theme::hover() });
+        }
+        p.line_segment([Pos2::new(more.left(), outer.top() + 4.0), Pos2::new(more.left(), outer.bottom() - 4.0)], Stroke::new(1.0, theme::field_edge()));
+        let c = more.center() + Vec2::new(0.0, 2.0);
+        p.line_segment([Pos2::new(c.x - 4.0, c.y - 5.0), Pos2::new(c.x + 4.0, c.y - 5.0)], Stroke::new(1.0, theme::text_dim()));
+        paint_chevron(&p, c, false, theme::text());
+        let resp = resp.on_hover_text("Cell Styles");
+        egui::Popup::menu(&resp).show(|ui| self.cell_styles_menu(ui));
+    }
+
     fn ib(&self, code: char, fallback: &'static str, label: &str, size: f32, vertical: bool) -> LayoutJob {
         let (g, is_icon) = self.icon(code, fallback);
         icon_job(&g, is_icon, label, size, vertical, theme::text())
@@ -156,10 +273,17 @@ impl App {
     }
 
     pub(super) fn group(&mut self, ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut Self, &mut egui::Ui)) {
+        self.group_with_launcher(ui, label, None, add);
+    }
+
+    /// A ribbon group; `launcher` adds the small dialog launcher at the right of the label
+    /// that opens Format Cells on the given tab.
+    pub(super) fn group_with_launcher(&mut self, ui: &mut egui::Ui, label: &str, launcher: Option<usize>, add: impl FnOnce(&mut Self, &mut egui::Ui)) {
         let label_w = ui.painter().layout_no_wrap(label.to_string(), theme::ui_font(11.0), theme::text_dim()).size().x;
+        let extra = if launcher.is_some() { 36.0 } else { 10.0 };
         let resp = ui.vertical(|ui| {
             ui.set_height(GROUP_H + 18.0);
-            ui.set_min_width(label_w + 10.0);
+            ui.set_min_width(label_w + extra);
             let w = ui.available_width();
             ui.allocate_ui_with_layout(Vec2::new(w, GROUP_H), egui::Layout::left_to_right(Align::Center), |ui| {
                 ui.set_height(GROUP_H);
@@ -168,9 +292,20 @@ impl App {
         });
         let r = resp.response.rect;
         ui.painter().text(Pos2::new(r.center().x, r.bottom() - 8.0), Align2::CENTER_CENTER, label, theme::ui_font(11.5), theme::text());
+        if let Some(tab) = launcher {
+            let lr = Rect::from_center_size(Pos2::new(r.right() - 6.0, r.bottom() - 8.0), Vec2::splat(15.0));
+            let lresp = ui.interact(lr, ui.id().with(("launcher", label)), Sense::click());
+            if lresp.hovered() {
+                ui.painter().rect_filled(lr, 3.0, if lresp.is_pointer_button_down_on() { theme::pressed() } else { theme::hover() });
+            }
+            paint_launcher(ui.painter(), lr.center(), theme::text_dim());
+            if lresp.on_hover_text(format!("{label} Settings (Format Cells)")).clicked() {
+                self.open_format_cells(tab);
+            }
+        }
         ui.add_space(6.0);
         let x = ui.cursor().left();
-        ui.painter().line_segment([Pos2::new(x, r.top() + 6.0), Pos2::new(x, r.bottom() - 4.0)], Stroke::new(1.0, theme::border()));
+        ui.painter().line_segment([Pos2::new(x, r.top() + 6.0), Pos2::new(x, r.bottom() - 4.0)], Stroke::new(1.0, theme::separator()));
         ui.add_space(7.0);
     }
 
@@ -206,8 +341,13 @@ impl App {
 
     pub fn ribbon_ui(&mut self, ui: &mut egui::Ui) {
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-        // ribbon buttons are flat until hovered
-        ui.visuals_mut().widgets.inactive.bg_stroke = Stroke::NONE;
+        // ribbon buttons are flat until hovered, then a soft rounded fill without an outline
+        let w = &mut ui.visuals_mut().widgets;
+        w.inactive.bg_stroke = Stroke::NONE;
+        for v in [&mut w.hovered, &mut w.active, &mut w.open] {
+            v.bg_stroke = Stroke::NONE;
+            v.corner_radius = egui::CornerRadius::same(4);
+        }
         // Tab strip
         let strip = ui.horizontal(|ui| {
             ui.set_height(30.0);
@@ -290,9 +430,9 @@ impl App {
             .fill(theme::ribbon())
             .stroke(if theme::is_dark() { Stroke::NONE } else { Stroke::new(1.0, theme::border()) })
             .corner_radius(8)
-            .inner_margin(egui::Margin { left: 6, right: 6, top: 4, bottom: 0 })
+            .inner_margin(egui::Margin { left: 6, right: 24, top: 4, bottom: 0 })
             .outer_margin(egui::Margin { left: 6, right: 6, top: 0, bottom: 6 });
-        frame.show(ui, |ui| {
+        let panel = frame.show(ui, |ui| {
             egui::ScrollArea::horizontal().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing = Vec2::new(2.0, 2.0);
@@ -309,6 +449,26 @@ impl App {
                     }
                 });
             });
+        });
+        // Ribbon Display Options (˅) at the bottom-right corner of the panel.
+        let outer = panel.response.rect;
+        let r = Rect::from_center_size(Pos2::new(outer.right() - 6.0 - 12.0, outer.bottom() - 6.0 - 12.0), Vec2::new(20.0, 18.0));
+        let resp = ui.interact(r, ui.id().with("ribbon_display"), Sense::click());
+        if resp.hovered() {
+            ui.painter().rect_filled(r, 3.0, if resp.is_pointer_button_down_on() { theme::pressed() } else { theme::hover() });
+        }
+        paint_chevron(ui.painter(), r.center(), false, theme::text());
+        let resp = resp.on_hover_text("Ribbon Display Options");
+        egui::Popup::menu(&resp).show(|ui| {
+            ui.set_min_width(190.0);
+            if ui.add(egui::Button::selectable(!self.ribbon_collapsed, "Always show Ribbon")).clicked() {
+                self.ribbon_collapsed = false;
+                ui.close();
+            }
+            if ui.add(egui::Button::selectable(self.ribbon_collapsed, "Show tabs only").shortcut_text("Ctrl+F1")).clicked() {
+                self.ribbon_collapsed = true;
+                ui.close();
+            }
         });
     }
 
@@ -351,7 +511,7 @@ impl App {
                 }
             });
         });
-        self.group(ui, "Font", |app, ui| {
+        self.group_with_launcher(ui, "Font", Some(2), |app, ui| {
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
                     let cur_font = st.font.clone().unwrap_or_else(|| theme::DEFAULT_CELL_FONT.to_string());
@@ -426,7 +586,7 @@ impl App {
                 });
             });
         });
-        self.group(ui, "Alignment", |app, ui| {
+        self.group_with_launcher(ui, "Alignment", Some(1), |app, ui| {
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
                     for (t, v, tip) in [("⭱", VAlign::Top, "Top Align"), ("☰", VAlign::Center, "Middle Align"), ("⭳", VAlign::Bottom, "Bottom Align")] {
@@ -495,7 +655,7 @@ impl App {
                 });
             });
         });
-        self.group(ui, "Number", |app, ui| {
+        self.group_with_launcher(ui, "Number", Some(0), |app, ui| {
             ui.vertical(|ui| {
                 let cur = NUMBER_FORMATS
                     .iter()
@@ -586,67 +746,13 @@ impl App {
                     });
                 }
             });
-            let job = app.ib(ic::TABLE, "▤", "Cell\nStyles", 20.0, true);
-            big_menu(ui, job, |ui| {
-                ui.set_min_width(170.0);
-                type F = fn(&mut crate::model::Style);
-                let presets: [(&str, F); 10] = [
-                    ("Normal", |s| *s = Default::default()),
-                    ("Good", |s| {
-                        s.fill = Some(0xC6EFCE);
-                        s.color = Some(0x006100);
-                    }),
-                    ("Bad", |s| {
-                        s.fill = Some(0xFFC7CE);
-                        s.color = Some(0x9C0006);
-                    }),
-                    ("Neutral", |s| {
-                        s.fill = Some(0xFFEB9C);
-                        s.color = Some(0x9C5700);
-                    }),
-                    ("Title", |s| {
-                        s.set_font_size(18.0);
-                        s.color = Some(0x44546A);
-                        s.font = Some("Calibri Light".into());
-                    }),
-                    ("Heading 1", |s| {
-                        s.set_font_size(15.0);
-                        s.bold = true;
-                        s.color = Some(0x44546A);
-                        s.border.bottom = crate::model::BorderLine::Thick;
-                    }),
-                    ("Heading 2", |s| {
-                        s.set_font_size(13.0);
-                        s.bold = true;
-                        s.color = Some(0x44546A);
-                        s.border.bottom = crate::model::BorderLine::Medium;
-                    }),
-                    ("Total", |s| {
-                        s.bold = true;
-                        s.border.top = crate::model::BorderLine::Thin;
-                        s.border.bottom = crate::model::BorderLine::Double;
-                    }),
-                    ("Note", |s| {
-                        s.fill = Some(0xFFFFCC);
-                        s.border = crate::model::Border {
-                            left: crate::model::BorderLine::Thin,
-                            right: crate::model::BorderLine::Thin,
-                            top: crate::model::BorderLine::Thin,
-                            bottom: crate::model::BorderLine::Thin,
-                        };
-                    }),
-                    ("Accent 1", |s| {
-                        s.fill = Some(0x4472C4);
-                        s.color = Some(0xFFFFFF);
-                    }),
-                ];
-                for (name, f) in presets {
-                    if ui.button(name).clicked() {
-                        app.apply_style(f);
-                        ui.close();
-                    }
-                }
-            });
+            // Wide windows show the first cell styles inline, like the desktop gallery.
+            if ui.ctx().content_rect().width() >= 1500.0 {
+                app.cell_styles_gallery(ui);
+            } else {
+                let job = app.ib(ic::TABLE, "▤", "Cell\nStyles", 20.0, true);
+                big_menu(ui, job, |ui| app.cell_styles_menu(ui));
+            }
         });
         self.group(ui, "Cells", |app, ui| {
             ui.vertical(|ui| {
