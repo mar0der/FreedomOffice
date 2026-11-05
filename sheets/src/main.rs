@@ -16,6 +16,7 @@ mod io;
 mod model;
 mod numfmt;
 mod page;
+mod pivot;
 mod print;
 mod solver;
 mod sparkline;

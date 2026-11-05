@@ -434,6 +434,8 @@ pub struct Sheet {
     pub scenarios: crate::whatif::Scenarios,
     /// Sparkline groups drawn in cells.
     pub sparklines: Vec<crate::sparkline::SparklineGroup>,
+    /// PivotTable reports on this sheet.
+    pub pivots: Vec<crate::pivot::PivotTable>,
 }
 
 /// One run of a rich-text cell.
@@ -645,6 +647,7 @@ impl Sheet {
             data_tables: Vec::new(),
             scenarios: Default::default(),
             sparklines: Vec::new(),
+            pivots: Vec::new(),
         }
     }
 

@@ -371,7 +371,7 @@ impl App {
         if self.chart_pointer(ui, lay, pos, hovered, pressed, down) || self.picture_pointer(ui, lay, pos, hovered, pressed, down) {
             return;
         }
-        if hovered && self.table_pointer(lay, pos, pressed) {
+        if hovered && (self.table_pointer(lay, pos, pressed) || self.pivot_pointer(lay, pos, pressed)) {
             return;
         }
 
@@ -554,6 +554,15 @@ impl App {
                 let r = lay.row_near(pos.y);
                 let c = lay.col_near(pos.x);
                 if !(e.sheet == self.wb.active && e.row == r && e.col == c) {
+                    // A PivotTable value becomes a GETPIVOTDATA call (Generate GetPivotData).
+                    if !mods.shift {
+                        if let Some(t) = self.pivot_point_text(r, c) {
+                            if let Some(e) = &mut self.edit {
+                                e.insert(&t);
+                            }
+                            return;
+                        }
+                    }
                     let prefix = if e.sheet != self.wb.active { Some(self.sheet().name.clone()) } else { None };
                     let anchor = if mods.shift { e.point.as_ref().map(|p| p.anchor).unwrap_or((r, c)) } else { (r, c) };
                     if let Some(e) = &mut self.edit {
@@ -662,6 +671,9 @@ impl App {
                 return;
             }
             if dbl {
+                if self.pivot_double_click(r, c) {
+                    return;
+                }
                 self.select(r, c, false);
                 self.begin_edit(None, EditMode::Edit);
                 return;
@@ -723,6 +735,9 @@ impl App {
             }
             let r = lay.row_near(pos.y);
             let c = lay.col_near(pos.x);
+            if self.pivot_double_click(r, c) {
+                return;
+            }
             self.select(r, c, false);
             self.begin_edit(None, EditMode::Edit);
         }
@@ -986,11 +1001,15 @@ impl App {
                 let ov = cf.eval(&self.wb, si, anchor.0, anchor.1);
                 let cell = sh.get(anchor.0, anchor.1);
                 let look = if sh.tables.is_empty() { None } else { self.table_look(si, anchor.0, anchor.1) };
+                let pv = if sh.pivots.is_empty() { None } else { self.pivot_look(si, anchor.0, anchor.1) };
                 if cell.is_none() && sh.spill_anchor_of(anchor.0, anchor.1).is_none() {
                     // Conditional formats and table styles can also mark empty cells.
-                    if ov.is_some() || look.is_some() {
+                    if ov.is_some() || look.is_some() || pv.is_some() {
                         let mut style = Style::default();
                         if let Some(l) = &look {
+                            super::table_view::apply_look(&mut style, l);
+                        }
+                        if let Some((l, _)) = &pv {
                             super::table_view::apply_look(&mut style, l);
                         }
                         if let Some(o) = &ov {
@@ -1004,6 +1023,10 @@ impl App {
                 let mut style = self.wb.style(cell.map_or(0, |c| c.style)).clone();
                 if let Some(l) = &look {
                     super::table_view::apply_look(&mut style, l);
+                }
+                if let Some((l, indent)) = &pv {
+                    super::table_view::apply_look(&mut style, l);
+                    style.indent = style.indent.max(*indent);
                 }
                 if let Some(o) = &ov {
                     super::condfmt_ui::apply_override(&mut style, o);
@@ -1387,6 +1410,7 @@ impl App {
         }
 
         self.paint_table_extras(ui, lay);
+        self.paint_pivot_extras(ui, lay);
         self.paint_pictures(ui, lay);
         self.paint_charts(ui, lay);
         // Validation list arrow

@@ -104,6 +104,9 @@ impl App {
 
     /// Sort A to Z / Z to A on the active cell's column.
     pub fn sort_simple(&mut self, desc: bool) {
+        if self.pivot_sort(desc) {
+            return;
+        }
         let (rg, header) = self.sort_area();
         let c = self.active().1.clamp(rg.c1, rg.c2);
         self.sort_range_by(rg, header, &[SortKey::values(c, desc)], SortOptions::default());

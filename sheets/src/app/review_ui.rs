@@ -67,6 +67,12 @@ impl App {
 
     /// `protect_blocks` for sheet `si`.
     pub fn protect_blocks_at(&mut self, si: usize, change: Change) -> bool {
+        // PivotTable report cells refuse direct edits even on an unprotected sheet.
+        if let Change::Cells(rg) = &change {
+            if si == self.wb.active && self.pivot_block(*rg) {
+                return true;
+            }
+        }
         let blocked = protection_blocks(&self.wb, si, change);
         if blocked {
             self.dialog = Some(super::dialogs::Dialog::Message { title: "FreedomOffice Sheets".into(), text: LOCKED_MSG.into() });

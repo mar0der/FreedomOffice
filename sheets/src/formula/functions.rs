@@ -180,6 +180,7 @@ pub const FUNCS: &[(&str, &str, &str)] = &[
     ("GCD", "number1, [number2], ...", "Math & Trig"),
     ("GEOMEAN", "number1, [number2], ...", "Statistical"),
     ("GESTEP", "number, [step]", "Engineering"),
+    ("GETPIVOTDATA", "data_field, pivot_table, [field1, item1], ...", "Lookup & Reference"),
     ("GROUPBY", "row_fields, values, function, [field_headers], [total_depth], [sort_order], [filter_array]", "Lookup & Reference"),
     ("GROWTH", "known_y's, [known_x's], [new_x's], [const]", "Statistical"),
     ("HARMEAN", "number1, [number2], ...", "Statistical"),
@@ -939,7 +940,7 @@ const LIFT_MORE: &[&str] = &[
 /// Functions that always return a single value regardless of their arguments (sorted).
 const SCALAR_ONLY: &[&str] = &[
     "AGGREGATE", "AND", "AVERAGE", "AVERAGEA", "COLUMNS", "CONCAT", "CONCATENATE", "CORREL", "COUNT", "COUNTA", "COUNTBLANK",
-    "FORMULATEXT", "ISFORMULA", "ISREF", "LARGE", "MAX", "MAXA", "MEDIAN", "MIN", "MINA", "NOW", "NPV", "OR", "PI", "PRODUCT",
+    "FORMULATEXT", "GETPIVOTDATA", "ISFORMULA", "ISREF", "LARGE", "MAX", "MAXA", "MEDIAN", "MIN", "MINA", "NOW", "NPV", "OR", "PI", "PRODUCT",
     "RAND", "ROWS", "SHEET", "SHEETS", "SMALL", "STDEV", "STDEV.P", "STDEV.S", "SUBTOTAL", "SUM", "SUMPRODUCT", "SUMSQ",
     "TEXTJOIN", "TODAY", "VAR", "VAR.P", "VAR.S", "XOR",
 ];

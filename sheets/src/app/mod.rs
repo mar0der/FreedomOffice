@@ -19,6 +19,8 @@ mod iconset_ui;
 mod keys;
 mod keytips;
 mod picture_view;
+mod pivot_pane;
+mod pivot_ui;
 mod menus;
 mod paste;
 mod print_ui;
@@ -56,6 +58,9 @@ pub enum RibbonTab {
     TableDesign,
     /// Contextual tab shown while the active cell has a sparkline.
     Sparkline,
+    /// Contextual tabs shown while the active cell is in a PivotTable.
+    PivotAnalyze,
+    PivotDesign,
 }
 
 #[derive(Clone)]
@@ -195,6 +200,7 @@ pub struct App {
     pub tab_drag: Option<usize>,
     pub chart: chart_view::ChartUi,
     pub tables: table_view::TableUi,
+    pub pivots: pivot_ui::PivotUi,
     pub pictures: picture_view::PictureUi,
     pub review: review_ui::ReviewUi,
     /// Sheet whose zoom `zoom` currently shows (zoom is kept per sheet, like Excel).
@@ -291,6 +297,7 @@ impl App {
             tab_drag: None,
             chart: Default::default(),
             tables: Default::default(),
+            pivots: Default::default(),
             pictures: Default::default(),
             review: Default::default(),
             zoom_for: None,
@@ -818,6 +825,7 @@ impl App {
         self.cf = Default::default();
         self.dv = Default::default();
         self.tables = Default::default();
+        self.pivots = Default::default();
         self.pictures = Default::default();
         self.zoom_for = None;
         // A cloud document stays attached only when its downloaded copy is what was opened.
@@ -1083,6 +1091,7 @@ impl eframe::App for App {
                 .show_separator_line(false)
                 .show(ctx, |ui| self.sheet_tabs_ui(ui));
             self.chart_format_pane(ctx);
+            self.pivot_field_pane(ctx);
             egui::CentralPanel::default().frame(egui::Frame::NONE.fill(egui::Color32::WHITE)).show(ctx, |ui| self.grid_ui(ui));
             self.popups_ui(ctx);
             self.keytips_ui(ctx);
@@ -1090,6 +1099,7 @@ impl eframe::App for App {
         self.dialogs_ui(ctx);
         self.chart_dialogs(ctx);
         self.protect_dialog_ui(ctx);
+        self.pivot_dialogs(ctx);
         self.cloud_dialogs_ui(ctx);
     }
 }

@@ -120,6 +120,7 @@ pub const KEYTIPS: &[(&str, &str)] = &[
     ("NS", "Insert Sheet"),
     ("NF", "Insert Function..."),
     ("NI", "Link..."),
+    ("NVT", "PivotTable from Table/Range..."),
     // Formulas
     ("MF", "Insert Function..."),
     ("MUS", "AutoSum"),
@@ -300,6 +301,7 @@ impl App {
             "HUI" => self.autosum("MIN"),
             "HUF" | "NF" | "MF" => self.dialog = Some(Dialog::insert_function()),
             "NI" => self.open_link_dialog(),
+            "NVT" => self.open_create_pivot(),
             "HFID" => self.fill_down(),
             "HFIR" => self.fill_right(),
             "HEA" => self.clear(true, true),
