@@ -15,6 +15,7 @@ mod flash;
 mod filter_ui;
 mod find_ui;
 mod grid;
+mod iconset_ui;
 mod keys;
 mod keytips;
 mod picture_view;
@@ -23,9 +24,12 @@ mod paste;
 mod print_ui;
 mod review_ui;
 mod ribbon;
+mod solver_ui;
+mod sparkline_ui;
 mod table_view;
 mod theme;
 mod validation_ui;
+mod whatif_ui;
 
 use std::path::PathBuf;
 
@@ -50,6 +54,8 @@ pub enum RibbonTab {
     ChartDesign,
     /// Contextual tab shown while the active cell is in a table.
     TableDesign,
+    /// Contextual tab shown while the active cell has a sparkline.
+    Sparkline,
 }
 
 #[derive(Clone)]
@@ -201,6 +207,8 @@ pub struct App {
     pub kb: keys::KbState,
     /// Context menu requested from the keyboard (Shift+F10 / Menu key), and which one.
     pub menu: menus::MenuState,
+    /// Contextual Sparkline tab state.
+    pub sparks: sparkline_ui::SparkUi,
 }
 
 const MAX_UNDO: usize = 100;
@@ -288,6 +296,7 @@ impl App {
             paste_button: None,
             kb: Default::default(),
             menu: Default::default(),
+            sparks: Default::default(),
         };
         if let Some(p) = path {
             app.open_path(p);
@@ -695,6 +704,10 @@ impl App {
             vec![(e.row, e.col)]
         };
         let rg = if fill_selection { self.sel() } else { Range::cell(e.row, e.col) };
+        if self.data_table_blocks(e.sheet, rg) {
+            self.edit = Some(e);
+            return false;
+        }
         let scope = if self.table_edit_affects(e.sheet, e.row, e.col) { Scope::Sheet(e.sheet) } else { Scope::Range(e.sheet, rg) };
         self.push_undo(&[scope]);
         let base = self.sheet().get(e.row, e.col).cloned();

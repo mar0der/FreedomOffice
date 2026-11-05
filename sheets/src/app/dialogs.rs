@@ -48,6 +48,8 @@ pub enum Dialog {
     CondFmt(Box<super::condfmt_ui::CfDialog>),
     Validation(Box<super::validation_ui::DvDialog>),
     DvAlert(Box<super::validation_ui::DvAlert>),
+    /// What-If Analysis, Solver and sparkline dialogs.
+    WhatIf(Box<super::whatif_ui::WhatIfDlg>),
 }
 
 impl Dialog {
@@ -198,6 +200,7 @@ impl App {
             Dialog::Validation(dv) => keep = self.dv_dialog_ui(ctx, dv),
             Dialog::DvAlert(a) => keep = self.dv_alert_ui(ctx, a),
             Dialog::Data(dd) => keep = self.data_dialog_ui(ctx, dd),
+            Dialog::WhatIf(w) => keep = self.whatif_dialog_ui(ctx, w),
             Dialog::Find => keep = self.find_dialog_ui(ctx),
             Dialog::Message { title, text } => {
                 win(title).show(ctx, |ui| {

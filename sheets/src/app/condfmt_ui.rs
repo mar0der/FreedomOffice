@@ -135,8 +135,9 @@ pub struct RuleEditor {
     title: &'static str,
     ranges: Vec<Range>,
     ty: usize,
-    /// 0 = 2-colour scale, 1 = 3-colour scale, 2 = data bar.
+    /// 0 = 2-colour scale, 1 = 3-colour scale, 2 = data bar, 3 = icon sets.
     style: usize,
+    icons: crate::iconset::IconSetRule,
     /// Scale colours: minimum, midpoint, maximum.
     colors: [u32; 3],
     bar_color: u32,
@@ -186,6 +187,7 @@ impl RuleEditor {
             colors: [0xF8696B, 0xFFEB84, 0x63BE7B],
             bar_color: 0x638EC6,
             bar_gradient: true,
+            icons: crate::iconset::IconSetRule::new(crate::iconset::IconStyle::TrafficLights3),
             contains: 0,
             op: CmpOp::Between,
             v1: String::new(),
@@ -250,6 +252,11 @@ impl RuleEditor {
                 e.bar_color = *color;
                 e.bar_gradient = *gradient;
             }
+            RuleKind::IconSet(ic) => {
+                e.ty = 0;
+                e.style = 3;
+                e.icons = ic.clone();
+            }
             RuleKind::ColorScale { colors } => {
                 e.ty = 0;
                 match colors.as_slice() {
@@ -273,6 +280,10 @@ impl RuleEditor {
             0 => match self.style {
                 0 => RuleKind::ColorScale { colors: vec![self.colors[0], self.colors[2]] },
                 1 => RuleKind::ColorScale { colors: self.colors.to_vec() },
+                3 => {
+                    super::iconset_ui::check_icon_rule(&self.icons)?;
+                    RuleKind::IconSet(self.icons.clone())
+                }
                 _ => RuleKind::DataBar { color: self.bar_color, gradient: self.bar_gradient },
             },
             1 => match self.contains {
@@ -647,6 +658,13 @@ impl App {
         }))));
     }
 
+    pub(super) fn cf_open_icon_editor(&mut self) {
+        self.commit_edit(false);
+        let mut e = RuleEditor::new(self.cf_selection(), 0);
+        e.style = 3;
+        self.dialog = Some(Dialog::CondFmt(Box::new(CfDialog::Rule(e))));
+    }
+
     pub(super) fn cf_open_editor(&mut self, ty: usize) {
         self.commit_edit(false);
         self.dialog = Some(Dialog::CondFmt(Box::new(CfDialog::Rule(RuleEditor::new(self.cf_selection(), ty)))));
@@ -667,7 +685,7 @@ impl App {
         }))));
     }
 
-    fn cf_visual(&mut self, kind: RuleKind) {
+    pub(super) fn cf_visual(&mut self, kind: RuleKind) {
         let rule = CondFormat::new(self.cf_selection(), kind, DiffFormat::default());
         self.cf_add_rule(rule);
     }
@@ -784,6 +802,7 @@ impl App {
                 ui.close();
             }
         });
+        ui.menu_button("Icon Sets", |ui| self.cf_icon_menu(ui));
         ui.separator();
         if ui.button("New Rule...").clicked() {
             self.cf_open_editor(1);
@@ -1023,6 +1042,10 @@ impl App {
                                     let (r, _) = ui.allocate_exact_size(Vec2::new(120.0, 18.0), Sense::hover());
                                     scale_preview(ui.painter(), r, colors);
                                 }
+                                RuleKind::IconSet(ic) => {
+                                    let (r, _) = ui.allocate_exact_size(Vec2::new(120.0, 18.0), Sense::hover());
+                                    super::iconset_ui::paint_set(ui.painter(), Rect::from_min_size(r.min + Vec2::new(2.0, 1.0), Vec2::splat(16.0)), ic.style);
+                                }
                                 RuleKind::DataBar { color, gradient } => {
                                     let (r, _) = ui.allocate_exact_size(Vec2::new(120.0, 18.0), Sense::hover());
                                     paint_data_bar(ui.painter(), r, &DataBarDraw { start: 0.0, end: 0.8, color: *color, gradient: *gradient, negative: false });
@@ -1181,8 +1204,8 @@ fn rule_description(ui: &mut egui::Ui, e: &mut RuleEditor) {
             ui.label(RichText::new("Format all cells based on their values:").strong());
             ui.horizontal(|ui| {
                 ui.label("Format Style:");
-                let names = ["2-Color Scale", "3-Color Scale", "Data Bar"];
-                egui::ComboBox::from_id_salt("cf_style").selected_text(names[e.style.min(2)]).show_ui(ui, |ui| {
+                let names = ["2-Color Scale", "3-Color Scale", "Data Bar", "Icon Sets"];
+                egui::ComboBox::from_id_salt("cf_style").selected_text(names[e.style.min(3)]).show_ui(ui, |ui| {
                     for (i, n) in names.iter().enumerate() {
                         ui.selectable_value(&mut e.style, i, *n);
                     }
@@ -1207,6 +1230,8 @@ fn rule_description(ui: &mut egui::Ui, e: &mut RuleEditor) {
                     let cols: Vec<u32> = if e.style == 0 { vec![e.colors[0], e.colors[2]] } else { e.colors.to_vec() };
                     scale_preview(ui.painter(), r, &cols);
                 });
+            } else if e.style == 3 {
+                super::iconset_ui::icon_rule_ui(ui, &mut e.icons);
             } else {
                 ui.horizontal(|ui| {
                     ui.label("Fill:");

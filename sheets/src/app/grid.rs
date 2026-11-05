@@ -1022,12 +1022,16 @@ impl App {
             if let Some(bar) = it.cf.as_ref().and_then(|o| o.bar) {
                 super::condfmt_ui::paint_data_bar(&cp, it.rect, &bar);
             }
+            if let Some(ic) = it.cf.as_ref().and_then(|o| o.icon) {
+                super::iconset_ui::paint_cell_icon(&cp.with_clip_rect(it.rect.intersect(lay.cells)), it.rect, &ic, z);
+            }
         }
+        self.paint_sparklines(&cp, lay);
 
         // Text
         let pad = 2.0 * z.max(0.5) + 1.0;
         for it in items.iter_mut() {
-            if it.shown.text.is_empty() {
+            if it.shown.text.is_empty() || it.cf.as_ref().is_some_and(|o| o.icon.is_some_and(|i| i.icon_only)) {
                 continue;
             }
             let font = self.cell_font(&it.style);
@@ -1252,6 +1256,9 @@ impl App {
                 cp.rect_filled(act.shrink(0.5), 0.0, fill.gamma_multiply(1.0));
                 if let Some(bar) = act_cf.as_ref().and_then(|o| o.bar) {
                     super::condfmt_ui::paint_data_bar(&cp, act, &bar);
+                }
+                if let Some(ic) = act_cf.as_ref().and_then(|o| o.icon) {
+                    super::iconset_ui::paint_cell_icon(&cp.with_clip_rect(act.intersect(lay.cells)), act, &ic, z);
                 }
                 // redraw active cell text above the white-out
                 let sh = &self.wb.sheets[si];

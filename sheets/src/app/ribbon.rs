@@ -432,6 +432,7 @@ impl App {
             }
             self.chart_tab_button(ui);
             self.table_tab_button(ui);
+            self.sparkline_tab_button(ui);
             self.cloud_tab_strip_ui(ui);
         });
         let _ = strip;
@@ -461,6 +462,7 @@ impl App {
                         RibbonTab::Help => self.help_tab(ui),
                         RibbonTab::ChartDesign => self.chart_design_tab(ui),
                         RibbonTab::TableDesign => self.table_design_tab(ui),
+                        RibbonTab::Sparkline => self.sparkline_tab(ui),
                     }
                 });
             });
@@ -998,6 +1000,7 @@ impl App {
             }
         });
         self.group(ui, "Charts", |app, ui| app.chart_insert_buttons(ui));
+        self.group(ui, "Sparklines", |app, ui| app.sparkline_insert_buttons(ui));
         self.group(ui, "Functions", |app, ui| {
             let job = icon_job("fx", false, "Function", 20.0, true, theme::text());
             if big_btn(ui, job, 54.0, false).on_hover_text("Insert Function (Shift+F3)").clicked() {
@@ -1310,7 +1313,9 @@ impl App {
             }
             app.dv_ribbon_button(ui);
         });
+        self.forecast_group(ui);
         self.outline_group(ui);
+        self.analyze_group(ui);
     }
 
     fn outline_group(&mut self, ui: &mut egui::Ui) {
