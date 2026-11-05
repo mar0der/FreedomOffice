@@ -1,7 +1,7 @@
 # FreedomOffice Sheets
 
 A lightweight, open-source spreadsheet for Windows, written in Rust.
-One portable ~9 MB executable — no installer, no runtime, no account.
+One portable ~13 MB executable — no installer, no runtime, no account needed.
 
 It deliberately follows the familiar desktop-spreadsheet layout and keyboard habits
 (ribbon, formula bar, Alt key sequences, Ctrl/Shift/F-key shortcuts), so years of
@@ -17,35 +17,53 @@ and run it. To open a file, use **File → Open**, `Ctrl+O`, or drag a workbook 
 ## Features
 
 **Interface**
-- Ribbon with Home, Insert, Page Layout, Formulas, Data, Review, View and Help tabs, plus a contextual Chart Design tab
-- File backstage (New, Open, Save As, Print, Recent files), Quick Access Toolbar, name box, formula bar
-- Sheet tabs (add, rename, colour, hide, drag to reorder), status bar with Sum / Count / Average and zoom slider
-- Alt KeyTips: `Alt, H, O, I` (AutoFit column), `Alt, H, B, A` (all borders), `Alt, W, F, F` (freeze panes) and many more
+- Light and dark mode that follow the Windows app setting, like desktop Office
+- Ribbon with Home, Insert, Page Layout, Formulas, Data, Review, View and Help tabs, plus contextual Table Design, PivotTable Analyze/Design, Chart Design and Sparkline tabs
+- Dialog launchers on Font, Alignment and Number, an inline Cell Styles gallery, Ribbon Display Options (`Ctrl+F1`)
+- File backstage (New, Open, Save As, Print, Export, Account, Recent files), Quick Access Toolbar
+- Name box with defined-name list, formula bar that expands (`Ctrl+Shift+U`)
+- Sheet tabs (add, rename, colour, hide, drag to reorder), status bar with Sum / Count / Average, Extend / Add / End modes and zoom
+- Excel-style right-click menus (also `Shift+F10` and the Menu key) and Alt KeyTips: `Alt, H, O, I`, `Alt, H, B, A`, `Alt, W, F, F`, `Alt, N, V, T` and many more
+
+**Microsoft 365**
+- Sign in with a Microsoft account; open and save files on OneDrive and SharePoint, including Shared with me and Sites
+- Saving back detects when someone else saved first (Save a Copy / Overwrite), optional AutoSave
+- Share: invite people (can edit / can view), copy a link, manage access
+- Needs your own app registration (client ID) in Microsoft Entra; File → Account shows the steps. Live co-authoring is not supported.
 
 **Formulas**
-- 287 functions: math, statistics, text, date/time, logical, lookup (VLOOKUP, INDEX/MATCH, XLOOKUP, XMATCH), financial, engineering, LET
+- 433 functions: math, statistics and distributions, text and REGEX, date/time, logical, lookup (VLOOKUP, LOOKUP, INDEX/MATCH, XLOOKUP), database (DSUM…), financial, engineering, LET
+- LAMBDA with named and recursive lambdas, MAP, REDUCE, SCAN, BYROW, BYCOL, MAKEARRAY, GROUPBY, PIVOTBY
 - Dynamic arrays that spill (`FILTER`, `SORT`, `UNIQUE`, `SEQUENCE`, `TEXTSPLIT`, `VSTACK`, … and the `A1#` spill reference)
+- 3-D references (`Jan:Dec!B2`), union and intersection operators, structured table references (`Table1[Col]`, `[@Col]`)
 - Fast incremental recalculation (125k formulas recalculate in ~0.2 s; single edits in under a millisecond)
 - Point-and-click references with colour-coded highlights, function autocomplete, argument hints, `F4` to toggle `$`
-- Named ranges, cross-sheet references, circular-reference detection
+- Named ranges with workbook or sheet scope, circular-reference detection, GETPIVOTDATA
 
 **Editing and formatting**
-- Fonts, fills, borders, alignment, text rotation, wrap text (rows grow to fit), merge & center, indent
+- Fonts, rich text within a cell, fills, borders, alignment, text rotation, wrap text, merge & center, indent
 - Number formats (General, Number, Currency, Accounting, Date, Time, Percentage, Scientific, Text, custom codes)
-- Cell styles, Format as Table, Format Painter (double-click to keep it on)
-- Conditional formatting: highlight rules, top/bottom, above/below average, duplicates, formulas, data bars, colour scales
+- Cell styles, Excel Tables (total row, banding, auto-expand), Format Painter (double-click to keep it on)
+- Conditional formatting: highlight rules, top/bottom, above/below average, duplicates, formulas, data bars, colour scales, icon sets
 - Data validation with in-cell dropdown lists, input messages and error alerts
-- Fill handle with series (numbers, dates, months, weekdays, “Item 1”…), Ctrl+D / Ctrl+R, AutoComplete from the column
-- Drag-to-move cells, Ctrl+click multi-selection, F4 / Ctrl+Y repeat last action, cell notes, hyperlinks
-- Undo / redo, AutoRecover (unsaved work is offered again after an unexpected exit)
+- Fill handle like Excel (Ctrl toggles copy/series, Auto Fill Options, drag back to clear), Flash Fill (`Ctrl+E`)
+- Paste Special (all paste types, operations, skip blanks, transpose, paste link) and the Paste Options button
+- Pictures (move, resize), sparklines, cell notes with authors, hyperlinks
+- Sheet protection with Excel's permissions and passwords
+- Undo / redo (also inside the cell editor), AutoRecover (unsaved work is offered again after an unexpected exit)
 
 **Data**
-- Sort (multi-level), AutoFilter, remove duplicates, text to columns
+- PivotTables: field list with drag and drop, compact/outline/tabular layouts, grouping, Show Values As, styles, drill-down, refresh
+- Sort with colour and custom lists; AutoFilter with text, number, date, colour and Top 10 filters
+- Text to Columns wizard, Remove Duplicates, Subtotal, Flash Fill
+- What-If Analysis: Goal Seek, Data Tables, Scenario Manager; Solver (linear, integer and nonlinear)
 - Group / ungroup rows and columns with outline buttons, freeze panes, hide/unhide rows, columns and sheets
-- Find & Replace, Go To, select precedents / dependents (`Ctrl+[` / `Ctrl+]`)
+- Find & Replace with options and Find All, Go To, select precedents / dependents (`Ctrl+[` / `Ctrl+]`)
 
 **Charts**
-- Column, bar, line, area, pie, doughnut and scatter charts that update live, with title, legend and data labels
+- Column, bar, line and area (clustered, stacked, 100%), pie, doughnut, scatter, radar and combo charts that update live
+- Axis titles and scaling, secondary axis, gridlines, data labels, data table, trendlines, error bars
+- Chart Elements (+) button, Format pane, Quick Layout, colour palettes, Select Data, Change Chart Type, Move Chart
 
 **Printing**
 - File → Print (`Ctrl+P`) with printer choice, Printer Properties, copies, pages, one/two-sided, collation, orientation, paper size, margins and scaling, plus a live page preview
@@ -57,7 +75,7 @@ and run it. To open a file, use **File → Open**, `Ctrl+O`, or drag a workbook 
 
 | Format | Open | Save |
 |---|---|---|
-| Excel workbook `.xlsx` / `.xlsm` | ✓ (values, formulas, styles, merges, charts, conditional formats, validation, notes, links, groups) | ✓ |
+| Excel workbook `.xlsx` / `.xlsm` | ✓ (values, formulas, styles, rich text, merges, tables, PivotTables, charts, pictures, sparklines, conditional formats, validation, filters, protection, notes, links, groups, scenarios) | ✓ (macros are not kept) |
 | Excel 97-2003 `.xls`, binary `.xlsb` | ✓ (values and formulas) | |
 | OpenDocument `.ods` | ✓ (values and formulas) | |
 | CSV / TSV / text | ✓ (delimiter and encoding detection) | ✓ |
@@ -105,14 +123,17 @@ sheets/src/
   numfmt.rs       number format codes, dates, input parsing
   formula/        parser, evaluator, dependency graph, function library
   io/             xlsx reader/writer, xls/xlsb/ods (calamine), csv
-  chart.rs, condfmt.rs, validation.rs, pdf.rs
-  app/            UI (egui): grid, ribbon, dialogs, keyboard, KeyTips, charts
+  table.rs, filter.rs, pivot/, whatif.rs, solver.rs, sparkline.rs, iconset.rs
+  chart.rs, condfmt.rs, validation.rs, page.rs, print/
+  cloud/          Microsoft sign-in and Microsoft Graph (OneDrive / SharePoint / sharing)
+  app/            UI (egui): grid, ribbon, dialogs, keyboard, KeyTips, charts, panes
 ```
 
 ## Not yet supported
 
-Pivot tables, macros/VBA, images and shapes, sparklines, threaded comments, sheet protection,
-icon sets, localized function names and right-to-left sheets.
+Macros/VBA, live co-authoring, slicers and timelines, shapes and SmartArt, Power Query,
+threaded comment replies (read as notes), waterfall/treemap/map charts, Forecast Sheet,
+localized function names and right-to-left sheets.
 
 ## License
 
