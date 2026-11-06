@@ -128,20 +128,24 @@ fn start_rename(ctx: &egui::Context, app: &mut App) {
     frame(ctx, app, vec![]);
 }
 
+fn renaming(app: &App) -> Option<String> {
+    app.rename_tab.as_ref().map(|(_, b)| b.clone())
+}
+
 #[test]
 fn renaming_a_tab_ends_with_enter_escape_or_a_click_elsewhere() {
     let (ctx, mut app) = app();
-    let name = app.sheet().name.clone();
 
-    // Enter commits; the typing goes into the tab, not a cell.
+    // The old name is selected, so typing replaces it; Enter commits; the typing goes into
+    // the tab, not a cell.
     start_rename(&ctx, &mut app);
-    frame(&ctx, &mut app, typing("X"));
-    assert_eq!(app.rename_tab.as_ref().map(|(_, b)| b.clone()), Some(format!("{name}X")));
+    frame(&ctx, &mut app, typing("Data"));
+    assert_eq!(renaming(&app).as_deref(), Some("Data"));
     assert!(app.edit.is_none());
     frame(&ctx, &mut app, key(Key::Enter));
     frame(&ctx, &mut app, vec![]);
     assert!(app.rename_tab.is_none(), "Enter ends the rename");
-    assert_eq!(app.sheet().name, format!("{name}X"));
+    assert_eq!(app.sheet().name, "Data");
     // ... and the grid has the keyboard again.
     frame(&ctx, &mut app, typing("7"));
     assert!(app.edit.is_some(), "typing after the rename edits a cell");
@@ -149,41 +153,69 @@ fn renaming_a_tab_ends_with_enter_escape_or_a_click_elsewhere() {
 
     // Escape cancels.
     start_rename(&ctx, &mut app);
-    frame(&ctx, &mut app, typing("Y"));
+    frame(&ctx, &mut app, typing("Nope"));
     frame(&ctx, &mut app, key(Key::Escape));
     frame(&ctx, &mut app, vec![]);
     assert!(app.rename_tab.is_none(), "Escape ends the rename");
-    assert_eq!(app.sheet().name, format!("{name}X"), "Escape keeps the old name");
+    assert_eq!(app.sheet().name, "Data", "Escape keeps the old name");
 
     // A click on the grid commits.
     start_rename(&ctx, &mut app);
+    frame(&ctx, &mut app, key(Key::End));
     frame(&ctx, &mut app, typing("Z"));
     for ev in click(Pos2::new(400.0, 400.0)) {
         frame(&ctx, &mut app, ev);
     }
     frame(&ctx, &mut app, vec![]);
     assert!(app.rename_tab.is_none(), "clicking elsewhere ends the rename");
-    assert_eq!(app.sheet().name, format!("{name}XZ"));
+    assert_eq!(app.sheet().name, "DataZ");
 }
 
 #[test]
 fn renaming_a_tab_in_a_live_session_sends_the_rename_and_survives_others_edits() {
+    use cosync::Op;
     let (ctx, mut app) = app();
     app.cloud.doc = Some(CloudDoc { item_id: "test".into(), ..server_doc() });
     app.live_for_test();
     let s = app.wb.sheets[0].uid;
+    let pos = app.wb.sheets[0].pos;
     start_rename(&ctx, &mut app);
-    frame(&ctx, &mut app, typing("X"));
-    // Someone else inserts a row meanwhile: the rename box stays, with what was typed.
-    app.live_remote_for_test(&[cosync::Op::Rows { s, at: 3, n: 1 }]);
-    frame(&ctx, &mut app, vec![]);
-    let name = app.rename_tab.as_ref().map(|(_, b)| b.clone()).expect("still renaming");
-    assert!(name.ends_with('X'));
-    frame(&ctx, &mut app, typing("Y"));
+    frame(&ctx, &mut app, typing("Pl"));
+    // Others insert a row, then add a sheet before this tab, move it after, delete it, while
+    // the box is open: it stays, with the focus and what was typed.
+    let other = 0x5eed;
+    let remote: [Vec<Op>; 4] = [
+        vec![Op::Rows { s, at: 3, n: 1 }],
+        vec![Op::AddSheet { s: other, name: "Front".into(), pos: pos - 1.0 }],
+        vec![Op::Place { s: other, pos: pos + 1.0 }, Op::Place { s: other, pos: pos - 2.0 }],
+        vec![Op::DelSheet { s: other, name: "Front".into() }],
+    ];
+    for (k, ops) in remote.iter().enumerate() {
+        app.live_remote_for_test(ops);
+        frame(&ctx, &mut app, vec![]);
+        frame(&ctx, &mut app, vec![]);
+        assert_eq!(renaming(&app).as_deref(), Some("Pl"), "still renaming after remote change {k}");
+        if k == 1 {
+            assert_eq!(app.wb.sheets[0].name, "Front", "the new sheet's tab is before the renamed one");
+        }
+    }
+    frame(&ctx, &mut app, typing("an"));
     frame(&ctx, &mut app, key(Key::Enter));
     assert!(app.rename_tab.is_none());
-    assert_eq!(app.wb.sheets[0].name, format!("{name}Y"));
+    assert_eq!(app.wb.sheets[0].name, "Plan");
     assert!(app.live.is_some());
     assert!(app.live_errors().is_empty(), "the rename's operations reproduce it");
     assert!(!app.live_pending_ops().is_empty(), "the rename goes to the server like any edit");
+
+    // The sheet being renamed is deleted by someone else: the rename ends, with a note.
+    app.add_sheet();
+    let keep = app.wb.sheets[1].uid;
+    app.switch_sheet(0);
+    start_rename(&ctx, &mut app);
+    frame(&ctx, &mut app, typing("Gone"));
+    app.live_remote_for_test(&[Op::DelSheet { s, name: "Plan".into() }]);
+    frame(&ctx, &mut app, vec![]);
+    assert!(app.rename_tab.is_none());
+    assert!(app.status.as_deref().is_some_and(|t| t.contains("deleted the sheet 'Plan'")), "{:?}", app.status);
+    assert_eq!(app.wb.sheets.iter().map(|x| x.uid).collect::<Vec<_>>(), [keep]);
 }

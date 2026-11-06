@@ -313,13 +313,22 @@ impl App {
                 let active = i == self.wb.active;
                 if let Some((ri, buf)) = &mut self.rename_tab {
                     if *ri == i {
-                        let te = ui.add(egui::TextEdit::singleline(buf).desired_width(110.0).font(font.clone()));
+                        // A stable id (by sheet, not by position): others adding or moving
+                        // sheets before this tab must not take the focus away from it.
+                        let uid = self.wb.sheets[i].uid;
+                        let te = ui.add(egui::TextEdit::singleline(buf).id_salt(("rename_tab", uid)).desired_width(110.0).font(font.clone()));
                         // Focus it once when the rename starts; asking every frame would take the
                         // focus straight back from Enter, Escape or a click elsewhere.
                         let focused_once = ui.data(|d| d.get_temp::<bool>(rename_focused()).unwrap_or(false));
                         if !focused_once {
                             ui.data_mut(|d| d.insert_temp(rename_focused(), true));
                             te.request_focus();
+                            // The old name is selected: typing replaces it.
+                            if let Some(mut st) = egui::TextEdit::load_state(ui.ctx(), te.id) {
+                                let n = buf.chars().count();
+                                st.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(n))));
+                                st.store(ui.ctx(), te.id);
+                            }
                         }
                         if te.lost_focus() || (focused_once && !te.has_focus()) {
                             ui.data_mut(|d| d.remove::<bool>(rename_focused()));

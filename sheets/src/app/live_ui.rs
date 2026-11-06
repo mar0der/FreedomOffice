@@ -759,7 +759,7 @@ impl App {
         }
         let active = self.wb.sheets.get(self.wb.active).map(|s| s.uid);
         let edit_sheet = self.edit.as_ref().and_then(|e| self.wb.sheets.get(e.sheet)).map(|s| s.uid);
-        let renaming = self.rename_tab.take().and_then(|(i, buf)| self.wb.sheets.get(i).map(|s| (s.uid, buf)));
+        let renaming = self.rename_tab.take().and_then(|(i, buf)| self.wb.sheets.get(i).map(|s| (s.uid, s.name.clone(), buf)));
         l.applying = true;
         let mut st = l.state.clone();
         let applied = live::apply_ops(&mut self.wb, ops, true, &mut st);
@@ -798,7 +798,12 @@ impl App {
         self.after_sheets_changed(applied.sheets, &applied.features);
         // A tab being renamed stays in its rename box while its sheet exists (others' edits
         // don't interrupt the typing).
-        self.rename_tab = renaming.and_then(|(u, buf)| live::index_of(&self.wb, u).map(|i| (i, buf)));
+        if let Some((u, name, buf)) = renaming {
+            match live::index_of(&self.wb, u) {
+                Some(i) => self.rename_tab = Some((i, buf)),
+                None => self.status = Some(format!("Someone else deleted the sheet '{name}', so it wasn't renamed.")),
+            }
+        }
     }
 
     /// UI state that refers to sheets or feature lists by index is reset when those change.
