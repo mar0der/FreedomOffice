@@ -230,9 +230,22 @@ pub struct App {
     pub live: Option<live_ui::Live>,
     /// Closing the window waits for the live session's last changes and snapshot.
     pub live_closing: Option<live_ui::Closing>,
+    /// Closing found changes the server didn't confirm (or store in its file): the next
+    /// close doesn't wait again, and the recovery copy is kept.
+    pub live_unconfirmed: bool,
 }
 
 const MAX_UNDO: usize = 100;
+
+fn write_recovery(path: &std::path::Path, mut wb: Workbook, name: &str) {
+    if let Some(d) = path.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    wb.path = None;
+    if crate::io::save(&wb, path).is_ok() {
+        let _ = std::fs::write(path.with_extension("name"), name);
+    }
+}
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, path: Option<PathBuf>) -> Self {
@@ -325,6 +338,7 @@ impl App {
             sparks: Default::default(),
             live: None,
             live_closing: None,
+            live_unconfirmed: false,
         };
         if let Some(p) = path {
             app.open_path(p);
@@ -359,18 +373,17 @@ impl App {
         }
         self.last_autosave = now;
         let Some(path) = self.recovery_path.clone() else { return };
-        let mut wb = self.wb.clone();
+        let wb = self.wb.clone();
         // Remember where the original lives inside the recovery copy's document name.
         let name = self.wb.file_name();
-        std::thread::spawn(move || {
-            if let Some(d) = path.parent() {
-                let _ = std::fs::create_dir_all(d);
-            }
-            wb.path = None;
-            if crate::io::save(&wb, &path).is_ok() {
-                let _ = std::fs::write(path.with_extension("name"), name);
-            }
-        });
+        std::thread::spawn(move || write_recovery(&path, wb, &name));
+    }
+
+    /// Writes the recovery copy now (exiting with changes the server may not have).
+    pub fn write_recovery_now(&self) {
+        if let Some(path) = &self.recovery_path {
+            write_recovery(path, self.wb.clone(), &self.wb.file_name());
+        }
     }
 
     pub fn remove_recovery(&self) {
@@ -1101,9 +1114,15 @@ impl App {
 impl eframe::App for App {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // Normally the live session was left before the window closed (live_begin_close).
+        let risky = self.live_exit_risky();
         self.live_exit();
-        // Normal exit (after the save prompt): the recovery copy is no longer needed.
-        self.remove_recovery();
+        if risky {
+            // Changes the server may not have: the recovery copy keeps them.
+            self.write_recovery_now();
+        } else {
+            // Normal exit (after the save prompt): the recovery copy is no longer needed.
+            self.remove_recovery();
+        }
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {

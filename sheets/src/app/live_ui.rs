@@ -36,10 +36,11 @@ const LEAVE_UPLOAD_MIN: Duration = Duration::from_secs(2);
 /// When the app exits without that, the window is already gone: wait only briefly.
 const LEAVE_EXIT_WAIT: Duration = Duration::from_secs(2);
 
-/// The window closes once the server has our last changes and a snapshot.
+/// The window closes once the server has our last changes and its file a snapshot of them.
 pub struct Closing {
     end: Instant,
-    upload: Option<std::thread::JoinHandle<()>>,
+    /// The snapshot was asked for (once).
+    snap_tried: bool,
 }
 
 fn wait_for(h: &std::thread::JoinHandle<()>, end: Instant) {
@@ -502,53 +503,78 @@ impl App {
         }))
     }
 
-    /// Closing the window has to wait for the server (our last changes or a snapshot).
-    pub(super) fn live_close_needs_wait(&self) -> bool {
-        self.live.as_ref().is_some_and(|l| l.editor && l.online && l.server.is_some() && (l.sess.has_pending() || l.sess.seq > l.snap_seq))
+    /// Closing the window has to wait for the server (our last changes, recorded first, or a
+    /// snapshot).
+    pub(super) fn live_close_needs_wait(&mut self) -> bool {
+        self.live_flush();
+        !self.live_unconfirmed && self.live.as_ref().is_some_and(|l| l.editor && l.online && l.server.is_some() && (l.sess.has_pending() || l.sess.seq > l.snap_seq))
+    }
+
+    /// Changes the server hasn't confirmed or the saved file doesn't have yet.
+    fn live_unsettled(&self) -> bool {
+        self.live.as_ref().is_some_and(|l| l.editor && (l.sess.has_pending() || l.sess.seq > l.snap_seq))
+    }
+
+    /// Exiting now could lose changes: keep (and write) the recovery copy.
+    pub(super) fn live_exit_risky(&self) -> bool {
+        self.live_unconfirmed || self.live.as_ref().is_some_and(|l| l.sess.has_pending())
     }
 
     /// The window's close button in a live session: the window stays open (and responsive)
     /// while the server gets our last changes and a snapshot, then closes; `LEAVE_WAIT` at
-    /// most. Asked again meanwhile: close now.
+    /// most, else the save prompt. Asked again meanwhile: close now (the recovery copy is
+    /// kept when something isn't confirmed).
     pub(super) fn live_begin_close(&mut self) {
         if self.live_closing.is_some() {
+            self.live_unconfirmed |= self.live_unsettled();
             self.allow_close = true;
             return;
         }
         self.live_flush();
         self.cancel_edit();
-        self.live_closing = Some(Closing { end: Instant::now() + LEAVE_WAIT, upload: None });
+        self.live_closing = Some(Closing { end: Instant::now() + LEAVE_WAIT, snap_tried: false });
         self.status = Some("Saving to the server...".into());
         self.repaint_soon();
     }
 
-    /// Frame hook while closing (after `poll_live`, which handles the acks).
+    /// Frame hook while closing (after `poll_live`, which handles acks and snapshot results).
     pub(super) fn live_poll_close(&mut self) {
         let Some(c) = &self.live_closing else { return };
-        let now = Instant::now();
-        let late = now >= c.end;
-        if let Some(h) = &c.upload {
-            if h.is_finished() || late {
-                self.allow_close = true;
+        let late = Instant::now() >= c.end;
+        let tried = c.snap_tried;
+        let Some(l) = &self.live else {
+            self.live_closing = None;
+            self.allow_close = true;
+            return;
+        };
+        let (online, pending, unsaved, busy) = (l.online, l.sess.has_pending(), l.sess.seq > l.snap_seq, l.snap_busy);
+        if !self.live_unsettled() {
+            // Everything is on the server and in its file.
+            self.live = None;
+            self.live_closing = None;
+            self.allow_close = true;
+            return;
+        }
+        let failed = !online || late || (tried && !busy && !pending && unsaved);
+        if failed {
+            self.live_closing = None;
+            self.live_unconfirmed = true;
+            self.status = Some(if pending {
+                "The server didn't confirm your last changes. Save a copy on this PC before closing, or they may be lost.".into()
             } else {
-                self.repaint_soon();
-            }
+                "The server didn't store the latest version of the workbook. Your changes are on the server; save a copy on this PC to be sure.".into()
+            });
+            self.pending = Some(super::Pending::Exit);
+            self.dialog = Some(super::dialogs::Dialog::SavePrompt);
             return;
         }
-        let waiting = self.live.as_ref().is_some_and(|l| l.online && l.sess.has_pending());
-        if waiting && !late {
-            self.repaint_soon();
-            return;
-        }
-        match self.live_leave_upload() {
-            Some(h) => {
-                let c = self.live_closing.as_mut().expect("closing");
-                c.end = c.end.max(now + LEAVE_UPLOAD_MIN);
-                c.upload = Some(h);
-                self.repaint_soon();
+        if !pending && unsaved && !busy && !tried {
+            self.live_snapshot();
+            if let Some(c) = &mut self.live_closing {
+                c.snap_tried = true;
             }
-            None => self.allow_close = true,
         }
+        self.repaint_soon();
     }
 
     /// Closing has finished its work (tests).
@@ -560,9 +586,7 @@ impl App {
     /// Last resort when the app exits without `live_begin_close` having finished (closed
     /// twice, logged out): a short wait only, the window is already gone.
     pub(super) fn live_exit(&mut self) {
-        if let Some(Closing { upload: Some(h), .. }) = self.live_closing.take() {
-            wait_for(&h, Instant::now() + LEAVE_EXIT_WAIT);
-        }
+        self.live_closing = None;
         self.live_leave_within(LEAVE_EXIT_WAIT);
     }
 

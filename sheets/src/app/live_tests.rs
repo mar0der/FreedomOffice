@@ -575,6 +575,50 @@ mod e2e {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The connection drops while closing waits for the last change: the window doesn't close
+    /// silently (the save prompt says why), and exiting anyway keeps the recovery copy.
+    #[test]
+    fn closing_with_an_unconfirmed_change_never_loses_it_silently() {
+        let dir = std::env::temp_dir().join(format!("fo-live-unconf-{}", freedomoffice_server::util::new_id()));
+        let cfg = Config { data_dir: dir.join("data"), ..Config::default() };
+        {
+            let st = Store::open(&cfg.db_path(), &cfg.files_dir(), cfg.versions_to_keep).unwrap();
+            st.create_user("ann", "Ann Lee", "", PW, false).unwrap();
+        }
+        let server = freedomoffice_server::spawn(cfg).unwrap();
+        let url = server.url();
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("start.xlsx");
+        crate::io::save(&crate::model::Workbook::new(), &file).unwrap();
+        let mut a = client(&url, "ann", &dir);
+        let id = a.session.upload_new("root", "Unconf.xlsx", &std::fs::read(&file).unwrap(), "fail").unwrap().id;
+        open(&mut a, &id);
+        settle(&mut [&mut a], "joined");
+        let recovery = dir.join("recovery").join("Recovered.xlsx");
+        a.app.recovery_path = Some(recovery.clone());
+
+        type_at(&mut a.app, 0, 0, "unconfirmed");
+        assert!(a.app.live_close_needs_wait());
+        a.app.live_begin_close();
+        // The connection is lost before the acknowledgement is handled.
+        a.app.live_drop_for_test();
+        for _ in 0..20 {
+            a.app.poll_live();
+            a.app.live_poll_close();
+        }
+        assert!(!a.app.live_close_done(), "the window must not close silently");
+        assert!(matches!(a.app.dialog, Some(super::super::dialogs::Dialog::SavePrompt)), "the save prompt is shown");
+        assert!(a.app.status.as_deref().is_some_and(|s| s.contains("didn't confirm")), "{:?}", a.app.status);
+        assert!(!a.app.live_close_needs_wait(), "closing again doesn't wait again");
+
+        // The app exits anyway (Don't Save, or the session ends): the recovery copy stays.
+        eframe::App::on_exit(&mut a.app, None);
+        let wb = crate::io::load(&recovery).expect("recovery copy kept");
+        assert_eq!(crate::numfmt::value_to_text(wb.sheets[0].display_value(0, 0)), "unconfirmed");
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Random edits from two people with random message timing (real engine, real server):
     /// both end with the same workbook, and it matches what a late joiner gets.
     #[test]
