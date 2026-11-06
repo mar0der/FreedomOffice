@@ -390,6 +390,8 @@ mod e2e {
         open(&mut a, &id);
         open(&mut b, &id);
         settle(&mut [&mut a, &mut b], "both joined");
+        // (Ben's Join can come after both are caught up.)
+        pump(&mut [&mut a, &mut b], "Ann sees Ben", |cs| !cs[0].app.live_peer_names().is_empty());
         assert_eq!(a.app.live_peer_names(), ["Ben Ode"]);
         assert!(a.app.cloud.autosave && a.app.cloud_title_suffix().contains("Saved to"));
 
