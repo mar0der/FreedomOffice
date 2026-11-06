@@ -545,8 +545,22 @@ mod e2e {
         std::thread::sleep(Duration::from_millis(1100));
 
         type_at(&mut a.app, 0, 0, "last word");
+        // Ann closes her window: it stays responsive (each frame returns at once) while her
+        // change is acknowledged and the snapshot uploaded, then closes. Ben's app exits.
         let t = Instant::now();
-        a.app.live_leave(true);
+        assert!(a.app.live_close_needs_wait());
+        a.app.live_begin_close();
+        assert!(a.app.modal_open(), "no editing while closing");
+        assert!(a.app.status.as_deref().is_some_and(|s| s.contains("Saving")));
+        while !a.app.live_close_done() {
+            let f = Instant::now();
+            a.app.poll_live();
+            a.app.live_poll_close();
+            assert!(f.elapsed() < Duration::from_millis(500), "a frame while closing blocked");
+            assert!(t.elapsed() < Duration::from_secs(10), "closing doesn't hang");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(a.app.live.is_none());
         b.app.live_leave(true);
         assert!(t.elapsed() < Duration::from_secs(10), "closing doesn't hang");
 

@@ -228,6 +228,8 @@ pub struct App {
     pub sparks: sparkline_ui::SparkUi,
     /// Live co-editing session of a FreedomOffice server document.
     pub live: Option<live_ui::Live>,
+    /// Closing the window waits for the live session's last changes and snapshot.
+    pub live_closing: Option<live_ui::Closing>,
 }
 
 const MAX_UNDO: usize = 100;
@@ -322,6 +324,7 @@ impl App {
             menu: Default::default(),
             sparks: Default::default(),
             live: None,
+            live_closing: None,
         };
         if let Some(p) = path {
             app.open_path(p);
@@ -402,6 +405,7 @@ impl App {
             || self.pivots.dialog.is_some()
             || self.chart.dialog.is_some()
             || self.crash_report.is_some()
+            || self.live_closing.is_some()
     }
 
     /// Expands a range so it fully contains any merged areas it touches.
@@ -858,7 +862,11 @@ impl App {
                 }
             }
             Pending::Exit => {
-                self.allow_close = true;
+                if self.live_close_needs_wait() {
+                    self.live_begin_close();
+                } else {
+                    self.allow_close = true;
+                }
             }
         }
     }
@@ -1092,8 +1100,8 @@ impl App {
 
 impl eframe::App for App {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        // Leaving a live session as its last editor saves a version first.
-        self.live_leave(true);
+        // Normally the live session was left before the window closed (live_begin_close).
+        self.live_exit();
         // Normal exit (after the save prompt): the recovery copy is no longer needed.
         self.remove_recovery();
     }
@@ -1113,7 +1121,11 @@ impl App {
 
         // Close handling with unsaved-changes prompt.
         if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
-            if self.dirty {
+            // Live and connected: every change goes to the server, no save prompt.
+            if self.live_closing.is_some() || self.live_close_needs_wait() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.live_begin_close();
+            } else if self.dirty {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 if self.dialog.is_none() {
                     self.pending = Some(Pending::Exit);
@@ -1132,6 +1144,7 @@ impl App {
         self.poll_print();
         self.poll_cloud(ctx);
         self.poll_live();
+        self.live_poll_close();
         self.autosave(ctx);
 
         if self.backstage.is_some() {

@@ -33,6 +33,20 @@ const PRESENCE_EVERY: Duration = Duration::from_millis(100);
 /// snapshot); the upload always gets `LEAVE_UPLOAD_MIN` of it.
 const LEAVE_WAIT: Duration = Duration::from_secs(6);
 const LEAVE_UPLOAD_MIN: Duration = Duration::from_secs(2);
+/// When the app exits without that, the window is already gone: wait only briefly.
+const LEAVE_EXIT_WAIT: Duration = Duration::from_secs(2);
+
+/// The window closes once the server has our last changes and a snapshot.
+pub struct Closing {
+    end: Instant,
+    upload: Option<std::thread::JoinHandle<()>>,
+}
+
+fn wait_for(h: &std::thread::JoinHandle<()>, end: Instant) {
+    while !h.is_finished() && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
 
 /// The session ends when access became view-only; unsent changes stay in the window.
 const VIEW_ONLY_NOW: &str = "You now have view-only access to this workbook, so your latest changes weren't saved to the server. They are still in this window: use Save As to keep a copy.";
@@ -437,17 +451,22 @@ impl App {
 
     /// Leaves the session. An editor with changes newer than its last snapshot (its own or
     /// others') uploads one, so the server's file holds everything even when everyone leaves
-    /// at once; the server keeps one version per state. `wait` (closing the app): first wait
-    /// for the server to take our last changes, then for the upload, `LEAVE_WAIT` at most.
+    /// at once; the server keeps one version per state. `wait`: block until the server has
+    /// our last changes and the upload is done, `LEAVE_WAIT` at most (tests; closing the
+    /// window goes through `live_begin_close` instead and doesn't block).
     /// Call while `self.wb` is still the session's workbook.
     pub fn live_leave(&mut self, wait: bool) {
+        self.live_leave_within(if wait { LEAVE_WAIT } else { Duration::ZERO });
+    }
+
+    fn live_leave_within(&mut self, wait: Duration) {
         self.live_flush();
-        let end = Instant::now() + LEAVE_WAIT;
-        // Handle what has arrived (acks, others' changes); when closing, wait for our acks.
+        let end = Instant::now() + wait;
+        // Handle what has arrived (acks, others' changes); when waiting, wait for our acks.
         while let Some(c) = self.live.as_ref().and_then(|l| l.conn.as_ref()) {
             let l = self.live.as_ref().expect("live");
             let left = end.saturating_duration_since(Instant::now());
-            let waiting = wait && l.online && l.sess.has_pending() && !left.is_zero();
+            let waiting = l.online && l.sess.has_pending() && !left.is_zero();
             let ev = if waiting {
                 match c.rx.recv_timeout(left.min(Duration::from_millis(50))) {
                     Ok(ev) => Some(ev),
@@ -460,24 +479,97 @@ impl App {
             let Some(ev) = ev else { break };
             self.live_event(ev);
         }
-        let Some(l) = self.live.take() else { return };
-        let unsaved = l.sess.seq > l.snap_seq;
-        if l.editor && l.online && !l.sess.has_pending() && unsaved && !l.local.as_os_str().is_empty() {
-            if let Some(server) = l.server.clone() {
-                let wb = self.wb.clone();
-                let (item, seq, local) = (l.item.clone(), l.sess.seq, l.local.clone());
-                let h = std::thread::spawn(move || {
-                    let _ = upload_snapshot(&server, &item, seq, &wb, &local);
-                });
-                if wait {
-                    let end = end.max(Instant::now() + LEAVE_UPLOAD_MIN);
-                    while !h.is_finished() && Instant::now() < end {
-                        std::thread::sleep(Duration::from_millis(20));
-                    }
-                }
+        if let Some(h) = self.live_leave_upload() {
+            if !wait.is_zero() {
+                wait_for(&h, end.max(Instant::now() + LEAVE_UPLOAD_MIN.min(wait)));
             }
         }
-        drop(l);
+    }
+
+    /// Ends the session; uploads a snapshot in the background when there is something the
+    /// server's file doesn't have yet.
+    fn live_leave_upload(&mut self) -> Option<std::thread::JoinHandle<()>> {
+        let l = self.live.take()?;
+        let unsaved = l.sess.seq > l.snap_seq;
+        if !(l.editor && l.online && !l.sess.has_pending() && unsaved && !l.local.as_os_str().is_empty()) {
+            return None;
+        }
+        let server = l.server.clone()?;
+        let wb = self.wb.clone();
+        let (item, seq, local) = (l.item.clone(), l.sess.seq, l.local.clone());
+        Some(std::thread::spawn(move || {
+            let _ = upload_snapshot(&server, &item, seq, &wb, &local);
+        }))
+    }
+
+    /// Closing the window has to wait for the server (our last changes or a snapshot).
+    pub(super) fn live_close_needs_wait(&self) -> bool {
+        self.live.as_ref().is_some_and(|l| l.editor && l.online && l.server.is_some() && (l.sess.has_pending() || l.sess.seq > l.snap_seq))
+    }
+
+    /// The window's close button in a live session: the window stays open (and responsive)
+    /// while the server gets our last changes and a snapshot, then closes; `LEAVE_WAIT` at
+    /// most. Asked again meanwhile: close now.
+    pub(super) fn live_begin_close(&mut self) {
+        if self.live_closing.is_some() {
+            self.allow_close = true;
+            return;
+        }
+        self.live_flush();
+        self.cancel_edit();
+        self.live_closing = Some(Closing { end: Instant::now() + LEAVE_WAIT, upload: None });
+        self.status = Some("Saving to the server...".into());
+        self.repaint_soon();
+    }
+
+    /// Frame hook while closing (after `poll_live`, which handles the acks).
+    pub(super) fn live_poll_close(&mut self) {
+        let Some(c) = &self.live_closing else { return };
+        let now = Instant::now();
+        let late = now >= c.end;
+        if let Some(h) = &c.upload {
+            if h.is_finished() || late {
+                self.allow_close = true;
+            } else {
+                self.repaint_soon();
+            }
+            return;
+        }
+        let waiting = self.live.as_ref().is_some_and(|l| l.online && l.sess.has_pending());
+        if waiting && !late {
+            self.repaint_soon();
+            return;
+        }
+        match self.live_leave_upload() {
+            Some(h) => {
+                let c = self.live_closing.as_mut().expect("closing");
+                c.end = c.end.max(now + LEAVE_UPLOAD_MIN);
+                c.upload = Some(h);
+                self.repaint_soon();
+            }
+            None => self.allow_close = true,
+        }
+    }
+
+    /// Closing has finished its work (tests).
+    #[cfg(test)]
+    pub(crate) fn live_close_done(&self) -> bool {
+        self.allow_close
+    }
+
+    /// Last resort when the app exits without `live_begin_close` having finished (closed
+    /// twice, logged out): a short wait only, the window is already gone.
+    pub(super) fn live_exit(&mut self) {
+        if let Some(Closing { upload: Some(h), .. }) = self.live_closing.take() {
+            wait_for(&h, Instant::now() + LEAVE_EXIT_WAIT);
+        }
+        self.live_leave_within(LEAVE_EXIT_WAIT);
+    }
+
+    fn repaint_soon(&self) {
+        if let Some(ctx) = &self.ctx {
+            ctx.request_repaint_after(Duration::from_millis(30));
+        }
     }
 
     /// Frame hook: connection events, snapshots, presence, reconnecting.
