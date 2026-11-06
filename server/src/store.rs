@@ -294,6 +294,13 @@ CREATE TABLE IF NOT EXISTS live_state (
     floor INTEGER NOT NULL DEFAULT 0,
     snap_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS live_clients (
+    item_id TEXT NOT NULL REFERENCES items(id),
+    cid TEXT NOT NULL,
+    batch INTEGER NOT NULL,
+    seq INTEGER NOT NULL,
+    PRIMARY KEY (item_id, cid)
+);
 "#;
 
 const USER_COLS: &str = "id, username, display_name, email, is_admin, disabled, created, root_id";
@@ -1040,11 +1047,27 @@ impl Store {
     }
 
     pub fn add_live_op(&self, item_id: &str, op: &LiveOp) -> Res<()> {
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO live_ops (item_id, seq, cid, batch, actor, ops, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![item_id, op.seq as i64, op.cid, op.batch as i64, op.actor, op.ops, op.at],
         )?;
+        tx.execute(
+            "INSERT INTO live_clients (item_id, cid, batch, seq) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(item_id, cid) DO UPDATE SET batch = excluded.batch, seq = excluded.seq",
+            params![item_id, op.cid, op.batch as i64, op.seq as i64],
+        )?;
+        tx.commit()?;
         Ok(())
+    }
+
+    /// Each client's last committed batch: (cid, batch, seq). Kept when the batch is pruned.
+    pub fn live_clients(&self, item_id: &str) -> Res<Vec<(String, u64, u64)>> {
+        let mut st = self.conn.prepare("SELECT cid, batch, seq FROM live_clients WHERE item_id = ?1")?;
+        let v = st
+            .query_map([item_id], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64, r.get::<_, i64>(2)? as u64)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(v)
     }
 
     /// Stores a snapshot uploaded by a live client as the next version: it contains every

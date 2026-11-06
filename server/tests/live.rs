@@ -434,8 +434,38 @@ fn reconnecting_after_a_plain_save_reloads() {
     assert_eq!(s.put(&a, &id, b"completely different workbook").status, 200);
     // The sleeping client reconnects the way the app does: since only, no v.
     let mut ws = s.ws(Some(&a), "since=1&cid=client-a", &id).unwrap();
-    match ws.recv() {
-        ServerMsg::Reload => {}
-        m => panic!("stale client resumed on a replaced workbook: {m:?}"),
+    loop {
+        match ws.recv() {
+            // (Its last batch was committed.)
+            ServerMsg::Ack { id: 1, seq: 1, .. } => {}
+            ServerMsg::Reload => break,
+            m => panic!("stale client resumed on a replaced workbook: {m:?}"),
+        }
     }
+}
+
+#[test]
+fn reload_tells_a_client_its_last_batch_was_committed() {
+    let s = start();
+    let a = s.login("alice");
+    let id = s.new_file(&a, "Lost.xlsx");
+    let (mut wa, _) = s.join(&a, &id, "client-a");
+    wa.send(&ClientMsg::Hello { sheets: vec![1] });
+    wa.send(&ClientMsg::Ops { base: 0, id: 7, ops: vec![text(0, 0, "a")] });
+    // Its ack is lost: the client never reads it.
+    let (mut wb, _) = s.join(&a, &id, "client-b");
+    for i in 0..3 {
+        wb.send(&ClientMsg::Ops { base: i + 1, id: i + 1, ops: vec![text(5, 0, "b")] });
+        while !matches!(wb.recv_data(), ServerMsg::Ack { .. }) {}
+    }
+    // Two snapshots prune past the client's base; then everyone leaves (the session is
+    // loaded from the database again).
+    for seq in [2, 4] {
+        assert_eq!(s.send("POST", &format!("/api/items/{id}/live/snapshot?seq={seq}"), Some(&a), &[("X-Live-Sheets", "1:0")], Some(b"snap".to_vec())).status, 200);
+    }
+    drop((wa, wb));
+    std::thread::sleep(Duration::from_millis(300));
+    let mut ws = s.ws(Some(&a), "since=0&cid=client-a", &id).unwrap();
+    assert_eq!(ws.recv(), ServerMsg::Ack { id: 7, seq: 1, extra: Vec::new() });
+    assert_eq!(ws.recv(), ServerMsg::Reload);
 }

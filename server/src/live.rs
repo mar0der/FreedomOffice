@@ -163,6 +163,9 @@ impl Hub {
             }
             log.entries.push(cosync::server::Entry { seq: o.seq, cid: o.cid, id: o.batch, by: o.actor, ops: parsed });
         }
+        for (cid, batch, seq) in s.live_clients(&item.id).map_err(|e| e.to_string())? {
+            log.last.insert(cid, (batch, seq));
+        }
         let ids = parse_sheets(&base.sheets);
         if !ids.is_empty() {
             log.set_sheets(ids);
@@ -291,7 +294,7 @@ pub async fn run(store: Arc<Mutex<Store>>, hub: Arc<Hub>, socket: WebSocket, j: 
     let item_id = j.item.id.clone();
     let setup = {
         let (store, hub, tx) = (store.clone(), hub.clone(), tx.clone());
-        let (item_id, who, role, since, version) = (j.item.id.clone(), j.who.clone(), j.role, j.since, j.version);
+        let (item_id, who, role, since, version, cid) = (j.item.id.clone(), j.who.clone(), j.role, j.since, j.version, j.cid.clone());
         tokio::task::spawn_blocking(move || -> Result<Arc<Mutex<Doc>>, String> {
             let (doc, current) = {
                 let s = lock(&store);
@@ -304,7 +307,12 @@ pub async fn run(store: Arc<Mutex<Store>>, hub: Arc<Hub>, socket: WebSocket, j: 
             let mut peer = peer_of(&who, role, conn_id);
             let replay = if version.is_none_or(|v| v == current) { d.log.since(since).map(<[_]>::to_vec) } else { None };
             let Some(replay) = replay else {
-                // The client's copy is older than what the session follows: it must reload.
+                // The client's copy is older than what the session follows: it must reload. If its
+                // last batch was committed (and its ack lost), say so first, or the reload would
+                // send it again as a new batch.
+                if let Some((id, seq)) = d.log.last_commit(&cid) {
+                    let _ = tx.send(Out::Text(json(&ServerMsg::Ack { id, seq, extra: Vec::new() })));
+                }
                 let _ = tx.send(Out::Text(json(&ServerMsg::Reload)));
                 let _ = tx.send(Out::Close(1000, "reload".into()));
                 return Ok(doc.clone());
@@ -454,7 +462,7 @@ pub async fn run(store: Arc<Mutex<Store>>, hub: Arc<Hub>, socket: WebSocket, j: 
 #[allow(clippy::too_many_arguments)]
 fn commit(store: &Mutex<Store>, doc: &Mutex<Doc>, item: &str, conn: u64, base: u64, cid: &str, id: u64, actor: &str, ops: Vec<cosync::Op>) -> bool {
     let mut d = lock(doc);
-    let sheets_before = d.log.sheets.clone();
+    let (sheets_before, last_before) = (d.log.sheets.clone(), d.log.last_commit(cid));
     match d.log.commit(base, cid, id, actor, ops) {
         Ok(Commit::New { seq, ops, extra }) => {
             let rec = LiveOp { seq, cid: cid.to_string(), batch: id, actor: actor.to_string(), ops: serde_json::to_string(&ops).unwrap_or_default(), at: now() };
@@ -462,6 +470,10 @@ fn commit(store: &Mutex<Store>, doc: &Mutex<Doc>, item: &str, conn: u64, base: u
                 tracing::error!("live: couldn't store a batch for item {item}: {e}");
                 d.log.entries.pop();
                 d.log.sheets = sheets_before;
+                match last_before {
+                    Some(l) => d.log.last.insert(cid.to_string(), l),
+                    None => d.log.last.remove(cid),
+                };
                 d.close(conn, 1011, "The server couldn't save your change.");
                 return false;
             }

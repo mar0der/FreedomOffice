@@ -809,3 +809,32 @@ fn random_concurrent_edits_converge() {
         run_sim(seed, 5, 600);
     }
 }
+
+/// A batch committed whose ack was lost, followed by pruning past the client's base: the
+/// server tells the client (an ack of its last committed batch before Reload), so the
+/// reload doesn't send it again as a new batch.
+#[test]
+fn reload_after_a_lost_ack_does_not_recommit() {
+    let mut log = Log::new(0);
+    let mut a = Session::new("a", 0);
+    let b = a.local(vec![rows(1, 0, 1)]).unwrap();
+    assert!(matches!(log.commit(b.base, "a", b.id, "u", b.ops.clone()).unwrap(), Commit::New { .. }));
+    a.offline(); // ack lost
+    a.local(vec![text(1, 5, 0, "later")]);
+    // Others keep editing; two snapshots prune past a's base.
+    for i in 0..3 {
+        log.commit(log.head(), "o", i + 1, "u", vec![text(1, 20, 0, "o")]).unwrap();
+    }
+    log.prune_to(2);
+    assert!(log.since(a.seq).is_none(), "the server answers Reload");
+    // Even resent as it was, the pruned batch is recognised.
+    assert_eq!(log.commit(b.base, "a", b.id, "u", b.ops.clone()), Ok(Commit::Duplicate { seq: 1 }));
+    // What the server sends before Reload.
+    let (id, seq) = log.last_commit("a").unwrap();
+    a.ack(id, seq, Vec::new());
+    let reapply = a.rebase_on_reload(log.head());
+    assert_eq!(reapply, vec![text(1, 5, 0, "later")], "only what wasn't committed is re-applied");
+    let b2 = a.resume().unwrap();
+    assert!(!b2.ops.iter().any(|o| matches!(o, Op::Rows { .. })), "re-sent: {:?}", b2.ops);
+    assert!(matches!(log.commit(b2.base, "a", b2.id, "u", b2.ops).unwrap(), Commit::New { seq: 5, .. }));
+}
