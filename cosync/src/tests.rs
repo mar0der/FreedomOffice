@@ -810,6 +810,32 @@ fn random_concurrent_edits_converge() {
     }
 }
 
+/// Undo steps (newest last) hold others' changes carried down through the newer steps: an
+/// older step is in the state left by undoing the ones above it (as the app does).
+#[test]
+fn undo_steps_below_a_later_own_insert_follow_remote_changes() {
+    let mut doc = base();
+    doc.apply(&text(1, 4, 3, "x"));
+    let inv1 = vec![Op::Cell { s: 1, r: 4, c: 3, v: None, adj: vec![] }];
+    doc.apply(&rows(1, 0, 3));
+    let inv2 = vec![rows(1, 0, -3)];
+    let mut stack = vec![inv1, inv2];
+    // Someone inserts a row at index 6 (above "x", now at index 7).
+    let remote = vec![rows(1, 6, 1)];
+    doc.apply_all(&remote);
+    let mut ops = remote;
+    for inv in stack.iter_mut().rev() {
+        let (i, below) = transform(inv, &ops, true);
+        *inv = i;
+        ops = below;
+    }
+    for inv in stack.iter().rev() {
+        doc.apply_all(inv);
+    }
+    let left: Vec<_> = doc.sheets[0].cells.iter().filter(|(_, v)| v.as_str() == "x").collect();
+    assert!(left.is_empty(), "undo cleared the wrong cell; x still at {left:?}");
+}
+
 /// A batch committed whose ack was lost, followed by pruning past the client's base: the
 /// server tells the client (an ack of its last committed batch before Reload), so the
 /// reload doesn't send it again as a new batch.

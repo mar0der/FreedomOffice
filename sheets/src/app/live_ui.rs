@@ -36,8 +36,9 @@ pub struct Seen {
     pub moved: Instant,
 }
 
-/// One undoable local change: the operations that reverse it (transformed over everything
-/// applied since), and whether someone else changed the same targets since.
+/// One undoable local change: the operations that reverse it (in the state left by undoing
+/// the newer steps, others' changes included), and whether someone else changed the same
+/// targets since.
 struct Undo {
     inverse: Vec<Op>,
     blocked: bool,
@@ -719,11 +720,18 @@ impl App {
     /// Applies others' changes (already transformed over ours) to the workbook.
     fn live_apply_remote(&mut self, ops: &[Op]) {
         let Some(l) = &mut self.live else { return };
-        for e in l.undo.iter_mut().chain(l.redo.iter_mut()) {
-            if cosync::touches(&e.inverse, ops) {
-                e.blocked = true;
+        // Only the newest step of each stack is in the current state; each older one is in the
+        // state left by undoing the steps above it. Carry the change down through them.
+        for stack in [&mut l.undo, &mut l.redo] {
+            let mut ops = ops.to_vec();
+            for e in stack.iter_mut().rev() {
+                if cosync::touches(&e.inverse, &ops) {
+                    e.blocked = true;
+                }
+                let (inverse, below) = cosync::transform(&e.inverse, &ops, true);
+                e.inverse = inverse;
+                ops = below;
             }
-            e.inverse = cosync::transform(&e.inverse, ops, true).0;
         }
         let active = self.wb.sheets.get(self.wb.active).map(|s| s.uid);
         let edit_sheet = self.edit.as_ref().and_then(|e| self.wb.sheets.get(e.sheet)).map(|s| s.uid);
@@ -1149,6 +1157,12 @@ impl App {
     pub(crate) fn live_errors(&mut self) -> Vec<String> {
         self.live_flush();
         self.live.as_mut().map(|l| std::mem::take(&mut l.verify_errors)).unwrap_or_default()
+    }
+
+    /// Someone else's change arrives (already transformed over ours).
+    pub(crate) fn live_remote_for_test(&mut self, ops: &[Op]) {
+        self.live_flush();
+        self.live_apply_remote(ops);
     }
 
     pub(crate) fn live_pending_ops(&self) -> Vec<Op> {

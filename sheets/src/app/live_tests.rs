@@ -192,6 +192,31 @@ fn undo_restores_deleted_rows_and_sheets() {
     let _ = egui::Context::default();
 }
 
+/// Undo steps recorded before a later own insert are in the coordinates from before it:
+/// others' changes must reach them through the steps above.
+#[test]
+fn undo_after_own_insert_and_remote_insert_clears_the_right_cell() {
+    let (_ctx, mut app) = super::data_ui::sample_app();
+    app.live_for_test();
+    app.switch_sheet(0);
+    let before = app.wb.clone();
+    let at = |wb: &crate::model::Workbook, r: u32, c: u32| crate::numfmt::value_to_text(wb.sheets[0].display_value(r, c));
+    type_at(&mut app, 4, 3, "x");
+    app.select_range(rg("1:3"));
+    app.insert_rows();
+    assert_eq!(at(&app.wb, 7, 3), "x");
+    // Someone inserts a row above "x" (row 7 now, row 4 before our insert).
+    let s = app.wb.sheets[0].uid;
+    app.live_remote_for_test(&[cosync::Op::Rows { s, at: 6, n: 1 }]);
+    assert_eq!(at(&app.wb, 8, 3), "x");
+    app.undo();
+    app.undo();
+    check(&mut app, "undo");
+    assert_eq!(at(&app.wb, 5, 3), at(&before, 4, 3), "the cell typed in gets its old value back");
+    assert_eq!(at(&app.wb, 4, 3), at(&before, 3, 3), "the cell above is left alone");
+    assert_eq!(at(&app.wb, 3, 3), "", "the row someone else inserted stays");
+}
+
 #[test]
 fn view_only_participants_change_nothing() {
     let (_ctx, mut app) = super::data_ui::sample_app();
