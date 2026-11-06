@@ -135,6 +135,8 @@ pub use find_ui::FindState;
 pub use review_ui::Change;
 
 pub struct App {
+    /// A crash from the previous run, offered for reporting (crash.rs).
+    pub crash_report: Option<crate::crash::Report>,
     pub wb: Workbook,
     pub fonts: FontManager,
     undo: Vec<UndoEntry>,
@@ -234,7 +236,9 @@ impl App {
         let hwnd = window_handle(cc);
         #[cfg(not(windows))]
         let hwnd = 0;
-        Self::with_context(&cc.egui_ctx, hwnd, path)
+        let mut app = Self::with_context(&cc.egui_ctx, hwnd, path);
+        app.crash_report = crate::crash::pending_report();
+        app
     }
 
     /// Builds the app on an egui context (also used headless by tests).
@@ -245,6 +249,7 @@ impl App {
         #[cfg(windows)]
         set_caption_color(hwnd);
         let mut app = App {
+            crash_report: None,
             wb: Workbook::new(),
             fonts,
             undo: Vec::new(),
@@ -1144,5 +1149,49 @@ impl eframe::App for App {
         self.protect_dialog_ui(ctx);
         self.pivot_dialogs(ctx);
         self.cloud_dialogs_ui(ctx);
+        self.crash_report_ui(ctx);
+        if std::env::var_os("FREEDOMSHEETS_TEST_PANIC").is_some() && self.generation > 30 {
+            panic!("FREEDOMSHEETS_TEST_PANIC set: test crash");
+        }
+    }
+}
+
+impl App {
+    /// "FreedomSheets closed unexpectedly" prompt after a crash in the previous run.
+    fn crash_report_ui(&mut self, ctx: &egui::Context) {
+        let Some(report) = self.crash_report.clone() else { return };
+        let mut close = false;
+        egui::Window::new("FreedomSheets closed unexpectedly")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, -40.0])
+            .show(ctx, |ui| {
+                ui.set_max_width(460.0);
+                ui.label(format!("The last session ended with a crash ({}).", report.summary));
+                ui.label("You can report it on GitHub. The issue opens in your browser with the details below filled in; you can review and edit it before submitting. Nothing is sent automatically.");
+                ui.add_space(4.0);
+                egui::CollapsingHeader::new("Details").show(ui, |ui| {
+                    egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                        ui.add(egui::Label::new(egui::RichText::new(&report.body).monospace().size(11.0)).wrap());
+                    });
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Report on GitHub…").clicked() {
+                        crate::cloud::open_in_browser(&report.issue_url());
+                        close = true;
+                    }
+                    if ui.button("Copy details").clicked() {
+                        ui.ctx().copy_text(report.body.clone());
+                    }
+                    if ui.button("Not now").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if close {
+            crate::crash::dismiss(&report);
+            self.crash_report = None;
+        }
     }
 }

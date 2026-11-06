@@ -6,6 +6,7 @@ mod app;
 mod chart;
 mod cloud;
 mod condfmt;
+mod crash;
 mod datatools;
 mod filter;
 mod formula;
@@ -29,6 +30,7 @@ mod whatif;
 use eframe::egui;
 
 fn main() -> eframe::Result<()> {
+    crash::install_panic_hook();
     // Windows links a 256 MB main-thread stack (build.rs). Elsewhere the main thread keeps
     // the OS default (8 MB on Linux), so run the UI on a thread with the same big stack.
     #[cfg(target_os = "linux")]
