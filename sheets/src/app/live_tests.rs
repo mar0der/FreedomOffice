@@ -495,18 +495,66 @@ mod e2e {
         eprintln!("(repaired, concurrent episodes): ann {:?}, ben {:?}", a.app.live_repaired(), b.app.live_repaired());
         assert!(d.app.wb.sheets.iter().zip(&a.app.wb.sheets).all(|(x, y)| x.uid == y.uid), "sheet ids survive the snapshot");
 
-        // Everyone leaves; the last editor saves a version, and plain saves work again.
+        // Everyone leaves; leaving saves a version (one for the same state), and plain saves
+        // work again.
         drop(c);
         drop(d);
+        let before = b.session.versions(&id).unwrap().len();
         a.app.live_leave(true);
         pump(&mut [&mut b], "the others left", |cs| cs[0].app.live_peer_names().is_empty());
-        let before = b.session.versions(&id).unwrap().len();
         b.app.live_leave(true);
-        assert!(b.session.versions(&id).unwrap().len() > before, "the last editor leaving stores a version");
+        assert_eq!(b.session.versions(&id).unwrap().len(), before + 1, "leaving stores one version of the latest state");
         std::thread::sleep(Duration::from_millis(300));
         let item = b.session.item(&id).unwrap();
         assert!(b.session.upload(&id, Some(&item.etag), b"plain save").is_ok());
         let _ = (Target::MyFiles, &a.ctx, &b.ctx);
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Everyone closes at once, right after typing (nobody has seen the others leave, the last
+    /// change isn't acknowledged yet): the server's file still gets the latest content and
+    /// date, for share links and clients that aren't live.
+    #[test]
+    fn closing_everything_at_once_leaves_the_file_up_to_date() {
+        let dir = std::env::temp_dir().join(format!("fo-live-close-{}", freedomoffice_server::util::new_id()));
+        let cfg = Config { data_dir: dir.join("data"), ..Config::default() };
+        {
+            let st = Store::open(&cfg.db_path(), &cfg.files_dir(), cfg.versions_to_keep).unwrap();
+            st.create_user("ann", "Ann Lee", "", PW, false).unwrap();
+            st.create_user("ben", "Ben Ode", "", PW, false).unwrap();
+        }
+        let server = freedomoffice_server::spawn(cfg).unwrap();
+        let url = server.url();
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("start.xlsx");
+        crate::io::save(&crate::model::Workbook::new(), &file).unwrap();
+        let mut a = client(&url, "ann", &dir);
+        let id = a.session.upload_new("root", "Close.xlsx", &std::fs::read(&file).unwrap(), "fail").unwrap().id;
+        a.session.grant(&id, "ben", true).unwrap();
+        let mut b = client(&url, "ben", &dir);
+        open(&mut a, &id);
+        open(&mut b, &id);
+        settle(&mut [&mut a, &mut b], "joined");
+        type_at(&mut b.app, 1, 0, "ben's");
+        settle(&mut [&mut a, &mut b], "ben typed");
+        let before = a.session.item(&id).unwrap();
+        let versions = a.session.versions(&id).unwrap().len();
+        std::thread::sleep(Duration::from_millis(1100));
+
+        type_at(&mut a.app, 0, 0, "last word");
+        let t = Instant::now();
+        a.app.live_leave(true);
+        b.app.live_leave(true);
+        assert!(t.elapsed() < Duration::from_secs(10), "closing doesn't hang");
+
+        let after = a.session.item(&id).unwrap();
+        assert_ne!(after.modified, before.modified, "the file's date moved");
+        assert_eq!(a.session.versions(&id).unwrap().len(), versions + 1, "one version");
+        let doc = a.session.open(&after, &dir.join("check")).unwrap();
+        let wb = crate::io::load(&doc.local).unwrap();
+        let cell = |r, c| crate::numfmt::value_to_text(wb.sheets[0].display_value(r, c));
+        assert_eq!((cell(0, 0), cell(1, 0)), ("last word".to_string(), "ben's".to_string()), "the stored file has every change");
         drop(server);
         let _ = std::fs::remove_dir_all(&dir);
     }

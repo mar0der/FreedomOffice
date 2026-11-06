@@ -29,6 +29,10 @@ pub fn peer_color(slot: u8) -> Color32 {
 /// How long a name flag stays up after someone moves.
 const FLAG_SECS: f32 = 3.0;
 const PRESENCE_EVERY: Duration = Duration::from_millis(100);
+/// Closing the window waits at most this long for the server (our last changes, then the
+/// snapshot); the upload always gets `LEAVE_UPLOAD_MIN` of it.
+const LEAVE_WAIT: Duration = Duration::from_secs(6);
+const LEAVE_UPLOAD_MIN: Duration = Duration::from_secs(2);
 
 /// The session ends when access became view-only; unsent changes stay in the window.
 const VIEW_ONLY_NOW: &str = "You now have view-only access to this workbook, so your latest changes weren't saved to the server. They are still in this window: use Save As to keep a copy.";
@@ -166,11 +170,6 @@ impl Live {
                 c.send(ClientMsg::Ops { base: b.base, id: b.id, ops: b.ops });
             }
         }
-    }
-
-    /// Others who can edit (for "last editor leaving").
-    fn other_editors(&self) -> usize {
-        self.peers.values().filter(|p| p.peer.editor).count()
     }
 }
 
@@ -436,14 +435,34 @@ impl App {
         l.retry_at = None;
     }
 
-    /// Leaves the session. The last editor uploads a snapshot so the server's version holds
-    /// everything (`wait`: block until it is stored, for closing the app).
+    /// Leaves the session. An editor with changes newer than its last snapshot (its own or
+    /// others') uploads one, so the server's file holds everything even when everyone leaves
+    /// at once; the server keeps one version per state. `wait` (closing the app): first wait
+    /// for the server to take our last changes, then for the upload, `LEAVE_WAIT` at most.
     /// Call while `self.wb` is still the session's workbook.
     pub fn live_leave(&mut self, wait: bool) {
         self.live_flush();
+        let end = Instant::now() + LEAVE_WAIT;
+        // Handle what has arrived (acks, others' changes); when closing, wait for our acks.
+        while let Some(c) = self.live.as_ref().and_then(|l| l.conn.as_ref()) {
+            let l = self.live.as_ref().expect("live");
+            let left = end.saturating_duration_since(Instant::now());
+            let waiting = wait && l.online && l.sess.has_pending() && !left.is_zero();
+            let ev = if waiting {
+                match c.rx.recv_timeout(left.min(Duration::from_millis(50))) {
+                    Ok(ev) => Some(ev),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
+                }
+            } else {
+                c.rx.try_recv().ok()
+            };
+            let Some(ev) = ev else { break };
+            self.live_event(ev);
+        }
         let Some(l) = self.live.take() else { return };
         let unsaved = l.sess.seq > l.snap_seq;
-        if l.editor && l.online && !l.sess.has_pending() && unsaved && l.other_editors() == 0 && !l.local.as_os_str().is_empty() {
+        if l.editor && l.online && !l.sess.has_pending() && unsaved && !l.local.as_os_str().is_empty() {
             if let Some(server) = l.server.clone() {
                 let wb = self.wb.clone();
                 let (item, seq, local) = (l.item.clone(), l.sess.seq, l.local.clone());
@@ -451,7 +470,7 @@ impl App {
                     let _ = upload_snapshot(&server, &item, seq, &wb, &local);
                 });
                 if wait {
-                    let end = Instant::now() + Duration::from_secs(15);
+                    let end = end.max(Instant::now() + LEAVE_UPLOAD_MIN);
                     while !h.is_finished() && Instant::now() < end {
                         std::thread::sleep(Duration::from_millis(20));
                     }
