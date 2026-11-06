@@ -550,8 +550,8 @@ fn path_safety_and_limits() {
     // JSON bodies are small.
     let huge = json!({ "parent": root, "name": "x".repeat(100 * 1024) });
     assert_eq!(s.json("POST", "/api/folders", Some(&a), huge).status, 413);
-    // Reserved live co-editing route.
-    assert_eq!(s.get(&format!("/api/items/{id}/live"), &a).status, 501);
+    // The live co-editing route needs a WebSocket upgrade.
+    assert_eq!(s.get(&format!("/api/items/{id}/live"), &a).status, 426);
 }
 
 #[test]
