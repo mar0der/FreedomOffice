@@ -416,3 +416,26 @@ fn deleting_every_sheet_concurrently_leaves_a_rescue_sheet() {
         }
     }
 }
+
+#[test]
+fn reconnecting_after_a_plain_save_reloads() {
+    let s = start();
+    let a = s.login("alice");
+    let id = s.new_file(&a, "Stale.xlsx");
+    let (mut wa, _) = s.join(&a, &id, "client-a");
+    wa.send(&ClientMsg::Hello { sheets: vec![1] });
+    wa.send(&ClientMsg::Ops { base: 0, id: 1, ops: vec![text(0, 0, "x")] });
+    assert!(matches!(wa.recv_data(), ServerMsg::Ack { seq: 1, .. }));
+    // The client snapshots everything, then its connection drops (laptop sleeps).
+    assert_eq!(s.send("POST", &format!("/api/items/{id}/live/snapshot?seq=1"), Some(&a), &[("X-Live-Sheets", "1:0")], Some(b"snap".to_vec())).status, 200);
+    drop(wa);
+    std::thread::sleep(Duration::from_millis(300));
+    // Someone replaces the content while nobody is connected (allowed: nothing unsaved).
+    assert_eq!(s.put(&a, &id, b"completely different workbook").status, 200);
+    // The sleeping client reconnects the way the app does: since only, no v.
+    let mut ws = s.ws(Some(&a), "since=1&cid=client-a", &id).unwrap();
+    match ws.recv() {
+        ServerMsg::Reload => {}
+        m => panic!("stale client resumed on a replaced workbook: {m:?}"),
+    }
+}

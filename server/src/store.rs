@@ -999,12 +999,14 @@ impl Store {
 
     /// What a live session starts from: the current version is at `seq` (its sheet ids in
     /// `sheets`), operations after `floor` are kept. A version saved outside a live session
-    /// (or the first live session) starts at the newest sequence number.
+    /// (or the first live session) starts at the newest sequence number; when it replaced
+    /// content a session followed, one past it, so a client still on the old content (which
+    /// reconnects with `since` alone) is below the floor and told to reload.
     pub fn live_base(&self, item: &Item) -> Res<LiveState> {
         match self.live_state(&item.id)? {
             Some(s) if s.version == item.version => Ok(s),
-            _ => {
-                let head = self.live_head(&item.id)?;
+            prev => {
+                let head = self.live_head(&item.id)? + u64::from(prev.is_some());
                 let s = LiveState { version: item.version, seq: head, sheets: String::new(), floor: head, snap_at: now() };
                 self.conn.execute(
                     "INSERT INTO live_state (item_id, version, seq, sheets, floor, snap_at) VALUES (?1, ?2, ?3, '', ?3, ?4)
