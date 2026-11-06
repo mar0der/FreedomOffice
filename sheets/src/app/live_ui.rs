@@ -76,6 +76,9 @@ pub struct Live {
     /// are in the batch in flight: to rebuild the server's state when concurrency starts.
     units: VecDeque<Vec<Op>>,
     sent_units: usize,
+    batch_id: u64,
+    /// The local working copy (snapshots are written there first).
+    local: std::path::PathBuf,
     /// The server's state while local changes are pending and others' arrive; adopted when
     /// everything is acknowledged (so every participant ends with exactly the same workbook).
     confirmed: Option<Workbook>,
@@ -126,6 +129,8 @@ impl Live {
             undoing: None,
             units: VecDeque::new(),
             sent_units: 0,
+            batch_id: 0,
+            local: std::path::PathBuf::new(),
             confirmed: None,
             confirmed_state: ApplyState::default(),
             last_presence: None,
@@ -148,7 +153,11 @@ impl Live {
 
     fn send_batch(&mut self, b: Option<Batch>) {
         if let Some(b) = b {
-            self.sent_units = self.units.len();
+            // A new batch takes everything buffered; a resent one covers what it covered.
+            if b.id != self.batch_id {
+                self.batch_id = b.id;
+                self.sent_units = self.units.len();
+            }
             if let Some(c) = &self.conn {
                 c.send(ClientMsg::Ops { base: b.base, id: b.id, ops: b.ops });
             }
@@ -391,7 +400,8 @@ impl App {
     /// After a document was opened (or a new one started): leave the old session, join the new
     /// document's if it is on a FreedomOffice server that supports live co-editing.
     pub(super) fn live_reset(&mut self) {
-        self.live_leave(false);
+        // (The previous session was left before its workbook was replaced.)
+        self.live = None;
         let Some(doc) = self.cloud.doc.clone() else { return };
         let (Provider::FreedomServer(url), Some(base)) = (&doc.provider, &doc.live) else { return };
         let server = self.cloud.servers.iter().find(|e| e.session.account.url == *url).map(|e| e.session.clone());
@@ -405,6 +415,7 @@ impl App {
         live::sort_sheets(&mut self.wb);
         let mut l = Live::new(doc.item_id.clone(), url.clone(), Some(server), base.seq);
         l.sess.online = false;
+        l.local = doc.local.clone();
         self.live = Some(l);
         self.cloud.autosave = true;
         self.live_connect(Some(base.version));
@@ -423,16 +434,17 @@ impl App {
 
     /// Leaves the session. The last editor uploads a snapshot so the server's version holds
     /// everything (`wait`: block until it is stored, for closing the app).
+    /// Call while `self.wb` is still the session's workbook.
     pub fn live_leave(&mut self, wait: bool) {
         self.live_flush();
         let Some(l) = self.live.take() else { return };
         let unsaved = l.sess.seq > l.snap_seq;
-        if l.editor && l.online && !l.sess.has_pending() && unsaved && l.other_editors() == 0 {
-            if let (Some(server), Some(doc)) = (l.server.clone(), self.cloud.doc.clone()) {
+        if l.editor && l.online && !l.sess.has_pending() && unsaved && l.other_editors() == 0 && !l.local.as_os_str().is_empty() {
+            if let Some(server) = l.server.clone() {
                 let wb = self.wb.clone();
-                let (item, seq) = (l.item.clone(), l.sess.seq);
+                let (item, seq, local) = (l.item.clone(), l.sess.seq, l.local.clone());
                 let h = std::thread::spawn(move || {
-                    let _ = upload_snapshot(&server, &item, seq, &wb, &doc.local);
+                    let _ = upload_snapshot(&server, &item, seq, &wb, &local);
                 });
                 if wait {
                     let end = Instant::now() + Duration::from_secs(15);
@@ -861,7 +873,8 @@ impl App {
     /// Uploads the workbook (which holds everything up to our sequence number) as a version.
     pub fn live_snapshot(&mut self) {
         let Some(l) = &mut self.live else { return };
-        let (Some(server), Some(doc)) = (l.server.clone(), self.cloud.doc.clone()) else { return };
+        let Some(server) = l.server.clone() else { return };
+        let local = l.local.clone();
         if l.snap_busy || l.sess.has_pending() || !l.online || !l.editor {
             l.snap_wanted = true;
             return;
@@ -872,7 +885,7 @@ impl App {
         let wb = self.wb.clone();
         let ctx = self.ctx.clone();
         std::thread::spawn(move || {
-            let result = upload_snapshot(&server, &item, seq, &wb, &doc.local);
+            let result = upload_snapshot(&server, &item, seq, &wb, &local);
             let _ = tx.send(Job::Snapshot(seq, result));
             if let Some(c) = ctx {
                 c.request_repaint();

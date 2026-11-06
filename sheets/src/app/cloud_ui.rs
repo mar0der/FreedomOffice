@@ -754,6 +754,16 @@ impl App {
         if self.live.is_some() {
             // Live: every change is already on the server; Save stores a version now.
             self.live_flush();
+            if self.live.as_ref().is_some_and(|l| l.sess.has_pending() && !l.online) {
+                // Offline: keep the local copy; the changes are sent when the connection is back.
+                let saved = crate::io::save(&self.wb, &doc.local).is_ok();
+                self.status = Some(format!(
+                    "Not connected to {}. Your latest changes are {}kept on this PC and are sent when the connection is back.",
+                    cloud::place_name(&doc.provider),
+                    if saved { "" } else { "not " }
+                ));
+                return saved;
+            }
             self.live_snapshot();
             if let Some(t) = self.live_title() {
                 self.status = Some(t.trim_start_matches(" - ").to_string());

@@ -110,7 +110,6 @@ sheet_fields!(PROPS, prop_get, prop_same, prop_set;
     "tab_color" => tab_color,
     "hidden" => hidden,
     "freeze" => freeze,
-    "gridlines" => gridlines,
     "protection" => protection,
 );
 
@@ -572,8 +571,10 @@ pub fn join_workbook(file: Workbook, state: Option<&[u8]>) -> Workbook {
     let mut wb = from_state(&ops);
     for (i, sh) in wb.sheets.iter_mut().enumerate() {
         if let Some(f) = file.sheets.get(i) {
+            // Per-person view settings, like Excel's co-authoring.
             sh.view = f.view.clone();
             sh.zoom = f.zoom;
+            sh.gridlines = f.gridlines;
         }
     }
     wb.active = file.active.min(wb.sheets.len() - 1);

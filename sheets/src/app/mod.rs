@@ -824,6 +824,7 @@ impl App {
     pub fn run_pending(&mut self, p: Pending) {
         match p {
             Pending::New => {
+                self.live_leave(false);
                 self.wb = Workbook::new();
                 self.reset_doc();
             }
@@ -869,6 +870,8 @@ impl App {
     pub fn open_path(&mut self, p: PathBuf) {
         match crate::io::load(&p) {
             Ok(mut wb) => {
+                // Leave a live session while its workbook is still here.
+                self.live_leave(false);
                 wb.path = Some(p.clone());
                 if wb.sheets.is_empty() {
                     wb.sheets.push(Sheet::new("Sheet1"));
