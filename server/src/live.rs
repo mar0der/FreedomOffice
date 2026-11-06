@@ -21,8 +21,14 @@ use crate::util::{self, now};
 
 /// Ask for a snapshot after this many committed batches...
 const SNAPSHOT_OPS: usize = 200;
-/// ...or when the oldest unsnapshotted batch is this old.
+/// ...or when the oldest unsnapshotted batch is this old...
 const SNAPSHOT_AGE: Duration = Duration::from_secs(120);
+/// ...or when nothing was committed for this long (editing paused: the saved file catches up),
+/// at most once per `SNAPSHOT_GAP` (each snapshot is a version in the history).
+const SNAPSHOT_IDLE: Duration = Duration::from_secs(15);
+const SNAPSHOT_GAP: Duration = Duration::from_secs(60);
+/// How often idle and old changes are checked.
+const SNAPSHOT_CHECK: Duration = Duration::from_secs(5);
 const SNAPSHOT_RETRY: Duration = Duration::from_secs(60);
 const PING_EVERY: Duration = Duration::from_secs(20);
 const IDLE_LIMIT: Duration = Duration::from_secs(60);
@@ -63,6 +69,9 @@ pub struct Doc {
     /// Committed batches since the last snapshot, and when the first of them came.
     unsnapped: usize,
     unsnapped_since: Option<Instant>,
+    /// When the last batch was committed, and the last snapshot stored.
+    last_commit: Option<Instant>,
+    last_snap: Option<Instant>,
     snap_asked: Option<Instant>,
     /// Round-robin over editors for snapshot requests.
     snap_turn: usize,
@@ -93,7 +102,9 @@ impl Doc {
         if self.unsnapped == 0 {
             return;
         }
-        let due = self.unsnapped >= SNAPSHOT_OPS || self.unsnapped_since.is_some_and(|t| t.elapsed() >= SNAPSHOT_AGE);
+        let due = self.unsnapped >= SNAPSHOT_OPS
+            || self.unsnapped_since.is_some_and(|t| t.elapsed() >= SNAPSHOT_AGE)
+            || (self.last_commit.is_some_and(|t| t.elapsed() >= SNAPSHOT_IDLE) && self.last_snap.is_none_or(|t| t.elapsed() >= SNAPSHOT_GAP));
         if !due || self.snap_asked.is_some_and(|t| t.elapsed() < SNAPSHOT_RETRY) {
             return;
         }
@@ -189,6 +200,8 @@ impl Hub {
             conns: Vec::new(),
             unsnapped,
             unsnapped_since: (unsnapped > 0).then(Instant::now),
+            last_commit: (unsnapped > 0).then(Instant::now),
+            last_snap: None,
             snap_asked: None,
             snap_turn: 0,
         }));
@@ -203,6 +216,7 @@ impl Hub {
         d.log.prune_to(floor);
         d.unsnapped = d.log.entries.iter().filter(|e| e.seq > seq).count();
         d.unsnapped_since = (d.unsnapped > 0).then(Instant::now);
+        d.last_snap = Some(Instant::now());
         d.snap_asked = None;
     }
 
@@ -212,7 +226,7 @@ impl Hub {
         }
         let hub = Arc::downgrade(self);
         tokio::spawn(async move {
-            let mut every = tokio::time::interval(Duration::from_secs(10));
+            let mut every = tokio::time::interval(SNAPSHOT_CHECK);
             loop {
                 every.tick().await;
                 let Some(hub) = hub.upgrade() else { break };
@@ -513,6 +527,7 @@ fn commit(store: &Mutex<Store>, doc: &Mutex<Doc>, item: &str, conn: u64, base: u
             if d.unsnapped_since.is_none() {
                 d.unsnapped_since = Some(Instant::now());
             }
+            d.last_commit = Some(Instant::now());
             d.maybe_ask_snapshot();
             true
         }
@@ -544,12 +559,54 @@ mod tests {
         let peer = |id| Peer { id, name: String::new(), user: String::new(), color: 0, editor: true, presence: None };
         let (tx, _rx) = mpsc::channel(2);
         let kick = Arc::new(Notify::new());
-        let d = Doc { log: Log::new(0), conns: vec![Conn { peer: peer(1), tx, kick: kick.clone() }], unsnapped: 0, unsnapped_since: None, snap_asked: None, snap_turn: 0 };
+        let d = Doc { log: Log::new(0), conns: vec![Conn { peer: peer(1), tx, kick: kick.clone() }], unsnapped: 0, unsnapped_since: None, last_commit: None, last_snap: None, snap_asked: None, snap_turn: 0 };
         for _ in 0..2 {
             d.broadcast(9, &ServerMsg::Leave { id: 9 });
         }
         assert!(kick.notified().now_or_never().is_none(), "not while there is room");
         d.broadcast(9, &ServerMsg::Leave { id: 9 });
         assert!(kick.notified().now_or_never().is_some(), "kicked when full");
+    }
+
+    /// A pause in editing gets the saved file up to date soon (not only after many changes or
+    /// minutes), but idle snapshots don't flood the version history.
+    #[test]
+    fn a_pause_in_editing_asks_for_a_snapshot() {
+        let peer = |id| Peer { id, name: String::new(), user: String::new(), color: 0, editor: true, presence: None };
+        let (tx, mut rx) = mpsc::channel(16);
+        let ago = |s: u64| Instant::now().checked_sub(Duration::from_secs(s));
+        let mut d = Doc { log: Log::new(0), conns: vec![Conn { peer: peer(1), tx, kick: Arc::new(Notify::new()) }], unsnapped: 1, unsnapped_since: ago(1), last_commit: ago(1), last_snap: None, snap_asked: None, snap_turn: 0 };
+        let asked = |rx: &mut mpsc::Receiver<Out>| {
+            let mut n = 0;
+            while let Ok(o) = rx.try_recv() {
+                if matches!(o, Out::Text(t) if t == json(&ServerMsg::Snapshot)) {
+                    n += 1;
+                }
+            }
+            n
+        };
+        d.maybe_ask_snapshot();
+        assert_eq!(asked(&mut rx), 0, "still typing");
+        d.last_commit = ago(SNAPSHOT_IDLE.as_secs() + 1);
+        d.unsnapped_since = d.last_commit;
+        d.maybe_ask_snapshot();
+        assert_eq!(asked(&mut rx), 1, "idle: asked");
+        d.maybe_ask_snapshot();
+        assert_eq!(asked(&mut rx), 0, "not again while the request is pending");
+
+        // Shortly after a snapshot, a pause doesn't ask again; later it does.
+        d.snap_asked = None;
+        d.last_snap = ago(5);
+        d.maybe_ask_snapshot();
+        assert_eq!(asked(&mut rx), 0, "a snapshot was stored a moment ago");
+        d.last_snap = ago(SNAPSHOT_GAP.as_secs() + 1);
+        d.maybe_ask_snapshot();
+        assert_eq!(asked(&mut rx), 1);
+
+        // Nothing unsnapshotted: nothing to ask.
+        d.snap_asked = None;
+        d.unsnapped = 0;
+        d.maybe_ask_snapshot();
+        assert_eq!(asked(&mut rx), 0);
     }
 }

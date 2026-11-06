@@ -1084,6 +1084,11 @@ impl Store {
         if seq < base.seq || seq > head {
             return Err(StoreError::Conflict("That snapshot is out of date.".into()));
         }
+        if seq == base.seq {
+            // The current version already holds everything up to `seq` (several editors
+            // leaving at once each upload one): no new version.
+            return Ok((item.clone(), base));
+        }
         let saved = self.write_content(item, data, by)?;
         if !state.is_empty() {
             self.write_file(&self.blob_path(&item.id, saved.version)?.with_extension("live"), saved.version, state)?;

@@ -388,7 +388,8 @@ fn tickets_garbage_and_limits() {
     }
     assert_eq!(code, Some(cosync::close::RATE));
     // A stale copy (older version) is told to reload.
-    s.send("POST", &format!("/api/items/{id}/live/snapshot?seq=0"), Some(&a), &[], Some(b"snap".to_vec()));
+    let ServerMsg::Welcome { seq: head, .. } = s.ws(Some(&a), "since=0&v=1&cid=h", &id).unwrap().recv() else { panic!("no welcome") };
+    assert_eq!(s.send("POST", &format!("/api/items/{id}/live/snapshot?seq={head}"), Some(&a), &[], Some(b"snap".to_vec())).status, 200);
     std::thread::sleep(Duration::from_millis(300));
     let mut w = s.ws(Some(&a), "since=0&v=1&cid=old", &id).unwrap();
     assert_eq!(w.recv(), ServerMsg::Reload);
@@ -449,10 +450,14 @@ fn share_links_get_the_live_state_of_the_current_version_only() {
     let s = start();
     let a = s.login("alice");
     let id = s.new_file(&a, "Linked.xlsx");
-    for state in ["old state", "new state"] {
+    let (mut wa, _) = s.join(&a, &id, "client-a");
+    wa.send(&ClientMsg::Hello { sheets: vec![1] });
+    for (seq, state) in [(1u64, "old state"), (2, "new state")] {
+        wa.send(&ClientMsg::Ops { base: seq - 1, id: seq, ops: vec![text(0, 0, state)] });
+        while !matches!(wa.recv_data(), ServerMsg::Ack { .. }) {}
         let mut body = b"snap".to_vec();
         body.extend_from_slice(state.as_bytes());
-        assert_eq!(s.send("POST", &format!("/api/items/{id}/live/snapshot?seq=0"), Some(&a), &[("X-Live-State-Offset", "4")], Some(body)).status, 200);
+        assert_eq!(s.send("POST", &format!("/api/items/{id}/live/snapshot?seq={seq}"), Some(&a), &[("X-Live-State-Offset", "4")], Some(body)).status, 200);
     }
     let link = s.json("POST", &format!("/api/items/{id}/links"), Some(&a), json!({ "role": "edit" })).json();
     let token = link["url"].as_str().unwrap().rsplit('/').next().unwrap().to_string();
@@ -492,4 +497,33 @@ fn reload_tells_a_client_its_last_batch_was_committed() {
     assert_eq!(s.json("POST", &format!("/api/items/{id}/permissions"), Some(&a), json!({ "username": "bob", "role": "edit" })).status, 200);
     let mut ws = s.ws(Some(&b), "since=0&cid=client-a", &id).unwrap();
     assert_eq!(ws.recv(), ServerMsg::Reload);
+}
+
+/// Several editors leaving at once each upload a snapshot of the same state: one version.
+/// A snapshot after the last one stores the newer content (and date) as the current version.
+#[test]
+fn snapshots_of_the_same_state_make_one_version() {
+    let s = start();
+    let a = s.login("alice");
+    let b = s.login("bob");
+    let id = s.new_file(&a, "Twice.xlsx");
+    assert_eq!(s.json("POST", &format!("/api/items/{id}/permissions"), Some(&a), json!({ "username": "bob", "role": "edit" })).status, 200);
+    let (mut wa, _) = s.join(&a, &id, "client-a");
+    wa.send(&ClientMsg::Hello { sheets: vec![1] });
+    wa.send(&ClientMsg::Ops { base: 0, id: 1, ops: vec![text(0, 0, "x")] });
+    assert!(matches!(wa.recv_data(), ServerMsg::Ack { seq: 1, .. }));
+    let before = s.send("GET", &format!("/api/items/{id}"), Some(&a), &[], None).json();
+    std::thread::sleep(Duration::from_millis(1100));
+    let snap = |who: &str, body: &[u8]| s.send("POST", &format!("/api/items/{id}/live/snapshot?seq=1"), Some(who), &[("X-Live-Sheets", "1:0")], Some(body.to_vec()));
+    let first = snap(&a, b"alice's copy");
+    assert_eq!(first.status, 200);
+    assert_eq!(first.json()["version"], 2);
+    assert_ne!(first.json()["modified"], before["modified"], "the file's date moves with its content");
+    let second = snap(&b, b"bob's copy");
+    assert_eq!(second.status, 200, "{}", String::from_utf8_lossy(&second.body));
+    assert_eq!(second.json()["version"], 2, "no second version for the same state");
+    let content = s.send("GET", &format!("/api/items/{id}/content"), Some(&a), &[], None);
+    assert_eq!(content.body, b"alice's copy");
+    let versions = s.send("GET", &format!("/api/items/{id}/versions"), Some(&a), &[], None).json();
+    assert_eq!(versions["versions"].as_array().map(|v| v.len()), Some(2));
 }
