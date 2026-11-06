@@ -217,6 +217,34 @@ fn undo_after_own_insert_and_remote_insert_clears_the_right_cell() {
     assert_eq!(at(&app.wb, 3, 3), "", "the row someone else inserted stays");
 }
 
+/// An editor made a viewer while changes are unsent: the session ends (instead of resending
+/// them on every reconnect) and the changes stay in the window.
+#[test]
+fn becoming_a_viewer_with_unsent_changes_ends_the_session() {
+    use crate::live::conn::Event;
+    for welcome in [false, true] {
+        let (_ctx, mut app) = super::data_ui::sample_app();
+        app.live_for_test();
+        type_at(&mut app, 0, 0, "unsent");
+        app.live_flush();
+        assert!(!app.live_pending_ops().is_empty());
+        if welcome {
+            // Reconnecting after access was changed: the server says we are a viewer.
+            let you = cosync::Peer { id: 1, name: "Me".into(), user: "me".into(), color: 0, editor: false, presence: None };
+            app.live_event_for_test(Event::Msg(cosync::ServerMsg::Welcome { seq: 0, you, peers: vec![] }));
+        } else {
+            // Sending them was refused.
+            app.live_event_for_test(Event::Closed { code: Some(cosync::close::READ_ONLY), http: None, reason: "view-only".into() });
+        }
+        let (stopped, retry) = app.live_stopped();
+        assert!(stopped.is_some_and(|m| m.contains("view-only")), "the user is told (welcome: {welcome})");
+        assert!(!retry, "no reconnect that would resend them (welcome: {welcome})");
+        assert!(!app.live_editor() && !app.live_quiet());
+        assert!(!app.live_pending_ops().is_empty(), "the changes are kept");
+        assert_eq!(crate::numfmt::value_to_text(app.wb.sheets[app.wb.active].display_value(0, 0)), "unsent");
+    }
+}
+
 #[test]
 fn view_only_participants_change_nothing() {
     let (_ctx, mut app) = super::data_ui::sample_app();

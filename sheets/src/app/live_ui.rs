@@ -30,6 +30,9 @@ pub fn peer_color(slot: u8) -> Color32 {
 const FLAG_SECS: f32 = 3.0;
 const PRESENCE_EVERY: Duration = Duration::from_millis(100);
 
+/// The session ends when access became view-only; unsent changes stay in the window.
+const VIEW_ONLY_NOW: &str = "You now have view-only access to this workbook, so your latest changes weren't saved to the server. They are still in this window: use Save As to keep a copy.";
+
 /// Someone else in the session.
 pub struct Seen {
     pub peer: Peer,
@@ -533,8 +536,9 @@ impl App {
                     (_, Some(404)) => Some("The workbook is no longer shared with you, or it was deleted.".to_string()),
                     (_, Some(426)) | (_, Some(501)) => Some("This server doesn't support live co-editing.".to_string()),
                     (Some(cosync::close::READ_ONLY), _) => {
+                        // Resending what is pending would only be refused again.
                         l.editor = false;
-                        None
+                        Some(VIEW_ONLY_NOW.to_string())
                     }
                     (Some(cosync::close::INVALID), _) => Some(format!("The server refused a change ({reason}). Reopen the workbook.")),
                     _ => None,
@@ -641,6 +645,15 @@ impl App {
             return;
         }
         l.catch_up = None;
+        if !l.editor && l.sess.has_pending() {
+            // Access was changed to view-only while our changes were unsent.
+            l.conn = None;
+            l.sess.offline();
+            l.peers.clear();
+            l.stopped = Some(VIEW_ONLY_NOW.to_string());
+            self.status = Some(VIEW_ONLY_NOW.to_string());
+            return;
+        }
         l.online = true;
         let b = l.sess.resume();
         l.send_batch(b);
@@ -1163,6 +1176,15 @@ impl App {
     pub(crate) fn live_remote_for_test(&mut self, ops: &[Op]) {
         self.live_flush();
         self.live_apply_remote(ops);
+    }
+
+    pub(crate) fn live_event_for_test(&mut self, ev: Event) {
+        self.live_event(ev);
+    }
+
+    /// Why the session ended for good, and whether a reconnect is scheduled.
+    pub(crate) fn live_stopped(&self) -> (Option<String>, bool) {
+        self.live.as_ref().map_or((None, false), |l| (l.stopped.clone(), l.retry_at.is_some()))
     }
 
     pub(crate) fn live_pending_ops(&self) -> Vec<Op> {
