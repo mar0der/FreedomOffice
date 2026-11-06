@@ -1,7 +1,8 @@
 //! FreedomOffice Server (self-hosted document server): sign-in with a device token, browsing,
 //! open and save with If-Match, sharing with server users, share links and version history.
 //! The password is sent once to the server to get a device token; only the token is kept,
-//! encrypted for the Windows user (`%LOCALAPPDATA%\FreedomOffice\servers.bin`).
+//! encrypted for the Windows user (`%LOCALAPPDATA%\FreedomOffice\servers.bin`); on Linux and
+//! macOS in a file only the user can read (`~/.local/share/freedomoffice/servers.bin`).
 
 use std::path::{Path, PathBuf};
 
@@ -104,16 +105,13 @@ fn parse_accounts(text: &str) -> Vec<Account> {
         .unwrap_or_default()
 }
 
-/// Writes the accounts (with their device tokens) encrypted for the current Windows user.
+/// Writes the accounts (with their device tokens) for the current user only (DPAPI on Windows).
 pub fn save_accounts_to(path: &Path, accounts: &[Account]) -> Result<(), String> {
-    if let Some(d) = path.parent() {
-        std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
-    }
     if accounts.is_empty() {
         let _ = std::fs::remove_file(path);
         return Ok(());
     }
-    std::fs::write(path, super::auth::dpapi::protect(accounts_json(accounts).as_bytes())?).map_err(|e| e.to_string())
+    super::write_private(path, &super::auth::dpapi::protect(accounts_json(accounts).as_bytes())?)
 }
 
 pub fn load_accounts_from(path: &Path) -> Vec<Account> {
@@ -123,7 +121,7 @@ pub fn load_accounts_from(path: &Path) -> Vec<Account> {
 }
 
 pub fn save_accounts(accounts: &[Account]) -> Result<(), String> {
-    save_accounts_to(&accounts_path().ok_or("LOCALAPPDATA isn't set.")?, accounts)
+    save_accounts_to(&accounts_path().ok_or(super::NO_SETTINGS_DIR)?, accounts)
 }
 
 pub fn load_accounts() -> Vec<Account> {

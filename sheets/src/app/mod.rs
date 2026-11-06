@@ -1007,11 +1007,11 @@ fn is_native_format(p: &std::path::Path) -> bool {
 }
 
 fn recovery_dir() -> Option<PathBuf> {
-    std::env::var("LOCALAPPDATA").ok().map(|a| PathBuf::from(a).join("FreedomOffice").join("AutoRecover"))
+    crate::cloud::local_dir().map(|d| d.join("AutoRecover"))
 }
 
 fn recent_file() -> Option<PathBuf> {
-    std::env::var("APPDATA").ok().map(|a| PathBuf::from(a).join("FreedomOffice").join("sheets-recent.txt"))
+    crate::cloud::roaming_dir().map(|d| d.join("sheets-recent.txt"))
 }
 
 fn load_recent() -> Vec<PathBuf> {

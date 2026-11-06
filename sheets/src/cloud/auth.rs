@@ -320,15 +320,13 @@ pub fn sign_in(http: &dyn Transport, client_id: &str, cancel: &AtomicBool) -> Re
 }
 
 // ---------------------------------------------------------------------------
-// Token cache (refresh token encrypted for the current Windows user with DPAPI)
+// Token cache (Windows: refresh token encrypted for the current user with DPAPI;
+// elsewhere: a file only the user can read, see `write_private`)
 // ---------------------------------------------------------------------------
 
 pub fn save_refresh_token(token: &str) -> Result<(), String> {
-    let path = super::token_path().ok_or("LOCALAPPDATA isn't set.")?;
-    if let Some(d) = path.parent() {
-        std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
-    }
-    std::fs::write(path, dpapi::protect(token.as_bytes())?).map_err(|e| e.to_string())
+    let path = super::token_path().ok_or(super::NO_SETTINGS_DIR)?;
+    super::write_private(&path, &dpapi::protect(token.as_bytes())?)
 }
 
 pub fn load_refresh_token() -> Option<String> {
@@ -375,14 +373,16 @@ pub(crate) mod dpapi {
     }
 }
 
+/// Without DPAPI the token file is protected by file permissions only (mode 0600, like
+/// ssh and gh keep theirs); the bytes are stored as they are.
 #[cfg(not(windows))]
 pub(crate) mod dpapi {
-    pub fn protect(_: &[u8]) -> Result<Vec<u8>, String> {
-        Err("Keeping you signed in is only supported on Windows.".into())
+    pub fn protect(data: &[u8]) -> Result<Vec<u8>, String> {
+        Ok(data.to_vec())
     }
 
-    pub fn unprotect(_: &[u8]) -> Result<Vec<u8>, String> {
-        Err("Keeping you signed in is only supported on Windows.".into())
+    pub fn unprotect(data: &[u8]) -> Result<Vec<u8>, String> {
+        Ok(data.to_vec())
     }
 }
 

@@ -848,7 +848,10 @@ impl App {
         if !name.to_lowercase().ends_with(".xlsx") && !name.to_lowercase().ends_with(".xlsm") {
             name.push_str(".xlsx");
         }
-        let Some(dir) = conn.cache_root().map(|d| d.join(format!("new-{}", cloud::auth::now_secs()))) else { return };
+        let Some(dir) = conn.cache_root().map(|d| d.join(format!("new-{}", cloud::auth::now_secs()))) else {
+            self.status = Some(cloud::NO_SETTINGS_DIR.to_string());
+            return;
+        };
         let local = cloud::local_copy_path(&dir, "", &name);
         if let Some(d) = local.parent() {
             let _ = std::fs::create_dir_all(d);
@@ -915,7 +918,10 @@ impl App {
     }
 
     fn cloud_open_with(&mut self, conn: Conn, item: DriveItem) {
-        let Some(root) = conn.cache_root() else { return };
+        let Some(root) = conn.cache_root() else {
+            self.status = Some(cloud::NO_SETTINGS_DIR.to_string());
+            return;
+        };
         self.cloud.opening = Some(item.name.clone());
         self.status = Some(format!("Downloading {}...", item.name));
         self.cloud_spawn(move || Event::Opened(conn.open(&item, &root)));
@@ -1288,7 +1294,7 @@ impl App {
                     }
                 });
                 ui.add_space(6.0);
-                ui.label(RichText::new("You stay signed in on this PC; the sign-in is stored encrypted for your Windows account.").size(12.0).color(theme::text_dim()));
+                ui.label(RichText::new(if cfg!(windows) { "You stay signed in on this PC; the sign-in is stored encrypted for your Windows account." } else { "You stay signed in on this computer; the sign-in is stored in a file only your user account can read." }).size(12.0).color(theme::text_dim()));
             }
             None => {
                 ui.label(RichText::new("Sign in with your work, school or personal Microsoft account to open, save and share files in OneDrive and SharePoint.").color(theme::text_dim()));
@@ -1464,7 +1470,7 @@ impl App {
                 });
                 ui.add_space(4.0);
                 let note = if a.url.starts_with("https://") {
-                    "Your password goes only to this server, encrypted (HTTPS), and isn't stored. This PC keeps a device sign-in, encrypted for your Windows account."
+                    if cfg!(windows) { "Your password goes only to this server, encrypted (HTTPS), and isn't stored. This PC keeps a device sign-in, encrypted for your Windows account." } else { "Your password goes only to this server, encrypted (HTTPS), and isn't stored. This computer keeps a device sign-in in a file only your user account can read." }
                 } else {
                     "Local test server (http://localhost): the connection isn't encrypted. Your password isn't stored."
                 };

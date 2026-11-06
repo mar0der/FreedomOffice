@@ -259,12 +259,59 @@ fn net_error(e: ureq::Error) -> String {
 // Settings and local folders
 // ---------------------------------------------------------------------------
 
-fn roaming_dir() -> Option<PathBuf> {
-    std::env::var("APPDATA").ok().map(|a| PathBuf::from(a).join("FreedomOffice"))
+/// An absolute directory from an environment variable.
+fn env_dir(var: &str) -> Option<PathBuf> {
+    std::env::var_os(var).map(PathBuf::from).filter(|p| p.is_absolute())
 }
 
-fn local_dir() -> Option<PathBuf> {
-    std::env::var("LOCALAPPDATA").ok().map(|a| PathBuf::from(a).join("FreedomOffice"))
+/// Per-user settings: `%APPDATA%\FreedomOffice`, `~/.config/freedomoffice` (XDG),
+/// `~/Library/Application Support/FreedomOffice` (macOS).
+pub(crate) fn roaming_dir() -> Option<PathBuf> {
+    if cfg!(windows) {
+        env_dir("APPDATA").map(|a| a.join("FreedomOffice"))
+    } else if cfg!(target_os = "macos") {
+        env_dir("HOME").map(|h| h.join("Library/Application Support/FreedomOffice"))
+    } else {
+        env_dir("XDG_CONFIG_HOME").or_else(|| env_dir("HOME").map(|h| h.join(".config"))).map(|d| d.join("freedomoffice"))
+    }
+}
+
+/// Per-user data that stays on this machine: `%LOCALAPPDATA%\FreedomOffice`,
+/// `~/.local/share/freedomoffice` (XDG), `~/Library/Application Support/FreedomOffice` (macOS).
+pub(crate) fn local_dir() -> Option<PathBuf> {
+    if cfg!(windows) {
+        env_dir("LOCALAPPDATA").map(|a| a.join("FreedomOffice"))
+    } else if cfg!(target_os = "macos") {
+        roaming_dir()
+    } else {
+        env_dir("XDG_DATA_HOME").or_else(|| env_dir("HOME").map(|h| h.join(".local/share"))).map(|d| d.join("freedomoffice"))
+    }
+}
+
+pub(crate) const NO_SETTINGS_DIR: &str = "The folder for FreedomOffice settings couldn't be found (APPDATA / HOME isn't set).";
+
+/// Writes a file only the current user can read (sign-in tokens). On Windows the content
+/// is already DPAPI-encrypted; elsewhere the file is created with mode 0600.
+pub(crate) fn write_private(path: &Path, data: &[u8]) -> Result<(), String> {
+    if let Some(d) = path.parent() {
+        std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
+    }
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let tmp = path.with_extension("tmp");
+        let _ = std::fs::remove_file(&tmp);
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp).map_err(|e| e.to_string())?;
+        f.write_all(data).and_then(|_| f.sync_all()).map_err(|e| e.to_string())?;
+        drop(f);
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, data).map_err(|e| e.to_string())
+    }
 }
 
 /// `%APPDATA%\FreedomOffice\cloud.json`
@@ -306,7 +353,7 @@ pub fn valid_client_id(id: &str) -> bool {
 }
 
 pub fn save_client_id(id: &str) -> Result<(), String> {
-    let path = config_path().ok_or("APPDATA isn't set.")?;
+    let path = config_path().ok_or(NO_SETTINGS_DIR)?;
     if let Some(d) = path.parent() {
         std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
     }
@@ -382,6 +429,29 @@ pub fn open_in_browser(url: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn private_files_are_user_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("fo-private-{}", std::process::id()));
+        let p = dir.join("sub").join("servers.bin");
+        write_private(&p, b"one").unwrap();
+        write_private(&p, b"two").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"two");
+        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn settings_dirs_follow_xdg() {
+        // Only checks the shape (the environment is shared with other tests).
+        let r = roaming_dir().unwrap();
+        let l = local_dir().unwrap();
+        assert!(r.ends_with("freedomoffice") && l.ends_with("freedomoffice"));
+        assert_ne!(r, l);
+    }
 
     #[test]
     fn spreadsheet_filter() {
