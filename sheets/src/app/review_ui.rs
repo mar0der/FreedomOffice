@@ -94,6 +94,10 @@ impl App {
         self.protect_blocks(Change::Format)
     }
 
+    pub(super) fn review_dialog_open(&self) -> bool {
+        self.review.dialog.is_some()
+    }
+
     pub fn open_protect_dialog(&mut self) {
         let _ = self.commit_edit(false);
         let protect = !self.sheet_protected();

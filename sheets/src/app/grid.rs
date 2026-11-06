@@ -277,7 +277,7 @@ impl App {
         if resp.clicked() || resp.drag_started() || resp.secondary_clicked() {
             resp.request_focus();
         }
-        if ui.memory(|m| m.focused().is_none()) && self.dialog.is_none() && self.rename_tab.is_none() && !self.name_box_editing {
+        if ui.memory(|m| m.focused().is_none()) && !self.modal_open() && self.rename_tab.is_none() && !self.name_box_editing {
             resp.request_focus();
         }
         ui.memory_mut(|m| {

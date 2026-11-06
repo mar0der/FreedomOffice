@@ -153,6 +153,8 @@ pub struct ShareState {
     pub invite: Vec<(String, String)>,
     pub link_days: u32,
     pub link_password: String,
+    /// The people search got the keyboard focus once (when the dialog opened).
+    focused: bool,
 }
 
 /// A FreedomOffice server account in this session.
@@ -1607,6 +1609,11 @@ impl App {
     // Dialogs: Share, save conflict, version history
     // ------------------------------------------------------------------
 
+    /// Share, version history or a save conflict is open.
+    pub(super) fn cloud_dialog_open(&self) -> bool {
+        self.cloud.share.is_some() || self.cloud.versions.is_some() || self.cloud.conflict.is_some()
+    }
+
     pub fn cloud_dialogs_ui(&mut self, ctx: &egui::Context) {
         self.conflict_ui(ctx);
         self.share_ui(ctx);
@@ -1849,6 +1856,7 @@ impl App {
                 for (k, label) in [(0u8, "Invite people"), (1, "Copy link"), (2, "Manage access")] {
                     if ui.selectable_label(sh.tab == k, RichText::new(label).size(13.5)).clicked() && sh.tab != k {
                         sh.tab = k;
+                        sh.focused = false;
                         sh.info = None;
                         sh.error = None;
                     }
@@ -1861,6 +1869,10 @@ impl App {
                 0 => {
                     ui.label(format!("People with an account on {host}:"));
                     let r = ui.add(egui::TextEdit::singleline(&mut sh.user_query).hint_text("Search by name or username").desired_width(f32::INFINITY));
+                    if !sh.focused {
+                        sh.focused = true;
+                        r.request_focus();
+                    }
                     if sh.user_query != sh.searched {
                         sh.searched = sh.user_query.clone();
                         sh.user_seq += 1;
@@ -1871,7 +1883,6 @@ impl App {
                             self.cloud_spawn(move || Event::Users(seq, s.search_users(&q)));
                         }
                     }
-                    let _ = r;
                     let mut add = None;
                     if !sh.user_results.is_empty() {
                         egui::Frame::group(ui.style()).inner_margin(4.0).show(ui, |ui| {
@@ -2172,6 +2183,11 @@ impl App {
     pub(super) fn cloud_for_test(&mut self, session: Arc<ServerSession>) {
         self.cloud.started = true;
         self.cloud.servers.push(ServerEntry { session, error: None });
+    }
+
+    /// No saved accounts or sign-ins are read from this PC (tests).
+    pub(super) fn no_cloud_for_test(&mut self) {
+        self.cloud.started = true;
     }
 
     /// As if the cloud browser had downloaded `doc` (tests).

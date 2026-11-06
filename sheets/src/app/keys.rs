@@ -78,7 +78,7 @@ impl App {    pub fn handle_keys(&mut self, ctx: &egui::Context) {
             }
             return;
         }
-        if self.dialog.is_some() || self.rename_tab.is_some() || self.name_box_editing {
+        if self.modal_open() || self.rename_tab.is_some() || self.name_box_editing {
             return;
         }
         if self.filter_popup.is_some() {
@@ -166,7 +166,7 @@ impl App {    pub fn handle_keys(&mut self, ctx: &egui::Context) {
         // A letter that picked a Paste Options entry must not also start typing.
         let mut eat_text = false;
         for ev in events {
-            if self.dialog.is_some() || self.backstage.is_some() {
+            if self.modal_open() || self.backstage.is_some() {
                 break;
             }
             match ev {

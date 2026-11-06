@@ -21,6 +21,8 @@ mod keytips;
 mod live_ui;
 #[cfg(test)]
 mod live_tests;
+#[cfg(test)]
+mod ui_tests;
 mod picture_view;
 mod pivot_pane;
 mod pivot_ui;
@@ -390,6 +392,16 @@ impl App {
     }
     pub fn active(&self) -> (u32, u32) {
         self.sheet().view.active
+    }
+
+    /// A dialog window is open: the keyboard belongs to it, never to the grid behind it.
+    pub(crate) fn modal_open(&self) -> bool {
+        self.dialog.is_some()
+            || self.cloud_dialog_open()
+            || self.review_dialog_open()
+            || self.pivots.dialog.is_some()
+            || self.chart.dialog.is_some()
+            || self.crash_report.is_some()
     }
 
     /// Expands a range so it fully contains any merged areas it touches.
@@ -1087,6 +1099,13 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.frame(ctx);
+    }
+}
+
+impl App {
+    /// One frame of the whole window (also run headless by tests).
+    pub(crate) fn frame(&mut self, ctx: &egui::Context) {
         self.fonts.flush(ctx);
         self.edit_rect = None;
         self.edit_bar_rect = None;
