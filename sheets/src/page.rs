@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 
 use crate::model::Range;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Paper {
     Letter,
     Legal,
@@ -87,7 +87,7 @@ impl Paper {
 }
 
 /// Margins in inches.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Margins {
     pub top: f32,
     pub bottom: f32,
@@ -120,7 +120,7 @@ impl Margins {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Scaling {
     /// Adjust to N% of normal size (10..=400).
     Percent(u16),
@@ -130,7 +130,7 @@ pub enum Scaling {
 
 /// Header or footer text in three sections, using the familiar codes
 /// (&P page, &N pages, &D date, &T time, &A sheet, &F file, &Z path, && ampersand).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HeaderFooter {
     pub left: String,
     pub center: String,
@@ -297,7 +297,7 @@ pub fn hf_presets() -> Vec<(&'static str, HeaderFooter)> {
     ]
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PageSetup {
     pub landscape: bool,
     pub paper: Paper,

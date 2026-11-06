@@ -587,7 +587,7 @@ impl App {
         self.sheet().iter_range(sel).filter_map(|(_, _, c)| c.value.as_number()).take(100_000).collect()
     }
 
-    fn cf_add_rule(&mut self, rule: CondFormat) {
+    pub(super) fn cf_add_rule(&mut self, rule: CondFormat) {
         self.commit_edit(false);
         if self.format_block() {
             return;

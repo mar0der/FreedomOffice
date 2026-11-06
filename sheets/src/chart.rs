@@ -17,7 +17,7 @@ pub const PALETTE: [u32; 6] = PALETTES[0].1;
 /// Points drawn per series are capped to keep painting cheap on huge ranges.
 pub const MAX_POINTS: usize = 4000;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ChartKind {
     Column,
     Bar,
@@ -71,7 +71,7 @@ impl ChartKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum Grouping {
     #[default]
     Standard,
@@ -79,7 +79,7 @@ pub enum Grouping {
     Percent,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum LegendPos {
     #[default]
     Bottom,
@@ -102,7 +102,7 @@ impl LegendPos {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum LabelPos {
     /// The chart type's default (outside end for clustered columns, centre for stacked, right for lines, best fit for pies).
     #[default]
@@ -159,7 +159,7 @@ impl LabelPos {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum Dash {
     #[default]
     Solid,
@@ -198,7 +198,7 @@ impl Dash {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum MarkerKind {
     /// Follows the chart type (circles on "with markers" charts, none otherwise).
     #[default]
@@ -244,7 +244,7 @@ impl MarkerKind {
 }
 
 /// What data labels show and where.
-#[derive(Clone, Debug, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Labels {
     pub value: bool,
     pub category: bool,
@@ -265,7 +265,7 @@ impl Labels {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Axis {
     pub visible: bool,
     /// `None` = no axis title, `Some("")` = the default "Axis Title".
@@ -307,7 +307,7 @@ impl Axis {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum TrendKind {
     #[default]
     Linear,
@@ -343,7 +343,7 @@ impl TrendKind {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Trendline {
     pub kind: TrendKind,
     /// Polynomial order (2-6).
@@ -364,7 +364,7 @@ impl Default for Trendline {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum ErrKind {
     Fixed,
     #[default]
@@ -385,7 +385,7 @@ impl ErrKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum ErrDir {
     #[default]
     Both,
@@ -393,7 +393,7 @@ pub enum ErrDir {
     Minus,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ErrorBars {
     pub kind: ErrKind,
     /// Fixed value, percentage or number of standard deviations.
@@ -409,7 +409,7 @@ impl Default for ErrorBars {
 }
 
 /// Formatting of one data point (pie slices).
-#[derive(Clone, Debug, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct PointFmt {
     pub idx: u32,
     pub fill: Option<u32>,
@@ -418,7 +418,7 @@ pub struct PointFmt {
 }
 
 /// Per-series formatting; `None`/default values follow the chart.
-#[derive(Clone, Debug, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct SeriesFmt {
     /// Combo charts: this series is drawn as another kind.
     pub kind: Option<ChartKind>,
@@ -454,7 +454,7 @@ impl SeriesFmt {
 }
 
 /// An explicitly defined series (Select Data), on the chart's source sheet.
-#[derive(Clone, Debug, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct SeriesSrc {
     pub name_cell: Option<(u32, u32)>,
     /// Name typed in when there is no name cell.
@@ -465,13 +465,13 @@ pub struct SeriesSrc {
 }
 
 /// Explicit series list replacing the automatic split of `Chart::range`.
-#[derive(Clone, Debug, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Custom {
     pub series: Vec<SeriesSrc>,
     pub cats: Option<Range>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Chart {
     pub kind: ChartKind,
     /// Name of the sheet holding the data.

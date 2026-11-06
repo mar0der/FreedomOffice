@@ -15,7 +15,7 @@ pub const DEFAULT_FONT_SIZE: f32 = 11.0;
 // Values
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ErrorKind {
     Null,
     Div0,
@@ -75,7 +75,7 @@ impl ErrorKind {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub enum Value {
     #[default]
     Empty,
@@ -154,7 +154,7 @@ pub fn parse_cell(s: &str) -> Option<(u32, u32)> {
 }
 
 /// A normalized rectangular cell range (inclusive, 0-based).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
 pub struct Range {
     pub r1: u32,
     pub c1: u32,
@@ -233,7 +233,7 @@ impl Range {
 // Styles
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
 pub enum HAlign {
     #[default]
     General,
@@ -242,7 +242,7 @@ pub enum HAlign {
     Right,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
 pub enum VAlign {
     Top,
     Center,
@@ -250,7 +250,7 @@ pub enum VAlign {
     Bottom,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
 pub enum BorderLine {
     #[default]
     None,
@@ -262,7 +262,7 @@ pub enum BorderLine {
     Dotted,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
 pub struct Border {
     pub left: BorderLine,
     pub right: BorderLine,
@@ -270,7 +270,7 @@ pub struct Border {
     pub bottom: BorderLine,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
 pub struct Style {
     /// Font family name, `None` = default (Calibri).
     pub font: Option<String>,
@@ -386,6 +386,10 @@ pub use crate::filter::AutoFilter;
 #[derive(Clone, Debug)]
 pub struct Sheet {
     pub name: String,
+    /// Stable identity for live co-editing (survives renames and moves).
+    pub uid: u64,
+    /// Tab order key for live co-editing (sheets are ordered by (pos, uid) there).
+    pub pos: f64,
     pub rows: BTreeMap<u32, BTreeMap<u32, Cell>>,
     pub col_w: HashMap<u32, f32>,
     pub row_h: HashMap<u32, f32>,
@@ -438,8 +442,23 @@ pub struct Sheet {
     pub pivots: Vec<crate::pivot::PivotTable>,
 }
 
+/// A random sheet identity (64 bits from the OS-seeded hasher; never the rescue id).
+pub fn new_sheet_uid() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    loop {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u64(N.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+        let v = h.finish() | (1 << 63);
+        if v != cosync::RESCUE_SHEET {
+            return v;
+        }
+    }
+}
+
 /// One run of a rich-text cell.
-#[derive(Clone, Debug, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct RichRun {
     pub text: String,
     pub bold: bool,
@@ -453,7 +472,7 @@ pub struct RichRun {
     pub font: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct RichText {
     pub runs: Vec<RichRun>,
 }
@@ -465,7 +484,7 @@ impl RichText {
 }
 
 /// Sheet protection settings (what users may still do, and the legacy password hash).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Protection {
     /// Excel's legacy 16-bit password hash, 0 = no password.
     pub hash: u16,
@@ -513,7 +532,7 @@ impl Default for Protection {
 }
 
 /// `algorithmName`, `hashValue`, `saltValue` and `spinCount` of `sheetProtection`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PasswordHash {
     pub algorithm: String,
     /// Base64 of the final hash.
@@ -572,9 +591,10 @@ pub fn legacy_password_hash(pw: &str) -> u16 {
 }
 
 /// A picture placed over the grid, anchored at a cell plus a pixel offset (at 100% zoom).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Picture {
     /// Encoded image bytes (PNG, JPEG, GIF, BMP).
+    #[serde(with = "crate::live::b64")]
     pub data: std::sync::Arc<Vec<u8>>,
     /// Lower-case file extension of the encoded data.
     pub ext: String,
@@ -616,6 +636,8 @@ impl Sheet {
     pub fn new(name: &str) -> Self {
         Sheet {
             name: name.to_string(),
+            uid: new_sheet_uid(),
+            pos: 0.0,
             rows: BTreeMap::new(),
             col_w: HashMap::new(),
             row_h: HashMap::new(),

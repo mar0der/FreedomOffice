@@ -168,9 +168,20 @@ impl Request {
 pub struct Response {
     pub status: u16,
     pub body: Vec<u8>,
+    /// Response headers (lower-case names).
+    pub headers: Vec<(String, String)>,
 }
 
 impl Response {
+    #[cfg(test)]
+    pub fn new(status: u16, body: Vec<u8>) -> Self {
+        Response { status, body, headers: Vec::new() }
+    }
+
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+    }
+
     pub fn ok(&self) -> bool {
         (200..300).contains(&self.status)
     }
@@ -229,8 +240,14 @@ impl Transport for Http {
         };
         let mut res = res.map_err(net_error)?;
         let status = res.status().as_u16();
+        let headers = res
+            .headers()
+            .iter()
+            .filter(|(k, _)| k.as_str().starts_with("x-") || *k == "etag")
+            .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+            .collect();
         let body = res.body_mut().with_config().limit(2 * 1024 * 1024 * 1024).read_to_vec().map_err(net_error)?;
-        Ok(Response { status, body })
+        Ok(Response { status, body, headers })
     }
 }
 

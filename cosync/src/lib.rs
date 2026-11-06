@@ -18,7 +18,7 @@ mod transform;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 
-pub use transform::{fix_range, map_index, over, transform};
+pub use transform::{fix_range, map_index, over, touches, transform};
 
 pub const MAX_ROWS: u32 = 1_048_576;
 pub const MAX_COLS: u32 = 16_384;

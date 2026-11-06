@@ -6,7 +6,7 @@
 use crate::formula;
 use crate::model::Value;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum IconStyle {
     Arrows3,
     ArrowsGray3,
@@ -133,7 +133,7 @@ impl IconStyle {
 }
 
 /// How a threshold value is read.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum ThresholdKind {
     Number,
     #[default]
@@ -169,7 +169,7 @@ impl ThresholdKind {
 }
 
 /// The lower bound of one icon: values `>=` (or `>`) this threshold get the icon.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Threshold {
     pub kind: ThresholdKind,
     /// Formula text without '=' (a plain number for Number/Percent/Percentile).
@@ -184,7 +184,7 @@ impl Threshold {
 }
 
 /// An icon set rule. `thresholds[i]` is the lower bound of icon i (the first is always 0%).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct IconSetRule {
     pub style: IconStyle,
     pub thresholds: Vec<Threshold>,

@@ -16,7 +16,7 @@ use crate::model::{Range, Sheet, Value, Workbook, MAX_COLS, MAX_ROWS};
 // ---------------------------------------------------------------------------
 
 /// Comparison operator shared by cell-value rules and data validation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum CmpOp {
     #[default]
     Between,
@@ -108,7 +108,7 @@ impl CmpOp {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum TextOp {
     #[default]
     Contains,
@@ -141,7 +141,7 @@ impl TextOp {
 }
 
 /// Differential format applied when a rule is true. Flags only switch attributes on.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct DiffFormat {
     pub fill: Option<u32>,
     pub color: Option<u32>,
@@ -172,7 +172,7 @@ impl DiffFormat {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum RuleKind {
     /// Cell value compared with one or two operand formulas.
     CellValue { op: CmpOp, f1: String, f2: String },
@@ -190,7 +190,7 @@ pub enum RuleKind {
     IconSet(crate::iconset::IconSetRule),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CondFormat {
     pub ranges: Vec<Range>,
     pub kind: RuleKind,

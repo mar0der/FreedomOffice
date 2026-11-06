@@ -22,7 +22,7 @@ pub const VALUES: usize = usize::MAX;
 // ---------------------------------------------------------------------------
 
 /// "Summarize value field by" functions.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum Agg {
     #[default]
     Sum,
@@ -80,7 +80,7 @@ impl Agg {
 }
 
 /// "Show Values As" calculations.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum ShowAs {
     #[default]
     Normal,
@@ -190,7 +190,7 @@ impl ShowAs {
 }
 
 /// Base item of "Difference From" and similar calculations.
-#[derive(Clone, Debug, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub enum BaseItem {
     #[default]
     Prev,
@@ -199,7 +199,7 @@ pub enum BaseItem {
     Item(String),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DataField {
     /// Index into `PivotTable::fields`.
     pub field: usize,
@@ -216,7 +216,7 @@ pub struct DataField {
 // Fields
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum SortOrder {
     #[default]
     Asc,
@@ -225,7 +225,7 @@ pub enum SortOrder {
     Source,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub enum DatePart {
     Years,
     Quarters,
@@ -260,7 +260,7 @@ impl DatePart {
 }
 
 /// Where a field's items come from.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum FieldSource {
     /// A column of the cache.
     Column(usize),
@@ -268,7 +268,7 @@ pub enum FieldSource {
     Date(usize, DatePart),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PivotField {
     /// Field name (the source column header, or "Years (Date)" for a grouping).
     pub name: String,
@@ -328,7 +328,7 @@ pub fn ikey(label: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Snapshot of the source data taken at the last refresh.
-#[derive(Clone, Debug, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Cache {
     pub names: Vec<String>,
     pub records: Vec<Vec<Value>>,
@@ -442,7 +442,7 @@ pub fn build_cache(wb: &Workbook, source: &str, default_sheet: usize) -> Result<
 // The PivotTable
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum Form {
     #[default]
     Compact,
@@ -451,7 +451,7 @@ pub enum Form {
 }
 
 /// The four areas of the field list.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Area {
     Filters,
     Columns,
@@ -470,7 +470,7 @@ impl Area {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PivotTable {
     pub name: String,
     /// Source reference text (see `resolve_source`).
@@ -507,6 +507,7 @@ pub struct PivotTable {
     /// Fit column widths after each update.
     pub autofit: bool,
     /// Last rendered layout (rebuilt by `engine::update`).
+    #[serde(skip)]
     pub out: Output,
 }
 

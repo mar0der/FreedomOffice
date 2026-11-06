@@ -365,7 +365,7 @@ impl App {
             self.cloud.last_edits = self.edits;
             self.cloud.last_edit_time = now;
         }
-        if self.cloud.autosave && self.cloud.doc.is_some() && self.dirty {
+        if self.cloud.autosave && self.cloud.doc.is_some() && self.dirty && self.live.is_none() {
             let idle = now - self.cloud.last_edit_time;
             if idle >= 5.0 && self.edit.is_none() && !self.cloud.uploading && self.dialog.is_none() && self.cloud.conflict.is_none() {
                 self.save();
@@ -401,6 +401,7 @@ impl App {
                     parent: None,
                     local: PathBuf::from("Budget 2026.xlsx"),
                     provider: Provider::Microsoft,
+                    live: None,
                 });
                 self.wb.path = Some(PathBuf::from("Budget 2026.xlsx"));
                 self.cloud_open_share();
@@ -750,6 +751,15 @@ impl App {
     /// Ctrl+S on a cloud document: write the local copy, then upload in the background.
     pub fn cloud_save(&mut self) -> bool {
         let Some(doc) = self.cloud.doc.clone() else { return false };
+        if self.live.is_some() {
+            // Live: every change is already on the server; Save stores a version now.
+            self.live_flush();
+            self.live_snapshot();
+            if let Some(t) = self.live_title() {
+                self.status = Some(t.trim_start_matches(" - ").to_string());
+            }
+            return true;
+        }
         let native = self.wb.path.as_ref().and_then(|p| p.extension()).map(|e| e.to_string_lossy().to_lowercase()).is_some_and(|e| e == "xlsx" || e == "xlsm");
         if !native {
             // .xls / .csv / .ods can't be written back: save a workbook copy instead.
@@ -863,6 +873,9 @@ impl App {
 
     /// Title bar suffix like "Saved to OneDrive" or "Saved to files.example.com".
     pub fn cloud_title_suffix(&self) -> String {
+        if let Some(t) = self.live_title() {
+            return t;
+        }
         match &self.cloud.doc {
             None => String::new(),
             Some(_) if self.cloud.uploading => " - Saving...".into(),
@@ -1516,6 +1529,8 @@ impl App {
                 self.commit_edit(false);
                 self.cloud_open_share();
             }
+            // Others editing with you (live co-editing)
+            self.live_avatars_ui(ui);
             // Version History (FreedomOffice server documents)
             if matches!(self.cloud.doc.as_ref().map(|d| &d.provider), Some(Provider::FreedomServer(_))) {
                 let (g, is_icon) = self.icon(HISTORY, "🕘");
@@ -1526,8 +1541,9 @@ impl App {
                 }
             }
             // AutoSave toggle (cloud documents only)
-            let enabled = self.cloud.doc.is_some();
-            let on = self.cloud.autosave && enabled;
+            let live = self.live.is_some();
+            let enabled = self.cloud.doc.is_some() && !live;
+            let on = (self.cloud.autosave && self.cloud.doc.is_some()) || live;
             let (tr, tresp) = ui.allocate_exact_size(Vec2::new(36.0, 18.0), Sense::click());
             let p = ui.painter();
             let alpha = if enabled { 1.0 } else { 0.45 };
@@ -1539,6 +1555,7 @@ impl App {
                 p.circle_filled(Pos2::new(tr.left() + 9.0, tr.center().y), 5.0, theme::text_dim().gamma_multiply(alpha));
             }
             let tip = match self.cloud.doc.as_ref().map(|d| &d.provider) {
+                Some(Provider::FreedomServer(url)) if live => format!("Everyone's changes are saved to {} as they are made. AutoSave stays on while a workbook is edited live.", server::host_of(url)),
                 Some(Provider::FreedomServer(url)) => format!("AutoSave saves your changes to {} a few seconds after you stop editing.", server::host_of(url)),
                 Some(_) => "AutoSave saves your changes to OneDrive a few seconds after you stop editing.".into(),
                 None => "AutoSave works for files in OneDrive, SharePoint and on FreedomOffice servers.".into(),
@@ -1546,7 +1563,7 @@ impl App {
             if tresp.on_hover_text(tip).clicked() && enabled {
                 self.cloud.autosave = !self.cloud.autosave;
             }
-            ui.label(RichText::new(if on { "AutoSave On" } else { "AutoSave Off" }).size(12.0).color(if enabled { theme::text() } else { theme::text_dim() }));
+            ui.label(RichText::new(if on { "AutoSave On" } else { "AutoSave Off" }).size(12.0).color(if enabled || live { theme::text() } else { theme::text_dim() }));
         });
     }
 

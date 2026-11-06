@@ -279,6 +279,13 @@ fn shift_content(x: &Op, s: SheetId, rows: bool, at: u32, n: i32, y: &Op) -> Vec
     vec![x]
 }
 
+/// True when some content operation of `a` writes a target that `b` also writes (undo uses
+/// this to refuse undoing a change someone else has changed since, like Excel).
+pub fn touches(a: &[Op], b: &[Op]) -> bool {
+    let tb: HashSet<Target> = b.iter().filter_map(target).collect();
+    !tb.is_empty() && a.iter().filter_map(target).any(|t| tb.contains(&t))
+}
+
 // ---------------------------------------------------------------------------
 // Sequences
 // ---------------------------------------------------------------------------

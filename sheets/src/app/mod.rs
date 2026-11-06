@@ -18,6 +18,9 @@ mod grid;
 mod iconset_ui;
 mod keys;
 mod keytips;
+mod live_ui;
+#[cfg(test)]
+mod live_tests;
 mod picture_view;
 mod pivot_pane;
 mod pivot_ui;
@@ -219,6 +222,8 @@ pub struct App {
     pub menu: menus::MenuState,
     /// Contextual Sparkline tab state.
     pub sparks: sparkline_ui::SparkUi,
+    /// Live co-editing session of a FreedomOffice server document.
+    pub live: Option<live_ui::Live>,
 }
 
 const MAX_UNDO: usize = 100;
@@ -309,6 +314,7 @@ impl App {
             kb: Default::default(),
             menu: Default::default(),
             sparks: Default::default(),
+            live: None,
         };
         if let Some(p) = path {
             app.open_path(p);
@@ -541,6 +547,11 @@ impl App {
     /// Records the current state of the given scopes before a change.
     pub fn push_undo(&mut self, scopes: &[Scope]) {
         self.edits += 1;
+        if self.live.is_some() {
+            // Live: undo is per user, by operations; the snapshot finds what the command changes.
+            self.live_record(scopes);
+            return;
+        }
         let snaps = scopes.iter().map(|s| self.snapshot(*s)).collect();
         let view = (self.wb.active, self.sheet().view.clone());
         self.undo.push(UndoEntry { snaps, view });
@@ -577,20 +588,35 @@ impl App {
     }
 
     pub fn undo(&mut self) {
+        if self.live.is_some() {
+            return self.live_undo(false);
+        }
         self.apply_undo(false);
     }
     pub fn redo(&mut self) {
+        if self.live.is_some() {
+            return self.live_undo(true);
+        }
         self.apply_undo(true);
     }
     pub fn can_undo(&self) -> bool {
+        if self.live.is_some() {
+            return self.live_can_undo(false);
+        }
         !self.undo.is_empty()
     }
     pub fn undo_len(&self) -> usize {
+        if self.live.is_some() {
+            return self.live_undo_len();
+        }
         self.undo.len()
     }
 
     /// Merges every undo step recorded since start into one, so a compound command undoes at once.
     pub fn squash_undo(&mut self, start: usize) {
+        if self.live.is_some() {
+            return self.live_squash(start);
+        }
         if self.undo.len() <= start + 1 {
             return;
         }
@@ -601,6 +627,9 @@ impl App {
     }
 
     pub fn can_redo(&self) -> bool {
+        if self.live.is_some() {
+            return self.live_can_redo();
+        }
         !self.redo.is_empty()
     }
 
@@ -724,7 +753,9 @@ impl App {
             self.edit = Some(e);
             return false;
         }
-        let scope = if self.table_edit_affects(e.sheet, e.row, e.col) { Scope::Sheet(e.sheet) } else { Scope::Range(e.sheet, rg) };
+        // A multi-line entry grows its row: that is outside the cells, so the whole sheet.
+        let grows = text.lines().count() > 1 && self.wb.sheets[e.sheet].raw_row_height(e.row) < (crate::model::DEFAULT_ROW_H - 5.0) * text.lines().count() as f32 + 5.0;
+        let scope = if grows || self.table_edit_affects(e.sheet, e.row, e.col) { Scope::Sheet(e.sheet) } else { Scope::Range(e.sheet, rg) };
         self.push_undo(&[scope]);
         let base = self.sheet().get(e.row, e.col).cloned();
         for (r, c) in targets {
@@ -831,6 +862,8 @@ impl App {
         // A cloud document stays attached only when its downloaded copy is what was opened.
         self.cloud.doc = self.cloud.pending_open.take().filter(|d| Some(&d.local) == self.wb.path.as_ref());
         self.cloud.upload_failed = false;
+        // Join the live session of a server document (or leave the previous one).
+        self.live_reset();
     }
 
     pub fn open_path(&mut self, p: PathBuf) {
@@ -1035,6 +1068,8 @@ impl App {
 
 impl eframe::App for App {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Leaving a live session as its last editor saves a version first.
+        self.live_leave(true);
         // Normal exit (after the save prompt): the recovery copy is no longer needed.
         self.remove_recovery();
     }
@@ -1065,6 +1100,7 @@ impl eframe::App for App {
         self.update_title(ctx);
         self.poll_print();
         self.poll_cloud(ctx);
+        self.poll_live();
         self.autosave(ctx);
 
         if self.backstage.is_some() {

@@ -11,7 +11,7 @@ use crate::model::{Range, Sheet, Value, Workbook};
 use crate::numfmt;
 
 /// An AutoFilter range with per-column criteria (keyed by absolute column).
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AutoFilter {
     pub range: Range,
     pub columns: BTreeMap<u32, ColumnFilter>,
@@ -28,7 +28,7 @@ impl AutoFilter {
 
 /// Comparison operator of a custom condition (wildcards in the value give
 /// "begins with", "contains" and friends, exactly like the file format).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CustomOp {
     Equal,
     NotEqual,
@@ -62,14 +62,14 @@ impl CustomOp {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Condition {
     pub op: CustomOp,
     pub val: String,
 }
 
 /// A checked node of the date tree: a whole year, a month or a single day.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 pub struct DateGroup {
     pub year: i32,
     /// 1-12, 0 = the whole year.
@@ -85,7 +85,7 @@ impl DateGroup {
 }
 
 /// Dynamic filters: averages and relative date periods.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Dynamic {
     AboveAverage,
     BelowAverage,
@@ -168,7 +168,7 @@ impl Dynamic {
 }
 
 /// Criteria of one filtered column.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ColumnFilter {
     /// Checklist: the displayed texts that stay visible (lower case), blanks, and checked date groups.
     Values { items: BTreeSet<String>, blanks: bool, dates: BTreeSet<DateGroup> },

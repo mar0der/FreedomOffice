@@ -1416,6 +1416,9 @@ impl App {
         // Validation list arrow
         self.dv_paint_arrow(&cp, lay, ui.input(|i| i.pointer.hover_pos()));
 
+        // Other people's selections (live co-editing)
+        self.paint_presence(&cp, lay, ui.input(|i| i.pointer.hover_pos()));
+
         // In-cell editor
         self.paint_editor(ui, lay);
 
