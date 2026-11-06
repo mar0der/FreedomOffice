@@ -487,4 +487,9 @@ fn reload_tells_a_client_its_last_batch_was_committed() {
     let mut ws = s.ws(Some(&a), "since=0&cid=client-a", &id).unwrap();
     assert_eq!(ws.recv(), ServerMsg::Ack { id: 7, seq: 1, extra: Vec::new() });
     assert_eq!(ws.recv(), ServerMsg::Reload);
+    // Someone else using that client id learns nothing (and can't make it drop its batch).
+    let b = s.login("bob");
+    assert_eq!(s.json("POST", &format!("/api/items/{id}/permissions"), Some(&a), json!({ "username": "bob", "role": "edit" })).status, 200);
+    let mut ws = s.ws(Some(&b), "since=0&cid=client-a", &id).unwrap();
+    assert_eq!(ws.recv(), ServerMsg::Reload);
 }

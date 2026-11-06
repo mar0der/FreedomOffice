@@ -176,8 +176,8 @@ impl Hub {
             }
             log.entries.push(cosync::server::Entry { seq: o.seq, cid: o.cid, id: o.batch, by: o.actor, ops: parsed });
         }
-        for (cid, batch, seq) in s.live_clients(&item.id).map_err(|e| e.to_string())? {
-            log.last.insert(cid, (batch, seq));
+        for (actor, cid, batch, seq) in s.live_clients(&item.id).map_err(|e| e.to_string())? {
+            log.last.insert((actor, cid), (batch, seq));
         }
         let ids = parse_sheets(&base.sheets);
         if !ids.is_empty() {
@@ -307,7 +307,7 @@ pub async fn run(store: Arc<Mutex<Store>>, hub: Arc<Hub>, socket: WebSocket, j: 
     let item_id = j.item.id.clone();
     let setup = {
         let (store, hub, kick) = (store.clone(), hub.clone(), kick.clone());
-        let (item_id, who, role, since, version, cid) = (j.item.id.clone(), j.who.clone(), j.role, j.since, j.version, j.cid.clone());
+        let (item_id, who, role, since, version, cid, actor) = (j.item.id.clone(), j.who.clone(), j.role, j.since, j.version, j.cid.clone(), j.actor.clone());
         type Setup = (Arc<Mutex<Doc>>, mpsc::Sender<Out>, mpsc::Receiver<Out>);
         tokio::task::spawn_blocking(move || -> Result<Setup, String> {
             let (doc, current) = {
@@ -325,7 +325,7 @@ pub async fn run(store: Arc<Mutex<Store>>, hub: Arc<Hub>, socket: WebSocket, j: 
                 // last batch was committed (and its ack lost), say so first, or the reload would
                 // send it again as a new batch.
                 let (tx, rx) = mpsc::channel(3);
-                if let Some((id, seq)) = d.log.last_commit(&cid) {
+                if let Some((id, seq)) = d.log.last_commit(&cid, &actor) {
                     let _ = tx.try_send(Out::Text(json(&ServerMsg::Ack { id, seq, extra: Vec::new() })));
                 }
                 let _ = tx.try_send(Out::Text(json(&ServerMsg::Reload)));
@@ -492,7 +492,7 @@ pub async fn run(store: Arc<Mutex<Store>>, hub: Arc<Hub>, socket: WebSocket, j: 
 #[allow(clippy::too_many_arguments)]
 fn commit(store: &Mutex<Store>, doc: &Mutex<Doc>, item: &str, conn: u64, base: u64, cid: &str, id: u64, actor: &str, ops: Vec<cosync::Op>) -> bool {
     let mut d = lock(doc);
-    let (sheets_before, last_before) = (d.log.sheets.clone(), d.log.last_commit(cid));
+    let (sheets_before, last_before) = (d.log.sheets.clone(), d.log.last_commit(cid, actor));
     match d.log.commit(base, cid, id, actor, ops) {
         Ok(Commit::New { seq, ops, extra }) => {
             let rec = LiveOp { seq, cid: cid.to_string(), batch: id, actor: actor.to_string(), ops: serde_json::to_string(&ops).unwrap_or_default(), at: now() };
@@ -501,8 +501,8 @@ fn commit(store: &Mutex<Store>, doc: &Mutex<Doc>, item: &str, conn: u64, base: u
                 d.log.entries.pop();
                 d.log.sheets = sheets_before;
                 match last_before {
-                    Some(l) => d.log.last.insert(cid.to_string(), l),
-                    None => d.log.last.remove(cid),
+                    Some(l) => d.log.last.insert((actor.to_string(), cid.to_string()), l),
+                    None => d.log.last.remove(&(actor.to_string(), cid.to_string())),
                 };
                 d.close(conn, 1011, "The server couldn't save your change.");
                 return false;

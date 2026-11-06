@@ -296,10 +296,11 @@ CREATE TABLE IF NOT EXISTS live_state (
 );
 CREATE TABLE IF NOT EXISTS live_clients (
     item_id TEXT NOT NULL REFERENCES items(id),
+    actor TEXT NOT NULL,
     cid TEXT NOT NULL,
     batch INTEGER NOT NULL,
     seq INTEGER NOT NULL,
-    PRIMARY KEY (item_id, cid)
+    PRIMARY KEY (item_id, actor, cid)
 );
 "#;
 
@@ -1021,6 +1022,7 @@ impl Store {
                     params![item.id, item.version, head as i64, s.snap_at],
                 )?;
                 self.conn.execute("DELETE FROM live_ops WHERE item_id = ?1 AND seq <= ?2", params![item.id, head as i64])?;
+                self.conn.execute("DELETE FROM live_clients WHERE item_id = ?1", [&item.id])?;
                 Ok(s)
             }
         }
@@ -1053,19 +1055,20 @@ impl Store {
             params![item_id, op.seq as i64, op.cid, op.batch as i64, op.actor, op.ops, op.at],
         )?;
         tx.execute(
-            "INSERT INTO live_clients (item_id, cid, batch, seq) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(item_id, cid) DO UPDATE SET batch = excluded.batch, seq = excluded.seq",
-            params![item_id, op.cid, op.batch as i64, op.seq as i64],
+            "INSERT INTO live_clients (item_id, actor, cid, batch, seq) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(item_id, actor, cid) DO UPDATE SET batch = excluded.batch, seq = excluded.seq",
+            params![item_id, op.actor, op.cid, op.batch as i64, op.seq as i64],
         )?;
         tx.commit()?;
         Ok(())
     }
 
-    /// Each client's last committed batch: (cid, batch, seq). Kept when the batch is pruned.
-    pub fn live_clients(&self, item_id: &str) -> Res<Vec<(String, u64, u64)>> {
-        let mut st = self.conn.prepare("SELECT cid, batch, seq FROM live_clients WHERE item_id = ?1")?;
+    /// Each client's last committed batch: (actor, cid, batch, seq). Kept when the batch is
+    /// pruned; forgotten when the live state is reset.
+    pub fn live_clients(&self, item_id: &str) -> Res<Vec<(String, String, u64, u64)>> {
+        let mut st = self.conn.prepare("SELECT actor, cid, batch, seq FROM live_clients WHERE item_id = ?1")?;
         let v = st
-            .query_map([item_id], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64, r.get::<_, i64>(2)? as u64)))?
+            .query_map([item_id], |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? as u64, r.get::<_, i64>(3)? as u64)))?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(v)
     }

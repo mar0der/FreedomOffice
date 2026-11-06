@@ -39,9 +39,9 @@ pub struct Log {
     /// The document's sheets at `head`, when known. Used to give the workbook a sheet again
     /// when concurrent deletes removed them all.
     pub sheets: Option<BTreeSet<SheetId>>,
-    /// Each client's last committed batch (id, seq), kept when its entry is pruned: so a
-    /// client whose ack was lost learns its batch is in even after it reloads.
-    pub last: BTreeMap<String, (u64, u64)>,
+    /// Each client's last committed batch (id, seq) by (who, cid), kept when its entry is
+    /// pruned: so a client whose ack was lost learns its batch is in even after it reloads.
+    pub last: BTreeMap<(String, String), (u64, u64)>,
 }
 
 impl Log {
@@ -70,10 +70,10 @@ impl Log {
 
     /// Transforms a client batch over everything committed after its base and commits it.
     pub fn commit(&mut self, base: u64, cid: &str, id: u64, by: &str, ops: Vec<Op>) -> Result<Commit, CommitError> {
-        if let Some(e) = self.entries.iter().find(|e| e.cid == cid && e.id == id) {
+        if let Some(e) = self.entries.iter().find(|e| e.cid == cid && e.id == id && e.by == by) {
             return Ok(Commit::Duplicate { seq: e.seq });
         }
-        if let Some(&(_, seq)) = self.last.get(cid).filter(|l| l.0 == id) {
+        if let Some((_, seq)) = self.last_commit(cid, by).filter(|l| l.0 == id) {
             return Ok(Commit::Duplicate { seq });
         }
         let later = self.since(base).ok_or(if base > self.head() { CommitError::Invalid } else { CommitError::TooOld })?;
@@ -107,13 +107,13 @@ impl Log {
         }
         let seq = self.head() + 1;
         self.entries.push(Entry { seq, cid: cid.to_string(), id, by: by.to_string(), ops: ops.clone() });
-        self.last.insert(cid.to_string(), (id, seq));
+        self.last.insert((by.to_string(), cid.to_string()), (id, seq));
         Ok(Commit::New { seq, ops, extra })
     }
 
-    /// The last batch `cid` committed (id, seq), if any.
-    pub fn last_commit(&self, cid: &str) -> Option<(u64, u64)> {
-        self.last.get(cid).copied()
+    /// The last batch `cid` (of `by`) committed (id, seq), if any.
+    pub fn last_commit(&self, cid: &str, by: &str) -> Option<(u64, u64)> {
+        self.last.get(&(by.to_string(), cid.to_string())).copied()
     }
 
     /// Forgets entries up to and including `seq`.

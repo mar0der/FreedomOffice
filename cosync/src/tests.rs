@@ -866,7 +866,8 @@ fn reload_after_a_lost_ack_does_not_recommit() {
     // Even resent as it was, the pruned batch is recognised.
     assert_eq!(log.commit(b.base, "a", b.id, "u", b.ops.clone()), Ok(Commit::Duplicate { seq: 1 }));
     // What the server sends before Reload.
-    let (id, seq) = log.last_commit("a").unwrap();
+    assert_eq!(log.last_commit("a", "someone else"), None, "only for the user who sent it");
+    let (id, seq) = log.last_commit("a", "u").unwrap();
     a.ack(id, seq, Vec::new());
     let reapply = a.rebase_on_reload(log.head());
     assert_eq!(reapply, vec![text(1, 5, 0, "later")], "only what wasn't committed is re-applied");
