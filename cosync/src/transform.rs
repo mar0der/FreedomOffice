@@ -286,6 +286,24 @@ pub fn touches(a: &[Op], b: &[Op]) -> bool {
     !tb.is_empty() && a.iter().filter_map(target).any(|t| tb.contains(&t))
 }
 
+/// Brings an undo stack (newest step first: each step's ops reverse it, in the state left by
+/// undoing the newer steps) over `ops`, someone else's change in the current state. A step is
+/// marked blocked when the change writes what it would restore. The change is carried down
+/// twice: as it applies below each step (positions), and with its writes winning over the
+/// step's, so older steps restoring the same targets are blocked too.
+pub fn carry_down<'a>(steps: impl IntoIterator<Item = (&'a mut Vec<Op>, &'a mut bool)>, ops: &[Op]) {
+    let (mut ops, mut writes) = (ops.to_vec(), ops.to_vec());
+    for (inverse, blocked) in steps {
+        if touches(inverse, &writes) {
+            *blocked = true;
+        }
+        writes = transform(&writes, inverse, true).0;
+        let (inv, below) = transform(inverse, &ops, true);
+        *inverse = inv;
+        ops = below;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Sequences
 // ---------------------------------------------------------------------------

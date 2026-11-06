@@ -819,21 +819,31 @@ fn undo_steps_below_a_later_own_insert_follow_remote_changes() {
     let inv1 = vec![Op::Cell { s: 1, r: 4, c: 3, v: None, adj: vec![] }];
     doc.apply(&rows(1, 0, 3));
     let inv2 = vec![rows(1, 0, -3)];
-    let mut stack = vec![inv1, inv2];
+    let mut stack = vec![(inv1, false), (inv2, false)];
     // Someone inserts a row at index 6 (above "x", now at index 7).
     let remote = vec![rows(1, 6, 1)];
     doc.apply_all(&remote);
-    let mut ops = remote;
-    for inv in stack.iter_mut().rev() {
-        let (i, below) = transform(inv, &ops, true);
-        *inv = i;
-        ops = below;
-    }
-    for inv in stack.iter().rev() {
+    carry_down(stack.iter_mut().rev().map(|(i, b)| (i, b)), &remote);
+    for (inv, blocked) in stack.iter().rev() {
+        assert!(!blocked);
         doc.apply_all(inv);
     }
     let left: Vec<_> = doc.sheets[0].cells.iter().filter(|(_, v)| v.as_str() == "x").collect();
     assert!(left.is_empty(), "undo cleared the wrong cell; x still at {left:?}");
+}
+
+/// Two own edits of A1, then someone else writes A1: both undo steps are blocked (the older
+/// one would overwrite their value once the newer one is discarded).
+#[test]
+fn undo_block_is_carried_down_to_older_steps() {
+    let mut stack = vec![(vec![Op::Cell { s: 1, r: 0, c: 0, v: None, adj: vec![] }], false), (vec![text(1, 0, 0, "mine-1")], false)];
+    carry_down(stack.iter_mut().rev().map(|(i, b)| (i, b)), &[text(1, 0, 0, "theirs")]);
+    assert!(stack[1].1, "newest blocked");
+    assert!(stack[0].1, "older step would overwrite 'theirs' on undo but is not blocked");
+    // Elsewhere: nothing blocked.
+    let mut stack = vec![(vec![text(1, 3, 3, "a")], false), (vec![text(1, 0, 0, "b")], false)];
+    carry_down(stack.iter_mut().rev().map(|(i, b)| (i, b)), &[text(1, 9, 9, "theirs")]);
+    assert!(!stack[0].1 && !stack[1].1);
 }
 
 /// A batch committed whose ack was lost, followed by pruning past the client's base: the

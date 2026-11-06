@@ -217,6 +217,22 @@ fn undo_after_own_insert_and_remote_insert_clears_the_right_cell() {
     assert_eq!(at(&app.wb, 3, 3), "", "the row someone else inserted stays");
 }
 
+/// Two own edits of a cell, then someone else's: neither undo overwrites their value.
+#[test]
+fn undo_never_overwrites_someone_elses_later_value() {
+    let (_ctx, mut app) = super::data_ui::sample_app();
+    app.live_for_test();
+    app.switch_sheet(0);
+    type_at(&mut app, 0, 0, "mine-1");
+    type_at(&mut app, 0, 0, "mine-2");
+    let s = app.wb.sheets[0].uid;
+    let theirs = cosync::Op::Cell { s, r: 0, c: 0, v: Some(Box::new(cosync::CellData { v: cosync::Val::Text("theirs".into()), ..Default::default() })), adj: vec![] };
+    app.live_remote_for_test(&[theirs]);
+    app.undo();
+    app.undo();
+    assert_eq!(crate::numfmt::value_to_text(app.wb.sheets[0].display_value(0, 0)), "theirs");
+}
+
 /// An editor made a viewer while changes are unsent: the session ends (instead of resending
 /// them on every reconnect) and the changes stay in the window.
 #[test]

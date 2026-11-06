@@ -736,15 +736,7 @@ impl App {
         // Only the newest step of each stack is in the current state; each older one is in the
         // state left by undoing the steps above it. Carry the change down through them.
         for stack in [&mut l.undo, &mut l.redo] {
-            let mut ops = ops.to_vec();
-            for e in stack.iter_mut().rev() {
-                if cosync::touches(&e.inverse, &ops) {
-                    e.blocked = true;
-                }
-                let (inverse, below) = cosync::transform(&e.inverse, &ops, true);
-                e.inverse = inverse;
-                ops = below;
-            }
+            cosync::carry_down(stack.iter_mut().rev().map(|e| (&mut e.inverse, &mut e.blocked)), ops);
         }
         let active = self.wb.sheets.get(self.wb.active).map(|s| s.uid);
         let edit_sheet = self.edit.as_ref().and_then(|e| self.wb.sheets.get(e.sheet)).map(|s| s.uid);
