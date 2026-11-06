@@ -280,9 +280,16 @@ fn two_editors_converge_and_reconnect_replays() {
         n += 1;
     }
     assert_eq!(n, 2);
-    let snap = s.send("POST", &format!("/api/items/{id}/live/snapshot?seq=2"), Some(&a), &[("X-Live-Sheets", "1:0")], Some(b"snapshot at 2".to_vec()));
+    // The workbook and the client's lossless state in one body, split at the offset.
+    let snap = s.send("POST", &format!("/api/items/{id}/live/snapshot?seq=2"), Some(&a), &[("X-Live-Sheets", "1:0"), ("X-Live-State-Offset", "13")], Some(b"snapshot at 2STATE".to_vec()));
     assert_eq!(snap.status, 200, "{}", String::from_utf8_lossy(&snap.body));
     assert_eq!(snap.json()["version"], 2);
+    let content = s.send("GET", &format!("/api/items/{id}/content"), Some(&a), &[], None);
+    assert_eq!((content.body.as_slice(), content.header("x-live-state")), (&b"snapshot at 2"[..], Some("1")));
+    let state = s.send("GET", &format!("/api/items/{id}/live/state?version=2"), Some(&b), &[], None);
+    assert_eq!((state.status, state.body.as_slice()), (200, &b"STATE"[..]));
+    assert_eq!(s.send("GET", &format!("/api/items/{id}/live/state?version=1"), Some(&a), &[], None).status, 404);
+    assert_eq!(s.send("POST", &format!("/api/items/{id}/live/snapshot?seq=2"), Some(&a), &[("X-Live-State-Offset", "99")], Some(b"x".to_vec())).status, 400);
     // An older snapshot is refused.
     assert_eq!(s.send("POST", &format!("/api/items/{id}/live/snapshot?seq=1"), Some(&a), &[], Some(b"x".to_vec())).status, 409);
     drop(wc);

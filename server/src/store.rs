@@ -673,7 +673,11 @@ impl Store {
 
     /// Atomic, durable write: temp file, fsync, rename, fsync the directory.
     fn write_blob(&self, id: &str, version: i64, data: &[u8]) -> Res<()> {
-        let path = self.blob_path(id, version)?;
+        self.write_file(&self.blob_path(id, version)?, version, data)
+    }
+
+    fn write_file(&self, path: &Path, version: i64, data: &[u8]) -> Res<()> {
+        let path = path.to_path_buf();
         let dir = path.parent().ok_or_else(|| StoreError::Internal("bad path".into()))?;
         std::fs::create_dir_all(dir)?;
         let tmp = dir.join(format!(".{version}.{}.tmp", util::hex(&util::random_bytes::<6>())));
@@ -722,7 +726,9 @@ impl Store {
         let doomed = versions_to_prune(&all, self.versions_to_keep as usize);
         for v in doomed {
             self.conn.execute("DELETE FROM versions WHERE item_id = ?1 AND version = ?2", params![item_id, v])?;
-            let _ = std::fs::remove_file(self.blob_path(item_id, v)?);
+            let path = self.blob_path(item_id, v)?;
+            let _ = std::fs::remove_file(path.with_extension("live"));
+            let _ = std::fs::remove_file(path);
         }
         Ok(())
     }
@@ -1011,6 +1017,16 @@ impl Store {
         }
     }
 
+    /// The live state stored with a version by `live_snapshot`, if any.
+    pub fn live_state_blob(&self, item_id: &str, version: i64) -> Res<Option<Vec<u8>>> {
+        let path = self.blob_path(item_id, version)?.with_extension("live");
+        match std::fs::read(&path) {
+            Ok(d) => Ok(Some(d)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     pub fn live_ops_after(&self, item_id: &str, seq: u64) -> Res<Vec<LiveOp>> {
         let mut st = self.conn.prepare("SELECT seq, cid, batch, actor, ops, at FROM live_ops WHERE item_id = ?1 AND seq > ?2 ORDER BY seq")?;
         let v = st
@@ -1032,13 +1048,18 @@ impl Store {
     /// Stores a snapshot uploaded by a live client as the next version: it contains every
     /// operation up to `seq`. Operations up to the previous snapshot are pruned (the ones in
     /// between stay for clients reconnecting with an older base).
-    pub fn live_snapshot(&self, item: &Item, data: &[u8], by: &str, seq: u64, sheets: &str) -> Res<(Item, LiveState)> {
+    /// `state`: the client's lossless copy of what it synchronises (opaque), kept next to the
+    /// version for clients joining later.
+    pub fn live_snapshot(&self, item: &Item, data: &[u8], state: &[u8], by: &str, seq: u64, sheets: &str) -> Res<(Item, LiveState)> {
         let base = self.live_base(item)?;
         let head = self.live_head(&item.id)?;
         if seq < base.seq || seq > head {
             return Err(StoreError::Conflict("That snapshot is out of date.".into()));
         }
         let saved = self.write_content(item, data, by)?;
+        if !state.is_empty() {
+            self.write_file(&self.blob_path(&item.id, saved.version)?.with_extension("live"), saved.version, state)?;
+        }
         let s = LiveState { version: saved.version, seq, sheets: sheets.to_string(), floor: base.seq.max(base.floor), snap_at: now() };
         self.conn.execute(
             "UPDATE live_state SET version = ?1, seq = ?2, sheets = ?3, floor = ?4, snap_at = ?5 WHERE item_id = ?6",

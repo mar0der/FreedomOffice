@@ -270,8 +270,8 @@ impl Bucket {
 /// Everything a connection needs to know about itself.
 pub struct Join {
     pub item: Item,
-    /// The version the client downloaded.
-    pub version: i64,
+    /// The version the client downloaded (None when resuming a session).
+    pub version: Option<i64>,
     pub who: Principal,
     pub role: Role,
     pub actor: String,
@@ -302,7 +302,7 @@ pub async fn run(store: Arc<Mutex<Store>>, hub: Arc<Hub>, socket: WebSocket, j: 
             };
             let mut d = lock(&doc);
             let mut peer = peer_of(&who, role, conn_id);
-            let replay = if version == current { d.log.since(since).map(<[_]>::to_vec) } else { None };
+            let replay = if version.is_none_or(|v| v == current) { d.log.since(since).map(<[_]>::to_vec) } else { None };
             let Some(replay) = replay else {
                 // The client's copy is older than what the session follows: it must reload.
                 let _ = tx.send(Out::Text(json(&ServerMsg::Reload)));
