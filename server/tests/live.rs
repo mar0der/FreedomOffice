@@ -445,6 +445,25 @@ fn reconnecting_after_a_plain_save_reloads() {
 }
 
 #[test]
+fn share_links_get_the_live_state_of_the_current_version_only() {
+    let s = start();
+    let a = s.login("alice");
+    let id = s.new_file(&a, "Linked.xlsx");
+    for state in ["old state", "new state"] {
+        let mut body = b"snap".to_vec();
+        body.extend_from_slice(state.as_bytes());
+        assert_eq!(s.send("POST", &format!("/api/items/{id}/live/snapshot?seq=0"), Some(&a), &[("X-Live-State-Offset", "4")], Some(body)).status, 200);
+    }
+    let link = s.json("POST", &format!("/api/items/{id}/links"), Some(&a), json!({ "role": "edit" })).json();
+    let token = link["url"].as_str().unwrap().rsplit('/').next().unwrap().to_string();
+    let access = s.send("GET", &format!("/api/links/{token}"), None, &[], None).json()["access_token"].as_str().unwrap().to_string();
+    let state = |who: &str, v: i64| s.send("GET", &format!("/api/items/{id}/live/state?version={v}"), Some(who), &[], None);
+    assert_eq!(state(&access, 3).body, b"new state");
+    assert_eq!(state(&access, 2).status, 404, "no history through links");
+    assert_eq!(state(&a, 2).body, b"old state");
+}
+
+#[test]
 fn reload_tells_a_client_its_last_batch_was_committed() {
     let s = start();
     let a = s.login("alice");

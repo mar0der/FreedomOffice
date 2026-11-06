@@ -1170,6 +1170,10 @@ async fn live_state(State(app): State<App>, headers: HeaderMap, Path(id): Path<S
     app.run(move |s| {
         let who = auth(s, &headers)?;
         let (it, _) = visible(s, &who, &id, false)?;
+        // Share links give the current version only (as for the content).
+        if version != it.version && matches!(who, Principal::Link { .. }) {
+            return Err(ApiError::not_found());
+        }
         let data = s.live_state_blob(&it.id, version)?.ok_or_else(ApiError::not_found)?;
         let mut res = data.into_response();
         res.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
