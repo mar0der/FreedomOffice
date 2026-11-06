@@ -7,6 +7,11 @@ use super::theme::{self, ic};
 use super::{App, Drag, EditMode, Editor, Pending};
 use crate::model::{cell_name, Value};
 
+/// Set once the sheet tab being renamed has had the keyboard focus.
+fn rename_focused() -> egui::Id {
+    egui::Id::new("rename_tab_focused")
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Backstage {
     Home,
@@ -270,6 +275,9 @@ impl App {
 
     pub fn sheet_tabs_ui(&mut self, ui: &mut egui::Ui) {
         let full = ui.max_rect();
+        if self.rename_tab.is_none() {
+            ui.data_mut(|d| d.remove::<bool>(rename_focused()));
+        }
         ui.painter().line_segment([full.left_top(), full.right_top()], Stroke::new(1.0, theme::border()));
         ui.horizontal_centered(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
@@ -306,8 +314,15 @@ impl App {
                 if let Some((ri, buf)) = &mut self.rename_tab {
                     if *ri == i {
                         let te = ui.add(egui::TextEdit::singleline(buf).desired_width(110.0).font(font.clone()));
-                        te.request_focus();
-                        if te.lost_focus() {
+                        // Focus it once when the rename starts; asking every frame would take the
+                        // focus straight back from Enter, Escape or a click elsewhere.
+                        let focused_once = ui.data(|d| d.get_temp::<bool>(rename_focused()).unwrap_or(false));
+                        if !focused_once {
+                            ui.data_mut(|d| d.insert_temp(rename_focused(), true));
+                            te.request_focus();
+                        }
+                        if te.lost_focus() || (focused_once && !te.has_focus()) {
+                            ui.data_mut(|d| d.remove::<bool>(rename_focused()));
                             let (ri, buf) = self.rename_tab.take().unwrap();
                             if !ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                                 if let Err(msg) = self.rename_sheet(ri, &buf) {

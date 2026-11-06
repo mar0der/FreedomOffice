@@ -115,3 +115,75 @@ fn typing_in_other_cloud_dialogs_stays_out_of_the_sheet() {
     app.open_protect_dialog();
     assert_cell_untouched(&ctx, &mut app, "protect sheet");
 }
+
+fn click(p: Pos2) -> Vec<Vec<Event>> {
+    let b = |pressed| Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+    vec![vec![Event::PointerMoved(p)], vec![b(true)], vec![b(false)]]
+}
+
+/// Starts renaming the active tab (as double-click, Format > Rename Sheet, Alt H O R do).
+fn start_rename(ctx: &egui::Context, app: &mut App) {
+    app.rename_tab = Some((app.wb.active, app.sheet().name.clone()));
+    frame(ctx, app, vec![]);
+    frame(ctx, app, vec![]);
+}
+
+#[test]
+fn renaming_a_tab_ends_with_enter_escape_or_a_click_elsewhere() {
+    let (ctx, mut app) = app();
+    let name = app.sheet().name.clone();
+
+    // Enter commits; the typing goes into the tab, not a cell.
+    start_rename(&ctx, &mut app);
+    frame(&ctx, &mut app, typing("X"));
+    assert_eq!(app.rename_tab.as_ref().map(|(_, b)| b.clone()), Some(format!("{name}X")));
+    assert!(app.edit.is_none());
+    frame(&ctx, &mut app, key(Key::Enter));
+    frame(&ctx, &mut app, vec![]);
+    assert!(app.rename_tab.is_none(), "Enter ends the rename");
+    assert_eq!(app.sheet().name, format!("{name}X"));
+    // ... and the grid has the keyboard again.
+    frame(&ctx, &mut app, typing("7"));
+    assert!(app.edit.is_some(), "typing after the rename edits a cell");
+    app.cancel_edit();
+
+    // Escape cancels.
+    start_rename(&ctx, &mut app);
+    frame(&ctx, &mut app, typing("Y"));
+    frame(&ctx, &mut app, key(Key::Escape));
+    frame(&ctx, &mut app, vec![]);
+    assert!(app.rename_tab.is_none(), "Escape ends the rename");
+    assert_eq!(app.sheet().name, format!("{name}X"), "Escape keeps the old name");
+
+    // A click on the grid commits.
+    start_rename(&ctx, &mut app);
+    frame(&ctx, &mut app, typing("Z"));
+    for ev in click(Pos2::new(400.0, 400.0)) {
+        frame(&ctx, &mut app, ev);
+    }
+    frame(&ctx, &mut app, vec![]);
+    assert!(app.rename_tab.is_none(), "clicking elsewhere ends the rename");
+    assert_eq!(app.sheet().name, format!("{name}XZ"));
+}
+
+#[test]
+fn renaming_a_tab_in_a_live_session_sends_the_rename_and_survives_others_edits() {
+    let (ctx, mut app) = app();
+    app.cloud.doc = Some(CloudDoc { item_id: "test".into(), ..server_doc() });
+    app.live_for_test();
+    let s = app.wb.sheets[0].uid;
+    start_rename(&ctx, &mut app);
+    frame(&ctx, &mut app, typing("X"));
+    // Someone else inserts a row meanwhile: the rename box stays, with what was typed.
+    app.live_remote_for_test(&[cosync::Op::Rows { s, at: 3, n: 1 }]);
+    frame(&ctx, &mut app, vec![]);
+    let name = app.rename_tab.as_ref().map(|(_, b)| b.clone()).expect("still renaming");
+    assert!(name.ends_with('X'));
+    frame(&ctx, &mut app, typing("Y"));
+    frame(&ctx, &mut app, key(Key::Enter));
+    assert!(app.rename_tab.is_none());
+    assert_eq!(app.wb.sheets[0].name, format!("{name}Y"));
+    assert!(app.live.is_some());
+    assert!(app.live_errors().is_empty(), "the rename's operations reproduce it");
+    assert!(!app.live_pending_ops().is_empty(), "the rename goes to the server like any edit");
+}
