@@ -32,6 +32,10 @@ tungstenite = { version = "0.29", default-features = false, features = ["handsha
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Graphics_Printing", "Win32_Security_Cryptography", "Win32_Storage_Xps", "Win32_Globalization", "Win32_UI_WindowsAndMessaging", "Win32_System_Registry"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+eframe = { version = "0.33", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
+winit = { version = "0.30", default-features = false, features = ["x11", "wayland"] }
+
 [dev-dependencies]
 # End-to-end tests of the server client against a real server on 127.0.0.1 (tests only).
 freedomoffice-server = { path = "../server" }

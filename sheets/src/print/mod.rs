@@ -5,6 +5,9 @@
 pub mod pdf;
 #[cfg(windows)]
 pub mod gdi;
+#[cfg(not(windows))]
+#[path = "cups.rs"]
+pub mod gdi;
 
 use crate::condfmt::CfFrame;
 use crate::model::{BorderLine, HAlign, Range, VAlign, Value, Workbook};

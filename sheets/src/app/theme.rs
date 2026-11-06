@@ -295,6 +295,32 @@ fn read_font(file: &str) -> Option<Vec<u8>> {
     None
 }
 
+/// Resolves a fontconfig pattern (e.g. "Calibri:bold") to font bytes and face index.
+/// fontconfig applies its own metric-compatible aliases (Calibri -> Carlito, Arial ->
+/// Liberation Sans, ...) and always answers with its best match.
+#[cfg(not(windows))]
+fn fc_match(pattern: &str) -> Option<(Vec<u8>, u32)> {
+    let out = std::process::Command::new("fc-match").args(["-f", "%{file}|%{index}", pattern]).output().ok()?;
+    let s = String::from_utf8(out.stdout).ok()?;
+    let (file, index) = s.trim().rsplit_once('|')?;
+    // Colour bitmap fonts (Noto Color Emoji) can't be rasterised by egui.
+    if file.is_empty() || file.to_lowercase().contains("color") {
+        return None;
+    }
+    Some((std::fs::read(file).ok()?, index.parse().unwrap_or(0)))
+}
+
+#[cfg(windows)]
+fn fc_match(_pattern: &str) -> Option<(Vec<u8>, u32)> {
+    None
+}
+
+fn font_data((bytes, index): (Vec<u8>, u32)) -> Arc<FontData> {
+    let mut d = FontData::from_owned(bytes);
+    d.index = index;
+    Arc::new(d)
+}
+
 pub struct FontManager {
     defs: FontDefinitions,
     loaded: HashSet<String>,
@@ -321,8 +347,19 @@ impl FontManager {
                 None => false,
             }
         };
+        // Not on Windows: take the font from fontconfig when the Windows file is missing.
+        let add_or = |defs: &mut FontDefinitions, key: &str, file: &str, pattern: &str| -> bool {
+            add(defs, key, file)
+                || match fc_match(pattern) {
+                    Some(f) if !cfg!(windows) => {
+                        defs.font_data.insert(key.to_string(), font_data(f));
+                        true
+                    }
+                    _ => false,
+                }
+        };
         let mut ui_chain = Vec::new();
-        if add(&mut defs, "ui", "segoeui.ttf") {
+        if add_or(&mut defs, "ui", "segoeui.ttf", "sans-serif") {
             ui_chain.push("ui".to_string());
         }
         if add(&mut defs, "ui-symbol", "seguisym.ttf") {
@@ -331,8 +368,25 @@ impl FontManager {
         if add(&mut defs, "ui-emoji", "seguiemj.ttf") {
             ui_fallbacks.push("ui-emoji".to_string());
         }
+        // Linux/macOS: broad symbol coverage for the icon fallbacks (arrows, ✂, ⧉, ⫷ ...).
+        if !cfg!(windows) {
+            for (i, pat) in ["DejaVu Sans", "Noto Sans Symbols2", "Noto Sans Symbols", "Noto Sans Math"].iter().enumerate() {
+                let key = format!("ui-symbol-{i}");
+                if let Some(f) = fc_match(pat).filter(|_| {
+                    // fc-match always answers; keep only the family that was asked for.
+                    std::process::Command::new("fc-list")
+                        .arg(pat)
+                        .output()
+                        .map(|o| !o.stdout.is_empty())
+                        .unwrap_or(false)
+                }) {
+                    defs.font_data.insert(key.clone(), font_data(f));
+                    ui_fallbacks.push(key);
+                }
+            }
+        }
         let icons = add(&mut defs, ICON_FAMILY, "SegoeIcons.ttf") || add(&mut defs, ICON_FAMILY, "segmdl2.ttf");
-        if add(&mut defs, "ui-bold", "segoeuib.ttf") {
+        if add_or(&mut defs, "ui-bold", "segoeuib.ttf", "sans-serif:bold") {
             let mut fam = vec!["ui-bold".to_string()];
             fam.extend(ui_fallbacks.iter().cloned());
             defs.families.insert(FontFamily::Name("ui-bold".into()), fam);
@@ -413,11 +467,20 @@ impl FontManager {
                 break;
             }
         }
-        let Some(bytes) = data else {
+        let data = data.map(|b| (b, 0)).or_else(|| {
+            let style = match (bold, italic) {
+                (false, false) => "",
+                (true, false) => ":bold",
+                (false, true) => ":italic",
+                (true, true) => ":bold:italic",
+            };
+            fc_match(&format!("{name}{style}"))
+        });
+        let Some(data) = data else {
             self.failed.insert(key);
             return false;
         };
-        self.defs.font_data.insert(key.clone(), Arc::new(FontData::from_owned(bytes)));
+        self.defs.font_data.insert(key.clone(), font_data(data));
         let mut chain = vec![key.clone()];
         chain.push("ui".to_string());
         chain.extend(self.ui_fallbacks.iter().cloned());

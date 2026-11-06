@@ -115,6 +115,19 @@ cargo build --release
 The executable is written to `target/release/FreedomSheets.exe` (statically linked C runtime, icon and DPI-aware manifest embedded).
 Run the tests with `cargo test`.
 
+### Linux (x86_64, experimental)
+
+Runs on X11 and Wayland. On Debian/Ubuntu install the build dependencies first:
+
+```bash
+sudo apt install build-essential pkg-config libssl-dev libxkbcommon-dev libwayland-dev libgtk-3-dev
+cargo build --release   # -> target/release/FreedomSheets
+```
+
+Fonts come from fontconfig. For layouts that match Windows, install the metric-compatible
+fonts (`fonts-crosextra-carlito fonts-crosextra-caladea fonts-liberation`). Printing goes
+through CUPS (`lp`); there is no printer-properties dialog.
+
 ## Project layout
 
 ```
