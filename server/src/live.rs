@@ -14,7 +14,7 @@ use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use cosync::server::{Commit, CommitError, Log};
 use cosync::{close, ClientMsg, Peer, ServerMsg, SheetId};
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 
 use crate::store::{Item, LiveOp, Principal, Role, Store};
 use crate::util::{self, now};
@@ -27,6 +27,9 @@ const SNAPSHOT_RETRY: Duration = Duration::from_secs(60);
 const PING_EVERY: Duration = Duration::from_secs(20);
 const IDLE_LIMIT: Duration = Duration::from_secs(60);
 const TICKET_LIFE: Duration = Duration::from_secs(60);
+/// Messages waiting for a connection (besides its initial replay): a client that doesn't read
+/// them is disconnected (it catches up when it reconnects).
+const QUEUE: usize = 1024;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -40,7 +43,17 @@ enum Out {
 
 struct Conn {
     peer: Peer,
-    tx: mpsc::UnboundedSender<Out>,
+    tx: mpsc::Sender<Out>,
+    /// Told when the queue is full.
+    kick: Arc<Notify>,
+}
+
+impl Conn {
+    fn push(&self, out: Out) {
+        if let Err(mpsc::error::TrySendError::Full(_)) = self.tx.try_send(out) {
+            self.kick.notify_one();
+        }
+    }
 }
 
 /// The live session of one document.
@@ -58,20 +71,20 @@ pub struct Doc {
 impl Doc {
     fn send(&self, id: u64, msg: &ServerMsg) {
         if let Some(c) = self.conns.iter().find(|c| c.peer.id == id) {
-            let _ = c.tx.send(Out::Text(json(msg)));
+            c.push(Out::Text(json(msg)));
         }
     }
 
     fn broadcast(&self, except: u64, msg: &ServerMsg) {
         let text = json(msg);
         for c in self.conns.iter().filter(|c| c.peer.id != except) {
-            let _ = c.tx.send(Out::Text(text.clone()));
+            c.push(Out::Text(text.clone()));
         }
     }
 
     fn close(&self, id: u64, code: u16, reason: &str) {
         if let Some(c) = self.conns.iter().find(|c| c.peer.id == id) {
-            let _ = c.tx.send(Out::Close(code, reason.to_string()));
+            c.push(Out::Close(code, reason.to_string()));
         }
     }
 
@@ -287,15 +300,16 @@ pub async fn run(store: Arc<Mutex<Store>>, hub: Arc<Hub>, socket: WebSocket, j: 
     hub.start_ticker();
     let conn_id = hub.next_conn.fetch_add(1, Ordering::SeqCst) + 1;
     let (mut sink, mut stream) = socket.split();
-    let (tx, mut rx) = mpsc::unbounded_channel::<Out>();
+    let kick = Arc::new(Notify::new());
 
     // Load the document and register, all under the document lock so the replay and the live
     // stream join without a gap.
     let item_id = j.item.id.clone();
     let setup = {
-        let (store, hub, tx) = (store.clone(), hub.clone(), tx.clone());
+        let (store, hub, kick) = (store.clone(), hub.clone(), kick.clone());
         let (item_id, who, role, since, version, cid) = (j.item.id.clone(), j.who.clone(), j.role, j.since, j.version, j.cid.clone());
-        tokio::task::spawn_blocking(move || -> Result<Arc<Mutex<Doc>>, String> {
+        type Setup = (Arc<Mutex<Doc>>, mpsc::Sender<Out>, mpsc::Receiver<Out>);
+        tokio::task::spawn_blocking(move || -> Result<Setup, String> {
             let (doc, current) = {
                 let s = lock(&store);
                 // Counted while holding the store, so a plain save can't slip in unnoticed.
@@ -310,28 +324,30 @@ pub async fn run(store: Arc<Mutex<Store>>, hub: Arc<Hub>, socket: WebSocket, j: 
                 // The client's copy is older than what the session follows: it must reload. If its
                 // last batch was committed (and its ack lost), say so first, or the reload would
                 // send it again as a new batch.
+                let (tx, rx) = mpsc::channel(3);
                 if let Some((id, seq)) = d.log.last_commit(&cid) {
-                    let _ = tx.send(Out::Text(json(&ServerMsg::Ack { id, seq, extra: Vec::new() })));
+                    let _ = tx.try_send(Out::Text(json(&ServerMsg::Ack { id, seq, extra: Vec::new() })));
                 }
-                let _ = tx.send(Out::Text(json(&ServerMsg::Reload)));
-                let _ = tx.send(Out::Close(1000, "reload".into()));
-                return Ok(doc.clone());
+                let _ = tx.try_send(Out::Text(json(&ServerMsg::Reload)));
+                let _ = tx.try_send(Out::Close(1000, "reload".into()));
+                return Ok((doc.clone(), tx, rx));
             };
+            let (tx, rx) = mpsc::channel(QUEUE + 1 + replay.len());
             let used: Vec<u8> = d.conns.iter().map(|c| c.peer.color).collect();
             peer.color = (0..u8::MAX).find(|c| !used.contains(c)).unwrap_or(0);
             let peers: Vec<Peer> = d.conns.iter().map(|c| c.peer.clone()).collect();
-            let _ = tx.send(Out::Text(json(&ServerMsg::Welcome { seq: d.log.head(), you: peer.clone(), peers })));
+            let _ = tx.try_send(Out::Text(json(&ServerMsg::Welcome { seq: d.log.head(), you: peer.clone(), peers })));
             for e in replay {
                 let msg = ServerMsg::Ops { seq: e.seq, cid: e.cid, id: e.id, by: 0, ops: e.ops };
-                let _ = tx.send(Out::Text(json(&msg)));
+                let _ = tx.try_send(Out::Text(json(&msg)));
             }
             d.broadcast(conn_id, &ServerMsg::Join { peer: peer.clone() });
-            d.conns.push(Conn { peer, tx });
-            Ok(doc.clone())
+            d.conns.push(Conn { peer, tx: tx.clone(), kick });
+            Ok((doc.clone(), tx, rx))
         })
         .await
     };
-    let doc = match setup {
+    let (doc, tx, mut rx) = match setup {
         Ok(Ok(d)) => d,
         Ok(Err(e)) => {
             hub.release(&item_id);
@@ -346,7 +362,7 @@ pub async fn run(store: Arc<Mutex<Store>>, hub: Arc<Hub>, socket: WebSocket, j: 
     };
     tracing::info!("live: connection {conn_id} joined item {item_id} ({})", if j.role >= Role::Edit { "editor" } else { "viewer" });
 
-    let writer = tokio::spawn(async move {
+    let mut writer = tokio::spawn(async move {
         while let Some(out) = rx.recv().await {
             let r = match out {
                 Out::Text(t) => sink.send(Message::Text(t.into())).await,
@@ -369,8 +385,9 @@ pub async fn run(store: Arc<Mutex<Store>>, hub: Arc<Hub>, socket: WebSocket, j: 
     heartbeat.tick().await;
     let editor = j.role >= Role::Edit;
     let fail = |code: u16, reason: &str| {
-        let _ = tx.send(Out::Close(code, reason.to_string()));
+        let _ = tx.try_send(Out::Close(code, reason.to_string()));
     };
+    let mut kicked = false;
     loop {
         tokio::select! {
             msg = stream.next() => {
@@ -434,9 +451,19 @@ pub async fn run(store: Arc<Mutex<Store>>, hub: Arc<Hub>, socket: WebSocket, j: 
                     fail(close::IDLE, "No response.");
                     break;
                 }
-                let _ = tx.send(Out::Ping);
+                if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(Out::Ping) {
+                    kicked = true;
+                    break;
+                }
+            }
+            _ = kick.notified() => {
+                kicked = true;
+                break;
             }
         }
+    }
+    if kicked {
+        tracing::warn!("live: connection {conn_id} to item {item_id} doesn't read its messages; disconnecting it");
     }
 
     // Leave.
@@ -454,7 +481,10 @@ pub async fn run(store: Arc<Mutex<Store>>, hub: Arc<Hub>, socket: WebSocket, j: 
         }
     }
     drop(tx);
-    let _ = tokio::time::timeout(Duration::from_secs(5), writer).await;
+    // A client that doesn't read is cut off at once; otherwise what is queued goes out first.
+    if kicked || tokio::time::timeout(Duration::from_secs(5), &mut writer).await.is_err() {
+        writer.abort();
+    }
     tracing::info!("live: connection {conn_id} left item {item_id}");
 }
 
@@ -498,5 +528,28 @@ fn commit(store: &Mutex<Store>, doc: &Mutex<Doc>, item: &str, conn: u64, base: u
             d.close(conn, close::INVALID, "Invalid base.");
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures_util::FutureExt;
+
+    use super::*;
+
+    /// A participant that doesn't read its messages is disconnected when its queue is full,
+    /// instead of the server queueing for it without bound.
+    #[test]
+    fn a_connection_that_does_not_read_is_kicked() {
+        let peer = |id| Peer { id, name: String::new(), user: String::new(), color: 0, editor: true, presence: None };
+        let (tx, _rx) = mpsc::channel(2);
+        let kick = Arc::new(Notify::new());
+        let d = Doc { log: Log::new(0), conns: vec![Conn { peer: peer(1), tx, kick: kick.clone() }], unsnapped: 0, unsnapped_since: None, snap_asked: None, snap_turn: 0 };
+        for _ in 0..2 {
+            d.broadcast(9, &ServerMsg::Leave { id: 9 });
+        }
+        assert!(kick.notified().now_or_never().is_none(), "not while there is room");
+        d.broadcast(9, &ServerMsg::Leave { id: 9 });
+        assert!(kick.notified().now_or_never().is_some(), "kicked when full");
     }
 }
