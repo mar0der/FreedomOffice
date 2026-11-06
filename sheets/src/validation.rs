@@ -9,7 +9,7 @@ use crate::formula::{self, Expr};
 use crate::model::{Range, Sheet, Value, Workbook};
 use crate::numfmt;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum Allow {
     #[default]
     Any,
@@ -71,7 +71,7 @@ impl Allow {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum ErrorStyle {
     #[default]
     Stop,
@@ -105,7 +105,7 @@ impl ErrorStyle {
 
 pub const DEFAULT_ERROR: &str = "This value doesn't match the data validation restrictions defined for this cell.";
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Validation {
     pub ranges: Vec<Range>,
     pub allow: Allow,

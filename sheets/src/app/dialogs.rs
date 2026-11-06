@@ -634,6 +634,7 @@ impl App {
                             Ok(mut wb) => {
                                 wb.path = None;
                                 wb.recalc();
+                                self.live_leave(false);
                                 self.wb = wb;
                                 self.zoom_for = None;
                                 self.dirty = true;

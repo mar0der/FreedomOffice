@@ -8,7 +8,7 @@ use crate::model::{BorderLine, ErrorKind, Range, Sheet, Value, Workbook};
 // ---------------------------------------------------------------------------
 
 /// Total-row function of a table column.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum TotalFn {
     #[default]
     None,
@@ -84,7 +84,7 @@ impl TotalFn {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct TableColumn {
     pub name: String,
     pub total: TotalFn,
@@ -92,7 +92,7 @@ pub struct TableColumn {
     pub total_label: String,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Table {
     pub name: String,
     /// Whole table, including the header and total rows.
@@ -280,7 +280,7 @@ fn tint(c: u32, t: f32) -> u32 {
 }
 
 /// What a table style draws on one cell (under the cell's own formatting).
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Look {
     pub fill: Option<u32>,
     pub color: Option<u32>,

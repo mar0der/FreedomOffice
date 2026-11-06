@@ -67,6 +67,10 @@ impl App {
 
     /// `protect_blocks` for sheet `si`.
     pub fn protect_blocks_at(&mut self, si: usize, change: Change) -> bool {
+        // View-only participants of a live session change nothing.
+        if self.live_read_only() {
+            return true;
+        }
         // PivotTable report cells refuse direct edits even on an unprotected sheet.
         if let Change::Cells(rg) = &change {
             if si == self.wb.active && self.pivot_block(*rg) {

@@ -161,7 +161,13 @@ pub fn doc_from_item(url: &str, item: &DriveItem, local: PathBuf) -> CloudDoc {
         parent: (!item.parent_id.is_empty()).then(|| item.parent_id.clone()),
         local,
         provider: Provider::FreedomServer(url.to_string()),
+        live: None,
     }
+}
+
+/// "v12-abc..." -> 12
+pub fn version_of_etag(etag: &str) -> Option<i64> {
+    etag.trim_matches('"').strip_prefix('v')?.split('-').next()?.parse().ok()
 }
 
 fn error_text(r: &Response, host: &str) -> String {
@@ -278,7 +284,46 @@ impl ServerSession {
             std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
         }
         std::fs::write(&local, &r.body).map_err(|e| format!("Couldn't write {}: {e}", local.display()))?;
-        Ok(doc_from_item(&self.account.url, &meta, local))
+        let mut doc = doc_from_item(&self.account.url, &meta, local);
+        // The live session this copy can join: the version downloaded and the sequence number
+        // it contains (servers without live co-editing send neither).
+        let version = r.header("etag").and_then(version_of_etag).or_else(|| version_of_etag(&meta.etag));
+        if let (Some(seq), Some(version)) = (r.header("x-live-seq").and_then(|v| v.parse().ok()), version) {
+            let mut state = None;
+            if r.header("x-live-state").is_some() {
+                let s = self.call(Request::new("GET", format!("/api/items/{}/live/state?version={version}", pct_encode(&meta.id))))?;
+                if s.ok() {
+                    let path = doc.local.with_file_name(format!("{}.live", meta.name));
+                    std::fs::write(&path, &s.body).map_err(|e| format!("Couldn't write {}: {e}", path.display()))?;
+                    state = Some(path);
+                }
+            }
+            doc.live = Some(super::graph::LiveBase { version, seq, sheets: r.header("x-live-sheets").unwrap_or("").to_string(), state });
+            if let Some(e) = r.header("etag") {
+                doc.etag = e.trim_matches('"').to_string();
+            }
+        }
+        Ok(doc)
+    }
+
+    /// Uploads a live client's copy that contains every change up to `seq` as a new version,
+    /// with its lossless live state (for people joining later).
+    pub fn live_snapshot(&self, id: &str, seq: u64, sheets: &str, data: &[u8], state: &[u8]) -> Result<DriveItem, String> {
+        let mut req = Request::new("POST", format!("/api/items/{}/live/snapshot?seq={seq}", pct_encode(id)))
+            .header("Content-Type", "application/octet-stream")
+            .header("X-Live-Sheets", sheets)
+            .header("X-Live-State-Offset", data.len().to_string());
+        req.body = [data, state].concat();
+        let r = self.call(req)?;
+        if !r.ok() {
+            return Err(error_text(&r, &self.host()));
+        }
+        Ok(item_from_json(&r.json()?))
+    }
+
+    /// The device token (for the live connection's Authorization header).
+    pub fn token(&self) -> &str {
+        &self.account.token
     }
 
     fn upload_result(&self, r: Response) -> Result<DriveItem, UploadError> {

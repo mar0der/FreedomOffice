@@ -474,15 +474,15 @@ mod tests {
 
     #[test]
     fn token_response() {
-        let ok = Response { status: 200, body: br#"{"access_token":"AT","refresh_token":"RT2","expires_in":3599}"#.to_vec() };
+        let ok = Response::new(200, br#"{"access_token":"AT","refresh_token":"RT2","expires_in":3599}"#.to_vec());
         assert_eq!(parse_token_response(&ok, "RT1", 1000), Ok(Tokens { access: "AT".into(), refresh: "RT2".into(), expires_at: 4599 }));
-        let keep = Response { status: 200, body: br#"{"access_token":"AT","expires_in":"60"}"#.to_vec() };
+        let keep = Response::new(200, br#"{"access_token":"AT","expires_in":"60"}"#.to_vec());
         let t = parse_token_response(&keep, "RT1", 1000).unwrap();
         assert_eq!((t.refresh.as_str(), t.expires_at), ("RT1", 1060));
         assert!(t.expired(1000));
-        let bad = Response { status: 400, body: br#"{"error":"invalid_grant","error_description":"AADSTS70008: expired"}"#.to_vec() };
+        let bad = Response::new(400, br#"{"error":"invalid_grant","error_description":"AADSTS70008: expired"}"#.to_vec());
         assert_eq!(parse_token_response(&bad, "RT1", 0), Err("Your sign-in has expired. Sign in again.".into()));
-        let other = Response { status: 400, body: br#"{"error":"invalid_client","error_description":"AADSTS7000218: needs secret\r\nTrace ID: 1"}"#.to_vec() };
+        let other = Response::new(400, br#"{"error":"invalid_client","error_description":"AADSTS7000218: needs secret\r\nTrace ID: 1"}"#.to_vec());
         assert_eq!(parse_token_response(&other, "RT1", 0), Err("AADSTS7000218: needs secret".into()));
     }
 

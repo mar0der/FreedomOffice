@@ -2,7 +2,7 @@
 
 use crate::model::{Range, Sheet, Value, Workbook};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum SparkKind {
     #[default]
     Line,
@@ -29,7 +29,7 @@ impl SparkKind {
 }
 
 /// How empty cells are shown.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum EmptyAs {
     #[default]
     Gap,
@@ -49,7 +49,7 @@ impl EmptyAs {
 }
 
 /// Vertical axis minimum / maximum option.
-#[derive(Clone, Copy, Debug, PartialEq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub enum AxisScale {
     /// Automatic for each sparkline.
     #[default]
@@ -59,7 +59,7 @@ pub enum AxisScale {
     Custom(f64),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SparkColors {
     pub series: u32,
     pub negative: u32,
@@ -107,7 +107,7 @@ impl SparkColors {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Sparkline {
     /// Cell the sparkline is drawn in.
     pub loc: (u32, u32),
@@ -115,7 +115,7 @@ pub struct Sparkline {
     pub data: String,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SparklineGroup {
     pub kind: SparkKind,
     pub items: Vec<Sparkline>,

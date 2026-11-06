@@ -3,6 +3,7 @@
 
 pub mod api;
 pub mod config;
+pub mod live;
 pub mod store;
 pub mod tls;
 pub mod util;

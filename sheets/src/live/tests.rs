@@ -1,0 +1,129 @@
+//! Tests of the live operations on the workbook model.
+
+use cosync::{CellData, Op, Val};
+
+use super::*;
+use crate::model::{cell_from_input, Range, Sheet, Workbook};
+
+fn book() -> Workbook {
+    let mut wb = Workbook::empty_with(vec![Sheet::new("Sheet1"), Sheet::new("Data")]);
+    assign_ids(&mut wb, "");
+    for (r, t) in ["1", "2", "3", "4", "5", "=SUM(A1:A5)", "=Data!B2*2"].iter().enumerate() {
+        let c = cell_from_input(&mut wb, t, 0);
+        wb.sheets[0].set(r as u32, 0, c);
+    }
+    wb.recalc();
+    wb
+}
+
+fn formula_at(wb: &Workbook, s: usize, r: u32, c: u32) -> String {
+    wb.sheets[s].get(r, c).and_then(|x| x.formula.as_ref()).map(|f| f.text.clone()).unwrap_or_default()
+}
+
+#[test]
+fn order_keys_keep_most_sheets_in_place() {
+    let p = diff::positions_for_test(&[(1, Some(0.0)), (2, Some(1.0)), (3, Some(2.0))]);
+    assert_eq!(p, [0.0, 1.0, 2.0]);
+    // Sheet 3 moved to the front: only it gets a new key.
+    let p = diff::positions_for_test(&[(3, Some(2.0)), (1, Some(0.0)), (2, Some(1.0))]);
+    assert_eq!((p[1], p[2]), (0.0, 1.0));
+    assert!(p[0] < 0.0);
+    // A new sheet between two others.
+    let p = diff::positions_for_test(&[(1, Some(0.0)), (9, None), (2, Some(1.0))]);
+    assert!(p[1] > 0.0 && p[1] < 1.0);
+    // Ties are fine when ids order them; otherwise everything is renumbered.
+    let p = diff::positions_for_test(&[(1, Some(0.0)), (2, Some(0.0))]);
+    assert_eq!(p, [0.0, 0.0]);
+}
+
+#[test]
+fn formulas_transformed_over_structure_are_adjusted_like_the_command_does() {
+    // A formula written before someone inserted rows above what it refers to.
+    let mut wb = book();
+    let s = wb.sheets[0].uid;
+    crate::structure::shift_structure(&mut wb, 0, true, 1, 2);
+    let op = Op::Cell { s, r: 9, c: 1, v: Some(Box::new(CellData { f: Some("A3+A5".into()), ..Default::default() })), adj: vec![Op::Rows { s, at: 1, n: 2 }] };
+    let mut st = ApplyState::default();
+    apply_ops(&mut wb, &[op], true, &mut st);
+    assert_eq!(formula_at(&wb, 0, 9, 1), "A5+A7");
+    // The same formula had it been there: shifted by the command itself.
+    assert_eq!(formula_at(&wb, 0, 7, 0), "SUM(A1:A7)");
+    // A rename it went through, then a delete of the sheet it refers to.
+    let data = wb.sheets[1].uid;
+    crate::structure::rename_sheet(&mut wb, 1, "Facts");
+    let op = Op::Cell { s, r: 10, c: 1, v: Some(Box::new(CellData { f: Some("Data!A1".into()), ..Default::default() })), adj: vec![Op::Rename { s: data, from: "Data".into(), to: "Facts".into() }] };
+    apply_ops(&mut wb, &[op], true, &mut st);
+    assert_eq!(formula_at(&wb, 0, 10, 1), "Facts!A1");
+}
+
+#[test]
+fn features_transformed_over_structure_match_the_command() {
+    let mut a = book();
+    let s = a.sheets[0].uid;
+    let rule = crate::condfmt::CondFormat::new(vec![Range::parse("A2:A6").unwrap()], crate::condfmt::RuleKind::Expression { formula: "A2>2".into() }, Default::default());
+    a.sheets[0].cond_formats.push(rule.clone());
+    let mut b = a.clone();
+    // Path 1: the rule existed when rows were deleted.
+    crate::structure::shift_structure(&mut a, 0, true, 0, -1);
+    // Path 2: rows deleted first, then the rule arrives having been transformed over that.
+    b.sheets[0].cond_formats.clear();
+    crate::structure::shift_structure(&mut b, 0, true, 0, -1);
+    let op = Op::Feature { s, key: "cond_formats".into(), val: serde_json::to_value(vec![rule]).unwrap(), adj: vec![Op::Rows { s, at: 0, n: -1 }] };
+    let mut st = ApplyState::default();
+    apply_ops(&mut b, &[op], true, &mut st);
+    assert_eq!(a.sheets[0].cond_formats, b.sheets[0].cond_formats);
+    assert_eq!(a.sheets[0].cond_formats[0].ranges, vec![Range::parse("A1:A5").unwrap()]);
+}
+
+#[test]
+fn cells_round_trip_by_content() {
+    let mut wb = book();
+    let bold = wb.intern_style(crate::model::Style { bold: true, num_fmt: "0.0".into(), ..Default::default() });
+    wb.sheets[0].cell_mut(0, 0).style = bold;
+    let d = cell_data(&wb, &wb.sheets[0], 0, 0, wb.sheets[0].get(0, 0).unwrap());
+    assert_eq!(d.v, Val::Num(1.0));
+    assert!(d.st.is_some());
+    // Another workbook interns styles in a different order: content still matches.
+    let mut other = Workbook::empty_with(vec![Sheet::new("Sheet1")]);
+    other.intern_style(crate::model::Style { italic: true, ..Default::default() });
+    assign_ids(&mut other, "");
+    let op = Op::Cell { s: other.sheets[0].uid, r: 0, c: 0, v: Some(Box::new(d)), adj: vec![] };
+    apply_ops(&mut other, &[op], true, &mut ApplyState::default());
+    let x = other.sheets[0].get(0, 0).unwrap();
+    assert!(other.style(x.style).bold && other.style(x.style).num_fmt == "0.0");
+    assert_ne!(x.style, bold);
+}
+
+#[test]
+fn deleting_the_last_sheet_shows_a_provisional_one_until_the_server_answers() {
+    let mut wb = Workbook::empty_with(vec![Sheet::new("Only")]);
+    assign_ids(&mut wb, "");
+    let mut st = ApplyState::default();
+    apply_ops(&mut wb, &[Op::DelSheet { s: 1, name: "Only".into() }], true, &mut st);
+    assert_eq!((wb.sheets.len(), wb.sheets[0].uid, st.provisional), (1, cosync::RESCUE_SHEET, true));
+    // Someone else's new sheet arrives first: the provisional one goes away.
+    apply_ops(&mut wb, &[Op::AddSheet { s: 77, name: "New".into(), pos: 3.0 }], true, &mut st);
+    assert_eq!(wb.sheets.iter().map(|s| s.uid).collect::<Vec<_>>(), [77]);
+    assert!(!st.provisional);
+}
+
+#[test]
+fn snapshot_metadata_gives_the_same_ids_everywhere() {
+    let mut wb = book();
+    wb.sheets[0].uid = 55;
+    wb.sheets[0].pos = 2.5;
+    let meta = sheets_meta(&wb);
+    let mut other = Workbook::empty_with(vec![Sheet::new("Sheet1"), Sheet::new("Data")]);
+    assign_ids(&mut other, &meta);
+    assert_eq!((other.sheets[0].uid, other.sheets[0].pos), (55, 2.5));
+    assert_eq!(other.sheets[1].uid, wb.sheets[1].uid);
+    // Without metadata (a version saved outside a live session): by position.
+    assign_ids(&mut other, "");
+    assert_eq!(other.sheets.iter().map(|s| s.uid).collect::<Vec<_>>(), [1, 2]);
+    // Pictures travel as base64.
+    let pic = crate::model::Picture { data: std::sync::Arc::new(vec![0x89, b'P', b'N', b'G', 0, 255]), ext: "png".into(), anchor: (1, 1), offset: (0.0, 0.0), size: (10.0, 10.0), name: "p".into(), descr: String::new() };
+    let j = serde_json::to_value(vec![pic.clone()]).unwrap();
+    assert!(j[0]["data"].is_string());
+    let back: Vec<crate::model::Picture> = serde_json::from_value(j).unwrap();
+    assert_eq!(back[0], pic);
+}

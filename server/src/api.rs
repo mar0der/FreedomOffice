@@ -50,11 +50,12 @@ pub struct App {
     store: Arc<Mutex<Store>>,
     cfg: Arc<Config>,
     limiter: Arc<Mutex<Limiter>>,
+    hub: Arc<crate::live::Hub>,
 }
 
 impl App {
     pub fn new(store: Store, cfg: Config) -> App {
-        App { store: Arc::new(Mutex::new(store)), cfg: Arc::new(cfg), limiter: Arc::new(Mutex::new(Limiter::default())) }
+        App { store: Arc::new(Mutex::new(store)), cfg: Arc::new(cfg), limiter: Arc::new(Mutex::new(Limiter::default())), hub: Arc::default() }
     }
 
     /// Runs blocking store work (SQLite, disk) on the blocking pool, one request at a time.
@@ -313,6 +314,9 @@ pub fn router(app: App) -> Router {
         .route("/api/items/{id}/links", get(list_links).post(create_link))
         .route("/api/items/{id}/links/{link}", axum::routing::delete(delete_link))
         .route("/api/items/{id}/live", get(live))
+        .route("/api/items/{id}/live-ticket", post(live_ticket))
+        .route("/api/items/{id}/live/snapshot", post(live_snapshot).layer(DefaultBodyLimit::max(app.cfg.max_upload_bytes().saturating_mul(4))))
+        .route("/api/items/{id}/live/state", get(live_state))
         .route("/api/links/{token}", get(open_link).post(open_link_password))
         .route("/l/{token}", get(link_page))
         .route("/l/{token}/download", get(link_download).post(link_download_form))
@@ -513,6 +517,7 @@ async fn create_folder(State(app): State<App>, headers: HeaderMap, body: Bytes) 
 }
 
 async fn upload_file(State(app): State<App>, headers: HeaderMap, Query(q): Query<HashMap<String, String>>, body: Bytes) -> ApiResult {
+    let hub = app.hub.clone();
     app.run(move |s| {
         let who = auth(s, &headers)?;
         let on_conflict = OnConflict::parse(q.get("conflict").map(String::as_str).unwrap_or("")).ok_or_else(|| ApiError::bad("conflict must be fail, rename or replace."))?;
@@ -523,6 +528,15 @@ async fn upload_file(State(app): State<App>, headers: HeaderMap, Query(q): Query
         };
         let (p, role) = visible(s, &who, &parent, false)?;
         need_edit(role)?;
+        if on_conflict == OnConflict::Replace {
+            if let Ok(clean) = util::clean_name(&name) {
+                if let Some(existing) = s.find_child(&p.id, &clean)? {
+                    if live_busy(s, &hub, &existing)? {
+                        return Err(locked());
+                    }
+                }
+            }
+        }
         let (it, created) = s.create_file(&p.id, &name, &body, &actor(&who), on_conflict)?;
         if let Principal::User { user, .. } = &who {
             s.touch_recent(&user.id, &it.id)?;
@@ -557,8 +571,19 @@ async fn get_content(State(app): State<App>, headers: HeaderMap, Path(id): Path<
         if let (Principal::User { user, .. }, None) = (&who, version) {
             s.touch_recent(&user.id, &it.id)?;
         }
+        // Where a live session starts from this version (for joining it).
+        let live = if version.is_none() { Some((s.live_base(&it)?, s.live_state_blob(&it.id, ver.version)?.is_some())) } else { None };
         let mut res = data.into_response();
         let h = res.headers_mut();
+        if let Some((l, state)) = live {
+            h.insert("x-live-seq", HeaderValue::from(l.seq));
+            if let Ok(v) = HeaderValue::from_str(&l.sheets) {
+                h.insert("x-live-sheets", v);
+            }
+            if state {
+                h.insert("x-live-state", HeaderValue::from_static("1"));
+            }
+        }
         h.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
         h.insert(header::ETAG, quoted(&crate::store::etag(ver.version, &ver.hash)));
         h.insert("x-version", HeaderValue::from(ver.version));
@@ -574,6 +599,7 @@ fn norm_etag(s: &str) -> String {
 }
 
 async fn put_content(State(app): State<App>, headers: HeaderMap, Path(id): Path<String>, body: Bytes) -> ApiResult {
+    let hub = app.hub.clone();
     app.run(move |s| {
         let who = auth(s, &headers)?;
         let (it, role) = visible(s, &who, &id, false)?;
@@ -581,6 +607,9 @@ async fn put_content(State(app): State<App>, headers: HeaderMap, Path(id): Path<
             return Err(ApiError::bad("Folders have no content."));
         }
         need_edit(role)?;
+        if live_busy(s, &hub, &it)? {
+            return Err(locked());
+        }
         if let Some(want) = headers.get(header::IF_MATCH).and_then(|v| v.to_str().ok()).map(norm_etag) {
             if want != "*" && want != it.etag() {
                 let body = json!({
@@ -687,11 +716,15 @@ async fn versions(State(app): State<App>, headers: HeaderMap, Path(id): Path<Str
 }
 
 async fn restore_version(State(app): State<App>, headers: HeaderMap, Path((id, n)): Path<(String, i64)>) -> ApiResult {
+    let hub = app.hub.clone();
     app.run(move |s| {
         let who = auth(s, &headers)?;
         user_of(&who)?;
         let (it, role) = visible(s, &who, &id, false)?;
         need_edit(role)?;
+        if live_busy(s, &hub, &it)? {
+            return Err(locked());
+        }
         let saved = s.restore_version(&it, n, &actor(&who))?;
         ok_json(item_json(s, &saved, role))
     })
@@ -1070,14 +1103,127 @@ async fn link_download_form(State(app): State<App>, ConnectInfo(Peer(peer)): Con
     app.run(move |s| file_response(s, &link)).await
 }
 
-/// Reserved for live co-editing (WebSocket) in a later version.
-async fn live(State(app): State<App>, headers: HeaderMap, Path(id): Path<String>) -> ApiResult {
+// ---------------------------------------------------------------------------
+// Live co-editing
+// ---------------------------------------------------------------------------
+
+fn locked() -> ApiError {
+    ApiError::new(StatusCode::LOCKED, "This workbook is being edited live. Open it again to join the live session; saving a separate copy would overwrite other people's changes.")
+}
+
+/// Someone is connected, or committed live changes aren't in a saved version yet.
+fn live_busy(s: &Store, hub: &crate::live::Hub, it: &Item) -> Result<bool, ApiError> {
+    if hub.connected(&it.id) {
+        return Ok(true);
+    }
+    Ok(match s.live_state(&it.id)? {
+        Some(st) if st.version == it.version => s.live_head(&it.id)? > st.seq,
+        _ => false,
+    })
+}
+
+/// `GET /api/items/{id}/live?since=<seq>[&v=<version>]&cid=<client>[&ticket=<t>]`: the
+/// co-editing WebSocket. Editors may send changes; viewers only receive.
+async fn live(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+    ws: Result<axum::extract::ws::WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
+) -> ApiResult {
+    let hub = app.hub.clone();
+    let ticket = q.get("ticket").cloned();
+    let iid = id.clone();
+    let (item, who, role) = app
+        .run(move |s| {
+            let who = match ticket {
+                Some(t) if bearer(&headers).is_none() => hub.redeem(&t, &iid).ok_or_else(ApiError::unauthorized)?,
+                _ => auth(s, &headers)?,
+            };
+            let (it, role) = visible(s, &who, &iid, false)?;
+            if it.kind != Kind::File {
+                return Err(ApiError::bad("Folders can't be edited live."));
+            }
+            Ok((it, who, role))
+        })
+        .await?;
+    let Ok(ws) = ws else {
+        return Err(ApiError::new(StatusCode::UPGRADE_REQUIRED, "Live co-editing needs a WebSocket connection."));
+    };
+    let num = |k: &str| q.get(k).and_then(|v| v.parse::<i64>().ok());
+    // `v`: the version a first join downloaded (a reconnect continues from `since` alone).
+    let (Some(since), version) = (num("since"), num("v")) else {
+        return Err(ApiError::bad("since is required."));
+    };
+    let cid: String = q.get("cid").map(|c| c.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').take(64).collect()).unwrap_or_default();
+    if cid.is_empty() || since < 0 {
+        return Err(ApiError::bad("cid is required."));
+    }
+    let join = crate::live::Join { actor: actor(&who), item, version, who, role, since: since as u64, cid };
+    let (store, hub) = (app.store.clone(), app.hub.clone());
+    Ok(ws.max_message_size(cosync::MAX_MESSAGE_BYTES).max_frame_size(cosync::MAX_MESSAGE_BYTES).on_upgrade(move |socket| crate::live::run(store, hub, socket, join)))
+}
+
+/// `GET /api/items/{id}/live/state?version=<v>`: the live state stored with a version.
+async fn live_state(State(app): State<App>, headers: HeaderMap, Path(id): Path<String>, Query(q): Query<HashMap<String, String>>) -> ApiResult {
+    let version: i64 = q.get("version").and_then(|v| v.parse().ok()).ok_or_else(|| ApiError::bad("version is required."))?;
     app.run(move |s| {
         let who = auth(s, &headers)?;
-        visible(s, &who, &id, false)?;
-        Err(ApiError::new(StatusCode::NOT_IMPLEMENTED, "Live co-editing isn't available on this server yet."))
+        let (it, _) = visible(s, &who, &id, false)?;
+        let data = s.live_state_blob(&it.id, version)?.ok_or_else(ApiError::not_found)?;
+        let mut res = data.into_response();
+        res.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
+        res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        Ok(res)
     })
     .await
+}
+
+/// A single-use ticket (valid one minute) for connecting without an Authorization header.
+async fn live_ticket(State(app): State<App>, headers: HeaderMap, Path(id): Path<String>) -> ApiResult {
+    let hub = app.hub.clone();
+    app.run(move |s| {
+        let who = auth(s, &headers)?;
+        let (it, _) = visible(s, &who, &id, false)?;
+        let t = hub.ticket(who, &it.id);
+        ok_json(json!({ "ticket": t, "expires_in": 60 }))
+    })
+    .await
+}
+
+/// `POST /api/items/{id}/live/snapshot?seq=<n>` with the workbook: a live client's copy that
+/// contains every change up to `n`, stored as a new version. `X-Live-Sheets` carries the
+/// sheet ids and order keys; with `X-Live-State-Offset: <k>` the first k bytes are the
+/// workbook and the rest the client's lossless live state (kept with the version).
+async fn live_snapshot(State(app): State<App>, headers: HeaderMap, Path(id): Path<String>, Query(q): Query<HashMap<String, String>>, body: Bytes) -> ApiResult {
+    let seq: u64 = q.get("seq").and_then(|v| v.parse().ok()).ok_or_else(|| ApiError::bad("seq is required."))?;
+    let sheets: String = headers.get("x-live-sheets").and_then(|v| v.to_str().ok()).unwrap_or("").chars().take(64 * 1024).collect();
+    let split = match headers.get("x-live-state-offset").and_then(|v| v.to_str().ok()) {
+        Some(v) => v.parse::<usize>().ok().filter(|k| *k <= body.len()).ok_or_else(|| ApiError::bad("Invalid X-Live-State-Offset."))?,
+        None => body.len(),
+    };
+    if split == 0 || split > app.cfg.max_upload_bytes() {
+        return Err(ApiError::new(if split == 0 { StatusCode::BAD_REQUEST } else { StatusCode::PAYLOAD_TOO_LARGE }, "The snapshot is empty or too large."));
+    }
+    let iid = id.clone();
+    let (saved, st, role) = app
+        .run(move |s| {
+            let who = auth(s, &headers)?;
+            let (it, role) = visible(s, &who, &iid, false)?;
+            need_edit(role)?;
+            let (saved, st) = s.live_snapshot(&it, &body[..split], &body[split..], &actor(&who), seq, &sheets)?;
+            Ok((saved, st, role))
+        })
+        .await?;
+    app.hub.snapshotted(&id, st.seq, st.floor);
+    let s = app.store.clone();
+    let v = tokio::task::spawn_blocking(move || {
+        let s = s.lock().unwrap_or_else(|e| e.into_inner());
+        item_json(&s, &saved, role)
+    })
+    .await
+    .map_err(|_| ApiError::internal())?;
+    ok_json(v)
 }
 
 #[cfg(test)]

@@ -197,6 +197,18 @@ pub struct CloudDoc {
     pub local: PathBuf,
     /// Microsoft 365 or a FreedomOffice server.
     pub provider: super::Provider,
+    /// Where a live co-editing session starts from the downloaded copy (FreedomOffice server).
+    pub live: Option<LiveBase>,
+}
+
+/// The downloaded version, the live sequence number it contains and its sheet ids.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LiveBase {
+    pub version: i64,
+    pub seq: u64,
+    pub sheets: String,
+    /// The lossless live state stored with that version (downloaded next to the copy).
+    pub state: Option<std::path::PathBuf>,
 }
 
 impl CloudDoc {
@@ -210,6 +222,7 @@ impl CloudDoc {
             parent: item.parent_path(),
             local,
             provider: super::Provider::Microsoft,
+            live: None,
         }
     }
 
@@ -587,7 +600,7 @@ mod tests {
     }
 
     fn resp(status: u16, body: &str) -> Response {
-        Response { status, body: body.as_bytes().to_vec() }
+        Response::new(status, body.as_bytes().to_vec())
     }
 
     fn session(fake: &Arc<Fake>, expires_at: u64) -> Session {
@@ -684,6 +697,7 @@ mod tests {
             parent: None,
             local: PathBuf::new(),
             provider: crate::cloud::Provider::Microsoft,
+            live: None,
         };
         let item = s.upload(&doc.item_path(), Some(&doc.etag), b"data").unwrap();
         doc.update_from(&item);

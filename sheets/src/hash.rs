@@ -68,8 +68,7 @@ pub fn sha512(data: &[u8]) -> [u8; 64] {
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-/// Standard base64 with padding (tests only: hashes are compared as bytes).
-#[cfg(test)]
+/// Standard base64 with padding.
 pub fn base64_encode(data: &[u8]) -> String {
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for ch in data.chunks(3) {

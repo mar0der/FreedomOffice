@@ -103,6 +103,30 @@ pub struct Link {
     pub created_by: String,
 }
 
+/// Where live co-editing of an item stands.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LiveState {
+    /// The version that contains every operation up to `seq`.
+    pub version: i64,
+    pub seq: u64,
+    /// Sheet ids and order keys of that version ("id:pos,id:pos"), empty when unknown.
+    pub sheets: String,
+    /// Operations up to here are no longer kept.
+    pub floor: u64,
+    pub snap_at: i64,
+}
+
+/// A committed batch of live operations (JSON).
+#[derive(Clone, Debug)]
+pub struct LiveOp {
+    pub seq: u64,
+    pub cid: String,
+    pub batch: u64,
+    pub actor: String,
+    pub ops: String,
+    pub at: i64,
+}
+
 #[derive(Clone, Debug)]
 pub struct Grant {
     pub user: User,
@@ -251,6 +275,24 @@ CREATE TABLE IF NOT EXISTS recent (
     item_id TEXT NOT NULL,
     at INTEGER NOT NULL,
     PRIMARY KEY (user_id, item_id)
+);
+CREATE TABLE IF NOT EXISTS live_ops (
+    item_id TEXT NOT NULL REFERENCES items(id),
+    seq INTEGER NOT NULL,
+    cid TEXT NOT NULL,
+    batch INTEGER NOT NULL,
+    actor TEXT NOT NULL,
+    ops TEXT NOT NULL,
+    at INTEGER NOT NULL,
+    PRIMARY KEY (item_id, seq)
+);
+CREATE TABLE IF NOT EXISTS live_state (
+    item_id TEXT PRIMARY KEY REFERENCES items(id),
+    version INTEGER NOT NULL,
+    seq INTEGER NOT NULL,
+    sheets TEXT NOT NULL DEFAULT '',
+    floor INTEGER NOT NULL DEFAULT 0,
+    snap_at INTEGER NOT NULL
 );
 "#;
 
@@ -631,7 +673,11 @@ impl Store {
 
     /// Atomic, durable write: temp file, fsync, rename, fsync the directory.
     fn write_blob(&self, id: &str, version: i64, data: &[u8]) -> Res<()> {
-        let path = self.blob_path(id, version)?;
+        self.write_file(&self.blob_path(id, version)?, version, data)
+    }
+
+    fn write_file(&self, path: &Path, version: i64, data: &[u8]) -> Res<()> {
+        let path = path.to_path_buf();
         let dir = path.parent().ok_or_else(|| StoreError::Internal("bad path".into()))?;
         std::fs::create_dir_all(dir)?;
         let tmp = dir.join(format!(".{version}.{}.tmp", util::hex(&util::random_bytes::<6>())));
@@ -680,7 +726,9 @@ impl Store {
         let doomed = versions_to_prune(&all, self.versions_to_keep as usize);
         for v in doomed {
             self.conn.execute("DELETE FROM versions WHERE item_id = ?1 AND version = ?2", params![item_id, v])?;
-            let _ = std::fs::remove_file(self.blob_path(item_id, v)?);
+            let path = self.blob_path(item_id, v)?;
+            let _ = std::fs::remove_file(path.with_extension("live"));
+            let _ = std::fs::remove_file(path);
         }
         Ok(())
     }
@@ -927,6 +975,98 @@ impl Store {
         self.conn.execute("DELETE FROM link_access WHERE expires <= ?1", [now()])?;
         self.conn.execute("INSERT INTO link_access (hash, link_id, expires) VALUES (?1, ?2, ?3)", params![util::token_hash(&token), link.id, expires])?;
         Ok((token, expires))
+    }
+
+    // ------------------------------------------------------------------
+    // Live co-editing: the committed operations and the snapshot they follow
+    // ------------------------------------------------------------------
+
+    pub fn live_state(&self, item_id: &str) -> Res<Option<LiveState>> {
+        Ok(self
+            .conn
+            .query_row("SELECT version, seq, sheets, floor, snap_at FROM live_state WHERE item_id = ?1", [item_id], |r| {
+                Ok(LiveState { version: r.get(0)?, seq: r.get::<_, i64>(1)? as u64, sheets: r.get(2)?, floor: r.get::<_, i64>(3)? as u64, snap_at: r.get(4)? })
+            })
+            .optional()?)
+    }
+
+    /// The newest committed sequence number of an item.
+    pub fn live_head(&self, item_id: &str) -> Res<u64> {
+        let ops: Option<i64> = self.conn.query_row("SELECT MAX(seq) FROM live_ops WHERE item_id = ?1", [item_id], |r| r.get(0))?;
+        let state = self.live_state(item_id)?.map_or(0, |s| s.seq);
+        Ok((ops.unwrap_or(0) as u64).max(state))
+    }
+
+    /// What a live session starts from: the current version is at `seq` (its sheet ids in
+    /// `sheets`), operations after `floor` are kept. A version saved outside a live session
+    /// (or the first live session) starts at the newest sequence number.
+    pub fn live_base(&self, item: &Item) -> Res<LiveState> {
+        match self.live_state(&item.id)? {
+            Some(s) if s.version == item.version => Ok(s),
+            _ => {
+                let head = self.live_head(&item.id)?;
+                let s = LiveState { version: item.version, seq: head, sheets: String::new(), floor: head, snap_at: now() };
+                self.conn.execute(
+                    "INSERT INTO live_state (item_id, version, seq, sheets, floor, snap_at) VALUES (?1, ?2, ?3, '', ?3, ?4)
+                     ON CONFLICT(item_id) DO UPDATE SET version = excluded.version, seq = excluded.seq, sheets = '', floor = excluded.floor, snap_at = excluded.snap_at",
+                    params![item.id, item.version, head as i64, s.snap_at],
+                )?;
+                self.conn.execute("DELETE FROM live_ops WHERE item_id = ?1 AND seq <= ?2", params![item.id, head as i64])?;
+                Ok(s)
+            }
+        }
+    }
+
+    /// The live state stored with a version by `live_snapshot`, if any.
+    pub fn live_state_blob(&self, item_id: &str, version: i64) -> Res<Option<Vec<u8>>> {
+        let path = self.blob_path(item_id, version)?.with_extension("live");
+        match std::fs::read(&path) {
+            Ok(d) => Ok(Some(d)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn live_ops_after(&self, item_id: &str, seq: u64) -> Res<Vec<LiveOp>> {
+        let mut st = self.conn.prepare("SELECT seq, cid, batch, actor, ops, at FROM live_ops WHERE item_id = ?1 AND seq > ?2 ORDER BY seq")?;
+        let v = st
+            .query_map(params![item_id, seq as i64], |r| {
+                Ok(LiveOp { seq: r.get::<_, i64>(0)? as u64, cid: r.get(1)?, batch: r.get::<_, i64>(2)? as u64, actor: r.get(3)?, ops: r.get(4)?, at: r.get(5)? })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(v)
+    }
+
+    pub fn add_live_op(&self, item_id: &str, op: &LiveOp) -> Res<()> {
+        self.conn.execute(
+            "INSERT INTO live_ops (item_id, seq, cid, batch, actor, ops, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![item_id, op.seq as i64, op.cid, op.batch as i64, op.actor, op.ops, op.at],
+        )?;
+        Ok(())
+    }
+
+    /// Stores a snapshot uploaded by a live client as the next version: it contains every
+    /// operation up to `seq`. Operations up to the previous snapshot are pruned (the ones in
+    /// between stay for clients reconnecting with an older base).
+    /// `state`: the client's lossless copy of what it synchronises (opaque), kept next to the
+    /// version for clients joining later.
+    pub fn live_snapshot(&self, item: &Item, data: &[u8], state: &[u8], by: &str, seq: u64, sheets: &str) -> Res<(Item, LiveState)> {
+        let base = self.live_base(item)?;
+        let head = self.live_head(&item.id)?;
+        if seq < base.seq || seq > head {
+            return Err(StoreError::Conflict("That snapshot is out of date.".into()));
+        }
+        let saved = self.write_content(item, data, by)?;
+        if !state.is_empty() {
+            self.write_file(&self.blob_path(&item.id, saved.version)?.with_extension("live"), saved.version, state)?;
+        }
+        let s = LiveState { version: saved.version, seq, sheets: sheets.to_string(), floor: base.seq.max(base.floor), snap_at: now() };
+        self.conn.execute(
+            "UPDATE live_state SET version = ?1, seq = ?2, sheets = ?3, floor = ?4, snap_at = ?5 WHERE item_id = ?6",
+            params![s.version, seq as i64, s.sheets, s.floor as i64, s.snap_at, item.id],
+        )?;
+        self.conn.execute("DELETE FROM live_ops WHERE item_id = ?1 AND seq <= ?2", params![item.id, s.floor as i64])?;
+        Ok((saved, s))
     }
 
     // ------------------------------------------------------------------

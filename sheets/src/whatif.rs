@@ -211,7 +211,7 @@ impl Seek<'_> {
 
 /// A What-If data table: `range` holds the {=TABLE()} results; the row above and the column to
 /// the left hold the input values and the formula(s).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DataTable {
     pub range: Range,
     pub row_input: Option<(u32, u32)>,
@@ -276,7 +276,7 @@ pub fn table_touching(sheet: &Sheet, rg: Range) -> Option<&DataTable> {
 // Scenarios
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Scenario {
     pub name: String,
     pub comment: String,
@@ -287,7 +287,7 @@ pub struct Scenario {
     pub cells: Vec<((u32, u32), String)>,
 }
 
-#[derive(Clone, Debug, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Scenarios {
     pub list: Vec<Scenario>,
     /// Scenario last selected / shown in the manager.
