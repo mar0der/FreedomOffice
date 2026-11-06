@@ -7,8 +7,6 @@
 pub mod conn;
 mod diff;
 
-use std::collections::HashMap;
-
 use cosync::{CellData, Op, SheetId, Val, RESCUE_SHEET};
 use serde_json::Value as Json;
 
@@ -319,7 +317,9 @@ fn apply_op(wb: &mut Workbook, op: &Op, remote: bool, st: &mut ApplyState, out: 
             let sh = &mut wb.sheets[i];
             let rg = Range::new(rg.r1, rg.c1, rg.r2, rg.c2);
             if *on {
-                if !sh.merges.contains(&rg) {
+                // Overlapping merges can't be saved; whichever comes first in the server's
+                // order stays (everyone adopts that order's result).
+                if !sh.merges.iter().any(|m| m.intersects(&rg)) {
                     sh.merges.push(rg);
                 }
             } else {
@@ -514,6 +514,74 @@ fn adjust_book(wb: &Workbook, val: Json, adj: &[Op]) -> Json {
 }
 
 // ---------------------------------------------------------------------------
+// Lossless live state (stored with snapshots for people joining later)
+// ---------------------------------------------------------------------------
+
+/// Everything that is synchronised, as operations that rebuild it on an empty workbook.
+pub fn state_ops(wb: &Workbook) -> Vec<Op> {
+    let mut ops = Vec::new();
+    let mut unused = Vec::new();
+    for sh in &wb.sheets {
+        ops.push(Op::AddSheet { s: sh.uid, name: sh.name.clone(), pos: sh.pos });
+        let mut blank = Sheet::new(&sh.name);
+        blank.uid = sh.uid;
+        blank.pos = sh.pos;
+        diff::sheet_pair(wb, &blank, wb, sh, &mut ops, &mut unused);
+    }
+    if !wb.names.is_empty() {
+        ops.push(Op::Book { key: "names".into(), val: serde_json::to_value(&wb.names).unwrap_or_default(), adj: Vec::new() });
+    }
+    ops
+}
+
+/// The workbook `state_ops` describes.
+pub fn from_state(ops: &[Op]) -> Workbook {
+    let mut wb = Workbook::empty_with(Vec::new());
+    apply_ops(&mut wb, ops, false, &mut ApplyState::default());
+    if wb.sheets.is_empty() {
+        wb.sheets.push(Sheet::new("Sheet1"));
+    }
+    wb.active = 0;
+    wb
+}
+
+/// Compressed JSON of the state operations.
+pub fn encode_state(ops: &[Op]) -> Result<Vec<u8>, String> {
+    use std::io::Write;
+    let json = serde_json::to_vec(ops).map_err(|e| e.to_string())?;
+    let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated).large_file(json.len() > u32::MAX as usize / 2);
+    z.start_file("state.json", opts).map_err(|e| e.to_string())?;
+    z.write_all(&json).map_err(|e| e.to_string())?;
+    Ok(z.finish().map_err(|e| e.to_string())?.into_inner())
+}
+
+pub fn decode_state(data: &[u8]) -> Result<Vec<Op>, String> {
+    use std::io::Read;
+    let mut z = zip::ZipArchive::new(std::io::Cursor::new(data)).map_err(|e| e.to_string())?;
+    let mut f = z.by_name("state.json").map_err(|e| e.to_string())?;
+    let mut json = Vec::new();
+    f.read_to_end(&mut json).map_err(|e| e.to_string())?;
+    serde_json::from_slice(&json).map_err(|e| e.to_string())
+}
+
+/// The workbook from a downloaded copy: the live state when there is one (lossless), with
+/// what isn't synchronised (zoom, selection) taken from the saved file.
+pub fn join_workbook(file: Workbook, state: Option<&[u8]>) -> Workbook {
+    let Some(ops) = state.and_then(|d| decode_state(d).ok()) else { return file };
+    let mut wb = from_state(&ops);
+    for (i, sh) in wb.sheets.iter_mut().enumerate() {
+        if let Some(f) = file.sheets.get(i) {
+            sh.view = f.view.clone();
+            sh.zoom = f.zoom;
+        }
+    }
+    wb.active = file.active.min(wb.sheets.len() - 1);
+    wb.path = file.path;
+    wb
+}
+
+// ---------------------------------------------------------------------------
 // Comparing workbooks (verification and tests)
 // ---------------------------------------------------------------------------
 
@@ -548,8 +616,8 @@ pub fn describe(op: &Op) -> String {
 
 /// Cell contents by position of every sheet (for convergence tests).
 #[cfg(test)]
-pub fn contents(wb: &Workbook) -> HashMap<(String, u32, u32), String> {
-    let mut out = HashMap::new();
+pub fn contents(wb: &Workbook) -> std::collections::HashMap<(String, u32, u32), String> {
+    let mut out = std::collections::HashMap::new();
     for sh in &wb.sheets {
         for (r, row) in &sh.rows {
             for (c, cell) in row {

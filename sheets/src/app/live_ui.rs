@@ -64,6 +64,8 @@ pub struct Live {
     pub peers: BTreeMap<u64, Seen>,
     befores: Vec<Before>,
     structs: Vec<(SheetId, bool, u32, i64)>,
+    /// Undo scopes of the change being recorded.
+    scopes: Vec<Scope>,
     /// Applying remote or undo operations: don't record them as local changes.
     applying: bool,
     undo: Vec<Undo>,
@@ -94,8 +96,10 @@ pub struct Live {
     /// operations reproduce every change exactly (and their inverses undo it).
     pub verify: Option<Workbook>,
     pub verify_errors: Vec<String>,
-    /// Tests: times the state adopted at quiescence differed from the transformed one.
+    /// Tests: times the state adopted at quiescence differed from the transformed one, and
+    /// times others' changes arrived while ours were pending.
     pub repaired: usize,
+    pub concurrent: usize,
 }
 
 impl Live {
@@ -115,6 +119,7 @@ impl Live {
             peers: BTreeMap::new(),
             befores: Vec::new(),
             structs: Vec::new(),
+            scopes: Vec::new(),
             applying: false,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -137,6 +142,7 @@ impl Live {
             verify: None,
             verify_errors: Vec::new(),
             repaired: 0,
+            concurrent: 0,
         }
     }
 
@@ -179,6 +185,15 @@ impl App {
     /// push_undo in a live session: the snapshot becomes the "before" of the next change.
     pub(super) fn live_record(&mut self, scopes: &[Scope]) {
         self.live_flush();
+        if let Some(l) = &mut self.live {
+            if !l.applying {
+                l.scopes = scopes.to_vec();
+            }
+        }
+        self.live_snap_scopes(scopes);
+    }
+
+    fn live_snap_scopes(&mut self, scopes: &[Scope]) {
         let befores: Vec<Before> = scopes
             .iter()
             .filter_map(|s| match *s {
@@ -207,6 +222,11 @@ impl App {
         }
     }
 
+    /// A mouse drag (resizing, moving a chart) changes the workbook over several frames.
+    fn pointer_down(&self) -> bool {
+        self.ctx.as_ref().is_some_and(|c| c.input(|i| i.pointer.any_down()))
+    }
+
     /// Turns the change since the last snapshot into operations and sends them.
     pub fn live_flush(&mut self) {
         let Some(l) = &mut self.live else { return };
@@ -215,7 +235,15 @@ impl App {
         }
         let befores = std::mem::take(&mut l.befores);
         let structs = std::mem::take(&mut l.structs);
+        let scopes = std::mem::take(&mut l.scopes);
         let ch = live::diff(befores, &structs, &mut self.wb);
+        if self.pointer_down() && !scopes.is_empty() {
+            // Mid-drag: what follows belongs to the same command; keep recording it.
+            self.live_snap_scopes(&scopes);
+            if let Some(l) = &mut self.live {
+                l.scopes = scopes;
+            }
+        }
         let l = self.live.as_mut().expect("live");
         if let Some(v) = l.verify.take() {
             let next = self.wb.clone();
@@ -369,6 +397,11 @@ impl App {
         let server = self.cloud.servers.iter().find(|e| e.session.account.url == *url).map(|e| e.session.clone());
         let Some(server) = server else { return };
         live::assign_ids(&mut self.wb, &base.sheets);
+        if let Some(data) = base.state.as_ref().and_then(|p| std::fs::read(p).ok()) {
+            // The lossless state of that version (the file may not keep everything exactly).
+            self.wb = live::join_workbook(std::mem::take(&mut self.wb), Some(&data));
+            self.wb.recalc();
+        }
         live::sort_sheets(&mut self.wb);
         let mut l = Live::new(doc.item_id.clone(), url.clone(), Some(server), base.seq);
         l.sess.online = false;
@@ -399,11 +432,7 @@ impl App {
                 let wb = self.wb.clone();
                 let (item, seq) = (l.item.clone(), l.sess.seq);
                 let h = std::thread::spawn(move || {
-                    if crate::io::save(&wb, &doc.local).is_ok() {
-                        if let Ok(data) = std::fs::read(&doc.local) {
-                            let _ = server.live_snapshot(&item, seq, &live::sheets_meta(&wb), &data);
-                        }
-                    }
+                    let _ = upload_snapshot(&server, &item, seq, &wb, &doc.local);
                 });
                 if wait {
                     let end = Instant::now() + Duration::from_secs(15);
@@ -430,7 +459,9 @@ impl App {
             self.live_leave(false);
             return;
         }
-        self.live_flush();
+        if !self.pointer_down() {
+            self.live_flush();
+        }
         loop {
             let ev = self.live.as_ref().and_then(|l| l.conn.as_ref()).and_then(|c| c.rx.try_recv().ok());
             let Some(ev) = ev else { break };
@@ -543,6 +574,7 @@ impl App {
                     }
                     l.confirmed = Some(c);
                     l.confirmed_state = st;
+                    l.concurrent += 1;
                     l.units.clear();
                     l.sent_units = 0;
                 }
@@ -641,9 +673,12 @@ impl App {
     /// Everything is acknowledged: the workbook must equal the server's state. When it doesn't
     /// (ranges that ended differently at an insert/delete boundary), take the server's.
     fn live_adopt(&mut self, mut c: Workbook) {
-        if live::compare(&c, &self.wb).is_empty() {
+        let diffs = live::compare(&c, &self.wb);
+        if diffs.is_empty() {
             return;
         }
+        #[cfg(test)]
+        eprintln!("adopting the server's state: {diffs:?}");
         if let Some(l) = &mut self.live {
             l.repaired += 1;
         }
@@ -837,9 +872,7 @@ impl App {
         let wb = self.wb.clone();
         let ctx = self.ctx.clone();
         std::thread::spawn(move || {
-            let result = crate::io::save(&wb, &doc.local)
-                .and_then(|_| std::fs::read(&doc.local).map_err(|e| e.to_string()))
-                .and_then(|data| server.live_snapshot(&item, seq, &live::sheets_meta(&wb), &data));
+            let result = upload_snapshot(&server, &item, seq, &wb, &doc.local);
             let _ = tx.send(Job::Snapshot(seq, result));
             if let Some(c) = ctx {
                 c.request_repaint();
@@ -896,6 +929,9 @@ impl App {
             wb.sheets.push(crate::model::Sheet::new("Sheet1"));
         }
         live::assign_ids(&mut wb, &base.sheets);
+        if let Some(data) = base.state.as_ref().and_then(|p| std::fs::read(p).ok()) {
+            wb = live::join_workbook(wb, Some(&data));
+        }
         live::sort_sheets(&mut wb);
         for sh in &mut wb.sheets {
             if let Some(i) = live::index_of(&self.wb, sh.uid) {
@@ -1059,6 +1095,14 @@ impl App {
     }
 }
 
+/// Saves the workbook (as the version) and its live state, and uploads both.
+fn upload_snapshot(server: &ServerSession, item: &str, seq: u64, wb: &Workbook, local: &std::path::Path) -> Result<DriveItem, String> {
+    crate::io::save(wb, local)?;
+    let data = std::fs::read(local).map_err(|e| e.to_string())?;
+    let state = live::encode_state(&live::state_ops(wb))?;
+    server.live_snapshot(item, seq, &live::sheets_meta(wb), &data, &state)
+}
+
 /// Checks a change against full copies of the workbook before and after it (tests): the
 /// operations reproduce the change, and their inverses undo it.
 fn verify_change(before: &Workbook, ch: &live::Change, after: &Workbook) -> Vec<String> {
@@ -1096,5 +1140,47 @@ impl App {
 
     pub(crate) fn live_pending_ops(&self) -> Vec<Op> {
         self.live.as_ref().map(|l| l.sess.pending()).unwrap_or_default()
+    }
+
+    /// Connected, caught up and nothing unacknowledged.
+    pub(crate) fn live_quiet(&self) -> bool {
+        self.live.as_ref().is_some_and(|l| l.online && !l.sess.has_pending() && l.confirmed.is_none())
+    }
+
+    pub(crate) fn live_seq(&self) -> u64 {
+        self.live.as_ref().map_or(0, |l| l.sess.seq)
+    }
+
+    /// The connection drops (the server doesn't know yet); reconnect at once when polled.
+    pub(crate) fn live_drop_for_test(&mut self) {
+        if let Some(l) = &mut self.live {
+            l.conn = None;
+            l.online = false;
+            l.sess.offline();
+            l.peers.clear();
+            l.retry_at = Some(Instant::now() + Duration::from_secs(3600));
+        }
+    }
+
+    pub(crate) fn live_reconnect_for_test(&mut self) {
+        if let Some(l) = &mut self.live {
+            l.retry_at = Some(Instant::now());
+        }
+    }
+
+    pub(crate) fn live_snap_seq(&self) -> u64 {
+        self.live.as_ref().map_or(0, |l| l.snap_seq)
+    }
+
+    pub(crate) fn live_editor(&self) -> bool {
+        self.live.as_ref().is_some_and(|l| l.editor)
+    }
+
+    pub(crate) fn live_peer_names(&self) -> Vec<String> {
+        self.live.as_ref().map(|l| l.peers.values().map(|p| p.peer.name.clone()).collect()).unwrap_or_default()
+    }
+
+    pub(crate) fn live_repaired(&self) -> (usize, usize) {
+        self.live.as_ref().map_or((0, 0), |l| (l.repaired, l.concurrent))
     }
 }

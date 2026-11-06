@@ -289,7 +289,16 @@ impl ServerSession {
         // it contains (servers without live co-editing send neither).
         let version = r.header("etag").and_then(version_of_etag).or_else(|| version_of_etag(&meta.etag));
         if let (Some(seq), Some(version)) = (r.header("x-live-seq").and_then(|v| v.parse().ok()), version) {
-            doc.live = Some(super::graph::LiveBase { version, seq, sheets: r.header("x-live-sheets").unwrap_or("").to_string() });
+            let mut state = None;
+            if r.header("x-live-state").is_some() {
+                let s = self.call(Request::new("GET", format!("/api/items/{}/live/state?version={version}", pct_encode(&meta.id))))?;
+                if s.ok() {
+                    let path = doc.local.with_file_name(format!("{}.live", meta.name));
+                    std::fs::write(&path, &s.body).map_err(|e| format!("Couldn't write {}: {e}", path.display()))?;
+                    state = Some(path);
+                }
+            }
+            doc.live = Some(super::graph::LiveBase { version, seq, sheets: r.header("x-live-sheets").unwrap_or("").to_string(), state });
             if let Some(e) = r.header("etag") {
                 doc.etag = e.trim_matches('"').to_string();
             }
@@ -297,12 +306,14 @@ impl ServerSession {
         Ok(doc)
     }
 
-    /// Uploads a live client's copy that contains every change up to `seq` as a new version.
-    pub fn live_snapshot(&self, id: &str, seq: u64, sheets: &str, data: &[u8]) -> Result<DriveItem, String> {
+    /// Uploads a live client's copy that contains every change up to `seq` as a new version,
+    /// with its lossless live state (for people joining later).
+    pub fn live_snapshot(&self, id: &str, seq: u64, sheets: &str, data: &[u8], state: &[u8]) -> Result<DriveItem, String> {
         let mut req = Request::new("POST", format!("/api/items/{}/live/snapshot?seq={seq}", pct_encode(id)))
             .header("Content-Type", "application/octet-stream")
-            .header("X-Live-Sheets", sheets);
-        req.body = data.to_vec();
+            .header("X-Live-Sheets", sheets)
+            .header("X-Live-State-Offset", data.len().to_string());
+        req.body = [data, state].concat();
         let r = self.call(req)?;
         if !r.ok() {
             return Err(error_text(&r, &self.host()));

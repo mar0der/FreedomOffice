@@ -1014,6 +1014,10 @@ fn load_recent() -> Vec<PathBuf> {
 }
 
 fn save_recent(v: &[PathBuf]) {
+    // Tests open throwaway files: keep them out of the user's Recent list.
+    if cfg!(test) {
+        return;
+    }
     if let Some(f) = recent_file() {
         if let Some(d) = f.parent() {
             let _ = std::fs::create_dir_all(d);

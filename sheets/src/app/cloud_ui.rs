@@ -2149,3 +2149,17 @@ fn initials_badge(ui: &mut egui::Ui, initials: &str, d: f32) -> egui::Response {
     ui.painter().text(rect.center(), Align2::CENTER_CENTER, initials, theme::ui_bold(d * 0.4), theme::window());
     resp
 }
+
+#[cfg(test)]
+impl App {
+    /// Signed in to a server without touching the saved accounts (tests).
+    pub(super) fn cloud_for_test(&mut self, session: Arc<ServerSession>) {
+        self.cloud.started = true;
+        self.cloud.servers.push(ServerEntry { session, error: None });
+    }
+
+    /// As if the cloud browser had downloaded `doc` (tests).
+    pub(super) fn cloud_opened_for_test(&mut self, doc: CloudDoc) {
+        self.cloud_event(Event::Opened(Ok(doc)));
+    }
+}

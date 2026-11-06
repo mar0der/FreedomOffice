@@ -207,6 +207,8 @@ pub struct LiveBase {
     pub version: i64,
     pub seq: u64,
     pub sheets: String,
+    /// The lossless live state stored with that version (downloaded next to the copy).
+    pub state: Option<std::path::PathBuf>,
 }
 
 impl CloudDoc {

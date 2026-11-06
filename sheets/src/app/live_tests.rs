@@ -164,6 +164,12 @@ fn commands_round_trip_as_operations() {
         check(&mut app, "redo");
     }
     assert!(!app.live_pending_ops().is_empty());
+
+    // The lossless state stored with snapshots rebuilds exactly this workbook.
+    let data = crate::live::encode_state(&crate::live::state_ops(&app.wb)).unwrap();
+    let back = crate::live::from_state(&crate::live::decode_state(&data).unwrap());
+    let d = crate::live::compare(&back, &app.wb);
+    assert!(d.is_empty(), "{d:#?}");
 }
 
 #[test]
@@ -202,4 +208,338 @@ fn view_only_participants_change_nothing() {
     app.live_flush();
     assert!(app.live_pending_ops().is_empty());
     assert!(crate::live::compare(&before, &app.wb).is_empty(), "{:?}", crate::live::compare(&before, &app.wb));
+}
+
+// ---------------------------------------------------------------------------
+// Against a real server on 127.0.0.1 (throwaway data and accounts)
+// ---------------------------------------------------------------------------
+
+mod e2e {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use eframe::egui;
+    use freedomoffice_server::config::Config;
+    use freedomoffice_server::store::Store;
+
+    use super::{rg, type_at};
+    use crate::app::App;
+    use crate::model::Range;
+    use crate::cloud::{Http, ServerSession, Target, UploadError};
+
+    /// Test-only password for the throwaway accounts.
+    const PW: &str = "live-test-password";
+
+    struct Client {
+        ctx: egui::Context,
+        app: App,
+        session: Arc<ServerSession>,
+        root: std::path::PathBuf,
+    }
+
+    fn client(url: &str, user: &str, dir: &std::path::Path) -> Client {
+        let ctx = egui::Context::default();
+        let mut app = App::with_context(&ctx, 0, None);
+        app.dialog = None;
+        let session = Arc::new(ServerSession::login(Box::new(Http::new()), url, user, PW, "test").unwrap());
+        app.cloud_for_test(session.clone());
+        Client { ctx, app, session, root: dir.join(format!("{user}-{}", crate::model::new_sheet_uid())) }
+    }
+
+    fn open(c: &mut Client, id: &str) {
+        let item = c.session.item(id).unwrap();
+        let doc = c.session.open(&item, &c.root).unwrap();
+        assert!(doc.live.is_some(), "the server tells where the live session starts");
+        c.app.cloud_opened_for_test(doc);
+        assert!(c.app.live.is_some(), "opening a server document joins its live session");
+    }
+
+    fn pump(cs: &mut [&mut Client], what: &str, done: impl Fn(&[&mut Client]) -> bool) {
+        let end = Instant::now() + Duration::from_secs(30);
+        loop {
+            for c in cs.iter_mut() {
+                c.app.poll_live();
+            }
+            if done(cs) {
+                return;
+            }
+            assert!(Instant::now() < end, "timed out waiting for: {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Everyone connected, nothing pending and at the same sequence number.
+    fn settle(cs: &mut [&mut Client], what: &str) {
+        pump(cs, what, |cs| cs.iter().all(|c| c.app.live_quiet()) && cs.windows(2).all(|w| w[0].app.live_seq() == w[1].app.live_seq()));
+    }
+
+    fn assert_same(a: &Client, b: &Client, what: &str) {
+        let (x, y) = (crate::live::contents(&a.app.wb), crate::live::contents(&b.app.wb));
+        if x != y {
+            let mut d: Vec<String> = x.iter().filter(|(k, v)| y.get(*k) != Some(*v)).map(|(k, v)| format!("{k:?}: {v} vs {:?}", y.get(k))).collect();
+            d.extend(y.keys().filter(|k| !x.contains_key(*k)).map(|k| format!("{k:?} only in second: {}", y[k])));
+            d.sort();
+            panic!("{what}: workbooks differ:\n{}", d.join("\n"));
+        }
+        let diffs = crate::live::compare(&a.app.wb, &b.app.wb);
+        assert!(diffs.is_empty(), "{what}: {diffs:#?}");
+    }
+
+    fn text(c: &Client, sheet: &str, r: u32, col: u32) -> String {
+        let wb = &c.app.wb;
+        let sh = &wb.sheets[wb.sheet_index(sheet).unwrap()];
+        crate::numfmt::value_to_text(sh.display_value(r, col))
+    }
+
+    #[test]
+    fn two_people_edit_one_workbook_live() {
+        let dir = std::env::temp_dir().join(format!("fo-live-e2e-{}", freedomoffice_server::util::new_id()));
+        let cfg = Config { data_dir: dir.join("data"), versions_to_keep: 50, ..Config::default() };
+        {
+            let st = Store::open(&cfg.db_path(), &cfg.files_dir(), cfg.versions_to_keep).unwrap();
+            st.create_user("ann", "Ann Lee", "", PW, false).unwrap();
+            st.create_user("ben", "Ben Ode", "", PW, false).unwrap();
+            st.create_user("cam", "Cam Viewer", "", PW, false).unwrap();
+        }
+        let server = freedomoffice_server::spawn(cfg).unwrap();
+        let url = server.url();
+
+        // Ann saves a workbook to the server and shares it.
+        let mut start = crate::model::Workbook::new();
+        for r in 0..8 {
+            let c = crate::model::cell_from_input(&mut start, &format!("{}", r + 1), 0);
+            start.sheets[0].set(r, 0, c);
+        }
+        let file = dir.join("start.xlsx");
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::io::save(&start, &file).unwrap();
+        let mut a = client(&url, "ann", &dir);
+        let id = a.session.upload_new("root", "Team.xlsx", &std::fs::read(&file).unwrap(), "fail").unwrap().id;
+        a.session.grant(&id, "ben", true).unwrap();
+        a.session.grant(&id, "cam", false).unwrap();
+        let mut b = client(&url, "ben", &dir);
+        open(&mut a, &id);
+        open(&mut b, &id);
+        settle(&mut [&mut a, &mut b], "both joined");
+        assert_eq!(a.app.live_peer_names(), ["Ben Ode"]);
+        assert!(a.app.cloud.autosave && a.app.cloud_title_suffix().contains("Saved to"));
+
+        // At the same time: Ann types in A5 while Ben inserts a row above it, and Ben types
+        // further down. Neither has seen the other's change.
+        type_at(&mut a.app, 4, 0, "alpha");
+        b.app.select_range(rg("2:2"));
+        b.app.insert_rows();
+        type_at(&mut b.app, 9, 0, "=SUM(A1:A9)");
+        settle(&mut [&mut a, &mut b], "concurrent insert and typing");
+        assert_same(&a, &b, "after a row insert while typing below it");
+        assert_eq!(text(&a, "Sheet1", 5, 0), "alpha", "Ann's cell moved down with the inserted row");
+        assert_eq!(text(&b, "Sheet1", 9, 0), "31", "formulas recalculate everywhere");
+
+        // Same cell at once: the later commit wins everywhere; others' cursors are shown.
+        type_at(&mut a.app, 0, 1, "ann");
+        type_at(&mut b.app, 0, 1, "ben");
+        settle(&mut [&mut a, &mut b], "same cell");
+        assert_same(&a, &b, "same cell");
+        assert!(a.app.live.as_ref().unwrap().peers.values().any(|p| p.peer.presence.is_some()));
+
+        // Structure, formatting and sheets from both sides.
+        a.app.select_range(rg("C:C"));
+        a.app.delete_cols();
+        b.app.select_range(rg("A1:B3"));
+        b.app.toggle_bold();
+        b.app.merge(2);
+        a.app.add_sheet();
+        let n = a.app.wb.sheets.len();
+        assert!(a.app.rename_sheet(n - 1, "Notes").is_ok());
+        type_at(&mut a.app, 0, 0, "=Sheet1!A6");
+        b.app.select_range(rg("4:5"));
+        b.app.delete_rows();
+        settle(&mut [&mut a, &mut b], "structure and sheets");
+        assert_same(&a, &b, "structure and sheets");
+
+        // Ben renames Sheet1 while Ann moves her new sheet first.
+        let i = b.app.wb.sheet_index("Sheet1").unwrap();
+        assert!(b.app.rename_sheet(i, "Plan").is_ok());
+        let notes = a.app.wb.sheet_index("Notes").unwrap();
+        a.app.move_sheet_to(notes, 0);
+        settle(&mut [&mut a, &mut b], "rename and move");
+        assert_same(&a, &b, "rename and move");
+        assert_eq!(a.app.wb.sheets[0].name, "Notes");
+        let f = |c: &Client| c.app.wb.sheets[0].get(0, 0).and_then(|x| x.formula.as_ref()).map(|f| f.text.clone());
+        assert_eq!(f(&a).as_deref(), Some("Plan!A4"), "references follow the rename and the deleted rows");
+
+        // Per-user undo: Ann undoes her last change; Ben's changes stay.
+        a.app.undo();
+        settle(&mut [&mut a, &mut b], "undo");
+        assert_same(&a, &b, "undo");
+        assert_eq!(b.app.wb.sheets.iter().map(|s| s.name.as_str()).next(), Some("Plan"), "undoing Ann's move keeps Ben's rename");
+
+        // Ben's connection drops; both keep editing; he reconnects and everything converges.
+        b.app.live_drop_for_test();
+        type_at(&mut b.app, 20, 0, "offline edit");
+        b.app.select_range(rg("1:1"));
+        b.app.insert_rows();
+        let plan = a.app.wb.sheet_index("Plan").unwrap();
+        a.app.switch_sheet(plan);
+        type_at(&mut a.app, 20, 1, "while ben was away");
+        pump(&mut [&mut a, &mut b], "ann's change", |cs| cs[0].app.live_quiet());
+        assert!(b.app.cloud_title_suffix().contains("Reconnecting"));
+        b.app.live_reconnect_for_test();
+        settle(&mut [&mut a, &mut b], "reconnect");
+        assert_same(&a, &b, "after reconnecting");
+        assert_eq!(text(&a, "Plan", 21, 0), "offline edit");
+
+        // A plain (non-live) save is refused while the session is live.
+        let doc = b.app.cloud.doc.clone().unwrap();
+        match b.session.upload(&doc.item_id, None, b"stale bytes") {
+            Err(UploadError::Failed(m)) => assert!(m.contains("edited live"), "{m}"),
+            r => panic!("{r:?}"),
+        }
+
+        // A viewer joins, sees everything, and can't change anything.
+        let mut c = client(&url, "cam", &dir);
+        open(&mut c, &id);
+        settle(&mut [&mut a, &mut b, &mut c], "viewer joined");
+        assert!(!c.app.live_editor());
+        assert_same(&a, &c, "viewer's copy");
+        c.app.select(0, 0, false);
+        c.app.begin_edit(Some("vandal".into()), super::EditMode::Enter);
+        assert!(c.app.edit.is_none(), "viewers can't start editing");
+        c.app.select_range(rg("1:3"));
+        c.app.delete_rows();
+        settle(&mut [&mut a, &mut b, &mut c], "viewer tried");
+        assert_same(&a, &c, "viewer changed nothing");
+
+        // Snapshot: the server's version holds everything; a late joiner gets the same workbook.
+        a.app.live_snapshot();
+        let seq = a.app.live_seq();
+        pump(&mut [&mut a, &mut b, &mut c], "snapshot", |cs| cs[0].app.live_snap_seq() == seq);
+        type_at(&mut b.app, 30, 0, "after the snapshot");
+        settle(&mut [&mut a, &mut b, &mut c], "after snapshot");
+        let versions = a.session.versions(&id).unwrap();
+        assert!(versions.len() >= 2, "the snapshot is a version in the history");
+        let mut d = client(&url, "ann", &dir);
+        open(&mut d, &id);
+        settle(&mut [&mut a, &mut b, &mut c, &mut d], "late joiner");
+        assert_same(&a, &d, "snapshot plus replay");
+        assert_same(&b, &c, "everyone");
+        eprintln!("(repaired, concurrent episodes): ann {:?}, ben {:?}", a.app.live_repaired(), b.app.live_repaired());
+        assert!(d.app.wb.sheets.iter().zip(&a.app.wb.sheets).all(|(x, y)| x.uid == y.uid), "sheet ids survive the snapshot");
+
+        // Everyone leaves; the last editor saves a version, and plain saves work again.
+        drop(c);
+        drop(d);
+        a.app.live_leave(true);
+        pump(&mut [&mut b], "the others left", |cs| cs[0].app.live_peer_names().is_empty());
+        let before = b.session.versions(&id).unwrap().len();
+        b.app.live_leave(true);
+        assert!(b.session.versions(&id).unwrap().len() > before, "the last editor leaving stores a version");
+        std::thread::sleep(Duration::from_millis(300));
+        let item = b.session.item(&id).unwrap();
+        assert!(b.session.upload(&id, Some(&item.etag), b"plain save").is_ok());
+        let _ = (Target::MyFiles, &a.ctx, &b.ctx);
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Random edits from two people with random message timing (real engine, real server):
+    /// both end with the same workbook, and it matches what a late joiner gets.
+    #[test]
+    fn random_live_edits_converge() {
+        let dir = std::env::temp_dir().join(format!("fo-live-rand-{}", freedomoffice_server::util::new_id()));
+        let cfg = Config { data_dir: dir.join("data"), ..Config::default() };
+        {
+            let st = Store::open(&cfg.db_path(), &cfg.files_dir(), cfg.versions_to_keep).unwrap();
+            st.create_user("ann", "Ann Lee", "", PW, false).unwrap();
+            st.create_user("ben", "Ben Ode", "", PW, false).unwrap();
+        }
+        let server = freedomoffice_server::spawn(cfg).unwrap();
+        let url = server.url();
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("start.xlsx");
+        let mut start = crate::model::Workbook::new();
+        start.sheets.push(crate::model::Sheet::new("Sheet2"));
+        crate::io::save(&start, &file).unwrap();
+        let mut a = client(&url, "ann", &dir);
+        let id = a.session.upload_new("root", "Rand.xlsx", &std::fs::read(&file).unwrap(), "fail").unwrap().id;
+        a.session.grant(&id, "ben", true).unwrap();
+        let mut b = client(&url, "ben", &dir);
+        open(&mut a, &id);
+        open(&mut b, &id);
+        settle(&mut [&mut a, &mut b], "joined");
+        let mut seed: u64 = std::env::var("FO_LIVE_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(0x2545_F491_4F6C_DD1D);
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n.max(1)
+        };
+        for step in 0..240 {
+            let c = if next(2) == 0 { &mut a } else { &mut b };
+            let app = &mut c.app;
+            app.dialog = None;
+            let (r, col) = (next(12) as u32, next(6) as u32);
+            match next(14) {
+                0..=3 => type_at(app, r, col, &format!("v{step}")),
+                4 => type_at(app, r, col, &format!("=SUM(A1:B{})+{step}", r + 2)),
+                5 => type_at(app, r, col, "=Sheet2!A1&\"x\""),
+                6 => {
+                    app.select_range(Range::new(r, 0, r + next(2) as u32, crate::model::MAX_COLS - 1));
+                    if next(2) == 0 { app.insert_rows() } else { app.delete_rows() }
+                }
+                7 => {
+                    app.select_range(Range::new(0, col, crate::model::MAX_ROWS - 1, col));
+                    if next(2) == 0 { app.insert_cols() } else { app.delete_cols() }
+                }
+                8 => {
+                    app.select_range(Range::new(r, col, r + 1, col + 1));
+                    app.toggle_bold();
+                }
+                9 => {
+                    app.select_range(Range::new(r, col, r + 1, col + 1));
+                    app.merge(if next(2) == 0 { 2 } else { 3 });
+                }
+                10 => {
+                    if next(3) == 0 && app.wb.sheets.len() > 1 {
+                        let i = next(app.wb.sheets.len() as u64) as usize;
+                        app.delete_sheet(i);
+                    } else {
+                        app.add_sheet();
+                    }
+                }
+                11 => {
+                    let i = next(app.wb.sheets.len() as u64) as usize;
+                    let _ = app.rename_sheet(i, &format!("S{step}"));
+                }
+                12 => {
+                    let n = app.wb.sheets.len();
+                    app.move_sheet_to(next(n as u64) as usize, next(n as u64 + 1) as usize);
+                }
+                _ => {
+                    let i = next(app.wb.sheets.len() as u64) as usize;
+                    app.switch_sheet(i);
+                    app.select_range(Range::new(0, col, 0, col));
+                    app.set_col_width(40.0 + step as f32);
+                }
+            }
+            // Messages are handled only now and then, so changes often cross on the way.
+            if next(4) == 0 {
+                std::thread::sleep(Duration::from_millis(next(3)));
+                a.app.poll_live();
+                b.app.poll_live();
+            }
+        }
+        settle(&mut [&mut a, &mut b], "random edits");
+        assert_same(&a, &b, "random edits");
+        eprintln!("random: (repaired, concurrent episodes): ann {:?}, ben {:?}", a.app.live_repaired(), b.app.live_repaired());
+        a.app.live_snapshot();
+        let seq = a.app.live_seq();
+        pump(&mut [&mut a, &mut b], "snapshot", |cs| cs[0].app.live_snap_seq() == seq);
+        let mut d = client(&url, "ben", &dir);
+        open(&mut d, &id);
+        settle(&mut [&mut a, &mut b, &mut d], "late joiner");
+        assert_same(&a, &d, "late joiner after random edits");
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
