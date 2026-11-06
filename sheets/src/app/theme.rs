@@ -240,6 +240,16 @@ fn font_dirs() -> Vec<PathBuf> {
         v.push(PathBuf::from(l).join("Microsoft").join("Windows").join("Fonts"));
     }
     v.push(PathBuf::from("/usr/share/fonts/truetype/msttcorefonts"));
+    if cfg!(target_os = "macos") {
+        // No fontconfig on macOS: look where Office for Mac and the system keep the fonts.
+        if let Ok(h) = std::env::var("HOME") {
+            v.push(PathBuf::from(h).join("Library/Fonts"));
+        }
+        v.push(PathBuf::from("/Applications/Microsoft Excel.app/Contents/Resources/DFonts"));
+        v.push(PathBuf::from("/Library/Fonts"));
+        v.push(PathBuf::from("/System/Library/Fonts/Supplemental"));
+        v.push(PathBuf::from("/System/Library/Fonts"));
+    }
     v
 }
 

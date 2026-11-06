@@ -115,7 +115,7 @@ cargo build --release
 The executable is written to `target/release/FreedomSheets.exe` (statically linked C runtime, icon and DPI-aware manifest embedded).
 Run the tests with `cargo test`.
 
-### Linux (x86_64, experimental)
+### Linux and macOS (experimental)
 
 Runs on X11 and Wayland. On Debian/Ubuntu install the build dependencies first:
 
@@ -127,6 +127,9 @@ cargo build --release   # -> target/release/FreedomSheets
 Fonts come from fontconfig. For layouts that match Windows, install the metric-compatible
 fonts (`fonts-crosextra-carlito fonts-crosextra-caladea fonts-liberation`). Printing goes
 through CUPS (`lp`); there is no printer-properties dialog.
+
+On macOS `cargo build --release` works as is (Xcode command line tools); fonts are read from
+the system font folders and Office for Mac, printing uses CUPS as on Linux.
 
 ## Project layout
 
