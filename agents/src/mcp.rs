@@ -33,6 +33,10 @@ pub struct Mcp {
     last_reconnect: Instant,
     /// This agent's own changes that others replaced, not yet reported to the model.
     replaced: Vec<ReplacedEvent>,
+    /// Where changes the server hasn't confirmed are kept (see `cosync::journal`); none in tests.
+    pub journal: Option<PathBuf>,
+    /// Changes an earlier run left unconfirmed that were sent now, not yet reported.
+    resumed: usize,
 }
 
 fn text_of(v: &Json) -> String {
@@ -70,6 +74,8 @@ impl Mcp {
             current: None,
             last_reconnect: Instant::now(),
             replaced: Vec::new(),
+            journal: None,
+            resumed: 0,
         }
     }
 
@@ -130,19 +136,20 @@ impl Mcp {
             }
             let out = f(l)?;
             if write && !l.wait_synced(Duration::from_secs(20)) {
-                return Err("The server didn't confirm the change yet; it will be sent when the connection is back.".into());
+                return Err("The server has NOT confirmed the change yet. It is kept and is sent when the connection is back (or the next time this workbook is opened); don't assume it is saved, and don't write it again.".into());
             }
             self.replaced.extend(l.take_replaced());
             return Ok((out, None));
         }
         // The saved file lacks what was edited live since; joining replays it.
-        let mut l = Live::open(&self.api, item, true)?;
+        let mut l = Live::open_in(&self.api, item, true, self.journal.as_deref())?;
         if !l.wait_synced(Duration::from_secs(20)) {
             return Err(l
                 .stopped
                 .clone()
                 .unwrap_or_else(|| "Couldn't join the live session.".into()));
         }
+        self.resumed += l.take_resumed();
         let out = f(&mut l);
         let version = if write && out.is_ok() {
             work::settle(&mut l)
@@ -247,13 +254,14 @@ impl Mcp {
                 let item = self.item(a)?;
                 self.current = Some(item.clone());
                 if !self.sessions.contains_key(&item) {
-                    let mut l = Live::open(&self.api, &item, true)?;
+                    let mut l = Live::open_in(&self.api, &item, true, self.journal.as_deref())?;
                     if !l.wait_synced(Duration::from_secs(20)) {
                         return Err(l
                             .stopped
                             .clone()
                             .unwrap_or_else(|| "Couldn't join the live session.".into()));
                     }
+                    self.resumed += l.take_resumed();
                     self.sessions.insert(item.clone(), l);
                 }
                 let l = self.sessions.get_mut(&item).expect("just joined");
@@ -321,6 +329,10 @@ impl Mcp {
         });
         if let Some(v) = version {
             out["saved_version"] = json!(v);
+        }
+        if self.resumed > 0 {
+            out["resumed_from_journal"] = json!(std::mem::take(&mut self.resumed));
+            out["resumed_notice"] = json!("Changes an earlier run made but the server never confirmed were sent now, before this one.");
         }
         self.report_replaced(out);
         self.current = Some(item.to_string());
@@ -435,6 +447,7 @@ pub fn serve(
         }
     });
     let mut mcp = Mcp::new(api);
+    mcp.journal = crate::config::journal_dir();
     let mut send = |v: &Json| -> Result<(), String> {
         writeln!(out, "{v}")
             .and_then(|_| out.flush())

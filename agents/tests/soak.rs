@@ -213,3 +213,88 @@ fn a_reload_request_is_followed_and_pending_changes_survive() {
     let (apis, item) = shared_workbook(&s, "tasks");
     common::reload_keeps_pending_changes(&apis[0], &item);
 }
+
+/// Clients are killed on purpose (dropped right after sending an edit, answer unread) and
+/// started again from their journals; everyone, and a fresh joiner, still ends identical, and
+/// no journal is left behind.
+#[test]
+fn clients_killed_and_restarted_from_their_journals_converge() {
+    let s = start();
+    let (apis, item) = shared_workbook(&s, "budget");
+    // FSHEETS_SOAK_SEEDS=N runs N seeds in a row (a longer hunt for rare interleavings).
+    let seeds: u64 = std::env::var("FSHEETS_SOAK_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    for k in 0..seeds {
+        let cfg = soak::Config {
+            clients: 3,
+            edits: 90,
+            seed: 0x6a0b + k,
+            interval_ms: 25,
+            disconnect_pct: 3.0,
+            restart_pct: 7.0,
+            ..Default::default()
+        };
+        let report = soak::run(&apis, &item, &cfg).unwrap();
+        report.print();
+        assert!(report.converged(), "seed {:#x}: {:?}", cfg.seed, report.difference);
+        assert!(report.restarts > 3, "too few kills to mean anything: {report:?}");
+        assert!(report.totals.journal_restores > 0, "no journal was ever put back: {report:?}");
+        assert_eq!(report.journals_left, 0);
+    }
+}
+
+/// An agent that dies with changes the server never confirmed (mid-send, or offline) loses
+/// nothing: the next run puts them back from the journal and sends them once.
+#[test]
+fn an_agent_that_dies_with_unconfirmed_changes_loses_nothing() {
+    use cosync::journal::Journal;
+    use cosync::{CellData, Op, Val};
+    let s = start();
+    let (apis, item) = shared_workbook(&s, "tasks");
+    let jdir = std::env::temp_dir().join(format!("fsheets-journal-test-{}", freedomoffice_server::util::new_id()));
+    let text = |t: &str| Some(CellData { v: Val::Text(t.into()), ..Default::default() });
+    let wait = std::time::Duration::from_secs(10);
+
+    let mut a = Live::open_in(&apis[0], &item, true, Some(&jdir)).unwrap();
+    assert!(a.wait_synced(wait));
+    let sheet = a.first_sheet().unwrap();
+    // Online: the first batch is sent, the rest buffered behind it; then the process dies.
+    a.set_content(sheet, 40, 0, text("one"));
+    a.edit(vec![Op::Rows { s: sheet, at: 2, n: 1 }]);
+    a.set_content(sheet, 41, 1, text("two"));
+    assert_eq!(Journal::all(&jdir).len(), 1, "journaled with the first edit");
+    drop(a);
+
+    let mut b = Live::open_in(&apis[0], &item, true, Some(&jdir)).unwrap();
+    assert!(b.wait_synced(wait));
+    assert_eq!(b.take_resumed(), 3);
+    assert!(Journal::all(&jdir).is_empty(), "everything acknowledged: no journal");
+    let sheet = b.first_sheet().unwrap();
+    let check = |l: &Live| {
+        // The row was inserted once, above both cells' rows: they moved down by one.
+        assert_eq!(l.cell_data(sheet, 41, 0).map(|c| c.v), Some(Val::Text("one".into())));
+        assert_eq!(l.cell_data(sheet, 41, 1).map(|c| c.v), Some(Val::Text("two".into())));
+        assert_eq!(l.cell_data(sheet, 40, 0).map(|c| c.v), None);
+    };
+    check(&b);
+
+    // Offline this time: the edit is only in the journal when the process dies.
+    b.disconnect();
+    b.set_content(sheet, 50, 2, text("offline"));
+    drop(b);
+    assert_eq!(Journal::all(&jdir).len(), 1);
+    let mut c = Live::open_in(&apis[0], &item, true, Some(&jdir)).unwrap();
+    assert!(c.wait_synced(wait));
+    assert_eq!(c.take_resumed(), 1);
+    drop(c);
+
+    // Nothing is replayed a third time, and another person sees everything exactly once.
+    let mut d = Live::open_in(&apis[0], &item, true, Some(&jdir)).unwrap();
+    assert!(d.wait_synced(wait));
+    assert_eq!(d.take_resumed(), 0);
+    let mut other = Live::open(&apis[1], &item, false).unwrap();
+    assert!(other.wait_synced(wait));
+    check(&other);
+    assert_eq!(other.cell_data(sheet, 50, 2).map(|c| c.v), Some(Val::Text("offline".into())));
+    assert!(d.differences(&other).is_empty(), "{:?}", d.differences(&other));
+    let _ = std::fs::remove_dir_all(&jdir);
+}

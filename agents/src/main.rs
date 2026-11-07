@@ -38,10 +38,14 @@ USAGE:
     fsheets add-sheet --item ID --name NAME
                                   Add a sheet
     fsheets versions --item ID    The version history
+    fsheets journal [--discard ID]
+                                  List changes an earlier run made but the server never confirmed (they
+                                  are sent when the workbook is next opened); --discard drops one journal
     fsheets mcp [--server URL --user NAME --password-file FILE] [--token-file FILE]
                                   MCP server on standard input/output for AI agents
     fsheets soak --server URL --item ID --users a,b,c --secrets-dir DIR
                  [--clients 4] [--edits 150] [--seed N] [--interval-ms 40]
+                 [--restart-pct 2] [--journal-dir DIR]
                                   Several clients edit at random, disconnect and reconnect; all must converge
     fsheets probe --server URL --item ID --users a,b --secrets-dir DIR
                                   Show what concurrent edits of one cell do
@@ -106,7 +110,11 @@ fn logins(server: &str, users: &str, dir: &str) -> Result<Vec<Api>, String> {
 /// Joins the item's live session (so the current state, including what was edited live since
 /// the last saved version, is replayed) and waits until caught up.
 fn join(api: &Api, item: &str) -> Result<Live, String> {
-    let mut live = Live::open(api, item, true)?;
+    let mut live = Live::open_in(api, item, true, config::journal_dir().as_deref())?;
+    let resumed = live.take_resumed();
+    if resumed > 0 {
+        eprintln!("fsheets: {resumed} change(s) from an earlier run were sent now (they had not been confirmed by the server).");
+    }
     if !live.wait_synced(Duration::from_secs(20)) {
         return Err(live
             .stopped
@@ -394,6 +402,10 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
             if let Some(v) = opt(&mut args, "--interval-ms") {
                 cfg.interval_ms = v.parse().map_err(|_| "--interval-ms must be a number")?;
             }
+            if let Some(v) = opt(&mut args, "--restart-pct") {
+                cfg.restart_pct = v.parse().map_err(|_| "--restart-pct must be a number")?;
+            }
+            cfg.journal_dir = opt(&mut args, "--journal-dir").map(PathBuf::from);
             cfg.seed = match opt(&mut args, "--seed") {
                 Some(v) => v.parse().map_err(|_| "--seed must be a number")?,
                 None => fsheets::rng::Rng::random_seed(),
@@ -402,6 +414,25 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
             report.print();
             if !report.converged() {
                 return Err("The clients did not converge.".into());
+            }
+        }
+        "journal" => {
+            let dir = config::journal_dir().ok_or("No folder for the journal (HOME is not set).")?;
+            if let Some(item) = opt(&mut args, "--discard") {
+                let mut n = 0;
+                for j in cosync::journal::Journal::all(&dir).into_iter().filter(|j| j.item == item) {
+                    cosync::journal::Journal::remove(&dir, &j.url, &j.user, &j.item);
+                    n += 1;
+                }
+                println!("discarded {n} journal(s)");
+            } else {
+                let all = cosync::journal::Journal::all(&dir);
+                for j in &all {
+                    println!("{}\t{}\t{}\t{} change(s), {} operation(s) unconfirmed (saved {})", j.item, j.user, j.url, j.pending_changes(), j.pending_ops(), j.saved_at);
+                }
+                if all.is_empty() {
+                    println!("no unconfirmed changes");
+                }
             }
         }
         "probe" => {

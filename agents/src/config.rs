@@ -26,6 +26,19 @@ pub fn config_dir() -> Option<PathBuf> {
     Some(base.join("freedomsheets-agents"))
 }
 
+/// Where unacknowledged changes are kept so a crashed agent loses nothing: `$FSHEETS_JOURNAL_DIR`,
+/// else `$XDG_DATA_HOME/freedomsheets-agents/journal` or `~/.local/share/freedomsheets-agents/journal`.
+pub fn journal_dir() -> Option<PathBuf> {
+    if let Some(d) = std::env::var_os("FSHEETS_JOURNAL_DIR").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(d));
+    }
+    let base = match std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
+        Some(x) => PathBuf::from(x),
+        None => PathBuf::from(std::env::var_os("HOME").filter(|v| !v.is_empty())?).join(".local/share"),
+    };
+    Some(base.join("freedomsheets-agents").join("journal"))
+}
+
 /// The cached token of an account: `<user>@<host>.token` in the config directory.
 pub fn token_path(server: &str, user: &str) -> Option<PathBuf> {
     let host = crate::api::normalize_url(server)
