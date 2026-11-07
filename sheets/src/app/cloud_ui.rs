@@ -14,7 +14,7 @@ use super::chrome::Backstage;
 use super::dialogs::Dialog;
 use super::theme::{self, ic};
 use super::{App, Pending};
-use crate::cloud::server::{self, VersionInfo};
+use crate::cloud::server::{self, Me, OrgInfo, VersionInfo};
 use crate::cloud::{self, graph, CloudDoc, Conn, DriveItem, Kind, Permission, Provider, ServerSession, Session, Target, UploadError, User};
 
 const SHARE: char = '\u{E72D}';
@@ -40,13 +40,16 @@ const SETUP_STEPS: &[&str] = &[
 /// Link expiry choices in the server Share dialog (days; 0 = never).
 const LINK_DAYS: &[(u32, &str)] = &[(0, "Never expires"), (1, "Expires in 1 day"), (7, "Expires in 7 days"), (30, "Expires in 30 days"), (90, "Expires in 90 days")];
 
-/// The three views of a FreedomOffice server place.
+/// The views of a FreedomOffice server place: My files, Shared with me, each organisation the
+/// person belongs to, Recent.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum ServerView {
     #[default]
     MyFiles,
     Shared,
     Recent,
+    /// An organisation's folder (index into the account's `Me::orgs`).
+    Org(usize),
 }
 
 /// A place in File > Open / Save As.
@@ -68,7 +71,7 @@ pub enum Place {
 impl Place {
     fn target(self) -> Option<Target> {
         match self {
-            Place::Local | Place::AddServer => None,
+            Place::Local | Place::AddServer | Place::Server(_, ServerView::Org(_)) => None,
             Place::MyFiles | Place::Server(_, ServerView::MyFiles) => Some(Target::MyFiles),
             Place::Recent | Place::Server(_, ServerView::Recent) => Some(Target::Recent),
             Place::Shared | Place::Server(_, ServerView::Shared) => Some(Target::Shared),
@@ -115,8 +118,10 @@ enum Event {
     Invited(Result<usize, String>),
     Link(Result<String, String>),
     Permissions(Result<Vec<Permission>, String>),
-    ServerSignedIn(Result<Arc<ServerSession>, String>),
-    ServerChecked { url: String, username: String, result: Result<String, String> },
+    ServerSignedIn(Result<(Arc<ServerSession>, Option<Me>), String>),
+    ServerChecked { url: String, username: String, result: Result<Me, String> },
+    PasswordChanged { url: String, result: Result<u64, String> },
+    OrgShared(Result<String, String>),
     Users(u64, Result<Vec<(String, String)>, String>),
     FolderCreated(Result<DriveItem, String>),
     Versions(Result<Vec<VersionInfo>, String>),
@@ -155,6 +160,10 @@ pub struct ShareState {
     pub link_password: String,
     /// The people search got the keyboard focus once (when the dialog opened).
     focused: bool,
+    /// Sharing with a whole organisation: which one (index into the account's organisations)
+    /// and whether everyone in it can edit.
+    pub org_pick: usize,
+    pub org_edit: bool,
 }
 
 /// A FreedomOffice server account in this session.
@@ -162,6 +171,47 @@ pub struct ServerEntry {
     pub session: Arc<ServerSession>,
     /// Set when the server rejected the device token (signed out elsewhere, revoked).
     pub error: Option<String>,
+    /// Who is signed in, with their organisations (once `/api/me` answered).
+    pub me: Option<Me>,
+}
+
+impl ServerEntry {
+    fn orgs(&self) -> &[OrgInfo] {
+        self.me.as_ref().map_or(&[], |m| m.orgs.as_slice())
+    }
+}
+
+/// "Choose a new password" (asked by the server after a temporary password) and
+/// File > Account > Change password. The passwords are sent once and then dropped.
+#[derive(Default)]
+pub struct PasswordForm {
+    pub url: String,
+    pub username: String,
+    /// The server asked for it: every request is refused until a new password is chosen.
+    pub forced: bool,
+    pub old: String,
+    pub new: String,
+    pub repeat: String,
+    pub busy: bool,
+    pub error: Option<String>,
+    focused: bool,
+}
+
+impl PasswordForm {
+    /// Checks what can be checked here (the server checks its password policy).
+    fn problem(&self) -> Option<&'static str> {
+        if self.old.is_empty() {
+            Some(if self.forced { "Enter the temporary password you signed in with." } else { "Enter your current password." })
+        } else if self.new.is_empty() {
+            Some("Enter a new password.")
+        } else if self.new != self.repeat {
+            Some("The new passwords don't match.")
+        } else if self.new == self.old {
+            Some("The new password must be different from the current one.")
+        } else {
+            None
+        }
+    }
 }
 
 /// The "Add server" form (Account page and the FreedomOffice Server place).
@@ -219,6 +269,7 @@ pub struct CloudState {
     pub servers: Vec<ServerEntry>,
     pub add_server: AddServer,
     pub versions: Option<VersionsState>,
+    pub password: Option<PasswordForm>,
 }
 
 impl Default for CloudState {
@@ -253,6 +304,7 @@ impl Default for CloudState {
             servers: Vec::new(),
             add_server: AddServer::default(),
             versions: None,
+            password: None,
         }
     }
 }
@@ -361,6 +413,7 @@ impl App {
         while let Ok(ev) = self.cloud.rx.try_recv() {
             self.cloud_event(ev);
         }
+        self.server_password_check();
         // AutoSave: upload a few seconds after the last edit.
         let now = ctx.input(|i| i.time);
         if self.edits != self.cloud.last_edits {
@@ -381,10 +434,62 @@ impl App {
     fn restore_servers(&mut self) {
         for account in server::load_accounts() {
             let session = Arc::new(ServerSession::new(account, Box::new(cloud::Http::new())));
-            let s = session.clone();
-            self.cloud_spawn(move || Event::ServerChecked { url: s.account.url.clone(), username: s.account.username.clone(), result: s.me() });
-            self.cloud.servers.push(ServerEntry { session, error: None });
+            self.server_check(&session);
+            self.cloud.servers.push(ServerEntry { session, error: None, me: None });
         }
+    }
+
+    /// Checks the device token and gets the account's organisations (in the background).
+    fn server_check(&self, session: &Arc<ServerSession>) {
+        let s = session.clone();
+        self.cloud_spawn(move || Event::ServerChecked { url: s.account.url.clone(), username: s.account.username.clone(), result: s.me_info() });
+    }
+
+    /// The server asked one of the accounts for a new password: ask the person.
+    fn server_password_check(&mut self) {
+        if self.cloud.password.is_some() {
+            return;
+        }
+        if let Some(e) = self.cloud.servers.iter().find(|e| e.session.needs_password_change()) {
+            let a = &e.session.account;
+            self.cloud.password = Some(PasswordForm { url: a.url.clone(), username: a.username.clone(), forced: true, ..Default::default() });
+        }
+    }
+
+    /// File > Account > Change password.
+    pub(super) fn server_change_password(&mut self, i: usize) {
+        if let Some(e) = self.cloud.servers.get(i) {
+            let a = &e.session.account;
+            let forced = e.session.needs_password_change();
+            self.cloud.password = Some(PasswordForm { url: a.url.clone(), username: a.username.clone(), forced, ..Default::default() });
+        }
+    }
+
+    /// Sends the password change; the typed passwords leave the form now and are dropped after
+    /// the request.
+    fn password_submit(&mut self) {
+        let Some(f) = &mut self.cloud.password else { return };
+        if f.busy {
+            return;
+        }
+        if let Some(p) = f.problem() {
+            f.error = Some(p.into());
+            return;
+        }
+        let Some(s) = self.cloud.servers.iter().find(|e| e.session.account.url == f.url).map(|e| e.session.clone()) else {
+            self.cloud.password = None;
+            return;
+        };
+        f.busy = true;
+        f.error = None;
+        let (old, new) = (std::mem::take(&mut f.old), std::mem::take(&mut f.new));
+        f.repeat.clear();
+        let url = f.url.clone();
+        self.cloud_spawn(move || {
+            let result = s.change_password(&old, &new);
+            drop((old, new));
+            Event::PasswordChanged { url, result }
+        });
     }
 
     /// Hidden screenshot helper: `FREEDOMOFFICE_CLOUD_DEMO=share|account|open` shows the cloud UI
@@ -520,10 +625,10 @@ impl App {
                 let a = &mut self.cloud.add_server;
                 a.busy = false;
                 match result {
-                    Ok(session) => {
+                    Ok((session, me)) => {
                         let host = session.host();
                         let (url, username) = (session.account.url.clone(), session.account.username.clone());
-                        let entry = ServerEntry { session, error: None };
+                        let entry = ServerEntry { session, error: None, me };
                         let i = match self.cloud.servers.iter().position(|e| e.session.account.url == url && e.session.account.username == username) {
                             Some(i) => {
                                 self.cloud.servers[i] = entry;
@@ -554,12 +659,61 @@ impl App {
                 }
             }
             Event::ServerChecked { url, username, result } => {
-                if let Err(e) = result {
-                    // Offline is fine (the token is checked again on use); a rejected token isn't.
-                    if e.contains("expired or was revoked") {
-                        if let Some(entry) = self.cloud.servers.iter_mut().find(|x| x.session.account.url == url && x.session.account.username == username) {
-                            entry.error = Some(e);
+                let Some(entry) = self.cloud.servers.iter_mut().find(|x| x.session.account.url == url && x.session.account.username == username) else { return };
+                match result {
+                    Ok(me) => {
+                        // A view of an organisation that is gone shows My files.
+                        let n = me.orgs.len();
+                        let changed = entry.me.as_ref().is_some_and(|m| m.orgs != me.orgs);
+                        entry.me = Some(me);
+                        entry.error = None;
+                        for p in [&mut self.cloud.open_place, &mut self.cloud.save_place] {
+                            if let Place::Server(i, ServerView::Org(k)) = *p {
+                                if self.cloud.servers.get(i).is_some_and(|e| e.session.account.url == url) && (k >= n || changed) {
+                                    *p = Place::Server(i, ServerView::MyFiles);
+                                    self.cloud.browser.root = None;
+                                }
+                            }
                         }
+                    }
+                    // Offline is fine (the token is checked again on use); a rejected token isn't.
+                    Err(e) if e.contains("expired or was revoked") => entry.error = Some(e),
+                    Err(_) => {}
+                }
+            }
+            Event::PasswordChanged { url, result } => {
+                let Some(f) = &mut self.cloud.password else { return };
+                if f.url != url {
+                    return;
+                }
+                f.busy = false;
+                match result {
+                    Ok(n) => {
+                        self.cloud.password = None;
+                        self.status = Some(match n {
+                            0 => "Your password was changed.".into(),
+                            1 => "Your password was changed. Your other device was signed out.".into(),
+                            n => format!("Your password was changed. Your {n} other devices were signed out."),
+                        });
+                        // Everything the temporary password blocked works now.
+                        if let Some(s) = self.cloud.servers.iter().find(|e| e.session.account.url == url).map(|e| e.session.clone()) {
+                            self.server_check(&s);
+                        }
+                        self.cloud.browser.root = None;
+                    }
+                    Err(e) => f.error = Some(e),
+                }
+            }
+            Event::OrgShared(result) => {
+                if let Some(sh) = &mut self.cloud.share {
+                    sh.busy = false;
+                    match result {
+                        Ok(name) => {
+                            sh.info = Some(format!("Shared with everyone in {name}."));
+                            sh.error = None;
+                            sh.perms = None;
+                        }
+                        Err(e) => sh.error = Some(e),
                     }
                 }
             }
@@ -714,7 +868,11 @@ impl App {
         self.cloud_spawn(move || {
             let result = ServerSession::login(Box::new(cloud::Http::new()), &url, &user, &password, &server::device_name());
             drop(password);
-            Event::ServerSignedIn(result.map(Arc::new))
+            // Also who this is (organisations); a temporary password is noticed here too.
+            Event::ServerSignedIn(result.map(|s| {
+                let me = s.me_info().ok();
+                (Arc::new(s), me)
+            }))
         });
     }
 
@@ -1063,22 +1221,25 @@ impl App {
             return;
         }
         if self.cloud.browser.root != Some(place) {
-            let root = place.target().unwrap_or(Target::MyFiles);
-            let label = match place {
-                Place::Recent | Place::Server(_, ServerView::Recent) => "Recent",
-                Place::Shared | Place::Server(_, ServerView::Shared) => "Shared with me",
-                Place::Sites => "Sites",
-                _ => "My files",
-            };
+            let (root, label) = self.place_root(place);
             self.cloud.browser = Browser { root: Some(place), seq: self.cloud.browser.seq, ..Default::default() };
-            self.cloud_navigate(root, label.into(), true);
+            self.cloud_navigate(root, label, true);
         }
-        // Server views: My files / Shared with me / Recent.
+        // Server views: My files / Shared with me / each organisation / Recent.
         if let Place::Server(i, view) = place {
             let mut pick = None;
-            ui.horizontal(|ui| {
-                for (v, label) in [(ServerView::MyFiles, "My files"), (ServerView::Shared, "Shared with me"), (ServerView::Recent, "Recent")] {
-                    if (!save_as || v != ServerView::Recent) && ui.selectable_label(view == v, RichText::new(label).size(13.5)).clicked() && view != v {
+            let mut views: Vec<(ServerView, String)> = vec![(ServerView::MyFiles, "My files".into()), (ServerView::Shared, "Shared with me".into())];
+            if let Some(e) = self.cloud.servers.get(i) {
+                views.extend(e.orgs().iter().enumerate().map(|(k, o)| (ServerView::Org(k), o.name.clone())));
+            }
+            if !save_as {
+                views.push((ServerView::Recent, "Recent".into()));
+            }
+            ui.horizontal_wrapped(|ui| {
+                for (v, label) in views {
+                    let r = ui.selectable_label(view == v, RichText::new(label).size(13.5));
+                    let r = if matches!(v, ServerView::Org(_)) { r.on_hover_text("Your organisation's folder") } else { r };
+                    if r.clicked() && view != v {
                         pick = Some(v);
                     }
                 }
@@ -1248,6 +1409,22 @@ impl App {
         }
     }
 
+    /// What a place lists first, and its breadcrumb label.
+    pub(super) fn place_root(&self, place: Place) -> (Target, String) {
+        if let Place::Server(i, ServerView::Org(k)) = place {
+            if let Some(o) = self.cloud.servers.get(i).and_then(|e| e.orgs().get(k)) {
+                return (Target::Folder(o.root.clone()), o.name.clone());
+            }
+        }
+        let label = match place {
+            Place::Recent | Place::Server(_, ServerView::Recent) => "Recent",
+            Place::Shared | Place::Server(_, ServerView::Shared) => "Shared with me",
+            Place::Sites => "Sites",
+            _ => "My files",
+        };
+        (place.target().unwrap_or(Target::MyFiles), label.into())
+    }
+
     fn default_cloud_name(&self) -> String {
         let stem = self.wb.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "Book1".into());
         format!("{stem}.xlsx")
@@ -1378,6 +1555,7 @@ impl App {
         ui.add_space(10.0);
         let mut sign_out = None;
         let mut again = None;
+        let mut password = None;
         for (i, e) in self.cloud.servers.iter().enumerate() {
             let u = server_user(&e.session);
             ui.horizontal(|ui| {
@@ -1399,7 +1577,31 @@ impl App {
                     }
                 });
             });
+            if e.error.is_none() {
+                ui.horizontal(|ui| {
+                    ui.add_space(46.0);
+                    if ui.add(egui::Button::new("Change password…").min_size(Vec2::new(130.0, 24.0))).clicked() {
+                        password = Some(i);
+                    }
+                    if e.me.as_ref().is_some_and(Me::can_manage) {
+                        let url = format!("{}/admin", e.session.account.url);
+                        if ui.add(egui::Button::new("Manage organisations…").min_size(Vec2::new(160.0, 24.0))).on_hover_text(format!("Opens {url} in your browser")).clicked() {
+                            cloud::open_in_browser(&url);
+                        }
+                    }
+                });
+                let orgs: Vec<&str> = e.orgs().iter().map(|o| o.name.as_str()).collect();
+                if !orgs.is_empty() {
+                    ui.horizontal(|ui| {
+                        ui.add_space(46.0);
+                        ui.label(RichText::new(format!("Organisations: {}", orgs.join(", "))).size(12.5).color(theme::text_dim()));
+                    });
+                }
+            }
             ui.add_space(8.0);
+        }
+        if let Some(i) = password {
+            self.server_change_password(i);
         }
         if let Some(i) = again {
             let a = &self.cloud.servers[i].session.account;
@@ -1611,13 +1813,85 @@ impl App {
 
     /// Share, version history or a save conflict is open.
     pub(super) fn cloud_dialog_open(&self) -> bool {
-        self.cloud.share.is_some() || self.cloud.versions.is_some() || self.cloud.conflict.is_some()
+        self.cloud.share.is_some() || self.cloud.versions.is_some() || self.cloud.conflict.is_some() || self.cloud.password.is_some()
     }
 
     pub fn cloud_dialogs_ui(&mut self, ctx: &egui::Context) {
         self.conflict_ui(ctx);
         self.share_ui(ctx);
         self.versions_ui(ctx);
+        self.password_ui(ctx);
+    }
+
+    /// "Choose a new password" / "Change password".
+    fn password_ui(&mut self, ctx: &egui::Context) {
+        let Some(mut f) = self.cloud.password.take() else { return };
+        let host = server::host_of(&f.url);
+        let mut submit = false;
+        let mut close = false;
+        let title = if f.forced { "Choose a new password" } else { "Change password" };
+        egui::Window::new(title).collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, -40.0]).show(ctx, |ui| {
+            ui.set_width(420.0);
+            let intro = if f.forced {
+                format!("You signed in to {host} as {} with a temporary password. Choose your own password to continue.", f.username)
+            } else {
+                format!("Change the password of {} on {host}. Your other devices will be signed out.", f.username)
+            };
+            ui.add(egui::Label::new(RichText::new(intro).color(theme::text())).wrap());
+            ui.add_space(8.0);
+            egui::Grid::new("password_form").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                ui.label(if f.forced { "Temporary password:" } else { "Current password:" });
+                let r = ui.add_enabled(!f.busy, egui::TextEdit::singleline(&mut f.old).password(true).desired_width(220.0));
+                if !f.focused {
+                    f.focused = true;
+                    r.request_focus();
+                }
+                ui.end_row();
+                ui.label("New password:");
+                ui.add_enabled(!f.busy, egui::TextEdit::singleline(&mut f.new).password(true).desired_width(220.0));
+                ui.end_row();
+                ui.label("Repeat new password:");
+                let r = ui.add_enabled(!f.busy, egui::TextEdit::singleline(&mut f.repeat).password(true).desired_width(220.0));
+                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    submit = true;
+                }
+                ui.end_row();
+            });
+            ui.add_space(4.0);
+            ui.label(RichText::new("At least 12 characters; not your username and not a common password.").size(12.0).color(theme::text_dim()));
+            if let Some(e) = &f.error {
+                ui.add_space(4.0);
+                ui.add(egui::Label::new(RichText::new(e).color(error_red())).wrap());
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let b = egui::Button::new(RichText::new("Change password").color(Color32::WHITE)).fill(share_green()).min_size(Vec2::new(140.0, 28.0));
+                if ui.add_enabled(!f.busy, b).clicked() {
+                    submit = true;
+                }
+                if ui.add_enabled(!f.busy, egui::Button::new(if f.forced { "Not now" } else { "Cancel" })).clicked() || (!f.busy && ui.input(|i| i.key_pressed(egui::Key::Escape))) {
+                    close = true;
+                }
+                if f.busy {
+                    ui.add(egui::Spinner::new());
+                    ui.label("Changing...");
+                }
+            });
+        });
+        if close {
+            // Typed passwords go with the form. "Not now": asked again on the next refusal.
+            if let Some(e) = self.cloud.servers.iter().find(|e| e.session.account.url == f.url) {
+                e.session.dismiss_password_change();
+            }
+            if f.forced {
+                self.status = Some(format!("Choose a new password (File > Account) to use {host}."));
+            }
+            return;
+        }
+        self.cloud.password = Some(f);
+        if submit {
+            self.password_submit();
+        }
     }
 
     fn conflict_ui(&mut self, ctx: &egui::Context) {
@@ -1844,6 +2118,11 @@ impl App {
         let Some(doc) = self.cloud.doc.clone() else { return };
         let session = self.doc_server();
         let host = cloud::place_name(&doc.provider);
+        // The organisations this account belongs to (to share with all their members).
+        let orgs: Vec<OrgInfo> = match &doc.provider {
+            Provider::FreedomServer(url) => self.server_index(url).map(|i| self.cloud.servers[i].orgs().to_vec()).unwrap_or_default(),
+            Provider::Microsoft => Vec::new(),
+        };
         let mut open = true;
         let mut versions = false;
         egui::Window::new(format!("Share '{}'", doc.name)).open(&mut open).collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, -40.0]).show(ctx, |ui| {
@@ -1869,6 +2148,7 @@ impl App {
                 0 => {
                     ui.label(format!("People with an account on {host}:"));
                     let r = ui.add(egui::TextEdit::singleline(&mut sh.user_query).hint_text("Search by name or username").desired_width(f32::INFINITY));
+                    ui.label(RichText::new("Finds people who share an organisation with you. Anyone else: type their exact username.").size(12.0).color(theme::text_dim()));
                     if !sh.focused {
                         sh.focused = true;
                         r.request_focus();
@@ -1897,7 +2177,7 @@ impl App {
                             });
                         });
                     } else if !sh.user_query.trim().is_empty() {
-                        ui.label(RichText::new("No matching people.").size(12.0).color(theme::text_dim()));
+                        ui.label(RichText::new("No matching people in your organisations, and no one with exactly that username.").size(12.0).color(theme::text_dim()));
                     }
                     if let Some(p) = add {
                         sh.invite.push(p);
@@ -1939,6 +2219,35 @@ impl App {
                         });
                     });
                     ui.label(RichText::new("They'll find it under Shared with me.").size(12.0).color(theme::text_dim()));
+                    if !orgs.is_empty() {
+                        ui.add_space(6.0);
+                        ui.separator();
+                        ui.label("Everyone in an organisation:");
+                        sh.org_pick = sh.org_pick.min(orgs.len() - 1);
+                        ui.horizontal(|ui| {
+                            egui::ComboBox::from_id_salt("server_share_org").width(190.0).selected_text(orgs[sh.org_pick].name.clone()).show_ui(ui, |ui| {
+                                for (k, o) in orgs.iter().enumerate() {
+                                    ui.selectable_value(&mut sh.org_pick, k, o.name.clone());
+                                }
+                            });
+                            egui::ComboBox::from_id_salt("server_share_org_role").selected_text(if sh.org_edit { "Can edit" } else { "Can view" }).show_ui(ui, |ui| {
+                                ui.selectable_value(&mut sh.org_edit, true, "Can edit");
+                                ui.selectable_value(&mut sh.org_edit, false, "Can view");
+                            });
+                            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                                let b = egui::Button::new(RichText::new("Share").color(Color32::WHITE)).fill(share_green()).min_size(Vec2::new(90.0, 28.0));
+                                if ui.add_enabled(!sh.busy && session.is_some(), b).on_hover_text(format!("Everyone in {} gets access, also people who join later.", orgs[sh.org_pick].name)).clicked() {
+                                    if let Some(s) = session.clone() {
+                                        sh.busy = true;
+                                        sh.info = None;
+                                        sh.error = None;
+                                        let (edit, org, id) = (sh.org_edit, orgs[sh.org_pick].clone(), id.clone());
+                                        self.cloud_spawn(move || Event::OrgShared(s.grant_org(&id, &org.id, edit).map(|_| org.name)));
+                                    }
+                                }
+                            });
+                        });
+                    }
                 }
                 1 => {
                     ui.label("Anyone with the link:");
@@ -2182,7 +2491,8 @@ impl App {
     /// Signed in to a server without touching the saved accounts (tests).
     pub(super) fn cloud_for_test(&mut self, session: Arc<ServerSession>) {
         self.cloud.started = true;
-        self.cloud.servers.push(ServerEntry { session, error: None });
+        let me = session.me_info().ok();
+        self.cloud.servers.push(ServerEntry { session, error: None, me });
     }
 
     /// No saved accounts or sign-ins are read from this PC (tests).
@@ -2195,3 +2505,7 @@ impl App {
         self.cloud_event(Event::Opened(Ok(doc)));
     }
 }
+
+#[cfg(test)]
+#[path = "cloud_tests.rs"]
+mod tests;

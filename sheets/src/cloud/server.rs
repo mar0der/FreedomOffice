@@ -338,7 +338,8 @@ impl ServerSession {
         self.json_ok(Request::new("GET", path))
     }
 
-    /// Checks the device token; returns the display name.
+    /// Checks the device token; returns the display name (tests).
+    #[cfg(test)]
     pub fn me(&self) -> Result<String, String> {
         Ok(self.me_info()?.display_name)
     }
