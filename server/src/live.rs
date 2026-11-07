@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use axum::extract::ws::{CloseFrame, Message, WebSocket};
+use axum::extract::ws::{CloseFrame, Message};
 use cosync::server::{Commit, CommitError, Log};
 use cosync::{close, ClientMsg, Peer, ServerMsg, SheetId};
 use futures_util::{SinkExt, StreamExt};
@@ -444,7 +444,10 @@ pub struct Join {
 }
 
 /// Runs one participant's connection until it closes.
-pub async fn run(store: Arc<Mutex<Store>>, hub: Arc<Hub>, socket: WebSocket, j: Join) {
+pub async fn run<S>(store: Arc<Mutex<Store>>, hub: Arc<Hub>, socket: S, j: Join)
+where
+    S: futures_util::Stream<Item = Result<Message, axum::Error>> + futures_util::Sink<Message, Error = axum::Error> + Send + 'static,
+{
     hub.start_ticker(store.clone());
     let conn_id = hub.next_conn.fetch_add(1, Ordering::SeqCst) + 1;
     let (mut sink, mut stream) = socket.split();

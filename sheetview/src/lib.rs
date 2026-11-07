@@ -112,6 +112,28 @@ fn check_archive(bytes: &[u8]) -> Result<(), LoadError> {
 }
 
 impl Book {
+    /// A book around a workbook that is already calculated (the live bridge keeps one).
+    pub fn from_workbook(wb: Workbook) -> Book {
+        let mut b = Book { wb, cells: 0, meta: Json::Null };
+        b.refresh();
+        b
+    }
+
+    /// Recounts the cells and rebuilds the sheet descriptions after the workbook changed.
+    pub fn refresh(&mut self) {
+        self.cells = self.wb.sheets.iter().map(|s| s.rows.values().map(|r| r.len()).sum::<usize>()).sum();
+        let sheets: Vec<Json> = self.wb.sheets.iter().enumerate().map(|(i, s)| sheet_meta(&self.wb, i, s)).collect();
+        self.meta = json!({ "sheets": sheets, "active": self.wb.active.min(self.wb.sheets.len().saturating_sub(1)) });
+    }
+
+    pub fn workbook_mut(&mut self) -> &mut Workbook {
+        &mut self.wb
+    }
+
+    pub fn into_workbook(self) -> Workbook {
+        self.wb
+    }
+
     /// Reads `bytes` (a file called `name`) and brings it to its current state with `live`.
     pub fn open(name: &str, bytes: &[u8], live: &LiveInput) -> Result<Book, LoadError> {
         let ext = extension(name);
@@ -481,6 +503,7 @@ fn sheet_meta(wb: &Workbook, i: usize, s: &Sheet) -> Json {
     let merges: Vec<Json> = s.merges.iter().take(20_000).map(|m| json!([m.r1, m.c1, m.r2, m.c2])).collect();
     json!({
         "i": i,
+        "uid": s.uid.to_string(),
         "name": s.name,
         "hidden": s.hidden,
         "tab": s.tab_color.map(hex),
@@ -498,6 +521,8 @@ fn sheet_meta(wb: &Workbook, i: usize, s: &Sheet) -> Json {
         "protected": s.protection.is_some(),
     })
 }
+
+pub mod bridge;
 
 #[cfg(test)]
 mod tests;

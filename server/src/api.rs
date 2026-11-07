@@ -474,7 +474,7 @@ fn user_of(p: &Principal) -> Result<&User, ApiError> {
 }
 
 /// Who a change is recorded as: a user id or `link:<id>`.
-fn actor(p: &Principal) -> String {
+pub(crate) fn actor(p: &Principal) -> String {
     match p {
         Principal::User { user, .. } => user.id.clone(),
         Principal::Link { link } => format!("link:{}", link.id),
@@ -491,7 +491,7 @@ fn audit_by(who: &Principal, action: &'static str) -> Audit {
 
 /// A new version of a file was saved (`how`: upload, save, live): one `file.version` row a
 /// minute per person and file, with the count of saves.
-fn audit_version(s: &Store, who: &Principal, it: &Item, how: &str) -> Result<(), ApiError> {
+pub(crate) fn audit_version(s: &Store, who: &Principal, it: &Item, how: &str) -> Result<(), ApiError> {
     let a = audit_by(who, "file.version").detail(format!("{}: version {} ({how})", it.name, it.version)).aggregate(format!("file.version|{}|{}", actor(who), it.id));
     Ok(s.audit_item(a, it)?)
 }
@@ -503,7 +503,7 @@ pub(crate) fn visible(s: &Store, who: &Principal, id: &str, include_deleted: boo
     Ok((item, role))
 }
 
-fn need_edit(role: Role) -> Result<(), ApiError> {
+pub(crate) fn need_edit(role: Role) -> Result<(), ApiError> {
     if role >= Role::Edit { Ok(()) } else { Err(ApiError::new(StatusCode::FORBIDDEN, "You have view-only access to this item.")) }
 }
 
@@ -658,6 +658,7 @@ pub fn router(app: App) -> Router {
         .route("/api/items/{id}/sheet/cells", get(crate::sheetweb::cells))
         .route("/api/items/{id}/sheet/cell", get(crate::sheetweb::cell))
         .route("/api/items/{id}/sheet/csv", get(crate::sheetweb::csv))
+        .route("/api/items/{id}/web-live", get(crate::webbridge::handler))
         .route("/api/items/{id}/live", get(live))
         .route("/api/items/{id}/live-ticket", post(live_ticket))
         .route("/api/items/{id}/live/snapshot", post(live_snapshot).layer(DefaultBodyLimit::max(app.cfg.max_upload_bytes().saturating_mul(4))))

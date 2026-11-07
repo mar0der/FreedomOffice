@@ -12,6 +12,7 @@ pub mod store;
 pub mod tls;
 pub mod util;
 pub mod web;
+pub mod webbridge;
 
 use std::net::SocketAddr;
 

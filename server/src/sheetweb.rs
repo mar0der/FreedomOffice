@@ -53,10 +53,10 @@ struct Loaded {
 }
 
 #[derive(Clone)]
-struct Fail {
-    status: StatusCode,
-    code: &'static str,
-    message: String,
+pub(crate) struct Fail {
+    pub(crate) status: StatusCode,
+    pub(crate) code: &'static str,
+    pub(crate) message: String,
 }
 
 impl Fail {
@@ -135,17 +135,17 @@ fn probe(s: &Store, headers: &HeaderMap, id: &str) -> Result<Probe, ApiError> {
 }
 
 /// Everything a conversion needs, read in one consistent step.
-struct Inputs {
-    key: Key,
-    name: String,
-    file: std::fs::File,
-    live: LiveParts,
+pub(crate) struct Inputs {
+    pub(crate) key: Key,
+    pub(crate) name: String,
+    pub(crate) file: std::fs::File,
+    pub(crate) live: LiveParts,
 }
 
-struct LiveParts {
-    state: Option<Vec<u8>>,
-    sheets: String,
-    batches: Vec<Vec<cosync::Op>>,
+pub(crate) struct LiveParts {
+    pub(crate) state: Option<Vec<u8>>,
+    pub(crate) sheets: String,
+    pub(crate) batches: Vec<Vec<cosync::Op>>,
 }
 
 fn inputs(s: &Store, headers: &HeaderMap, id: &str) -> Result<Inputs, ApiError> {
@@ -177,14 +177,13 @@ fn fail_of(e: &LoadError) -> Fail {
 }
 
 /// Reads and converts the file on a thread of its own, within the limits (see the module docs).
-async fn convert(app: &App, i: Inputs) -> Result<Arc<Loaded>, Fail> {
+pub(crate) async fn convert(app: &App, i: Inputs) -> Result<Book, Fail> {
     let busy = || Fail { status: StatusCode::SERVICE_UNAVAILABLE, code: "busy", message: "The server is busy opening other workbooks. Try again in a moment.".into() };
     let permit = match tokio::time::timeout(SLOT_WAIT, app.sheets.convert.clone().acquire_owned()).await {
         Ok(Ok(p)) => p,
         _ => return Err(busy()),
     };
-    let Inputs { key, name, file, live } = i;
-    let rev = format!("{}.{}", key.1, key.2);
+    let Inputs { name, file, live, .. } = i;
     let (tx, rx) = tokio::sync::oneshot::channel();
     let spawned = std::thread::Builder::new().name("sheetview".into()).stack_size(STACK).spawn(move || {
         // Held until the work really ends, even if nobody waits for it any more.
@@ -204,7 +203,7 @@ async fn convert(app: &App, i: Inputs) -> Result<Arc<Loaded>, Fail> {
         return Err(busy());
     }
     match tokio::time::timeout(CONVERT_TIMEOUT, rx).await {
-        Ok(Ok(Ok(book))) => Ok(Arc::new(Loaded { book, rev })),
+        Ok(Ok(Ok(book))) => Ok(book),
         Ok(Ok(Err(e))) => Err(fail_of(&e)),
         Ok(Err(_)) => Err(Fail { status: StatusCode::UNPROCESSABLE_ENTITY, code: "unreadable", message: "This file couldn't be read.".into() }),
         Err(_) => Err(Fail { status: StatusCode::GATEWAY_TIMEOUT, code: "timeout", message: "This workbook is too complex to open in the browser (it took too long). Download it instead.".into() }),
@@ -223,7 +222,10 @@ async fn book(app: &App, headers: &HeaderMap, id: &str) -> Result<(Probe, Arc<Lo
         .get_or_init(|| async {
             let (h, i) = (headers.clone(), id.to_string());
             match app.run(move |s| inputs(s, &h, &i)).await {
-                Ok(inp) => convert(app, inp).await,
+                Ok(inp) => {
+                    let rev = format!("{}.{}", inp.key.1, inp.key.2);
+                    convert(app, inp).await.map(|book| Arc::new(Loaded { book, rev }))
+                }
                 Err(e) => Err(Fail { status: e.status(), code: "error", message: e.message().to_string() }),
             }
         })
