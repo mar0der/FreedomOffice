@@ -67,7 +67,8 @@ pub struct Api {
 }
 
 fn agent() -> ureq::Agent {
-    ureq::Agent::config_builder().http_status_as_error(false).timeout_global(Some(Duration::from_secs(30))).build().into()
+    let tls = ureq::tls::TlsConfig::builder().provider(ureq::tls::TlsProvider::NativeTls).root_certs(ureq::tls::RootCerts::PlatformVerifier).build();
+    ureq::Agent::config_builder().tls_config(tls).http_status_as_error(false).timeout_global(Some(Duration::from_secs(30))).build().into()
 }
 
 /// "http://host:port" without a trailing slash.
