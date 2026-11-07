@@ -3,6 +3,7 @@
 
 pub mod auth;
 pub mod graph;
+pub mod open_url;
 pub mod server;
 
 use std::path::{Path, PathBuf};

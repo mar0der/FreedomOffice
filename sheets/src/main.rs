@@ -54,7 +54,12 @@ fn run() -> eframe::Result<()> {
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     // "--print-preview" opens File > Print right away (like a print-preview shortcut).
     let preview = args.iter().any(|a| a == "--print-preview");
-    let path = args.iter().find(|a| !a.to_string_lossy().starts_with("--")).map(std::path::PathBuf::from);
+    let first = args.iter().find(|a| !a.to_string_lossy().starts_with("--"));
+    // A `freedomoffice://open?…` link ("Open in Sheets" on the server's web page) or a file.
+    let link = first.map(|a| a.to_string_lossy().into_owned()).filter(|a| cloud::open_url::is_open_url(a));
+    let path = first.filter(|_| link.is_none()).map(std::path::PathBuf::from);
+    #[cfg(windows)]
+    cloud::open_url::register_windows_handler();
     let icon = egui::IconData { rgba: icon::icon_rgba(64), width: 64, height: 64 };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -75,6 +80,9 @@ fn run() -> eframe::Result<()> {
             let mut app = app::App::new(cc, path);
             if preview {
                 app.backstage = Some(app::Backstage::Print);
+            }
+            if let Some(link) = &link {
+                app.open_link(link);
             }
             Ok(Box::new(app))
         }))

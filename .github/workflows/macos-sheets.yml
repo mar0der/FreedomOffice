@@ -45,6 +45,10 @@ jobs:
           APP=dist/FreedomSheets.app
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
           cp target/release/FreedomSheets "$APP/Contents/MacOS/FreedomSheets"
+          # CFBundleURLTypes registers freedomoffice:// ("Open in Sheets" links). macOS hands the
+          # link to a running app as an Apple Event (kAEGetURL), not in argv, and winit 0.30 has
+          # no public event for it, so for now clicking a link only starts the app; the link
+          # opens when given as an argument: open -a FreedomSheets --args 'freedomoffice://open?...'
           cat > "$APP/Contents/Info.plist" <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -65,6 +69,13 @@ jobs:
                 <key>CFBundleTypeName</key><string>Spreadsheet</string>
                 <key>CFBundleTypeRole</key><string>Editor</string>
                 <key>CFBundleTypeExtensions</key><array><string>xlsx</string><string>csv</string></array>
+              </dict>
+            </array>
+            <key>CFBundleURLTypes</key>
+            <array>
+              <dict>
+                <key>CFBundleURLName</key><string>com.freedomoffice.sheets.open</string>
+                <key>CFBundleURLSchemes</key><array><string>freedomoffice</string></array>
               </dict>
             </array>
           </dict>

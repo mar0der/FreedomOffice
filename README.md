@@ -131,6 +131,38 @@ through CUPS (`lp`); there is no printer-properties dialog.
 On macOS `cargo build --release` works as is (Xcode command line tools); fonts are read from
 the system font folders and Office for Mac, printing uses CUPS as on Linux.
 
+#### "Open in Sheets" links
+
+The FreedomOffice server's web page opens files with links like
+`freedomoffice://open?server=https%3A%2F%2Ffiles.example.com&item=<id>`. Sheets opens the
+file with the account already signed in to that server (and joins its live session); with no
+account for that server it shows File > Account with the address filled in. On Windows the
+link handler is registered for the current user at start (only if no other program has it).
+
+On Linux, add a desktop entry `~/.local/share/applications/freedom-sheets.desktop`
+(`Exec` takes `%u`, the link or file):
+
+```ini
+[Desktop Entry]
+Type=Application
+Name=FreedomOffice Sheets
+Exec=/path/to/FreedomSheets %u
+Icon=/path/to/freedom-sheets.png
+Categories=Office;Spreadsheet;
+MimeType=x-scheme-handler/freedomoffice;application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;application/vnd.ms-excel;application/vnd.oasis.opendocument.spreadsheet;text/csv;
+StartupWMClass=freedom-sheets
+```
+
+```bash
+xdg-mime default freedom-sheets.desktop x-scheme-handler/freedomoffice
+update-desktop-database ~/.local/share/applications
+```
+
+On macOS the app bundle registers the `freedomoffice` scheme, but macOS hands links over as
+an Apple Event that the window library (winit 0.30) doesn't expose yet, so clicking a link
+only starts Sheets. Pass the link as an argument instead:
+`open -a FreedomSheets --args 'freedomoffice://open?server=...&item=...'`.
+
 ## Project layout
 
 ```

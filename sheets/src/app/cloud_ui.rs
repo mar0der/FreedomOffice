@@ -14,6 +14,7 @@ use super::chrome::Backstage;
 use super::dialogs::Dialog;
 use super::theme::{self, ic};
 use super::{App, Pending};
+use crate::cloud::open_url::{self, OpenRequest};
 use crate::cloud::server::{self, Me, OrgInfo, VersionInfo};
 use crate::cloud::{self, graph, CloudDoc, Conn, DriveItem, Kind, Permission, Provider, ServerSession, Session, Target, UploadError, User};
 
@@ -284,6 +285,11 @@ pub struct CloudState {
     pub add_server: AddServer,
     pub versions: Option<VersionsState>,
     pub password: Option<PasswordForm>,
+    /// An "Open in Sheets" link from the command line, handled once the saved accounts are
+    /// loaded (`Err`: the link was refused).
+    pub link: Option<Result<OpenRequest, String>>,
+    /// A link's file, opened when its server is signed in to (from the prefilled Add server form).
+    pub link_wait: Option<OpenRequest>,
     /// The frame the Open / Save As places were last drawn in (to notice when they are shown
     /// again).
     places_frame: Option<u64>,
@@ -344,6 +350,8 @@ impl Default for CloudState {
             add_server: AddServer::default(),
             versions: None,
             password: None,
+            link: None,
+            link_wait: None,
             places_frame: None,
             #[cfg(test)]
             cache_override: None,
@@ -432,6 +440,11 @@ impl App {
     }
 
     fn save_servers(&mut self) {
+        // Tests never write the user's saved sign-ins.
+        #[cfg(test)]
+        if self.cloud.cache_override.is_some() {
+            return;
+        }
         let accounts: Vec<server::Account> = self.cloud.servers.iter().map(|e| e.session.account.clone()).collect();
         if let Err(e) = server::save_accounts(&accounts) {
             self.status = Some(format!("Couldn't remember the server sign-in: {e}"));
@@ -461,6 +474,9 @@ impl App {
             self.restore_servers();
             self.cloud_demo();
         }
+        if let Some(link) = self.cloud.link.take() {
+            self.cloud_open_link(link);
+        }
         while let Ok(ev) = self.cloud.rx.try_recv() {
             self.cloud_event(ev);
         }
@@ -477,6 +493,38 @@ impl App {
                 self.save();
             } else {
                 ctx.request_repaint_after(std::time::Duration::from_millis(500));
+            }
+        }
+    }
+
+    /// A `freedomoffice://open?…` link from the command line (see `cloud::open_url`).
+    pub fn open_link(&mut self, link: &str) {
+        self.cloud.link = Some(open_url::parse(link));
+    }
+
+    /// Opens a link's file with the account signed in to its server (joining the live session
+    /// like File > Open). Without one, nothing is sent anywhere: File > Account shows the Add
+    /// server form with the address filled in, and the file opens after signing in.
+    fn cloud_open_link(&mut self, link: Result<OpenRequest, String>) {
+        let req = match link {
+            Ok(r) => r,
+            Err(e) => {
+                self.dialog = Some(Dialog::Message { title: "Open".into(), text: format!("Sorry, we couldn't open the link.\n\n{e}") });
+                return;
+            }
+        };
+        let session = self.cloud.servers.iter().find(|e| open_url::same_server(&e.session.account.url, &req.server)).map(|e| e.session.clone());
+        match session {
+            Some(s) => {
+                self.cloud.link_wait = None;
+                let item = DriveItem { kind: Kind::File, id: req.item, drive_id: String::new(), name: "the file".into(), modified: String::new(), modified_by: String::new(), web_url: String::new(), etag: String::new(), parent_id: String::new(), size: 0 };
+                self.cloud_open_with(Conn::Server(s), item);
+            }
+            None => {
+                self.cloud.add_server = AddServer { open: true, url_input: req.server.clone(), ..Default::default() };
+                self.status = Some(format!("Sign in to {} to open the linked file.", server::host_of(&req.server)));
+                self.cloud.link_wait = Some(req);
+                self.backstage = Some(Backstage::Account);
             }
         }
     }
@@ -756,6 +804,10 @@ impl App {
                         if self.cloud.upload_again {
                             self.cloud.upload_again = false;
                             self.cloud_upload(UploadKind::Save, true);
+                        }
+                        // Signed in to the server of an "Open in Sheets" link: open its file.
+                        if let Some(req) = self.cloud.link_wait.take_if(|r| open_url::same_server(&r.server, &url)) {
+                            self.cloud_open_link(Ok(req));
                         }
                     }
                     Err(e) => a.error = Some(e),

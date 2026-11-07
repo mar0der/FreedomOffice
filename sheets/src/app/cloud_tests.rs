@@ -459,3 +459,59 @@ fn a_revoked_live_session_refreshes_the_organisations() {
     drop(t.server);
     let _ = std::fs::remove_dir_all(&t.dir);
 }
+
+#[test]
+fn open_in_sheets_links_open_the_file_with_the_signed_in_account() {
+    let t = setup();
+    let (ctx, mut app, ann) = client(&t, "ann", PW);
+    app.cloud_save_as(Conn::Server(ann.clone()), t.org_root.clone(), "Linked".into(), false);
+    until(&ctx, &mut app, "saved", |a| !a.cloud.uploading);
+    let doc = app.cloud.doc.clone().expect("saved to the server");
+    let link = |server: &str| format!("freedomoffice://open?server={}&item={}", cloud::pct_encode(server), doc.item_id);
+
+    // Ben is signed in to the server (the link spells its address differently): the file opens
+    // and he joins its live session.
+    let (bctx, mut ben, _) = client(&t, "ben", PW);
+    ben.open_link(&link(&format!("{}/", t.url.to_uppercase())));
+    until(&bctx, &mut ben, "opened from the link", |a| a.cloud.doc.is_some());
+    assert_eq!(ben.cloud.doc.as_ref().map(|d| d.item_id.clone()), Some(doc.item_id.clone()));
+    assert_eq!(ben.cloud.doc.as_ref().map(|d| d.name.clone()).as_deref(), Some("Linked.xlsx"));
+    until(&bctx, &mut ben, "ben is live", |a| a.live_quiet());
+    assert!(ben.live.is_some());
+
+    // A file that doesn't exist: the usual error message, nothing opened.
+    let (bctx2, mut ben2, _) = client(&t, "ben", PW);
+    ben2.open_link(&format!("freedomoffice://open?server={}&item={}", cloud::pct_encode(&t.url), "0".repeat(32)));
+    until(&bctx2, &mut ben2, "an error", |a| matches!(a.dialog, Some(Dialog::Message { .. })));
+    assert!(ben2.cloud.doc.is_none());
+
+    // A refused link: a message, nothing sent.
+    ben2.dialog = None;
+    ben2.open_link("freedomoffice://open?server=http%3A%2F%2Fevil.com&item=0123456789abcdef0123456789abcdef");
+    frame(&bctx2, &mut ben2, vec![]);
+    assert!(matches!(&ben2.dialog, Some(Dialog::Message { text, .. }) if text.contains("couldn't open the link")));
+    assert!(ben2.cloud.opening.is_none());
+
+    // No account for that server: File > Account with the address filled in; nothing opens
+    // until the person signs in there.
+    let cctx = egui::Context::default();
+    let mut cara = App::with_context(&cctx, 0, None);
+    cara.dialog = None;
+    cara.no_cloud_for_test();
+    cara.open_link(&link(&t.url));
+    frame(&cctx, &mut cara, vec![]);
+    assert!(matches!(cara.backstage, Some(Backstage::Account)));
+    let a = &cara.cloud.add_server;
+    assert!(a.open && a.stage == 0 && a.url_input == t.url && a.password.is_empty() && a.username.is_empty());
+    assert!(cara.cloud.servers.is_empty() && cara.cloud.opening.is_none() && cara.cloud.doc.is_none());
+    let session = Arc::new(ServerSession::login(Box::new(Http::new()), &t.url, "ben", PW, "test").unwrap());
+    let me = session.me_info().ok();
+    cara.cloud_event(super::Event::ServerSignedIn(Ok((session, me))));
+    until(&cctx, &mut cara, "opened after signing in", |a| a.cloud.doc.is_some());
+    assert_eq!(cara.cloud.doc.as_ref().map(|d| d.item_id.clone()), Some(doc.item_id.clone()));
+    assert!(cara.cloud.link_wait.is_none());
+
+    let _ = ann;
+    drop(t.server);
+    let _ = std::fs::remove_dir_all(&t.dir);
+}
