@@ -282,7 +282,7 @@ workbook state, only the log), so the server answers a `hello` with `proto < 2` 
 and closes with `4426` (`close::UPGRADE`); nothing the client sent is committed. A v2 client that gets a
 `welcome` without `proto` (an older server) switches to protocol 1 mode: it sends only whole `cell`
 operations (every `content`/`format` its diff makes is collapsed into one `cell` carrying the cell's full
-current data, also for changes still waiting from before the `welcome`), omits `made`, and shows no
+current data, also for changes still waiting from before the `welcome`: those are found at the place later row/column changes of the same list moved them to, and written last, in final coordinates), omits `made`, and shows no
 "replaced" messages (an old server relays no `base`). It converges with other clients like any v1 client. Stored logs and live-state blobs from before still replay: `cell` is unchanged.
 
 **"Your change was replaced".** A relayed `ops` carries `base`: what the sender had seen when it *made* the
