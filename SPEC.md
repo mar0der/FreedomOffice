@@ -1,6 +1,7 @@
 # FreedomOffice — server, organisations, permissions and storage
 
-Status: design for the `orgs` branch (2026-11-07). Parts marked **(exists)** are already in the code.
+Status: design for the `orgs` branch (2026-11-07). Parts marked **(exists)** are already in the code; §3a
+describes what the server implements (Phase 1).
 
 ## 1. Storage model (like Microsoft 365)
 
@@ -42,9 +43,14 @@ Versions kept: the newest `versions_to_keep` (default 25) plus the first version
 
 - **Super-admin** (`users.is_admin`, Petar): creates organisations, manages any account. Being super-admin
   does **not** grant access to other people's documents (privacy); it manages accounts and orgs only.
+  **Accepted policy:** the super-admin can reset anyone's password and is shown the new temporary password
+  once, so they could sign in as that person (as a Microsoft 365 admin can). Every reset is logged as a
+  warning (who reset whom, never the password) and signs the person out of every device.
 - **Organisation**: name, root folder, members. Member roles:
-  - `owner` / `admin`: add and remove people, change roles, reset passwords of members, see storage use,
-    full control over everything in the org folder.
+  - `owner` / `admin`: add and remove people, change roles, see storage use, full control over everything
+    in the org folder. (Password resets: super-admin only for now.) They add directly only people who
+    already share an organisation with them; anyone else gets an invite. An organisation keeps at least
+    one owner.
   - `member`: gets the org's default role on the org folder (`edit` by default, settable to `view`).
 - A person can belong to several organisations (family + a team).
 - Adding people:
@@ -74,6 +80,128 @@ re-checks every open live session on the affected items at once:
 - role lowered to view → the server sends `Role{view}`, refuses further edits; the client switches to
   read-only and offers to save the person's unsent changes as their own copy;
 - access removed → the session ends with "Your access to this file was removed"; same offer.
+
+## 3a. Server implementation (Phase 1, `orgs-server` branch)
+
+### How organisation ownership is stored
+
+Every organisation has **its own account**: a `users` row with `org_id` set, username `org:<org id>`
+(`:` isn't allowed in real usernames, so it can never be signed into or found by name), password hash
+`!`, `disabled = 1`. That account owns the org's root folder and, because new items belong to the owner
+of their folder, everything created inside it. So:
+
+- the existing owner checks keep working unchanged ("owner of the item" is never a person for org files);
+- items can't be moved between an org folder and personal files (different owners) — copy instead;
+- restoring from the trash falls back to the org folder;
+- removing a person never takes files away from the org;
+- the org account is hidden from `/api/users`, the CLI user list and grants; in item JSON the owner of org
+  files is `{"username": "", "display_name": "<org name>", "org": "<org id>"}` and the item has
+  `"org": {"id", "name"}`.
+
+`Store::role` (three queries whatever the depth: the parent chain is one recursive query, then the org
+of the chain's root with the caller's membership, then one query over user and org grants on the chain):
+owner → org owner/admin (owner) → org member (`member_role`, edit or view) → max of grants to the person
+and to their orgs → share link. `users.is_admin` is not consulted (no implicit document access; note that
+the super-admin can still add themselves to an org — that is a policy matter, and it is logged).
+
+### Schema and migration
+
+`PRAGMA user_version` (0 = the schema before organisations, 1 = now). `Store::open` runs the migration in
+one `BEGIN IMMEDIATE` transaction (a second process opening the database waits and then finds it done; a
+crash leaves the old schema). Version 1:
+
+- `users` + `must_change_password`, `org_id`;
+- new `orgs(id, name UNIQUE NOCASE, root_id, account_id, member_role 'edit'|'view', created, created_by)`,
+  `org_members(org_id, user_id, role 'owner'|'admin'|'member', added_by, created, PK(org_id, user_id))`,
+  `invites(id, token_hash, email, org_id, role, expires, created, created_by, used, used_by)`;
+- `permissions` rebuilt as `(item_id, grantee_kind 'user'|'org', grantee_id, role, granted_by, created,
+  PK(item_id, grantee_kind, grantee_id))`; existing rows are copied as user grants.
+
+**No downgrade:** an older server binary can't open a migrated database (its schema statements refer to
+`permissions.user_id`). Back up (`freedomoffice-server backup`) before upgrading.
+
+Deleting an organisation requires its folder to be empty (trashed items don't count); members, grants
+to it and invites are deleted, the org account and any trashed items stay (unreachable).
+
+### Endpoints added
+
+| Endpoint | Who |
+|---|---|
+| `GET /api/me` → also `must_change_password`, `orgs: [{id, name, root, role, member_role, members}]` | anyone signed in |
+| `POST /api/me/password {old_password, new_password}` (signs out the other devices) | the user |
+| `POST /api/users {username, display_name?, email?, org?, role?}` → `{user, temporary_password}` | super-admin; org owner/admin with `org` |
+| `POST /api/users/{username}/reset-password` → `{user, temporary_password}` | super-admin |
+| `POST /api/users/{username}/disable`, `/enable` | super-admin |
+| `GET /api/orgs` (super-admin: all), `POST /api/orgs {name}` | members / super-admin |
+| `GET /api/orgs/{org}` (id or name; with `member_list`), `PATCH {name?, member_role?}`, `DELETE` | rename/delete: super-admin; member_role: org owner/admin |
+| `GET /api/orgs/{org}/members`, `POST {username, role?}`, `PATCH .../{username} {role}`, `DELETE .../{username}` | org owner/admin (anyone may leave, except the last owner); only owners (or super-admin) add/change/remove owners; org admins add only people sharing an org with them (else 403 `invite_required`); emails are listed for the super-admin only |
+| `GET /api/users?query=` (share dialog) | people sharing an org with the caller, plus an exact username match (super-admin: everyone) |
+| `GET/POST /api/orgs/{org}/invites {email, role?}` → `url` once, `DELETE .../{id}` | org owner/admin |
+| `GET /api/invites/{token}`, `POST {username, password, display_name?, device?}` → `{token, user, org}` | anyone with the link |
+| `GET/POST /i/{token}`: the same as a plain HTML form for browsers | anyone with the link |
+| `GET /api/orgs/{org}/storage`, `GET /api/admin/storage` (sum of kept version sizes, trash included) | org owner/admin; super-admin |
+| `POST /api/items/{id}/permissions {org, role}`, `DELETE ... {org}` or `DELETE .../permissions/org/{org}`; `GET` lists `orgs` next to `permissions` | edit access; granting needs membership of that org (orgs can't be probed by name) |
+
+Errors keep the `{"error": "..."}` shape; some add `"code"`: `password_change_required` (403, every
+endpoint except `/api/me`, `/api/me/password`, `/api/logout` while a temporary password is set),
+`wrong_password`, `links_disabled`, `invite_required`.
+
+Temporary passwords: 20 random characters (about 99 bits), returned once in the response, never logged.
+Invites: 32-byte random token (only SHA-256 stored), single use, 7 days; a failed attempt (weak password,
+taken username) doesn't use it up; invalid tokens count towards the per-address limit. Accepting is one
+transaction and only works while whoever made the invite may still add people with its role (an owner
+invite needs an owner; the super-admin always may).
+
+Passwords (`util::check_new_password`, all new and changed passwords including the CLI): at least 12
+characters, not the username and not containing it (usernames of 3+ characters), not one repeated
+character, not in the embedded list `server/src/common_passwords.txt` — also after stripping leading and
+trailing digits and symbols ("Password2024!" is refused).
+
+Sign-in: after 3 failures for a username within 15 minutes, every attempt for it (right or wrong) first
+waits 1 s, 2 s, 4 s, then 8 s (async sleep); the 10-failure lockout per address and username stays. Each
+attempt counts as a failure in the same step as the limit check (taken back when it succeeds), so
+parallel attempts can't get past the limit. Text that can't be a username is refused before the limiter,
+the database and Argon2. Failures are logged as `failed sign-in for user '<name>' from <ip>` (or
+`... with an invalid username from <ip>`; never the password). The limiter keeps at most 100 000 keys.
+
+Argon2 (about 19 MiB and one core per run) runs at most once per core at a time, never under the store
+lock; requests waiting for it hold no thread.
+
+`allow_links = false` in server.toml: creating a link answers 403 (`links_disabled`), opening one 404, and
+link access tokens no longer authenticate.
+
+CLI: `org add NAME`, `org list`, `org members ORG`, `org add-member ORG USER [member|admin|owner]`,
+`org remove-member ORG USER` (passwords are still only read from the terminal or stdin).
+
+### Live permission changes (protocol)
+
+After every API change that can affect access (grant/revoke to a person or org, membership add/remove/role,
+org `member_role`, org delete, account disable, password reset, sign-out, share link removed, item moved or
+trashed) the server re-checks every open live connection before answering; it also re-checks every 30 s for
+changes made by the CLI in another process. Re-checks run one at a time, and a connection checks its access
+and registers without a re-check in between, so the guarantee is: **once the HTTP response of the change
+has arrived, every live connection affected has been told** (and a connection that lost access never gets
+it back from an older check). Live tickets are re-checked when used. Per connection:
+
+- role now view (was edit) → `{"t":"role","role":"view"}`; changes it sends afterwards close the connection
+  with `4403` (`close::READ_ONLY`) and are not committed;
+- role now edit (was view) → `{"t":"role","role":"edit"}`;
+- no access any more (grant removed, left the org, account disabled, signed out, link removed, file in the
+  trash or deleted) → `{"t":"revoked","reason":"<for people>"}`, then close `4401` (`close::REVOKED`).
+
+Not yet: other participants aren't told that someone's role changed (their peer list keeps the old
+`editor` flag until that person reconnects).
+
+### Known limits
+
+- Anyone can lock a username out for 15 minutes with 10 wrong passwords (per-username lockout DoS).
+- Every sign-out, grant or membership change re-checks all live connections (fine at this scale).
+- Live tickets (60 s, single use) aren't limited in number per user.
+- Clients older than this server don't know the `role`/`revoked` messages and close codes; they treat
+  the close as a lost connection and keep trying to reconnect (each attempt answers 401/404).
+- Share-link (`/l/`) and invite (`/i/`) tokens are in URL paths: the server redacts them in its log, but a
+  reverse proxy logs them unless told not to (the deploy notes must say so for nginx/Caddy).
+- No storage quotas yet (usage is reported only).
 
 ## 4. Admin UI
 

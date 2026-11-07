@@ -4,6 +4,14 @@
 //! memory while anyone is connected, and in SQLite) and never needs a spreadsheet engine:
 //! batches are transformed with `cosync`, snapshots of the workbook come from clients. Presence
 //! (who is where) is relayed, never stored. Operation contents are never logged.
+//!
+//! Access is checked when a connection opens and again whenever something that can change it
+//! happens (`Hub::recheck`: shares, organisation membership and roles, disabled accounts,
+//! revoked sign-ins, removed links, files moved or trashed), plus every `RECHECK_EVERY` for
+//! changes made outside the server process (the admin CLI). A connection whose role drops to
+//! view gets `{"t":"role","role":"view"}` and from then on is closed with `close::READ_ONLY`
+//! if it sends changes; one raised to edit gets `{"t":"role","role":"edit"}`. A connection
+//! that lost access gets `{"t":"revoked","reason":"..."}` and is closed with `close::REVOKED`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -33,6 +41,8 @@ const SNAPSHOT_RETRY: Duration = Duration::from_secs(60);
 const PING_EVERY: Duration = Duration::from_secs(20);
 const IDLE_LIMIT: Duration = Duration::from_secs(60);
 const TICKET_LIFE: Duration = Duration::from_secs(60);
+/// Access of every connection is re-checked this often (changes through the API re-check at once).
+const RECHECK_EVERY: Duration = Duration::from_secs(30);
 /// Messages waiting for a connection (besides its initial replay): a client that doesn't read
 /// them is disconnected (it catches up when it reconnects).
 const QUEUE: usize = 1024;
@@ -52,6 +62,13 @@ struct Conn {
     tx: mpsc::Sender<Out>,
     /// Told when the queue is full.
     kick: Arc<Notify>,
+    /// Who connected and their current role on the document (`peer.editor` follows it).
+    who: Principal,
+    role: Role,
+    /// Access ended (final: a later, older verdict can't give it back).
+    revoked: bool,
+    /// Told when access ended (the goodbye is queued already).
+    end: Arc<Notify>,
 }
 
 impl Conn {
@@ -89,6 +106,11 @@ impl Doc {
         for c in self.conns.iter().filter(|c| c.peer.id != except) {
             c.push(Out::Text(text.clone()));
         }
+    }
+
+    /// Whether the connection may send changes (its current role, not the one it joined with).
+    fn is_editor(&self, id: u64) -> bool {
+        self.conns.iter().any(|c| c.peer.id == id && c.peer.editor)
     }
 
     fn close(&self, id: u64, code: u16, reason: &str) {
@@ -138,6 +160,34 @@ pub struct Hub {
     tickets: Mutex<HashMap<Vec<u8>, Ticket>>,
     next_conn: AtomicU64,
     ticker: AtomicBool,
+    /// Held for a whole `recheck` and while a connection checks its access and registers, so
+    /// verdicts are applied in the order they were computed and none misses a new connection.
+    /// Lock order: `recheck_lock` before the store, the document map or a document; never
+    /// taken while holding any of them.
+    recheck_lock: Mutex<()>,
+    /// Bumped (under the document map lock) whenever a document's session is dropped, so a
+    /// session loaded from the store meanwhile is known to be stale.
+    dropped: AtomicU64,
+}
+
+/// What a connection may do now.
+#[derive(Debug, PartialEq)]
+enum Verdict {
+    Role(Role),
+    Revoked(&'static str),
+}
+
+fn verdict(s: &Store, item_id: &str, who: &Principal) -> Result<Verdict, crate::store::StoreError> {
+    let who = match s.recheck_principal(who)? {
+        Ok(p) => p,
+        Err(reason) => return Ok(Verdict::Revoked(reason)),
+    };
+    let Some(item) = s.item(item_id)? else { return Ok(Verdict::Revoked("This workbook was deleted.")) };
+    Ok(match s.role(&who, &item, false)? {
+        Some(r) => Verdict::Role(r),
+        None if s.role(&who, &item, true)?.is_some() => Verdict::Revoked("This workbook was moved to the trash."),
+        None => Verdict::Revoked("Your access to this workbook was removed."),
+    })
 }
 
 impl Hub {
@@ -170,12 +220,36 @@ impl Hub {
         }
     }
 
-    /// The document's session, loaded from the store on first use.
-    fn doc(&self, s: &Store, item: &Item) -> Result<Arc<Mutex<Doc>>, String> {
-        let mut docs = lock(&self.docs);
-        if let Some(d) = docs.get(&item.id) {
-            return Ok(d.clone());
+    /// The document's session, loaded from the store on first use. The store and the
+    /// document map are never held together (a connection leaving holds the map, then a
+    /// document; a commit holds a document, then the store).
+    fn doc(&self, store: &Mutex<Store>, item_id: &str) -> Result<Arc<Mutex<Doc>>, String> {
+        loop {
+            let seen = self.dropped.load(Ordering::SeqCst);
+            if let Some(d) = lock(&self.docs).get(item_id) {
+                return Ok(d.clone());
+            }
+            let loaded = {
+                let s = lock(store);
+                let item = s.item(item_id).ok().flatten().ok_or("item gone")?;
+                Self::load(&s, &item)?
+            };
+            let mut docs = lock(&self.docs);
+            if let Some(d) = docs.get(item_id) {
+                return Ok(d.clone());
+            }
+            if self.dropped.load(Ordering::SeqCst) != seen {
+                // A session was dropped while we read the store: it may have committed batches
+                // after our read. Load again.
+                continue;
+            }
+            let doc = Arc::new(Mutex::new(loaded));
+            docs.insert(item_id.to_string(), doc.clone());
+            return Ok(doc);
         }
+    }
+
+    fn load(s: &Store, item: &Item) -> Result<Doc, String> {
         let base = s.live_base(item).map_err(|e| e.to_string())?;
         let mut log = Log::new(base.floor);
         let ops = s.live_ops_after(&item.id, base.floor).map_err(|e| e.to_string())?;
@@ -195,7 +269,7 @@ impl Hub {
             log.set_sheets(ids);
             replay_sheets(&mut log, base.seq);
         }
-        let doc = Arc::new(Mutex::new(Doc {
+        Ok(Doc {
             log,
             conns: Vec::new(),
             unsnapped,
@@ -204,9 +278,7 @@ impl Hub {
             last_snap: None,
             snap_asked: None,
             snap_turn: 0,
-        }));
-        docs.insert(item.id.clone(), doc.clone());
-        Ok(doc)
+        })
     }
 
     /// A snapshot containing everything up to `seq` was stored; operations up to `floor` are gone.
@@ -220,19 +292,79 @@ impl Hub {
         d.snap_asked = None;
     }
 
-    fn start_ticker(self: &Arc<Self>) {
+    /// Re-evaluates the access of every live connection and tells those whose access changed
+    /// (see the module comment). Call after anything that can change who may see or edit what.
+    /// Blocking (takes the store); no lock is held while taking another.
+    pub fn recheck(&self, store: &Mutex<Store>) {
+        let _serial = lock(&self.recheck_lock);
+        let docs: Vec<(String, Arc<Mutex<Doc>>)> = lock(&self.docs).iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let mut sessions: Vec<(usize, u64, Principal)> = Vec::new();
+        for (i, (_, d)) in docs.iter().enumerate() {
+            sessions.extend(lock(d).conns.iter().filter(|c| !c.revoked).map(|c| (i, c.peer.id, c.who.clone())));
+        }
+        if sessions.is_empty() {
+            return;
+        }
+        let verdicts: Vec<(usize, u64, Verdict)> = {
+            let s = lock(store);
+            sessions
+                .into_iter()
+                .filter_map(|(i, id, who)| match verdict(&s, &docs[i].0, &who) {
+                    Ok(v) => Some((i, id, v)),
+                    Err(e) => {
+                        // Keep the connection as it is; the next check tries again.
+                        tracing::error!("live: couldn't re-check access to item {}: {e}", docs[i].0);
+                        None
+                    }
+                })
+                .collect()
+        };
+        for (i, id, v) in verdicts {
+            let (item, doc) = &docs[i];
+            let mut d = lock(doc);
+            let Some(c) = d.conns.iter_mut().find(|c| c.peer.id == id && !c.revoked) else { continue };
+            match v {
+                Verdict::Role(r) => {
+                    c.role = r;
+                    let editor = r >= Role::Edit;
+                    if editor != c.peer.editor {
+                        c.peer.editor = editor;
+                        let role = if editor { "edit" } else { "view" };
+                        c.push(Out::Text(json(&ServerMsg::Role { role: role.into() })));
+                        tracing::info!("live: connection {id} to item {item} is now a{}", if editor { "n editor" } else { " viewer" });
+                    }
+                }
+                Verdict::Revoked(reason) => {
+                    c.revoked = true;
+                    c.peer.editor = false;
+                    c.push(Out::Text(json(&ServerMsg::Revoked { reason: reason.into() })));
+                    c.push(Out::Close(close::REVOKED, reason.into()));
+                    c.end.notify_one();
+                    tracing::info!("live: connection {id} to item {item} lost access; closing it");
+                }
+            }
+        }
+    }
+
+    fn start_ticker(self: &Arc<Self>, store: Arc<Mutex<Store>>) {
         if self.ticker.swap(true, Ordering::SeqCst) {
             return;
         }
         let hub = Arc::downgrade(self);
         tokio::spawn(async move {
             let mut every = tokio::time::interval(SNAPSHOT_CHECK);
+            let mut last_check = Instant::now();
             loop {
                 every.tick().await;
                 let Some(hub) = hub.upgrade() else { break };
                 let docs: Vec<Arc<Mutex<Doc>>> = lock(&hub.docs).values().cloned().collect();
                 for d in docs {
                     lock(&d).maybe_ask_snapshot();
+                }
+                if last_check.elapsed() >= RECHECK_EVERY {
+                    last_check = Instant::now();
+                    let store = store.clone();
+                    let _ = tokio::task::spawn_blocking(move || hub.recheck(&store)).await;
                 }
             }
         });
@@ -311,25 +443,41 @@ pub struct Join {
 
 /// Runs one participant's connection until it closes.
 pub async fn run(store: Arc<Mutex<Store>>, hub: Arc<Hub>, socket: WebSocket, j: Join) {
-    hub.start_ticker();
+    hub.start_ticker(store.clone());
     let conn_id = hub.next_conn.fetch_add(1, Ordering::SeqCst) + 1;
     let (mut sink, mut stream) = socket.split();
     let kick = Arc::new(Notify::new());
+    let end = Arc::new(Notify::new());
 
     // Load the document and register, all under the document lock so the replay and the live
     // stream join without a gap.
     let item_id = j.item.id.clone();
     let setup = {
-        let (store, hub, kick) = (store.clone(), hub.clone(), kick.clone());
-        let (item_id, who, role, since, version, cid, actor) = (j.item.id.clone(), j.who.clone(), j.role, j.since, j.version, j.cid.clone(), j.actor.clone());
-        type Setup = (Arc<Mutex<Doc>>, mpsc::Sender<Out>, mpsc::Receiver<Out>);
+        let (store, hub, kick, end) = (store.clone(), hub.clone(), kick.clone(), end.clone());
+        let (item_id, who, since, version, cid, actor) = (j.item.id.clone(), j.who.clone(), j.since, j.version, j.cid.clone(), j.actor.clone());
+        // The last field: registered (false: only the queued farewell goes out, nothing is read).
+        type Setup = (Arc<Mutex<Doc>>, mpsc::Sender<Out>, mpsc::Receiver<Out>, Role, bool);
         tokio::task::spawn_blocking(move || -> Result<Setup, String> {
-            let (doc, current) = {
+            // No re-check runs from here until the connection is registered: the access checked
+            // now is the one every later re-check starts from.
+            let _serial = lock(&hub.recheck_lock);
+            let (current, access) = {
                 let s = lock(&store);
                 // Counted while holding the store, so a plain save can't slip in unnoticed.
                 *lock(&hub.active).entry(item_id.clone()).or_default() += 1;
                 let item = s.item(&item_id).ok().flatten().ok_or("item gone")?;
-                (hub.doc(&s, &item)?, item.version)
+                (item.version, verdict(&s, &item_id, &who).map_err(|e| e.to_string())?)
+            };
+            let doc = hub.doc(&store, &item_id)?;
+            let role = match access {
+                Verdict::Role(r) => r,
+                Verdict::Revoked(reason) => {
+                    // Access ended between the HTTP check and now.
+                    let (tx, rx) = mpsc::channel(2);
+                    let _ = tx.try_send(Out::Text(json(&ServerMsg::Revoked { reason: reason.into() })));
+                    let _ = tx.try_send(Out::Close(close::REVOKED, reason.into()));
+                    return Ok((doc, tx, rx, Role::View, false));
+                }
             };
             let mut d = lock(&doc);
             let mut peer = peer_of(&who, role, conn_id);
@@ -344,7 +492,7 @@ pub async fn run(store: Arc<Mutex<Store>>, hub: Arc<Hub>, socket: WebSocket, j: 
                 }
                 let _ = tx.try_send(Out::Text(json(&ServerMsg::Reload)));
                 let _ = tx.try_send(Out::Close(1000, "reload".into()));
-                return Ok((doc.clone(), tx, rx));
+                return Ok((doc.clone(), tx, rx, role, false));
             };
             let (tx, rx) = mpsc::channel(QUEUE + 1 + replay.len());
             let used: Vec<u8> = d.conns.iter().map(|c| c.peer.color).collect();
@@ -356,12 +504,12 @@ pub async fn run(store: Arc<Mutex<Store>>, hub: Arc<Hub>, socket: WebSocket, j: 
                 let _ = tx.try_send(Out::Text(json(&msg)));
             }
             d.broadcast(conn_id, &ServerMsg::Join { peer: peer.clone() });
-            d.conns.push(Conn { peer, tx: tx.clone(), kick });
-            Ok((doc.clone(), tx, rx))
+            d.conns.push(Conn { peer, tx: tx.clone(), kick, who, role, revoked: false, end });
+            Ok((doc.clone(), tx, rx, role, true))
         })
         .await
     };
-    let (doc, tx, mut rx) = match setup {
+    let (doc, tx, mut rx, role, registered) = match setup {
         Ok(Ok(d)) => d,
         Ok(Err(e)) => {
             hub.release(&item_id);
@@ -374,7 +522,7 @@ pub async fn run(store: Arc<Mutex<Store>>, hub: Arc<Hub>, socket: WebSocket, j: 
             return;
         }
     };
-    tracing::info!("live: connection {conn_id} joined item {item_id} ({})", if j.role >= Role::Edit { "editor" } else { "viewer" });
+    tracing::info!("live: connection {conn_id} joined item {item_id} ({})", if role >= Role::Edit { "editor" } else { "viewer" });
 
     let mut writer = tokio::spawn(async move {
         while let Some(out) = rx.recv().await {
@@ -397,12 +545,15 @@ pub async fn run(store: Arc<Mutex<Store>>, hub: Arc<Hub>, socket: WebSocket, j: 
     let mut last_seen = Instant::now();
     let mut heartbeat = tokio::time::interval(PING_EVERY);
     heartbeat.tick().await;
-    let editor = j.role >= Role::Edit;
     let fail = |code: u16, reason: &str| {
         let _ = tx.try_send(Out::Close(code, reason.to_string()));
     };
     let mut kicked = false;
     loop {
+        // Not registered (access ended, or must reload): ignore whatever the client sends.
+        if !registered {
+            break;
+        }
         tokio::select! {
             msg = stream.next() => {
                 let Some(Ok(msg)) = msg else { break };
@@ -439,7 +590,9 @@ pub async fn run(store: Arc<Mutex<Store>>, hub: Arc<Hub>, socket: WebSocket, j: 
                         d.broadcast(conn_id, &ServerMsg::Presence { id: conn_id, p });
                     }
                     ClientMsg::Ops { base, id, ops } => {
-                        if !editor {
+                        // The role may have changed since the connection opened (`Hub::recheck`);
+                        // `commit` checks again under the document lock.
+                        if !lock(&doc).is_editor(conn_id) {
                             fail(close::READ_ONLY, "You have view-only access to this workbook.");
                             break;
                         }
@@ -474,6 +627,7 @@ pub async fn run(store: Arc<Mutex<Store>>, hub: Arc<Hub>, socket: WebSocket, j: 
                 kicked = true;
                 break;
             }
+            _ = end.notified() => break,
         }
     }
     if kicked {
@@ -491,6 +645,7 @@ pub async fn run(store: Arc<Mutex<Store>>, hub: Arc<Hub>, socket: WebSocket, j: 
             let mut docs = lock(&hub.docs);
             if docs.get(&item_id).is_some_and(|x| lock(x).conns.is_empty()) {
                 docs.remove(&item_id);
+                hub.dropped.fetch_add(1, Ordering::SeqCst);
             }
         }
     }
@@ -506,6 +661,10 @@ pub async fn run(store: Arc<Mutex<Store>>, hub: Arc<Hub>, socket: WebSocket, j: 
 #[allow(clippy::too_many_arguments)]
 fn commit(store: &Mutex<Store>, doc: &Mutex<Doc>, item: &str, conn: u64, base: u64, cid: &str, id: u64, actor: &str, ops: Vec<cosync::Op>) -> bool {
     let mut d = lock(doc);
+    if !d.is_editor(conn) {
+        d.close(conn, close::READ_ONLY, "You have view-only access to this workbook.");
+        return false;
+    }
     let (sheets_before, last_before) = (d.log.sheets.clone(), d.log.last_commit(cid, actor));
     match d.log.commit(base, cid, id, actor, ops) {
         Ok(Commit::New { seq, ops, extra }) => {
@@ -552,6 +711,35 @@ mod tests {
 
     use super::*;
 
+    fn link() -> Principal {
+        Principal::Link { link: crate::store::Link { id: String::new(), item_id: String::new(), role: Role::Edit, expires: None, pw_hash: None, created: 0, created_by: String::new() } }
+    }
+
+    /// Once a connection lost access, no later re-check (e.g. a stale one) gives it back.
+    #[test]
+    fn revoked_is_final() {
+        let dir = std::env::temp_dir().join(format!("fo-live-unit-{}", util::new_id()));
+        let store = Store::open(&dir.join("db"), &dir.join("files"), 5).unwrap();
+        let u = store.create_user("ann", "", "", "test-password-1", false).unwrap();
+        let (item, _) = store.create_file(&u.root_id, "A.xlsx", b"a", &u.id, crate::store::OnConflict::Fail).unwrap();
+        let (link, _) = store.create_link(&item, Role::Edit, None, None, &u.id).unwrap();
+        let store = Mutex::new(store);
+        let hub = Hub::default();
+        let (tx, mut rx) = mpsc::channel(16);
+        let peer = Peer { id: 1, name: String::new(), user: String::new(), color: 0, editor: false, presence: None };
+        let mut d = Doc { log: Log::new(0), conns: vec![], unsnapped: 0, unsnapped_since: None, last_commit: None, last_snap: None, snap_asked: None, snap_turn: 0 };
+        d.conns.push(Conn { peer, tx, kick: Arc::new(Notify::new()), who: Principal::Link { link }, role: Role::View, revoked: true, end: Arc::new(Notify::new()) });
+        let doc = Arc::new(Mutex::new(d));
+        lock(&hub.docs).insert(item.id.clone(), doc.clone());
+        hub.recheck(&store);
+        assert!(rx.try_recv().is_err(), "a revoked connection isn't given edit back");
+        lock(&doc).conns[0].revoked = false;
+        hub.recheck(&store);
+        assert!(matches!(rx.try_recv(), Ok(Out::Text(t)) if t.contains("\"role\"")), "a live one is");
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A participant that doesn't read its messages is disconnected when its queue is full,
     /// instead of the server queueing for it without bound.
     #[test]
@@ -559,7 +747,7 @@ mod tests {
         let peer = |id| Peer { id, name: String::new(), user: String::new(), color: 0, editor: true, presence: None };
         let (tx, _rx) = mpsc::channel(2);
         let kick = Arc::new(Notify::new());
-        let d = Doc { log: Log::new(0), conns: vec![Conn { peer: peer(1), tx, kick: kick.clone() }], unsnapped: 0, unsnapped_since: None, last_commit: None, last_snap: None, snap_asked: None, snap_turn: 0 };
+        let d = Doc { log: Log::new(0), conns: vec![Conn { peer: peer(1), tx, kick: kick.clone(), who: link(), role: Role::Edit, revoked: false, end: Arc::new(Notify::new()) }], unsnapped: 0, unsnapped_since: None, last_commit: None, last_snap: None, snap_asked: None, snap_turn: 0 };
         for _ in 0..2 {
             d.broadcast(9, &ServerMsg::Leave { id: 9 });
         }
@@ -575,7 +763,7 @@ mod tests {
         let peer = |id| Peer { id, name: String::new(), user: String::new(), color: 0, editor: true, presence: None };
         let (tx, mut rx) = mpsc::channel(16);
         let ago = |s: u64| Instant::now().checked_sub(Duration::from_secs(s));
-        let mut d = Doc { log: Log::new(0), conns: vec![Conn { peer: peer(1), tx, kick: Arc::new(Notify::new()) }], unsnapped: 1, unsnapped_since: ago(1), last_commit: ago(1), last_snap: None, snap_asked: None, snap_turn: 0 };
+        let mut d = Doc { log: Log::new(0), conns: vec![Conn { peer: peer(1), tx, kick: Arc::new(Notify::new()), who: link(), role: Role::Edit, revoked: false, end: Arc::new(Notify::new()) }], unsnapped: 1, unsnapped_since: ago(1), last_commit: ago(1), last_snap: None, snap_asked: None, snap_turn: 0 };
         let asked = |rx: &mut mpsc::Receiver<Out>| {
             let mut n = 0;
             while let Ok(o) = rx.try_recv() {

@@ -18,6 +18,84 @@ pub struct User {
     pub disabled: bool,
     pub created: i64,
     pub root_id: String,
+    /// Signed in with a temporary password: must choose a new one before anything else.
+    pub must_change_password: bool,
+    /// Set on an organisation's own account (it owns the organisation's files and never signs in).
+    pub org_id: Option<String>,
+}
+
+/// An organisation. Its files belong to its own account (`account_id`, a `users` row with
+/// `org_id` set that can't sign in) whose root folder is the organisation's folder.
+#[derive(Clone, Debug)]
+pub struct Org {
+    pub id: String,
+    pub name: String,
+    pub root_id: String,
+    pub account_id: String,
+    /// What plain members get on the organisation's folder (edit or view).
+    pub member_role: Role,
+    pub created: i64,
+    pub created_by: String,
+}
+
+/// A person's role in an organisation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum OrgRole {
+    Member = 1,
+    Admin = 2,
+    Owner = 3,
+}
+
+impl OrgRole {
+    pub fn parse(s: &str) -> Option<OrgRole> {
+        match s {
+            "member" => Some(OrgRole::Member),
+            "admin" => Some(OrgRole::Admin),
+            "owner" => Some(OrgRole::Owner),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OrgRole::Member => "member",
+            OrgRole::Admin => "admin",
+            OrgRole::Owner => "owner",
+        }
+    }
+
+    /// Owners and admins manage the organisation and fully control its files.
+    pub fn manages(self) -> bool {
+        self >= OrgRole::Admin
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Member {
+    pub user: User,
+    pub role: OrgRole,
+    pub created: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct Invite {
+    pub id: String,
+    pub email: String,
+    pub org_id: String,
+    pub role: OrgRole,
+    pub expires: i64,
+    pub created: i64,
+    pub created_by: String,
+    /// 0, or when it was used.
+    pub used: i64,
+}
+
+/// Bytes of all kept versions of the files an account owns.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Usage {
+    pub files: i64,
+    pub versions: i64,
+    pub bytes: i64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -135,6 +213,14 @@ pub struct Grant {
     pub inherited_from: Option<Item>,
 }
 
+/// A permission granted to everyone in an organisation.
+#[derive(Clone, Debug)]
+pub struct OrgGrant {
+    pub org: Org,
+    pub role: Role,
+    pub inherited_from: Option<Item>,
+}
+
 #[derive(Clone, Debug)]
 pub struct DeviceToken {
     pub id: i64,
@@ -200,7 +286,9 @@ impl OnConflict {
     }
 }
 
-const SCHEMA: &str = r#"
+/// The original schema (`user_version` 0): created on a new database, then migrated like an
+/// existing one, so both take the same path.
+const SCHEMA_V0: &str = r#"
 CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
     username TEXT NOT NULL UNIQUE COLLATE NOCASE,
@@ -304,7 +392,123 @@ CREATE TABLE IF NOT EXISTS live_clients (
 );
 "#;
 
-const USER_COLS: &str = "id, username, display_name, email, is_admin, disabled, created, root_id";
+/// Version 1: organisations, members, grants to whole organisations, temporary passwords and
+/// invites. `permissions` is rebuilt (its key changes); existing grants become user grants.
+const MIGRATION_V1: &str = r#"
+ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE users ADD COLUMN org_id TEXT;
+CREATE TABLE orgs (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    root_id TEXT NOT NULL UNIQUE REFERENCES items(id),
+    account_id TEXT NOT NULL UNIQUE REFERENCES users(id),
+    member_role TEXT NOT NULL DEFAULT 'edit' CHECK (member_role IN ('edit', 'view')),
+    created INTEGER NOT NULL,
+    created_by TEXT NOT NULL
+);
+CREATE TABLE org_members (
+    org_id TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(id),
+    role TEXT NOT NULL CHECK (role IN ('owner', 'admin', 'member')),
+    added_by TEXT NOT NULL,
+    created INTEGER NOT NULL,
+    PRIMARY KEY (org_id, user_id)
+);
+CREATE INDEX org_members_user ON org_members(user_id);
+CREATE TABLE permissions_v1 (
+    item_id TEXT NOT NULL REFERENCES items(id),
+    grantee_kind TEXT NOT NULL CHECK (grantee_kind IN ('user', 'org')),
+    grantee_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    granted_by TEXT NOT NULL,
+    created INTEGER NOT NULL,
+    PRIMARY KEY (item_id, grantee_kind, grantee_id)
+);
+INSERT INTO permissions_v1 (item_id, grantee_kind, grantee_id, role, granted_by, created)
+    SELECT item_id, 'user', user_id, role, granted_by, created FROM permissions;
+DROP TABLE permissions;
+ALTER TABLE permissions_v1 RENAME TO permissions;
+CREATE INDEX permissions_grantee ON permissions(grantee_kind, grantee_id);
+CREATE TABLE invites (
+    id TEXT PRIMARY KEY,
+    token_hash BLOB NOT NULL UNIQUE,
+    email TEXT NOT NULL DEFAULT '',
+    org_id TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+    role TEXT NOT NULL CHECK (role IN ('owner', 'admin', 'member')),
+    expires INTEGER NOT NULL,
+    created INTEGER NOT NULL,
+    created_by TEXT NOT NULL,
+    used INTEGER NOT NULL DEFAULT 0,
+    used_by TEXT
+);
+"#;
+
+/// The schema version this code writes (`PRAGMA user_version`).
+pub const SCHEMA_VERSION: i64 = 1;
+
+/// Brings a database (new, or written by an older server) to `SCHEMA_VERSION`. One write
+/// transaction, so a crash leaves the old schema intact, and a second process opening the
+/// database at the same time waits and then finds it done.
+fn migrate(conn: &Connection) -> Res<()> {
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let r = (|| -> Res<()> {
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if v > SCHEMA_VERSION {
+            return Err(StoreError::Internal(format!("the database was written by a newer server (schema {v}, this server knows {SCHEMA_VERSION})")));
+        }
+        if v < 1 {
+            conn.execute_batch(SCHEMA_V0)?;
+            conn.execute_batch(MIGRATION_V1)?;
+        }
+        conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
+        Ok(())
+    })();
+    match r {
+        Ok(()) => Ok(conn.execute_batch("COMMIT")?),
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
+const USER_COLS: &str = "id, username, display_name, email, is_admin, disabled, created, root_id, must_change_password, org_id";
+const ORG_COLS: &str = "id, name, root_id, account_id, member_role, created, created_by";
+
+fn org_row(r: &Row) -> rusqlite::Result<Org> {
+    Ok(Org {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        root_id: r.get(2)?,
+        account_id: r.get(3)?,
+        member_role: Role::from_db(&r.get::<_, String>(4)?),
+        created: r.get(5)?,
+        created_by: r.get(6)?,
+    })
+}
+
+fn invite_row(r: &Row) -> rusqlite::Result<Invite> {
+    Ok(Invite {
+        id: r.get(0)?,
+        email: r.get(1)?,
+        org_id: r.get(2)?,
+        role: OrgRole::parse(&r.get::<_, String>(3)?).unwrap_or(OrgRole::Member),
+        expires: r.get(4)?,
+        created: r.get(5)?,
+        created_by: r.get(6)?,
+        used: r.get(7)?,
+    })
+}
+
+const INVITE_COLS: &str = "id, email, org_id, role, expires, created, created_by, used";
+
+/// Invites are valid this long.
+pub const INVITE_DAYS: i64 = 7;
+
+/// "?1, ?2, ..." for `n` values starting at `?{from}`.
+fn placeholders(from: usize, n: usize) -> String {
+    (from..from + n).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ")
+}
 const ITEM_COLS: &str = "id, parent_id, name, kind, owner_id, size, version, hash, modified, modified_by, created, deleted";
 
 fn user_row(r: &Row) -> rusqlite::Result<User> {
@@ -317,6 +521,8 @@ fn user_row(r: &Row) -> rusqlite::Result<User> {
         disabled: r.get::<_, i64>(5)? != 0,
         created: r.get(6)?,
         root_id: r.get(7)?,
+        must_change_password: r.get::<_, i64>(8)? != 0,
+        org_id: r.get(9)?,
     })
 }
 
@@ -355,6 +561,9 @@ pub struct Store {
     pub conn: Connection,
     files: PathBuf,
     pub versions_to_keep: u32,
+    /// `allow_links` from the configuration: when false, share-link access tokens don't
+    /// authenticate and links can't be opened.
+    pub allow_links: bool,
 }
 
 impl Store {
@@ -368,8 +577,8 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        conn.execute_batch(SCHEMA)?;
-        Ok(Store { conn, files: files.to_path_buf(), versions_to_keep: versions_to_keep.max(1) })
+        migrate(&conn)?;
+        Ok(Store { conn, files: files.to_path_buf(), versions_to_keep: versions_to_keep.max(1), allow_links: true })
     }
 
     pub fn files_dir(&self) -> &Path {
@@ -381,46 +590,126 @@ impl Store {
     // ------------------------------------------------------------------
 
     pub fn create_user(&self, username: &str, display_name: &str, email: &str, password: &str, is_admin: bool) -> Res<User> {
+        self.create_account(username, display_name, email, password, is_admin, false)
+    }
+
+    /// A person's account; with `must_change_password` the password is a temporary one.
+    /// Checks the password policy and hashes here (for the CLI and tests); the server hashes
+    /// outside the store lock and calls `create_account_hashed`.
+    pub fn create_account(&self, username: &str, display_name: &str, email: &str, password: &str, is_admin: bool, must_change_password: bool) -> Res<User> {
+        util::check_new_password(password, username.trim()).map_err(StoreError::Invalid)?;
+        self.create_account_hashed(username, display_name, email, &util::hash_password(password), is_admin, must_change_password)
+    }
+
+    /// The username for a new account, trimmed, when it is valid and free.
+    pub fn check_new_username(&self, username: &str) -> Res<String> {
         let username = username.trim();
         if !util::valid_username(username) {
             return Err(StoreError::Invalid("A username may contain letters, digits, '.', '-' and '_' (64 characters at most).".into()));
         }
-        util::check_new_password(password).map_err(StoreError::Invalid)?;
         if self.user_by_name(username)?.is_some() {
             return Err(StoreError::Conflict(format!("The user '{username}' already exists.")));
         }
-        let display = if display_name.trim().is_empty() { username.to_string() } else { display_name.trim().to_string() };
-        let (id, root) = (util::new_id(), util::new_id());
-        let t = now();
-        let hash = util::hash_password(password);
+        Ok(username.to_string())
+    }
+
+    /// `create_account` with the password already checked and hashed (`util::hash_password`).
+    pub fn create_account_hashed(&self, username: &str, display_name: &str, email: &str, pw_hash: &str, is_admin: bool, must_change_password: bool) -> Res<User> {
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "INSERT INTO users (id, username, display_name, email, pw_hash, is_admin, created, root_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![id, username, display, email.trim(), hash, is_admin as i64, t, root],
-        )?;
-        tx.execute(
-            "INSERT INTO items (id, parent_id, name, kind, owner_id, modified, modified_by, created) VALUES (?1, NULL, 'My files', 'folder', ?2, ?3, ?2, ?3)",
-            params![root, id, t],
-        )?;
+        let id = self.insert_account(username, display_name, email, pw_hash, is_admin, must_change_password)?;
         tx.commit()?;
         self.user_by_id(&id)?.ok_or(StoreError::NotFound)
     }
 
+    /// An account with a temporary password (hash), joined to `org` with a role (added by
+    /// the given user id) in the same transaction.
+    pub fn create_temp_account(&self, username: &str, display_name: &str, email: &str, pw_hash: &str, org: Option<(&Org, OrgRole, &str)>) -> Res<User> {
+        let tx = self.conn.unchecked_transaction()?;
+        let id = self.insert_account(username, display_name, email, pw_hash, false, true)?;
+        if let Some((o, role, by)) = org {
+            self.conn.execute(
+                "INSERT INTO org_members (org_id, user_id, role, added_by, created) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![o.id, id, role.as_str(), by, now()],
+            )?;
+        }
+        tx.commit()?;
+        self.user_by_id(&id)?.ok_or(StoreError::NotFound)
+    }
+
+    /// The account row and its root folder; the caller holds a transaction.
+    fn insert_account(&self, username: &str, display_name: &str, email: &str, pw_hash: &str, is_admin: bool, must_change_password: bool) -> Res<String> {
+        let username = self.check_new_username(username)?;
+        let display = if display_name.trim().is_empty() { username.clone() } else { display_name.trim().chars().filter(|c| !c.is_control()).take(100).collect() };
+        let email: String = email.trim().chars().filter(|c| !c.is_control()).take(254).collect();
+        let (id, root) = (util::new_id(), util::new_id());
+        let t = now();
+        self.conn.execute(
+            "INSERT INTO users (id, username, display_name, email, pw_hash, is_admin, created, root_id, must_change_password) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![id, username, display, email, pw_hash, is_admin as i64, t, root, must_change_password as i64],
+        )?;
+        self.conn.execute(
+            "INSERT INTO items (id, parent_id, name, kind, owner_id, modified, modified_by, created) VALUES (?1, NULL, 'My files', 'folder', ?2, ?3, ?2, ?3)",
+            params![root, id, t],
+        )?;
+        Ok(id)
+    }
+
+    /// A person (organisation accounts are never found by name).
     pub fn user_by_name(&self, username: &str) -> Res<Option<User>> {
-        Ok(self.conn.query_row(&format!("SELECT {USER_COLS} FROM users WHERE username = ?1"), [username.trim()], user_row).optional()?)
+        Ok(self.conn.query_row(&format!("SELECT {USER_COLS} FROM users WHERE username = ?1 AND org_id IS NULL"), [username.trim()], user_row).optional()?)
     }
 
     pub fn user_by_id(&self, id: &str) -> Res<Option<User>> {
         Ok(self.conn.query_row(&format!("SELECT {USER_COLS} FROM users WHERE id = ?1"), [id], user_row).optional()?)
     }
 
+    /// Every person (not the organisations' own accounts).
     pub fn users(&self) -> Res<Vec<User>> {
-        let mut st = self.conn.prepare(&format!("SELECT {USER_COLS} FROM users ORDER BY username COLLATE NOCASE"))?;
+        let mut st = self.conn.prepare(&format!("SELECT {USER_COLS} FROM users WHERE org_id IS NULL ORDER BY username COLLATE NOCASE"))?;
         let v = st.query_map([], user_row)?.collect::<Result<Vec<_>, _>>()?;
         Ok(v)
     }
 
-    /// Enabled users whose username or display name contains `query` (for the share dialog).
+    /// Whether two people are in at least one organisation together.
+    pub fn shares_org(&self, a: &str, b: &str) -> Res<bool> {
+        Ok(self
+            .conn
+            .query_row("SELECT 1 FROM org_members x JOIN org_members y ON x.org_id = y.org_id WHERE x.user_id = ?1 AND y.user_id = ?2 LIMIT 1", params![a, b], |_| Ok(()))
+            .optional()?
+            .is_some())
+    }
+
+    /// People `caller` may find in the share dialog: those whose username or display name
+    /// contains `query` among the people sharing an organisation with them (the server
+    /// administrator: everyone), plus whoever has exactly that username. Enabled accounts only.
+    pub fn search_users_for(&self, caller: &User, query: &str, limit: usize) -> Res<Vec<User>> {
+        if caller.is_admin {
+            return self.search_users(query, limit);
+        }
+        let q = query.trim().to_lowercase();
+        let cols = USER_COLS.split(", ").map(|c| format!("u.{c}")).collect::<Vec<_>>().join(", ");
+        let mut st = self.conn.prepare(&format!(
+            "SELECT DISTINCT {cols} FROM users u JOIN org_members m ON m.user_id = u.id
+             WHERE m.org_id IN (SELECT org_id FROM org_members WHERE user_id = ?1) AND u.disabled = 0 AND u.org_id IS NULL
+             ORDER BY u.username COLLATE NOCASE"
+        ))?;
+        let mut out: Vec<User> = st
+            .query_map([&caller.id], user_row)?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|u| q.is_empty() || u.username.to_lowercase().contains(&q) || u.display_name.to_lowercase().contains(&q))
+            .collect();
+        if let Some(exact) = self.user_by_name(&q)?.filter(|u| !u.disabled)
+            && !out.iter().any(|u| u.id == exact.id)
+        {
+            out.insert(0, exact);
+        }
+        out.truncate(limit);
+        Ok(out)
+    }
+
+    /// Enabled users whose username or display name contains `query` (everyone; for the server
+    /// administrator).
     pub fn search_users(&self, query: &str, limit: usize) -> Res<Vec<User>> {
         let q = query.trim().to_lowercase();
         Ok(self.users()?.into_iter().filter(|u| !u.disabled && (q.is_empty() || u.username.to_lowercase().contains(&q) || u.display_name.to_lowercase().contains(&q))).take(limit).collect())
@@ -431,10 +720,28 @@ impl Store {
         Ok(self.conn.query_row("SELECT pw_hash FROM users WHERE id = ?1", [user_id], |r| r.get(0))?)
     }
 
+    /// A password the person chose (clears `must_change_password`). Checks and hashes here
+    /// (CLI); the server uses `set_password_hash`.
     pub fn set_password(&self, user_id: &str, password: &str) -> Res<()> {
-        util::check_new_password(password).map_err(StoreError::Invalid)?;
-        self.conn.execute("UPDATE users SET pw_hash = ?1 WHERE id = ?2", params![util::hash_password(password), user_id])?;
+        let u = self.user_by_id(user_id)?.filter(|u| u.org_id.is_none()).ok_or(StoreError::NotFound)?;
+        util::check_new_password(password, &u.username).map_err(StoreError::Invalid)?;
+        self.set_password_hash(user_id, &util::hash_password(password))
+    }
+
+    /// Stores the hash of a password the person chose (checked by the caller); clears
+    /// `must_change_password`.
+    pub fn set_password_hash(&self, user_id: &str, pw_hash: &str) -> Res<()> {
+        self.user_by_id(user_id)?.filter(|u| u.org_id.is_none()).ok_or(StoreError::NotFound)?;
+        self.conn.execute("UPDATE users SET pw_hash = ?1, must_change_password = 0 WHERE id = ?2", params![pw_hash, user_id])?;
         Ok(())
+    }
+
+    /// Stores the hash of a temporary password (`util::temp_password`), which must be changed at
+    /// the next sign-in, and signs the user out everywhere.
+    pub fn set_temp_password_hash(&self, user_id: &str, pw_hash: &str) -> Res<usize> {
+        self.user_by_id(user_id)?.filter(|u| u.org_id.is_none()).ok_or(StoreError::NotFound)?;
+        self.conn.execute("UPDATE users SET pw_hash = ?1, must_change_password = 1 WHERE id = ?2", params![pw_hash, user_id])?;
+        self.revoke_user_tokens(user_id)
     }
 
     pub fn set_disabled(&self, user_id: &str, disabled: bool) -> Res<()> {
@@ -487,6 +794,40 @@ impl Store {
         Ok(self.conn.execute("DELETE FROM tokens WHERE user_id = ?1", [user_id])?)
     }
 
+    /// Signs the user out of every device except `keep`.
+    pub fn revoke_other_tokens(&self, user_id: &str, keep: i64) -> Res<usize> {
+        Ok(self.conn.execute("DELETE FROM tokens WHERE user_id = ?1 AND id != ?2", params![user_id, keep])?)
+    }
+
+    /// Whether a device token still exists (it isn't revoked).
+    pub fn token_exists(&self, token_id: i64) -> Res<bool> {
+        Ok(self.conn.query_row("SELECT 1 FROM tokens WHERE id = ?1", [token_id], |_| Ok(())).optional()?.is_some())
+    }
+
+    /// Re-checks who a connection authenticated as earlier: `Err(reason)` when that is no
+    /// longer valid (signed out, account disabled, link removed or expired or links switched
+    /// off), else the principal with fresh details.
+    pub fn recheck_principal(&self, who: &Principal) -> Res<Result<Principal, &'static str>> {
+        match who {
+            Principal::User { user, token_id } => {
+                let fresh = self.user_by_id(&user.id)?;
+                Ok(match fresh {
+                    Some(u) if u.disabled => Err("Your account was disabled."),
+                    None => Err("Your account was removed."),
+                    Some(_) if !self.token_exists(*token_id)? => Err("You were signed out."),
+                    Some(u) if u.must_change_password => Err("Your password was reset; sign in again."),
+                    Some(u) => Ok(Principal::User { user: u, token_id: *token_id }),
+                })
+            }
+            Principal::Link { link } => Ok(match self.link(&link.id)? {
+                _ if !self.allow_links => Err("Share links were switched off on this server."),
+                Some(l) if l.expires.is_none_or(|e| e > now()) => Ok(Principal::Link { link: l }),
+                Some(_) => Err("The share link expired."),
+                None => Err("The share link was removed."),
+            }),
+        }
+    }
+
     /// Resolves a bearer token: a device token of an enabled user, or a live share-link access token.
     pub fn authenticate(&self, token: &str) -> Res<Option<Principal>> {
         if token.is_empty() || token.len() > 200 {
@@ -508,6 +849,9 @@ impl Store {
                 self.conn.execute("UPDATE tokens SET last_used = ?1 WHERE id = ?2", params![t, token_id])?;
             }
             return Ok(Some(Principal::User { user, token_id }));
+        }
+        if !self.allow_links {
+            return Ok(None);
         }
         let row: Option<(Vec<u8>, String, i64)> =
             self.conn.query_row("SELECT hash, link_id, expires FROM link_access WHERE hash = ?1", [&hash], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?;
@@ -536,22 +880,33 @@ impl Store {
     }
 
     /// The item followed by its ancestors up to the root.
+    /// One query (a recursive walk up the parents).
     pub fn chain(&self, item: &Item) -> Res<Vec<Item>> {
+        let mut st = self.conn.prepare_cached(&format!(
+            "WITH RECURSIVE up(id, depth) AS (
+                 SELECT parent_id, 1 FROM items WHERE id = ?1 AND parent_id IS NOT NULL
+                 UNION ALL
+                 SELECT i.parent_id, up.depth + 1 FROM items i JOIN up ON i.id = up.id WHERE i.parent_id IS NOT NULL AND up.depth <= 1001
+             )
+             SELECT {} FROM up JOIN items it ON it.id = up.id ORDER BY up.depth",
+            ITEM_COLS.split(", ").map(|c| format!("it.{c}")).collect::<Vec<_>>().join(", ")
+        ))?;
         let mut out = vec![item.clone()];
-        let mut next = item.parent_id.clone();
-        while let Some(p) = next {
-            if out.len() > 1000 {
-                return Err(StoreError::Internal("folder nesting is too deep".into()));
-            }
-            let Some(it) = self.item(&p)? else { break };
-            next = it.parent_id.clone();
-            out.push(it);
+        out.extend(st.query_map([&item.id], item_row)?.collect::<Result<Vec<_>, _>>()?);
+        if out.len() > 1000 {
+            return Err(StoreError::Internal("folder nesting is too deep".into()));
         }
         Ok(out)
     }
 
     /// The caller's role on an item; `None` when the caller can't see it. Items in the trash
     /// (or inside a folder in the trash) are invisible unless `include_deleted`.
+    ///
+    /// The highest of (SPEC.md §3): owner of the item; owner or admin of the organisation whose
+    /// folder it is in (-> owner); member of that organisation (-> its `member_role`); a grant
+    /// to the person, or to an organisation they belong to, on the item or a parent folder.
+    /// A share link sees its item and what is inside it. Being a server administrator gives
+    /// no access to anyone's documents. Three queries, whatever the depth.
     pub fn role(&self, who: &Principal, item: &Item, include_deleted: bool) -> Res<Option<Role>> {
         let chain = self.chain(item)?;
         if !include_deleted && chain.iter().any(|i| i.deleted != 0) {
@@ -563,14 +918,36 @@ impl Store {
                     return Ok(Some(Role::Owner));
                 }
                 let mut best: Option<Role> = None;
-                for it in &chain {
-                    let r: Option<String> =
-                        self.conn.query_row("SELECT role FROM permissions WHERE item_id = ?1 AND user_id = ?2", params![it.id, user.id], |r| r.get(0)).optional()?;
-                    if let Some(r) = r {
-                        best = best.max(Some(Role::from_db(&r)));
+                // The organisation whose folder this is in (the chain ends at its root).
+                let top = chain.last().map(|i| i.id.as_str()).unwrap_or_default();
+                let org: Option<(String, Option<String>)> = self
+                    .conn
+                    .prepare_cached("SELECT o.member_role, m.role FROM orgs o LEFT JOIN org_members m ON m.org_id = o.id AND m.user_id = ?2 WHERE o.root_id = ?1")?
+                    .query_row(params![top, user.id], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .optional()?;
+                if let Some((member_role, Some(mine))) = org {
+                    match OrgRole::parse(&mine) {
+                        Some(r) if r.manages() => return Ok(Some(Role::Owner)),
+                        Some(_) => best = Some(Role::from_db(&member_role).min(Role::Edit)),
+                        None => {}
                     }
                 }
-                Ok(best)
+                let ids: Vec<&str> = chain.iter().map(|i| i.id.as_str()).collect();
+                let sql = format!(
+                    "SELECT MAX(CASE role WHEN 'edit' THEN 2 ELSE 1 END) FROM permissions WHERE item_id IN ({}) AND (
+                         (grantee_kind = 'user' AND grantee_id = ?1)
+                         OR (grantee_kind = 'org' AND grantee_id IN (SELECT org_id FROM org_members WHERE user_id = ?1)))",
+                    placeholders(2, ids.len())
+                );
+                let mut values: Vec<&str> = vec![user.id.as_str()];
+                values.extend(ids);
+                let granted: Option<i64> = self.conn.query_row(&sql, rusqlite::params_from_iter(values), |r| r.get(0))?;
+                let granted = match granted {
+                    Some(2) => Some(Role::Edit),
+                    Some(_) => Some(Role::View),
+                    None => None,
+                };
+                Ok(best.max(granted))
             }
             Principal::Link { link } => Ok(chain.iter().any(|i| i.id == link.item_id).then_some(link.role)),
         }
@@ -795,6 +1172,13 @@ impl Store {
         if item.deleted == 0 {
             return Ok(item.clone());
         }
+        // Files of a deleted organisation stay where nobody can reach them.
+        if let Some(owner) = self.user_by_id(&item.owner_id)?
+            && let Some(org) = &owner.org_id
+            && self.org(org)?.is_none()
+        {
+            return Err(StoreError::Invalid("The organisation these files belonged to was deleted.".into()));
+        }
         let parent_ok = match &item.parent_id {
             Some(p) => match self.item(p)? {
                 Some(pi) => self.chain(&pi)?.iter().all(|i| i.deleted == 0),
@@ -812,9 +1196,14 @@ impl Store {
         self.item(&item.id)?.ok_or(StoreError::NotFound)
     }
 
-    /// Items the user owns that are in the trash.
+    /// Items in the trash that the user owns or that belong to an organisation the user is in
+    /// (callers filter by role).
     pub fn trash_of(&self, user_id: &str) -> Res<Vec<Item>> {
-        let mut st = self.conn.prepare(&format!("SELECT {ITEM_COLS} FROM items WHERE owner_id = ?1 AND deleted != 0 ORDER BY deleted DESC"))?;
+        let mut st = self.conn.prepare(&format!(
+            "SELECT {ITEM_COLS} FROM items WHERE deleted != 0 AND (owner_id = ?1
+                 OR owner_id IN (SELECT o.account_id FROM orgs o JOIN org_members m ON m.org_id = o.id WHERE m.user_id = ?1))
+             ORDER BY deleted DESC"
+        ))?;
         let v = st.query_map([user_id], item_row)?.collect::<Result<Vec<_>, _>>()?;
         Ok(v)
     }
@@ -827,46 +1216,97 @@ impl Store {
         if user.id == item.owner_id {
             return Err(StoreError::Invalid(format!("{} owns this item.", user.display_name)));
         }
+        if user.org_id.is_some() {
+            return Err(StoreError::Invalid(format!("{} is an organisation; share with the organisation instead.", user.display_name)));
+        }
         if user.disabled {
             return Err(StoreError::Invalid(format!("The user '{}' is disabled.", user.username)));
         }
         self.conn.execute(
-            "INSERT INTO permissions (item_id, user_id, role, granted_by, created) VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(item_id, user_id) DO UPDATE SET role = excluded.role, granted_by = excluded.granted_by",
+            "INSERT INTO permissions (item_id, grantee_kind, grantee_id, role, granted_by, created) VALUES (?1, 'user', ?2, ?3, ?4, ?5)
+             ON CONFLICT(item_id, grantee_kind, grantee_id) DO UPDATE SET role = excluded.role, granted_by = excluded.granted_by",
             params![item.id, user.id, role.as_str(), by, now()],
         )?;
         Ok(())
     }
 
     pub fn revoke(&self, item: &Item, user_id: &str) -> Res<bool> {
-        Ok(self.conn.execute("DELETE FROM permissions WHERE item_id = ?1 AND user_id = ?2", params![item.id, user_id])? > 0)
+        Ok(self.conn.execute("DELETE FROM permissions WHERE item_id = ?1 AND grantee_kind = 'user' AND grantee_id = ?2", params![item.id, user_id])? > 0)
+    }
+
+    /// Gives everyone in `org` a role on the item (and what is inside it).
+    pub fn grant_org(&self, item: &Item, org: &Org, role: Role, by: &str) -> Res<()> {
+        if item.owner_id == org.account_id {
+            return Err(StoreError::Invalid(format!("This item is in the folder of {}; its members already have access.", org.name)));
+        }
+        self.conn.execute(
+            "INSERT INTO permissions (item_id, grantee_kind, grantee_id, role, granted_by, created) VALUES (?1, 'org', ?2, ?3, ?4, ?5)
+             ON CONFLICT(item_id, grantee_kind, grantee_id) DO UPDATE SET role = excluded.role, granted_by = excluded.granted_by",
+            params![item.id, org.id, role.as_str(), by, now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn revoke_org(&self, item: &Item, org_id: &str) -> Res<bool> {
+        Ok(self.conn.execute("DELETE FROM permissions WHERE item_id = ?1 AND grantee_kind = 'org' AND grantee_id = ?2", params![item.id, org_id])? > 0)
+    }
+
+    /// (position in the chain, grantee id, role) of every grant of `kind` on the item and its parents.
+    fn chain_grants(&self, chain: &[Item], kind: &str) -> Res<Vec<(usize, String, Role)>> {
+        let mut st = self.conn.prepare_cached("SELECT grantee_id, role FROM permissions WHERE item_id = ?1 AND grantee_kind = ?2")?;
+        let mut out = Vec::new();
+        for (i, it) in chain.iter().enumerate() {
+            for row in st.query_map(params![it.id, kind], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+                let (id, role) = row?;
+                out.push((i, id, Role::from_db(&role)));
+            }
+        }
+        Ok(out)
     }
 
     /// Direct and inherited (from parent folders) permissions on an item.
     pub fn grants(&self, item: &Item) -> Res<Vec<Grant>> {
+        let chain = self.chain(item)?;
         let mut out: Vec<Grant> = Vec::new();
-        for (i, it) in self.chain(item)?.iter().enumerate() {
-            let mut st = self.conn.prepare("SELECT user_id, role FROM permissions WHERE item_id = ?1")?;
-            let rows = st.query_map([&it.id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?.collect::<Result<Vec<_>, _>>()?;
-            for (uid, role) in rows {
-                let Some(user) = self.user_by_id(&uid)? else { continue };
-                let g = Grant { user, role: Role::from_db(&role), inherited_from: (i > 0).then(|| it.clone()) };
-                match out.iter_mut().find(|x| x.user.id == uid) {
-                    Some(x) if g.role > x.role => *x = g,
-                    Some(_) => {}
-                    None => out.push(g),
-                }
+        for (i, uid, role) in self.chain_grants(&chain, "user")? {
+            let Some(user) = self.user_by_id(&uid)? else { continue };
+            let g = Grant { user, role, inherited_from: (i > 0).then(|| chain[i].clone()) };
+            match out.iter_mut().find(|x| x.user.id == uid) {
+                Some(x) if g.role > x.role => *x = g,
+                Some(_) => {}
+                None => out.push(g),
             }
         }
         out.sort_by_key(|g| g.user.display_name.to_lowercase());
         Ok(out)
     }
 
-    /// Items shared directly with the user (still visible to them).
+    /// Direct and inherited grants to whole organisations.
+    pub fn org_grants(&self, item: &Item) -> Res<Vec<OrgGrant>> {
+        let chain = self.chain(item)?;
+        let mut out: Vec<OrgGrant> = Vec::new();
+        for (i, oid, role) in self.chain_grants(&chain, "org")? {
+            let Some(org) = self.org(&oid)? else { continue };
+            let g = OrgGrant { org, role, inherited_from: (i > 0).then(|| chain[i].clone()) };
+            match out.iter_mut().find(|x| x.org.id == oid) {
+                Some(x) if g.role > x.role => *x = g,
+                Some(_) => {}
+                None => out.push(g),
+            }
+        }
+        out.sort_by_key(|g| g.org.name.to_lowercase());
+        Ok(out)
+    }
+
+    /// Items shared directly with the user or with an organisation they are in (still visible
+    /// to them), not counting the organisations' own folders.
     pub fn shared_with(&self, who: &Principal) -> Res<Vec<Item>> {
         let Principal::User { user, .. } = who else { return Ok(Vec::new()) };
         let mut st = self.conn.prepare(&format!(
-            "SELECT {} FROM items i JOIN permissions p ON p.item_id = i.id WHERE p.user_id = ?1 AND i.deleted = 0 AND i.owner_id != ?1 ORDER BY i.modified DESC",
+            "SELECT DISTINCT {} FROM items i JOIN permissions p ON p.item_id = i.id
+             WHERE ((p.grantee_kind = 'user' AND p.grantee_id = ?1)
+                    OR (p.grantee_kind = 'org' AND p.grantee_id IN (SELECT org_id FROM org_members WHERE user_id = ?1)))
+               AND i.deleted = 0 AND i.owner_id != ?1 ORDER BY i.modified DESC",
             ITEM_COLS.split(", ").map(|c| format!("i.{c}")).collect::<Vec<_>>().join(", ")
         ))?;
         let items = st.query_map([&user.id], item_row)?.collect::<Result<Vec<_>, _>>()?;
@@ -913,22 +1353,285 @@ impl Store {
     }
 
     // ------------------------------------------------------------------
+    // Organisations
+    // ------------------------------------------------------------------
+
+    fn clean_org_name(name: &str) -> Res<String> {
+        let n = util::clean_name(name).map_err(StoreError::Invalid)?;
+        if n.chars().count() > 100 {
+            return Err(StoreError::Invalid("An organisation name can be 100 characters at most.".into()));
+        }
+        Ok(n)
+    }
+
+    /// A new organisation with its own account and an empty folder named after it.
+    pub fn create_org(&self, name: &str, by: &str) -> Res<Org> {
+        let name = Self::clean_org_name(name)?;
+        if self.org_by_name(&name)?.is_some() {
+            return Err(StoreError::Conflict(format!("The organisation '{name}' already exists.")));
+        }
+        let (id, account, root) = (util::new_id(), util::new_id(), util::new_id());
+        let t = now();
+        let tx = self.conn.unchecked_transaction()?;
+        // The account can't sign in: no valid password hash, disabled, and never found by name
+        // (':' isn't allowed in usernames).
+        tx.execute(
+            "INSERT INTO users (id, username, display_name, email, pw_hash, is_admin, disabled, created, root_id, org_id) VALUES (?1, ?2, ?3, '', '!', 0, 1, ?4, ?5, ?6)",
+            params![account, format!("org:{id}"), name, t, root, id],
+        )?;
+        tx.execute(
+            "INSERT INTO items (id, parent_id, name, kind, owner_id, modified, modified_by, created) VALUES (?1, NULL, ?2, 'folder', ?3, ?4, ?5, ?4)",
+            params![root, name, account, t, by],
+        )?;
+        tx.execute(
+            "INSERT INTO orgs (id, name, root_id, account_id, member_role, created, created_by) VALUES (?1, ?2, ?3, ?4, 'edit', ?5, ?6)",
+            params![id, name, root, account, t, by],
+        )?;
+        tx.commit()?;
+        self.org(&id)?.ok_or(StoreError::NotFound)
+    }
+
+    pub fn org(&self, id: &str) -> Res<Option<Org>> {
+        Ok(self.conn.query_row(&format!("SELECT {ORG_COLS} FROM orgs WHERE id = ?1"), [id], org_row).optional()?)
+    }
+
+    pub fn org_by_name(&self, name: &str) -> Res<Option<Org>> {
+        Ok(self.conn.query_row(&format!("SELECT {ORG_COLS} FROM orgs WHERE name = ?1"), [name.trim()], org_row).optional()?)
+    }
+
+    /// By id, else by name.
+    pub fn find_org(&self, name_or_id: &str) -> Res<Option<Org>> {
+        if util::valid_id(name_or_id)
+            && let Some(o) = self.org(name_or_id)?
+        {
+            return Ok(Some(o));
+        }
+        self.org_by_name(name_or_id)
+    }
+
+    pub fn orgs(&self) -> Res<Vec<Org>> {
+        let mut st = self.conn.prepare(&format!("SELECT {ORG_COLS} FROM orgs ORDER BY name COLLATE NOCASE"))?;
+        let v = st.query_map([], org_row)?.collect::<Result<Vec<_>, _>>()?;
+        Ok(v)
+    }
+
+    /// The organisations a person belongs to, with their role in each.
+    pub fn orgs_of(&self, user_id: &str) -> Res<Vec<(Org, OrgRole)>> {
+        let cols = ORG_COLS.split(", ").map(|c| format!("o.{c}")).collect::<Vec<_>>().join(", ");
+        let mut st = self.conn.prepare(&format!("SELECT {cols}, m.role FROM orgs o JOIN org_members m ON m.org_id = o.id WHERE m.user_id = ?1 ORDER BY o.name COLLATE NOCASE"))?;
+        let v = st
+            .query_map([user_id], |r| Ok((org_row(r)?, OrgRole::parse(&r.get::<_, String>(7)?).unwrap_or(OrgRole::Member))))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(v)
+    }
+
+    /// The organisation whose folder the item is in.
+    pub fn org_of_item(&self, item: &Item) -> Res<Option<Org>> {
+        let Some(owner) = self.user_by_id(&item.owner_id)? else { return Ok(None) };
+        match owner.org_id {
+            Some(id) => self.org(&id),
+            None => Ok(None),
+        }
+    }
+
+    /// Renames the organisation and its folder.
+    pub fn rename_org(&self, org: &Org, name: &str) -> Res<Org> {
+        let name = Self::clean_org_name(name)?;
+        if self.org_by_name(&name)?.is_some_and(|o| o.id != org.id) {
+            return Err(StoreError::Conflict(format!("The organisation '{name}' already exists.")));
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("UPDATE orgs SET name = ?1 WHERE id = ?2", params![name, org.id])?;
+        tx.execute("UPDATE users SET display_name = ?1 WHERE id = ?2", params![name, org.account_id])?;
+        tx.execute("UPDATE items SET name = ?1 WHERE id = ?2", params![name, org.root_id])?;
+        tx.commit()?;
+        self.org(&org.id)?.ok_or(StoreError::NotFound)
+    }
+
+    /// What plain members get on the organisation's folder: view or edit.
+    pub fn set_org_member_role(&self, org: &Org, role: Role) -> Res<()> {
+        if role == Role::Owner {
+            return Err(StoreError::Invalid("member_role must be view or edit.".into()));
+        }
+        self.conn.execute("UPDATE orgs SET member_role = ?1 WHERE id = ?2", params![role.as_str(), org.id])?;
+        Ok(())
+    }
+
+    /// Deletes an organisation whose folder is empty (items in its trash are kept, owned by
+    /// the organisation's disabled account, but nobody can reach them any more). Members,
+    /// grants to the organisation and invites go with it.
+    pub fn delete_org(&self, org: &Org) -> Res<()> {
+        if !self.children(&org.root_id)?.is_empty() {
+            return Err(StoreError::Conflict(format!("The folder of {} isn't empty. Move or delete its files first.", org.name)));
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM permissions WHERE grantee_kind = 'org' AND grantee_id = ?1", [&org.id])?;
+        tx.execute("DELETE FROM org_members WHERE org_id = ?1", [&org.id])?;
+        tx.execute("DELETE FROM invites WHERE org_id = ?1", [&org.id])?;
+        tx.execute("DELETE FROM orgs WHERE id = ?1", [&org.id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn members(&self, org_id: &str) -> Res<Vec<Member>> {
+        let cols = USER_COLS.split(", ").map(|c| format!("u.{c}")).collect::<Vec<_>>().join(", ");
+        let mut st = self.conn.prepare(&format!("SELECT {cols}, m.role, m.created FROM org_members m JOIN users u ON u.id = m.user_id WHERE m.org_id = ?1 ORDER BY u.display_name COLLATE NOCASE"))?;
+        let v = st
+            .query_map([org_id], |r| Ok(Member { user: user_row(r)?, role: OrgRole::parse(&r.get::<_, String>(10)?).unwrap_or(OrgRole::Member), created: r.get(11)? }))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(v)
+    }
+
+    pub fn member_role(&self, org_id: &str, user_id: &str) -> Res<Option<OrgRole>> {
+        let r: Option<String> = self.conn.query_row("SELECT role FROM org_members WHERE org_id = ?1 AND user_id = ?2", params![org_id, user_id], |r| r.get(0)).optional()?;
+        Ok(r.and_then(|r| OrgRole::parse(&r)))
+    }
+
+    /// Adds a person to the organisation, or changes their role. True when added.
+    pub fn set_member(&self, org: &Org, user: &User, role: OrgRole, by: &str) -> Res<bool> {
+        if user.org_id.is_some() {
+            return Err(StoreError::Invalid("Organisations can't be members.".into()));
+        }
+        let existed = self.member_role(&org.id, &user.id)?.is_some();
+        self.conn.execute(
+            "INSERT INTO org_members (org_id, user_id, role, added_by, created) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(org_id, user_id) DO UPDATE SET role = excluded.role",
+            params![org.id, user.id, role.as_str(), by, now()],
+        )?;
+        Ok(!existed)
+    }
+
+    pub fn remove_member(&self, org_id: &str, user_id: &str) -> Res<bool> {
+        Ok(self.conn.execute("DELETE FROM org_members WHERE org_id = ?1 AND user_id = ?2", params![org_id, user_id])? > 0)
+    }
+
+    // ------------------------------------------------------------------
+    // Invites
+    // ------------------------------------------------------------------
+
+    /// A one-time invite to join `org` (valid `INVITE_DAYS`); returns it with its secret token
+    /// (shown once; only its SHA-256 is stored).
+    pub fn create_invite(&self, org: &Org, email: &str, role: OrgRole, by: &str) -> Res<(Invite, String)> {
+        let email: String = email.trim().chars().filter(|c| !c.is_control()).take(254).collect();
+        let token = util::new_token();
+        let id = util::new_id();
+        let t = now();
+        self.conn.execute(
+            "INSERT INTO invites (id, token_hash, email, org_id, role, expires, created, created_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![id, util::token_hash(&token), email, org.id, role.as_str(), t + INVITE_DAYS * 86400, t, by],
+        )?;
+        Ok((self.invite(&id)?.ok_or(StoreError::NotFound)?, token))
+    }
+
+    pub fn invite(&self, id: &str) -> Res<Option<Invite>> {
+        Ok(self.conn.query_row(&format!("SELECT {INVITE_COLS} FROM invites WHERE id = ?1"), [id], invite_row).optional()?)
+    }
+
+    /// An unused, unexpired invite.
+    pub fn invite_by_token(&self, token: &str) -> Res<Option<Invite>> {
+        if token.is_empty() || token.len() > 200 {
+            return Ok(None);
+        }
+        let hash = util::token_hash(token);
+        let row: Option<(Vec<u8>, Invite)> = self
+            .conn
+            .query_row(&format!("SELECT token_hash, {INVITE_COLS} FROM invites WHERE token_hash = ?1"), [&hash], |r| {
+                Ok((r.get(0)?, Invite {
+                    id: r.get(1)?,
+                    email: r.get(2)?,
+                    org_id: r.get(3)?,
+                    role: OrgRole::parse(&r.get::<_, String>(4)?).unwrap_or(OrgRole::Member),
+                    expires: r.get(5)?,
+                    created: r.get(6)?,
+                    created_by: r.get(7)?,
+                    used: r.get(8)?,
+                }))
+            })
+            .optional()?;
+        Ok(row.filter(|(h, i)| util::ct_eq(h, &hash) && i.used == 0 && i.expires > now()).map(|(_, i)| i))
+    }
+
+    /// Open (unused, unexpired) invites of an organisation.
+    pub fn invites_of(&self, org_id: &str) -> Res<Vec<Invite>> {
+        let mut st = self.conn.prepare(&format!("SELECT {INVITE_COLS} FROM invites WHERE org_id = ?1 AND used = 0 AND expires > ?2 ORDER BY created DESC"))?;
+        let v = st.query_map(params![org_id, now()], invite_row)?.collect::<Result<Vec<_>, _>>()?;
+        Ok(v)
+    }
+
+    pub fn delete_invite(&self, id: &str) -> Res<bool> {
+        Ok(self.conn.execute("DELETE FROM invites WHERE id = ?1", [id])? > 0)
+    }
+
+    /// Whether the person who made an invite may still add people with its role: the server
+    /// administrator, or an owner/admin of the organisation (an owner for owner invites).
+    pub fn invite_still_authorised(&self, inv: &Invite) -> Res<bool> {
+        let Some(creator) = self.user_by_id(&inv.created_by)? else { return Ok(false) };
+        if creator.disabled || creator.org_id.is_some() {
+            return Ok(false);
+        }
+        if creator.is_admin {
+            return Ok(true);
+        }
+        Ok(match self.member_role(&inv.org_id, &creator.id)? {
+            Some(OrgRole::Owner) => true,
+            Some(OrgRole::Admin) => inv.role != OrgRole::Owner,
+            _ => false,
+        })
+    }
+
+    /// Uses an invite: creates the account (the password was checked against the policy and
+    /// hashed by the caller) and the membership, in one transaction. An invite works once, and
+    /// only while whoever made it may still add people; a failed attempt (username taken)
+    /// leaves it usable.
+    pub fn accept_invite(&self, token: &str, username: &str, display_name: &str, pw_hash: &str) -> Res<(User, Org)> {
+        let inv = self.invite_by_token(token)?.ok_or(StoreError::NotFound)?;
+        let org = self.org(&inv.org_id)?.ok_or(StoreError::NotFound)?;
+        if !self.invite_still_authorised(&inv)? {
+            return Err(StoreError::Forbidden("This invite is no longer valid (whoever sent it can't add people any more). Ask for a new one.".into()));
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        if self.conn.execute("UPDATE invites SET used = ?1 WHERE id = ?2 AND used = 0", params![now(), inv.id])? != 1 {
+            return Err(StoreError::NotFound);
+        }
+        let id = self.insert_account(username, display_name, &inv.email, pw_hash, false, false)?;
+        self.conn.execute("UPDATE invites SET used_by = ?1 WHERE id = ?2", params![id, inv.id])?;
+        self.conn.execute(
+            "INSERT INTO org_members (org_id, user_id, role, added_by, created) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![org.id, id, inv.role.as_str(), inv.created_by, now()],
+        )?;
+        tx.commit()?;
+        Ok((self.user_by_id(&id)?.ok_or(StoreError::NotFound)?, org))
+    }
+
+    // ------------------------------------------------------------------
+    // Storage use
+    // ------------------------------------------------------------------
+
+    /// Per owning account (a person or an organisation's account): files, kept versions and
+    /// their bytes, trash included.
+    pub fn usage(&self) -> Res<Vec<(String, Usage)>> {
+        let mut st = self.conn.prepare(
+            "SELECT i.owner_id, COUNT(DISTINCT i.id), COUNT(v.version), COALESCE(SUM(v.size), 0)
+             FROM items i JOIN versions v ON v.item_id = i.id WHERE i.kind = 'file' GROUP BY i.owner_id",
+        )?;
+        let v = st.query_map([], |r| Ok((r.get(0)?, Usage { files: r.get(1)?, versions: r.get(2)?, bytes: r.get(3)? })))?.collect::<Result<Vec<_>, _>>()?;
+        Ok(v)
+    }
+
+    pub fn usage_of(&self, owner_id: &str) -> Res<Usage> {
+        Ok(self.usage()?.into_iter().find(|(o, _)| o == owner_id).map(|(_, u)| u).unwrap_or_default())
+    }
+
+    // ------------------------------------------------------------------
     // Share links
     // ------------------------------------------------------------------
 
     /// Creates a link; returns it with its secret token (shown once).
-    pub fn create_link(&self, item: &Item, role: Role, expires: Option<i64>, password: Option<&str>, by: &str) -> Res<(Link, String)> {
+    /// `pw_hash`: the hash of the link's password, if it has one (`util::hash_password`).
+    pub fn create_link(&self, item: &Item, role: Role, expires: Option<i64>, pw_hash: Option<&str>, by: &str) -> Res<(Link, String)> {
         let token = util::new_token();
         let id = util::new_id();
-        let pw = match password.filter(|p| !p.is_empty()) {
-            Some(p) => {
-                if p.len() > 1024 {
-                    return Err(StoreError::Invalid("The password is too long.".into()));
-                }
-                Some(util::hash_password(p))
-            }
-            None => None,
-        };
+        let pw = pw_hash;
         self.conn.execute(
             "INSERT INTO links (id, token_hash, item_id, role, expires, pw_hash, created, created_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![id, util::token_hash(&token), item.id, role.as_str(), expires, pw, now(), by],
@@ -1189,5 +1892,140 @@ mod tests {
         // Keep 6, 5 (newest), 1 and 4 (first of each day).
         assert_eq!(doomed, vec![2, 3]);
         assert!(versions_to_prune(&all, 10).is_empty());
+    }
+
+    fn temp() -> PathBuf {
+        let d = std::env::temp_dir().join(format!("fo-store-test-{}", util::new_id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn user_of(s: &Store, name: &str) -> Principal {
+        Principal::User { user: s.user_by_name(name).unwrap().unwrap(), token_id: 0 }
+    }
+
+    /// A database written by the server before organisations existed (schema 0, with data)
+    /// is migrated in place: grants survive as user grants, and opening it again changes nothing.
+    #[test]
+    fn migrates_a_database_with_the_old_schema() {
+        let dir = temp();
+        let db = dir.join("freedomoffice.db");
+        {
+            let c = Connection::open(&db).unwrap();
+            c.execute_batch(SCHEMA_V0).unwrap();
+            let h = util::hash_password("old-password-123");
+            for (id, name, root) in [("a0", "alice", "ra"), ("b0", "bob", "rb")] {
+                c.execute("INSERT INTO users (id, username, display_name, pw_hash, created, root_id) VALUES (?1, ?2, ?2, ?3, 1, ?4)", params![id, name, h, root]).unwrap();
+                c.execute("INSERT INTO items (id, parent_id, name, kind, owner_id, modified, modified_by, created) VALUES (?1, NULL, 'My files', 'folder', ?2, 1, ?2, 1)", params![root, id]).unwrap();
+            }
+            let (folder, file) = ("f".repeat(32), "e".repeat(32));
+            c.execute("INSERT INTO items (id, parent_id, name, kind, owner_id, modified, modified_by, created) VALUES (?1, 'ra', 'Team', 'folder', 'a0', 1, 'a0', 1)", [&folder]).unwrap();
+            c.execute("INSERT INTO items (id, parent_id, name, kind, owner_id, version, modified, modified_by, created) VALUES (?1, ?2, 'Plan.xlsx', 'file', 'a0', 1, 1, 'a0', 1)", params![file, folder]).unwrap();
+            c.execute("INSERT INTO versions (item_id, version, size, hash, modified, modified_by) VALUES (?1, 1, 42, 'h', 1, 'a0')", [&file]).unwrap();
+            c.execute("INSERT INTO permissions (item_id, user_id, role, granted_by, created) VALUES (?1, 'b0', 'edit', 'a0', 1)", [&folder]).unwrap();
+            assert_eq!(c.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        }
+        for _ in 0..2 {
+            let s = Store::open(&db, &dir.join("files"), 25).unwrap();
+            assert_eq!(s.conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), SCHEMA_VERSION);
+            let file = s.item(&"e".repeat(32)).unwrap().unwrap();
+            assert_eq!(s.role(&user_of(&s, "bob"), &file, false).unwrap(), Some(Role::Edit), "the old grant still works");
+            assert_eq!(s.role(&user_of(&s, "alice"), &file, false).unwrap(), Some(Role::Owner));
+            let g = s.grants(&file).unwrap();
+            assert_eq!((g.len(), g[0].user.username.as_str(), g[0].inherited_from.as_ref().map(|i| i.name.as_str())), (1, "bob", Some("Team")));
+            let bob = s.user_by_name("bob").unwrap().unwrap();
+            assert!(!bob.must_change_password && bob.org_id.is_none());
+            assert_eq!(s.usage_of("a0").unwrap(), Usage { files: 1, versions: 1, bytes: 42 });
+        }
+        // The new tables work on the migrated database.
+        let s = Store::open(&db, &dir.join("files"), 25).unwrap();
+        let org = s.create_org("Family", "a0").unwrap();
+        assert_eq!(s.orgs().unwrap().len(), 1);
+        assert!(s.users().unwrap().iter().all(|u| u.org_id.is_none()), "organisation accounts aren't people");
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = org;
+    }
+
+    /// SPEC §3: org admins own the org's files, members get the member role, grants to a whole
+    /// organisation reach its members, and the server administrator sees nothing implicitly.
+    #[test]
+    fn roles_from_organisations() {
+        let dir = temp();
+        let s = Store::open(&dir.join("db"), &dir.join("files"), 25).unwrap();
+        let pw = "test-password-1";
+        let admin = s.create_user("root", "", "", pw, true).unwrap();
+        let (ann, ben, cat) = (s.create_user("ann", "", "", pw, false).unwrap(), s.create_user("ben", "", "", pw, false).unwrap(), s.create_user("cat", "", "", pw, false).unwrap());
+        let org = s.create_org("Team", &admin.id).unwrap();
+        assert!(s.create_org("team", &admin.id).is_err(), "names are unique, ignoring case");
+        let folder = s.create_folder(&org.root_id, "Docs", &ann.id).unwrap();
+        let (file, _) = s.create_file(&folder.id, "Plan.xlsx", b"x", &ann.id, OnConflict::Fail).unwrap();
+        assert_eq!(file.owner_id, org.account_id, "files in the org folder belong to the org");
+        let p = |u: &User| Principal::User { user: u.clone(), token_id: 0 };
+        assert_eq!(s.role(&p(&admin), &file, false).unwrap(), None, "no implicit access for the server admin");
+        s.set_member(&org, &ann, OrgRole::Admin, &admin.id).unwrap();
+        s.set_member(&org, &ben, OrgRole::Member, &admin.id).unwrap();
+        assert_eq!(s.role(&p(&ann), &file, false).unwrap(), Some(Role::Owner));
+        assert_eq!(s.role(&p(&ben), &file, false).unwrap(), Some(Role::Edit));
+        s.set_org_member_role(&org, Role::View).unwrap();
+        assert_eq!(s.role(&p(&ben), &file, false).unwrap(), Some(Role::View));
+        // A personal grant raises it again.
+        s.grant(&folder, &ben, Role::Edit, &ann.id).unwrap();
+        assert_eq!(s.role(&p(&ben), &file, false).unwrap(), Some(Role::Edit));
+        // Grants to an organisation reach its members.
+        let (mine, _) = s.create_file(&cat.root_id, "Cat.xlsx", b"c", &cat.id, OnConflict::Fail).unwrap();
+        assert_eq!(s.role(&p(&ben), &mine, false).unwrap(), None);
+        s.grant_org(&mine, &org, Role::View, &cat.id).unwrap();
+        assert_eq!(s.role(&p(&ben), &mine, false).unwrap(), Some(Role::View));
+        assert_eq!(s.shared_with(&p(&ben)).unwrap().len(), 2);
+        assert_eq!(s.org_grants(&mine).unwrap()[0].org.name, "Team");
+        s.remove_member(&org.id, &ben.id).unwrap();
+        assert_eq!(s.role(&p(&ben), &mine, false).unwrap(), None);
+        assert_eq!(s.role(&p(&ben), &file, false).unwrap(), Some(Role::Edit), "the personal grant stays");
+        assert!(s.grant(&file, &s.user_by_id(&org.account_id).unwrap().unwrap(), Role::Edit, &ann.id).is_err());
+        // Deleting needs an empty folder.
+        assert!(s.delete_org(&org).is_err());
+        s.trash(&folder, &ann.id).unwrap();
+        assert_eq!(s.trash_of(&ann.id).unwrap().len(), 1, "org admins see the org's trash");
+        s.delete_org(&org).unwrap();
+        assert!(s.org(&org.id).unwrap().is_none());
+        let trashed = s.item(&folder.id).unwrap().unwrap();
+        assert!(s.restore(&trashed).is_err(), "nothing comes back into a deleted organisation");
+        let account = s.user_by_id(&org.account_id).unwrap().unwrap();
+        assert!(s.grant(&mine, &account, Role::View, &cat.id).unwrap_err().to_string().contains("organisation"));
+        assert_eq!(s.role(&p(&ann), &file, true).unwrap(), None);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invites_work_once() {
+        let dir = temp();
+        let s = Store::open(&dir.join("db"), &dir.join("files"), 25).unwrap();
+        let org = s.create_org("Club", "x").unwrap();
+        let boss = s.create_user("boss", "", "", "test-password-1", false).unwrap();
+        s.set_member(&org, &boss, OrgRole::Admin, "x").unwrap();
+        let (inv, token) = s.create_invite(&org, "new@example.test", OrgRole::Member, &boss.id).unwrap();
+        // An admin's owner invite, or any invite after its maker lost the right to add people, is void.
+        let (_, owner_token) = s.create_invite(&org, "", OrgRole::Owner, &boss.id).unwrap();
+        let h0 = util::hash_password("test-password-1");
+        assert!(matches!(s.accept_invite(&owner_token, "sneaky", "", &h0), Err(StoreError::Forbidden(_))));
+        assert_eq!(s.invite_by_token(&token).unwrap().unwrap().id, inv.id);
+        let h = util::hash_password("test-password-1");
+        s.create_user("taken", "", "", "test-password-1", false).unwrap();
+        assert!(s.accept_invite(&token, "taken", "", &h).is_err(), "username taken");
+        assert!(s.invite_by_token(&token).unwrap().is_some(), "still usable after a failed attempt");
+        assert!(s.user_by_name("taken").unwrap().is_some());
+        let (u, o) = s.accept_invite(&token, "newbie", "New Bie", &h).unwrap();
+        assert_eq!((u.email.as_str(), o.id.as_str()), ("new@example.test", org.id.as_str()));
+        assert_eq!(s.member_role(&org.id, &u.id).unwrap(), Some(OrgRole::Member));
+        assert!(s.invite_by_token(&token).unwrap().is_none());
+        assert!(s.accept_invite(&token, "other", "", &h).is_err());
+        assert!(s.user_by_name("other").unwrap().is_none(), "nothing half-created");
+        let (_, t2) = s.create_invite(&org, "", OrgRole::Member, &boss.id).unwrap();
+        s.set_member(&org, &boss, OrgRole::Member, "x").unwrap();
+        assert!(matches!(s.accept_invite(&t2, "late", "", &h), Err(StoreError::Forbidden(_))));
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

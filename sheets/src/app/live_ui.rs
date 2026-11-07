@@ -678,6 +678,7 @@ impl App {
                         Some(VIEW_ONLY_NOW.to_string())
                     }
                     (Some(cosync::close::INVALID), _) => Some(format!("The server refused a change ({reason}). Reopen the workbook.")),
+                    (Some(cosync::close::REVOKED), _) => Some(reason.clone()),
                     _ => None,
                 };
                 if let Some(msg) = fatal {
@@ -771,6 +772,12 @@ impl App {
             }
             ServerMsg::Reload => self.live_reload(),
             ServerMsg::Error { message } => self.status = Some(message),
+            // Full handling (read-only switch, saving unsent changes as a copy) comes with the
+            // organisations work in Sheets; for now say what happened.
+            ServerMsg::Role { role } => {
+                self.status = Some(if role == "view" { "Your access to this workbook was changed to view-only.".into() } else { "You can edit this workbook again.".into() });
+            }
+            ServerMsg::Revoked { reason } => self.status = Some(reason),
         }
     }
 

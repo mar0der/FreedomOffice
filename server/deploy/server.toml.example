@@ -40,3 +40,7 @@ versions_to_keep = 25
 
 # How long a share link stays usable after it was opened, in hours.
 link_access_hours = 12
+
+# Share links ("anyone with the link"). false switches them off: none can be created or
+# opened, and sessions opened through one end.
+allow_links = true
