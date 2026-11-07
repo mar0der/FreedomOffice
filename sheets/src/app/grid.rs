@@ -1249,15 +1249,6 @@ impl App {
             }
         }
 
-        // Comment threads: a purple marker, bigger than a note's and on top of it
-        for t in &self.wb.sheets[si].threads {
-            if let (Some((top, _)), Some((_, rx))) = (lay.row_span(t.r), lay.col_span(t.c)) {
-                let s = 9.0 * z.max(0.7);
-                let col = if t.done { super::comments_ui::MARKER.gamma_multiply(0.45) } else { super::comments_ui::MARKER };
-                cp.add(egui::Shape::convex_polygon(vec![Pos2::new(rx - s - 1.0, top), Pos2::new(rx - 1.0, top), Pos2::new(rx - 1.0, top + s)], col, Stroke::NONE));
-            }
-        }
-
         // Page breaks (after Print Preview / Page Setup, like the desktop app)
         self.paint_page_breaks(&cp, lay);
 
@@ -1427,6 +1418,15 @@ impl App {
 
         // Other people's selections (live co-editing)
         self.paint_presence(&cp, lay, ui.input(|i| i.pointer.hover_pos()));
+
+        // Comment threads: a purple marker, bigger than a note's and on top of it
+        for t in &self.wb.sheets[si].threads {
+            if let (Some((top, _)), Some((_, rx))) = (lay.row_span(t.r), lay.col_span(t.c)) {
+                let s = 9.0 * z.max(0.7);
+                let col = if t.done { super::comments_ui::MARKER.gamma_multiply(0.45) } else { super::comments_ui::MARKER };
+                cp.add(egui::Shape::convex_polygon(vec![Pos2::new(rx - s - 1.0, top), Pos2::new(rx - 1.0, top), Pos2::new(rx - 1.0, top + s)], col, Stroke::NONE));
+            }
+        }
 
         // In-cell editor
         self.paint_editor(ui, lay);

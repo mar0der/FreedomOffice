@@ -621,11 +621,13 @@ impl App {
 
 /// A multi-line box with @mention suggestions below it; true on Ctrl+Enter.
 fn input_box(ui: &mut egui::Ui, id: &str, text: &mut String, hint: &str, members: &[(String, String)], focus: bool) -> bool {
-    let out = egui::TextEdit::multiline(text).id_salt(id).hint_text(hint).desired_rows(2).desired_width(f32::INFINITY).show(ui);
+    // Ctrl+Enter is taken before the box sees it (the box would turn it into a new line).
+    let eid = ui.make_persistent_id(id);
+    let submit = ui.memory(|m| m.has_focus(eid)) && ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter));
+    let out = egui::TextEdit::multiline(text).id(eid).hint_text(hint).desired_rows(2).desired_width(f32::INFINITY).show(ui);
     if focus {
         out.response.request_focus();
     }
-    let submit = out.response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) && (i.modifiers.ctrl || i.modifiers.command));
     if out.response.has_focus() || out.response.lost_focus() || focus {
         if let Some((at, list)) = suggestions(text, members) {
             let mut pick: Option<String> = None;

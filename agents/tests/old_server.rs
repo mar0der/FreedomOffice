@@ -135,7 +135,8 @@ fn fsheets_works_against_the_real_pre_m2_server() {
     // The soak, leaving a backlog without snapshot first so that joins race the snapshot.
     let item = workbook(&api, "Proto1-soak.xlsx");
     for seed in [3u64, 9, 17] {
-        let cfg = soak::Config { clients: 3, edits: 120, seed, ..Default::default() };
+        // (No comment actions: the old server has none, and the same random edits as before are made.)
+        let cfg = soak::Config { clients: 3, edits: 120, seed, comment_pct: 0.0, ..Default::default() };
         let report = soak::run(std::slice::from_ref(&api), &item, &cfg).unwrap();
         report.print();
         assert!(report.converged(), "{:?}", report.difference);

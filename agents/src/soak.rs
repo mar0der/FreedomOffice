@@ -305,7 +305,7 @@ fn client(api: Api, item: String, cfg: Config, idx: usize, jdir: Option<PathBuf>
             rng.below(cfg.hot_rows as u64) as u32,
             rng.below(cfg.hot_cols as u64) as u32,
         );
-        if rng.chance(cfg.comment_pct) {
+        if cfg.comment_pct > 0.0 && rng.chance(cfg.comment_pct) {
             if comment_action(&mut live, &mut rng, sheet, idx, i, (r, c)) {
                 comments += 1;
             }
