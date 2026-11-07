@@ -274,10 +274,8 @@ pub fn run(apis: &[Api], item: &str, cfg: &Config) -> Result<Report, String> {
         let diff = lives[0].differences(l);
         if !diff.is_empty() {
             clients_identical = false;
-            difference = difference.or_else(|| {
-                diff.first()
-                    .map(|d| format!("client 0 vs client {i}: {d}"))
-            });
+            difference =
+                difference.or_else(|| diff.first().map(|d| format!("client 0 vs client {i}: {d}")));
         }
     }
     let joiner_diff = lives[0].differences(&joiner);

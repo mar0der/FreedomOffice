@@ -34,7 +34,9 @@ pub struct Mcp {
 }
 
 fn text_of(v: &Json) -> String {
-    v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())
+    v.as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| v.to_string())
 }
 
 fn str_arg<'a>(a: &'a Json, k: &str) -> Option<&'a str> {
@@ -48,9 +50,10 @@ fn need_str<'a>(a: &'a Json, k: &str) -> Result<&'a str, String> {
 /// The grid of a write: an array of rows, a single row, or a single value.
 fn grid_of(v: &Json) -> Result<Vec<Vec<Json>>, String> {
     match v {
-        Json::Array(rows) if rows.iter().all(Json::is_array) && !rows.is_empty() => {
-            Ok(rows.iter().map(|r| r.as_array().cloned().unwrap_or_default()).collect())
-        }
+        Json::Array(rows) if rows.iter().all(Json::is_array) && !rows.is_empty() => Ok(rows
+            .iter()
+            .map(|r| r.as_array().cloned().unwrap_or_default())
+            .collect()),
         Json::Array(row) => Ok(vec![row.clone()]),
         Json::Null => Err("`values` is required: a 2D array like [[1,2],[\"=A1+B1\",3]].".into()),
         one => Ok(vec![vec![one.clone()]]),
@@ -59,7 +62,12 @@ fn grid_of(v: &Json) -> Result<Vec<Vec<Json>>, String> {
 
 impl Mcp {
     pub fn new(api: Api) -> Mcp {
-        Mcp { api, sessions: BTreeMap::new(), current: None, last_reconnect: Instant::now() }
+        Mcp {
+            api,
+            sessions: BTreeMap::new(),
+            current: None,
+            last_reconnect: Instant::now(),
+        }
     }
 
     /// Keeps joined sessions alive: receives what others did, answers snapshot requests,
@@ -68,19 +76,29 @@ impl Mcp {
         let retry = self.last_reconnect.elapsed() > Duration::from_secs(2);
         for (item, l) in self.sessions.iter_mut() {
             l.pump(Duration::from_millis(1));
-            if !l.connected() && l.stopped.is_none() && retry {
-                if let Err(e) = l.connect() {
-                    eprintln!("fsheets: reconnecting to {item}: {e}");
-                }
+            if !l.connected()
+                && l.stopped.is_none()
+                && retry
+                && let Err(e) = l.connect()
+            {
+                eprintln!("fsheets: reconnecting to {item}: {e}");
             }
         }
         if retry {
             self.last_reconnect = Instant::now();
         }
-        let gone: Vec<String> = self.sessions.iter().filter(|(_, l)| l.stopped.is_some()).map(|(i, _)| i.clone()).collect();
+        let gone: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|(_, l)| l.stopped.is_some())
+            .map(|(i, _)| i.clone())
+            .collect();
         for i in gone {
             if let Some(l) = self.sessions.remove(&i) {
-                eprintln!("fsheets: session on {i} ended: {}", l.stopped.clone().unwrap_or_default());
+                eprintln!(
+                    "fsheets: session on {i} ended: {}",
+                    l.stopped.clone().unwrap_or_default()
+                );
             }
         }
     }
@@ -94,7 +112,12 @@ impl Mcp {
 
     /// Runs `f` on the joined session, or on a session joined for the moment it takes. A write
     /// without a joined session saves a snapshot (a version) before it leaves.
-    fn with_live<T>(&mut self, item: &str, write: bool, f: impl FnOnce(&mut Live) -> Result<T, String>) -> Result<(T, Option<i64>), String> {
+    fn with_live<T>(
+        &mut self,
+        item: &str,
+        write: bool,
+        f: impl FnOnce(&mut Live) -> Result<T, String>,
+    ) -> Result<(T, Option<i64>), String> {
         self.tick();
         if let Some(l) = self.sessions.get_mut(item) {
             if !l.connected() {
@@ -110,10 +133,17 @@ impl Mcp {
         // The saved file lacks what was edited live since; joining replays it.
         let mut l = Live::open(&self.api, item, true)?;
         if !l.wait_synced(Duration::from_secs(20)) {
-            return Err(l.stopped.clone().unwrap_or_else(|| "Couldn't join the live session.".into()));
+            return Err(l
+                .stopped
+                .clone()
+                .unwrap_or_else(|| "Couldn't join the live session.".into()));
         }
         let out = f(&mut l);
-        let version = if write && out.is_ok() { work::settle(&mut l) } else { Ok(None) };
+        let version = if write && out.is_ok() {
+            work::settle(&mut l)
+        } else {
+            Ok(None)
+        };
         l.disconnect();
         Ok((out?, version?))
     }
@@ -122,8 +152,20 @@ impl Mcp {
         match name {
             "list_files" => work::list_files(&self.api, str_arg(a, "folder")),
             "create_file" => {
-                let sheets: Vec<String> = a["sheets"].as_array().map(|v| v.iter().filter_map(|s| s.as_str().map(str::to_string)).collect()).unwrap_or_default();
-                let it = work::create_file(&self.api, need_str(a, "folder")?, need_str(a, "name")?, &sheets)?;
+                let sheets: Vec<String> = a["sheets"]
+                    .as_array()
+                    .map(|v| {
+                        v.iter()
+                            .filter_map(|s| s.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let it = work::create_file(
+                    &self.api,
+                    need_str(a, "folder")?,
+                    need_str(a, "name")?,
+                    &sheets,
+                )?;
                 self.current = Some(it.id.clone());
                 Ok(work::item_json(&it))
             }
@@ -135,43 +177,58 @@ impl Mcp {
                 }
                 let (sheets, _) = self.with_live(&item, false, |l| Ok(work::list_sheets(l)))?;
                 self.current = Some(item.clone());
-                Ok(json!({ "file": work::item_json(&meta), "joined": self.sessions.contains_key(&item), "sheets": sheets["sheets"] }))
+                Ok(
+                    json!({ "file": work::item_json(&meta), "joined": self.sessions.contains_key(&item), "sheets": sheets["sheets"] }),
+                )
             }
             "list_sheets" => {
                 let item = self.item(a)?;
-                Ok(self.with_live(&item, false, |l| Ok(work::list_sheets(l)))?.0)
+                Ok(self
+                    .with_live(&item, false, |l| Ok(work::list_sheets(l)))?
+                    .0)
             }
             "read_range" => {
                 let item = self.item(a)?;
                 let (sheet, range) = (str_arg(a, "sheet"), str_arg(a, "range"));
                 let display = a["display"].as_bool().unwrap_or(false);
-                Ok(self.with_live(&item, false, |l| work::read_range(l, sheet, range, display))?.0)
+                Ok(self
+                    .with_live(&item, false, |l| work::read_range(l, sheet, range, display))?
+                    .0)
             }
             "write_range" => {
                 let item = self.item(a)?;
                 let grid = grid_of(&a["values"])?;
                 let (sheet, range) = (str_arg(a, "sheet"), need_str(a, "range")?);
-                let (mut out, version) = self.with_live(&item, true, |l| work::write_range(l, sheet, range, &grid))?;
+                let (mut out, version) =
+                    self.with_live(&item, true, |l| work::write_range(l, sheet, range, &grid))?;
                 self.note_saved(&item, &mut out, version);
                 Ok(out)
             }
             "add_sheet" => {
                 let item = self.item(a)?;
                 let name = need_str(a, "name")?;
-                let (mut out, version) = self.with_live(&item, true, |l| work::add_sheet(l, name))?;
+                let (mut out, version) =
+                    self.with_live(&item, true, |l| work::add_sheet(l, name))?;
                 self.note_saved(&item, &mut out, version);
                 Ok(out)
             }
             "evaluate" => {
                 let item = self.item(a)?;
                 let (sheet, src) = (str_arg(a, "sheet"), need_str(a, "formula")?);
-                Ok(self.with_live(&item, false, |l| work::evaluate(l, sheet, src))?.0)
+                Ok(self
+                    .with_live(&item, false, |l| work::evaluate(l, sheet, src))?
+                    .0)
             }
             "export" => {
                 let item = self.item(a)?;
                 let path = PathBuf::from(need_str(a, "path")?);
-                let (sheet, over) = (str_arg(a, "sheet"), a["overwrite"].as_bool().unwrap_or(false));
-                Ok(self.with_live(&item, false, |l| work::export(l, &path, sheet, over))?.0)
+                let (sheet, over) = (
+                    str_arg(a, "sheet"),
+                    a["overwrite"].as_bool().unwrap_or(false),
+                );
+                Ok(self
+                    .with_live(&item, false, |l| work::export(l, &path, sheet, over))?
+                    .0)
             }
             "list_versions" => work::versions(&self.api, &self.item(a)?),
             "join_session" => {
@@ -180,7 +237,10 @@ impl Mcp {
                 if !self.sessions.contains_key(&item) {
                     let mut l = Live::open(&self.api, &item, true)?;
                     if !l.wait_synced(Duration::from_secs(20)) {
-                        return Err(l.stopped.clone().unwrap_or_else(|| "Couldn't join the live session.".into()));
+                        return Err(l
+                            .stopped
+                            .clone()
+                            .unwrap_or_else(|| "Couldn't join the live session.".into()));
                     }
                     self.sessions.insert(item.clone(), l);
                 }
@@ -188,13 +248,19 @@ impl Mcp {
                 match str_arg(a, "range") {
                     Some(r) => {
                         let p = crate::a1::parse_ref(r)?;
-                        let idx = work::find_sheet(&l.wb, p.sheet.as_deref().or(str_arg(a, "sheet")))?;
+                        let idx =
+                            work::find_sheet(&l.wb, p.sheet.as_deref().or(str_arg(a, "sheet")))?;
                         let uid = l.wb.sheets[idx].uid;
                         work::show_presence(l, uid, p.range, false);
                     }
                     None => {
                         if let Some(first) = l.first_sheet() {
-                            work::show_presence(l, first, freedom_sheets::model::Range::cell(0, 0), false);
+                            work::show_presence(
+                                l,
+                                first,
+                                freedom_sheets::model::Range::cell(0, 0),
+                                false,
+                            );
                         }
                     }
                 }
@@ -206,7 +272,10 @@ impl Mcp {
             }
             "leave_session" => {
                 let item = self.item(a)?;
-                let mut l = self.sessions.remove(&item).ok_or("There is no joined session for that item.")?;
+                let mut l = self
+                    .sessions
+                    .remove(&item)
+                    .ok_or("There is no joined session for that item.")?;
                 let saved = work::settle(&mut l);
                 l.disconnect();
                 let version = saved?;
@@ -233,7 +302,11 @@ impl Mcp {
 
     fn note_saved(&mut self, item: &str, out: &mut Json, version: Option<i64>) {
         let joined = self.sessions.contains_key(item);
-        out["session"] = json!(if joined { "joined: seen live by others; leave_session saves a version" } else { "one-off: joined, wrote, saved a version, left" });
+        out["session"] = json!(if joined {
+            "joined: seen live by others; leave_session saves a version"
+        } else {
+            "one-off: joined, wrote, saved a version, left"
+        });
         if let Some(v) = version {
             out["saved_version"] = json!(v);
         }
@@ -254,16 +327,27 @@ impl Mcp {
     pub fn handle(&mut self, msg: &Json) -> Option<Json> {
         let id = msg.get("id").cloned();
         let method = msg["method"].as_str().unwrap_or("");
-        let reply = |result: Json| id.clone().map(|id| json!({ "jsonrpc": "2.0", "id": id, "result": result }));
+        let reply = |result: Json| {
+            id.clone()
+                .map(|id| json!({ "jsonrpc": "2.0", "id": id, "result": result }))
+        };
         let fail = |code: i64, text: &str| json!({ "jsonrpc": "2.0", "id": id.clone().unwrap_or(Json::Null), "error": { "code": code, "message": text } });
         if !msg.is_object() || msg["jsonrpc"] != "2.0" || method.is_empty() {
             // A response from the client (to a request we never send) or garbage.
-            return if msg.get("result").is_some() || msg.get("error").is_some() { None } else { Some(fail(-32600, "Invalid request")) };
+            return if msg.get("result").is_some() || msg.get("error").is_some() {
+                None
+            } else {
+                Some(fail(-32600, "Invalid request"))
+            };
         }
         match method {
             "initialize" => {
                 let want = msg["params"]["protocolVersion"].as_str().unwrap_or(LATEST);
-                let version = SUPPORTED.iter().find(|v| **v == want).copied().unwrap_or(LATEST);
+                let version = SUPPORTED
+                    .iter()
+                    .find(|v| **v == want)
+                    .copied()
+                    .unwrap_or(LATEST);
                 reply(json!({
                     "protocolVersion": version,
                     "capabilities": { "tools": { "listChanged": false } },
@@ -275,28 +359,43 @@ impl Mcp {
             "tools/list" => reply(json!({ "tools": tools() })),
             "tools/call" => {
                 let name = msg["params"]["name"].as_str().unwrap_or("");
-                if !tools().as_array().is_some_and(|t| t.iter().any(|x| x["name"] == name)) {
-                    return id.as_ref().map(|_| fail(-32602, &format!("Unknown tool: {name}")));
+                if !tools()
+                    .as_array()
+                    .is_some_and(|t| t.iter().any(|x| x["name"] == name))
+                {
+                    return id
+                        .as_ref()
+                        .map(|_| fail(-32602, &format!("Unknown tool: {name}")));
                 }
                 let args = match &msg["params"]["arguments"] {
                     Json::Null => json!({}),
                     a => a.clone(),
                 };
                 let result = match self.call(name, &args) {
-                    Ok(v) => json!({ "content": [{ "type": "text", "text": text_of(&v) }], "isError": false }),
-                    Err(e) => json!({ "content": [{ "type": "text", "text": e }], "isError": true }),
+                    Ok(v) => {
+                        json!({ "content": [{ "type": "text", "text": text_of(&v) }], "isError": false })
+                    }
+                    Err(e) => {
+                        json!({ "content": [{ "type": "text", "text": e }], "isError": true })
+                    }
                 };
                 reply(result)
             }
             m if m.starts_with("notifications/") => None,
-            _ => id.as_ref().map(|_| fail(-32601, &format!("Method not found: {method}"))),
+            _ => id
+                .as_ref()
+                .map(|_| fail(-32601, &format!("Method not found: {method}"))),
         }
     }
 }
 
 /// Serves requests from `input` until it ends, writing responses to `out`. While waiting for
 /// input the joined sessions are kept alive.
-pub fn serve(api: Api, input: impl BufRead + Send + 'static, mut out: impl Write) -> Result<(), String> {
+pub fn serve(
+    api: Api,
+    input: impl BufRead + Send + 'static,
+    mut out: impl Write,
+) -> Result<(), String> {
     let (tx, rx) = channel::<String>();
     std::thread::spawn(move || {
         for line in input.lines() {
@@ -313,15 +412,21 @@ pub fn serve(api: Api, input: impl BufRead + Send + 'static, mut out: impl Write
     });
     let mut mcp = Mcp::new(api);
     let mut send = |v: &Json| -> Result<(), String> {
-        writeln!(out, "{v}").and_then(|_| out.flush()).map_err(|e| e.to_string())
+        writeln!(out, "{v}")
+            .and_then(|_| out.flush())
+            .map_err(|e| e.to_string())
     };
     loop {
         match rx.recv_timeout(Duration::from_millis(250)) {
             Ok(line) => {
                 let resp = match serde_json::from_str::<Json>(&line) {
-                    Ok(Json::Array(_)) => Some(json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32600, "message": "Batches are not supported" } })),
+                    Ok(Json::Array(_)) => Some(
+                        json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32600, "message": "Batches are not supported" } }),
+                    ),
                     Ok(msg) => mcp.handle(&msg),
-                    Err(_) => Some(json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32700, "message": "Parse error" } })),
+                    Err(_) => Some(
+                        json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32700, "message": "Parse error" } }),
+                    ),
                 };
                 if let Some(r) = resp {
                     send(&r)?;
@@ -347,39 +452,83 @@ fn tools() -> Json {
     let item = json!({ "type": "string", "description": "File id from list_files. May be left out after open_file / join_session / create_file." });
     let sheet = json!({ "type": "string", "description": "Sheet name. Defaults to the first sheet (or the sheet named in the range, like Data!A1:B2)." });
     json!([
-        tool("list_files",
+        tool(
+            "list_files",
             "Without `folder`: where to start: My files (folder id), organisation folders, and files shared with you. With `folder`: the files and folders inside it.",
-            json!({ "folder": { "type": "string", "description": "Folder id." } }), &[]),
-        tool("open_file",
+            json!({ "folder": { "type": "string", "description": "Folder id." } }),
+            &[]
+        ),
+        tool(
+            "open_file",
             "Opens a workbook (does not join the live session) and lists its sheets with their used ranges. Makes it the default item.",
-            json!({ "item": item }), &["item"]),
-        tool("create_file",
+            json!({ "item": item }),
+            &["item"]
+        ),
+        tool(
+            "create_file",
             "Creates a new empty workbook (.xlsx) in a folder and makes it the default item.",
             json!({ "folder": { "type": "string", "description": "Folder id." }, "name": { "type": "string" }, "sheets": { "type": "array", "items": { "type": "string" }, "description": "Sheet names; default one sheet." } }),
-            &["folder", "name"]),
-        tool("list_sheets", "Sheets of a workbook with used ranges.", json!({ "item": item }), &[]),
-        tool("read_range",
+            &["folder", "name"]
+        ),
+        tool(
+            "list_sheets",
+            "Sheets of a workbook with used ranges.",
+            json!({ "item": item }),
+            &[]
+        ),
+        tool(
+            "read_range",
             "Reads cells. Returns calculated `values` (null = empty, errors as text like #DIV/0!) and `formulas` (the =formula text or null) as 2D arrays. Without `range` the whole used range. While joined it shows the range as this agent's selection.",
-            json!({ "item": item, "sheet": sheet, "range": { "type": "string", "description": "A1 notation: B7, A1:C5, A:C, 3:5, Data!A1:B2." }, "display": { "type": "boolean", "description": "Also return the text as formatted in the workbook." } }), &[]),
-        tool("write_range",
+            json!({ "item": item, "sheet": sheet, "range": { "type": "string", "description": "A1 notation: B7, A1:C5, A:C, 3:5, Data!A1:B2." }, "display": { "type": "boolean", "description": "Also return the text as formatted in the workbook." } }),
+            &[]
+        ),
+        tool(
+            "write_range",
             "Writes a 2D array starting at the top-left cell of `range` (a single cell, or a range of exactly the array's size). Strings starting with = are formulas, other strings are read as typed in a cell (\"12\" is a number, \"'12\" text), numbers and booleans as given, null clears. Cell formats are kept. Returns the calculated values. Nothing is written if any entry is invalid. Goes through the joined live session when there is one, otherwise joins briefly and saves a version.",
-            json!({ "item": item, "sheet": sheet, "range": { "type": "string" }, "values": { "type": "array", "items": { "type": "array" }, "description": "Rows of cells, e.g. [[1,2],[\"=A1+B1\",null]]." } }), &["range", "values"]),
-        tool("add_sheet", "Adds a sheet at the end.", json!({ "item": item, "name": { "type": "string" } }), &["name"]),
-        tool("evaluate",
+            json!({ "item": item, "sheet": sheet, "range": { "type": "string" }, "values": { "type": "array", "items": { "type": "array" }, "description": "Rows of cells, e.g. [[1,2],[\"=A1+B1\",null]]." } }),
+            &["range", "values"]
+        ),
+        tool(
+            "add_sheet",
+            "Adds a sheet at the end.",
+            json!({ "item": item, "name": { "type": "string" } }),
+            &["name"]
+        ),
+        tool(
+            "evaluate",
             "Calculates a formula against the workbook (as if typed in A1) with FreedomSheets' own engine, without changing anything.",
-            json!({ "item": item, "sheet": sheet, "formula": { "type": "string", "description": "e.g. =SUM(Budget!B2:B9)/COUNT(B2:B9)" } }), &["formula"]),
-        tool("export",
+            json!({ "item": item, "sheet": sheet, "formula": { "type": "string", "description": "e.g. =SUM(Budget!B2:B9)/COUNT(B2:B9)" } }),
+            &["formula"]
+        ),
+        tool(
+            "export",
             "Writes the workbook to a local file: .xlsx (all sheets) or .csv/.tsv (one sheet, as formatted). Refuses to replace an existing file unless overwrite is true.",
-            json!({ "item": item, "sheet": sheet, "path": { "type": "string", "description": "Local file path ending in .xlsx, .csv or .tsv." }, "overwrite": { "type": "boolean" } }), &["path"]),
-        tool("list_versions", "The version history of a file.", json!({ "item": item }), &[]),
-        tool("join_session",
+            json!({ "item": item, "sheet": sheet, "path": { "type": "string", "description": "Local file path ending in .xlsx, .csv or .tsv." }, "overwrite": { "type": "boolean" } }),
+            &["path"]
+        ),
+        tool(
+            "list_versions",
+            "The version history of a file.",
+            json!({ "item": item }),
+            &[]
+        ),
+        tool(
+            "join_session",
             "Joins the workbook's live session and stays connected, marked as an agent in the presence of the people editing. Edits then appear live for them. Optionally shows `range` as this agent's selection.",
-            json!({ "item": item, "sheet": sheet, "range": { "type": "string" } }), &[]),
-        tool("leave_session",
+            json!({ "item": item, "sheet": sheet, "range": { "type": "string" } }),
+            &[]
+        ),
+        tool(
+            "leave_session",
             "Leaves the live session. Changes are sent first and saved as a version.",
-            json!({ "item": item }), &[]),
-        tool("who_is_here",
+            json!({ "item": item }),
+            &[]
+        ),
+        tool(
+            "who_is_here",
             "Who has the workbook open, and the range each is working on. Works without a joined session.",
-            json!({ "item": item }), &[]),
+            json!({ "item": item }),
+            &[]
+        ),
     ])
 }

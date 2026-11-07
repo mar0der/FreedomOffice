@@ -522,12 +522,14 @@ impl Live {
     }
 
     fn answer_snapshot_request(&mut self) {
-        if self.snapshot_wanted && self.synced() && self.editor {
-            if let Err(e) = self.snapshot() {
-                self.last_error = Some(format!("Snapshot failed: {e}"));
-                // Ask again when the server does, rather than at every pump.
-                self.snapshot_wanted = false;
-            }
+        if self.snapshot_wanted
+            && self.synced()
+            && self.editor
+            && let Err(e) = self.snapshot()
+        {
+            self.last_error = Some(format!("Snapshot failed: {e}"));
+            // Ask again when the server does, rather than at every pump.
+            self.snapshot_wanted = false;
         }
     }
 }

@@ -220,10 +220,17 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
                     Err(e) => return Err(e),
                 };
                 if multi {
-                    println!("# {} ({})", r["sheet"].as_str().unwrap_or(""), r["range"].as_str().unwrap_or(""));
+                    println!(
+                        "# {} ({})",
+                        r["sheet"].as_str().unwrap_or(""),
+                        r["range"].as_str().unwrap_or("")
+                    );
                 }
                 let cells = |k: &str| r[k].as_array().cloned().unwrap_or_default();
-                for (row, f) in cells(if formulas { "formulas" } else { "display" }).iter().zip(cells("formulas")) {
+                for (row, f) in cells(if formulas { "formulas" } else { "display" })
+                    .iter()
+                    .zip(cells("formulas"))
+                {
                     let line: Vec<String> = row
                         .as_array()
                         .into_iter()
@@ -233,7 +240,13 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
                             if formulas && !formula.is_null() {
                                 formula.as_str().unwrap_or("").to_string()
                             } else {
-                                shown.as_str().map(str::to_string).unwrap_or_else(|| if shown.is_null() { String::new() } else { shown.to_string() })
+                                shown.as_str().map(str::to_string).unwrap_or_else(|| {
+                                    if shown.is_null() {
+                                        String::new()
+                                    } else {
+                                        shown.to_string()
+                                    }
+                                })
                             }
                         })
                         .collect();
@@ -248,13 +261,21 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
             let clear = flag(&mut args, "--clear");
             let value = opt(&mut args, "--value");
             let sheet = opt(&mut args, "--sheet");
-            let v = if clear { Json::Null } else { json!(need(value, "--value or --clear")?) };
-            let (out, saved) = change(&api, &item, |l| work::write_range(l, sheet.as_deref(), &cell, &[vec![v]]))?;
+            let v = if clear {
+                Json::Null
+            } else {
+                json!(need(value, "--value or --clear")?)
+            };
+            let (out, saved) = change(&api, &item, |l| {
+                work::write_range(l, sheet.as_deref(), &cell, &[vec![v]])
+            })?;
             println!(
                 "Set {} to {} (confirmed{}).",
                 cell,
                 out["values"][0][0],
-                saved.map(|v| format!(", saved as version {v}")).unwrap_or_default()
+                saved
+                    .map(|v| format!(", saved as version {v}"))
+                    .unwrap_or_default()
             );
         }
         "write" => {
@@ -263,7 +284,8 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
             let range = need(opt(&mut args, "--range"), "--range")?;
             let sheet = opt(&mut args, "--sheet");
             let values = need(opt(&mut args, "--values"), "--values")?;
-            let grid: Json = serde_json::from_str(&values).map_err(|e| format!("--values isn't JSON: {e}"))?;
+            let grid: Json =
+                serde_json::from_str(&values).map_err(|e| format!("--values isn't JSON: {e}"))?;
             let grid = match grid {
                 Json::Array(rows) if rows.iter().all(Json::is_array) => rows
                     .iter()
@@ -271,7 +293,9 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
                     .collect::<Vec<_>>(),
                 _ => return Err("--values must be a 2D JSON array like [[1,2],[3,4]].".into()),
             };
-            let (out, saved) = change(&api, &item, |l| work::write_range(l, sheet.as_deref(), &range, &grid))?;
+            let (out, saved) = change(&api, &item, |l| {
+                work::write_range(l, sheet.as_deref(), &range, &grid)
+            })?;
             print_json(&out);
             if let Some(v) = saved {
                 eprintln!("saved as version {v}");
@@ -282,7 +306,9 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
             let item = need(opt(&mut args, "--item"), "--item")?;
             let sheet = opt(&mut args, "--sheet");
             let [formula] = args.as_slice() else {
-                return Err("Expected one formula, e.g. fsheets eval --item ID \"=SUM(A1:A5)\".".into());
+                return Err(
+                    "Expected one formula, e.g. fsheets eval --item ID \"=SUM(A1:A5)\".".into(),
+                );
             };
             let mut live = join(&api, &item)?;
             let out = work::evaluate(&mut live, sheet.as_deref(), formula)?;
@@ -306,20 +332,30 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
             println!(
                 "Added sheet {}{}.",
                 out["added"].as_str().unwrap_or(""),
-                saved.map(|v| format!(" (saved as version {v})")).unwrap_or_default()
+                saved
+                    .map(|v| format!(" (saved as version {v})"))
+                    .unwrap_or_default()
             );
         }
         "versions" => {
             let api = token(&mut args)?;
             let item = need(opt(&mut args, "--item"), "--item")?;
-            for v in work::versions(&api, &item)?["versions"].as_array().into_iter().flatten() {
+            for v in work::versions(&api, &item)?["versions"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
                 println!(
                     "v{}\t{}\t{}\t{} bytes{}",
                     v["version"],
                     v["modified"].as_str().unwrap_or(""),
                     v["modified_by"].as_str().unwrap_or(""),
                     v["size"],
-                    if v["current"].as_bool().unwrap_or(false) { "\tcurrent" } else { "" }
+                    if v["current"].as_bool().unwrap_or(false) {
+                        "\tcurrent"
+                    } else {
+                        ""
+                    }
                 );
             }
         }
@@ -331,7 +367,11 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
                 token_file: opt(&mut args, "--token-file").map(PathBuf::from),
             };
             let api = config::connect(&acct)?;
-            fsheets::mcp::serve(api, std::io::BufReader::new(std::io::stdin()), std::io::stdout())?;
+            fsheets::mcp::serve(
+                api,
+                std::io::BufReader::new(std::io::stdin()),
+                std::io::stdout(),
+            )?;
         }
         "soak" => {
             let server = need(opt(&mut args, "--server"), "--server")?;

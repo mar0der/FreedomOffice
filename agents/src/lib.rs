@@ -9,8 +9,8 @@
 pub mod a1;
 pub mod api;
 pub mod config;
-pub mod mcp;
 pub mod live;
+pub mod mcp;
 pub mod rng;
 pub mod sample;
 pub mod soak;

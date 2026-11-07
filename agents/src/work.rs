@@ -32,7 +32,9 @@ pub fn item_json(i: &Item) -> Json {
 /// The places to start from, or the contents of a folder.
 pub fn list_files(api: &Api, folder: Option<&str>) -> Result<Json, String> {
     match folder {
-        Some(f) => Ok(json!({ "folder": f, "items": api.children(f)?.iter().map(item_json).collect::<Vec<_>>() })),
+        Some(f) => Ok(
+            json!({ "folder": f, "items": api.children(f)?.iter().map(item_json).collect::<Vec<_>>() }),
+        ),
         None => {
             let orgs: Vec<Json> = api
                 .org_roots()?
@@ -108,7 +110,11 @@ pub fn cell_text(wb: &Workbook, sheet: usize, r: u32, c: u32) -> String {
 /// The index of a sheet by name (any case) or numeric id; the first sheet when none is named.
 pub fn find_sheet(wb: &Workbook, name: Option<&str>) -> Result<usize, String> {
     let Some(n) = name.map(str::trim).filter(|n| !n.is_empty()) else {
-        return if wb.sheets.is_empty() { Err("The workbook has no sheet.".into()) } else { Ok(0) };
+        return if wb.sheets.is_empty() {
+            Err("The workbook has no sheet.".into())
+        } else {
+            Ok(0)
+        };
     };
     wb.sheets
         .iter()
@@ -116,7 +122,11 @@ pub fn find_sheet(wb: &Workbook, name: Option<&str>) -> Result<usize, String> {
         .ok_or_else(|| {
             format!(
                 "No sheet called '{n}'. Sheets: {}.",
-                wb.sheets.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ")
+                wb.sheets
+                    .iter()
+                    .map(|s| s.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )
         })
 }
@@ -142,7 +152,12 @@ pub fn list_sheets(live: &mut Live) -> Json {
 
 fn check_sheet_name(wb: &Workbook, name: &str) -> Result<(), String> {
     let n = name.trim();
-    if n.is_empty() || n.chars().count() > 31 || n.chars().any(|c| "[]:*?/\\".contains(c)) || n.starts_with('\'') || n.ends_with('\'') {
+    if n.is_empty()
+        || n.chars().count() > 31
+        || n.chars().any(|c| "[]:*?/\\".contains(c))
+        || n.starts_with('\'')
+        || n.ends_with('\'')
+    {
         return Err("A sheet name has 1 to 31 characters and none of [ ] : * ? / \\".into());
     }
     if wb.sheet_index(n).is_some() {
@@ -157,12 +172,20 @@ pub fn add_sheet(live: &mut Live, name: &str) -> Result<Json, String> {
     let name = name.trim().to_string();
     let uid = model::new_sheet_uid();
     let pos = live.wb.sheets.iter().map(|s| s.pos).fold(-1.0, f64::max) + 1.0;
-    live.edit(vec![Op::AddSheet { s: uid, name: name.clone(), pos }]);
+    live.edit(vec![Op::AddSheet {
+        s: uid,
+        name: name.clone(),
+        pos,
+    }]);
     Ok(json!({ "added": name, "id": uid }))
 }
 
 fn need_editor(live: &Live) -> Result<(), String> {
-    if live.editor { Ok(()) } else { Err("You have view-only access to this workbook.".into()) }
+    if live.editor {
+        Ok(())
+    } else {
+        Err("You have view-only access to this workbook.".into())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -171,8 +194,15 @@ fn need_editor(live: &Live) -> Result<(), String> {
 
 /// Resolves "Sheet!A1:B2" (or the `sheet` argument) and a range to (sheet index, range). No
 /// range means the sheet's used range. Whole-column and whole-row ranges are cut to it.
-fn resolve(wb: &Workbook, sheet: Option<&str>, range: Option<&str>) -> Result<(usize, Range), String> {
-    let parsed = range.filter(|r| !r.trim().is_empty()).map(parse_ref).transpose()?;
+fn resolve(
+    wb: &Workbook,
+    sheet: Option<&str>,
+    range: Option<&str>,
+) -> Result<(usize, Range), String> {
+    let parsed = range
+        .filter(|r| !r.trim().is_empty())
+        .map(parse_ref)
+        .transpose()?;
     let name = parsed.as_ref().and_then(|p| p.sheet.as_deref()).or(sheet);
     let si = find_sheet(wb, name)?;
     let used = wb.sheets[si].used_range();
@@ -191,7 +221,10 @@ fn resolve(wb: &Workbook, sheet: Option<&str>, range: Option<&str>) -> Result<(u
         None => used.ok_or("The sheet is empty.")?,
     };
     if u64::from(rg.rows()) * u64::from(rg.cols()) > MAX_CELLS {
-        return Err(format!("{} is more than {MAX_CELLS} cells; use a smaller range.", rg.to_a1()));
+        return Err(format!(
+            "{} is more than {MAX_CELLS} cells; use a smaller range.",
+            rg.to_a1()
+        ));
     }
     Ok((si, rg))
 }
@@ -199,13 +232,23 @@ fn resolve(wb: &Workbook, sheet: Option<&str>, range: Option<&str>) -> Result<(u
 /// Tells the other people in the session where this agent is working.
 pub fn show_presence(live: &mut Live, sheet: SheetId, rg: Range, editing: bool) {
     if live.connected() {
-        let sel = Rect { r1: rg.r1, c1: rg.c1, r2: rg.r2, c2: rg.c2 };
+        let sel = Rect {
+            r1: rg.r1,
+            c1: rg.c1,
+            r2: rg.r2,
+            c2: rg.c2,
+        };
         live.send_selection(sheet, rg.r1, rg.c1, sel, editing);
     }
 }
 
 /// Values (calculated), formulas and, on request, the text as formatted, of a range.
-pub fn read_range(live: &mut Live, sheet: Option<&str>, range: Option<&str>, with_display: bool) -> Result<Json, String> {
+pub fn read_range(
+    live: &mut Live,
+    sheet: Option<&str>,
+    range: Option<&str>,
+    with_display: bool,
+) -> Result<Json, String> {
     let (si, rg) = resolve(live.workbook(), sheet, range)?;
     let uid = live.wb.sheets[si].uid;
     show_presence(live, uid, rg, false);
@@ -228,7 +271,8 @@ pub fn read_range(live: &mut Live, sheet: Option<&str>, range: Option<&str>, wit
         formulas.push(f);
         shown.push(d);
     }
-    let mut out = json!({ "sheet": sh.name, "range": rg.to_a1(), "values": values, "formulas": formulas });
+    let mut out =
+        json!({ "sheet": sh.name, "range": rg.to_a1(), "values": values, "formulas": formulas });
     if with_display {
         out["display"] = json!(shown);
     }
@@ -238,13 +282,26 @@ pub fn read_range(live: &mut Live, sheet: Option<&str>, range: Option<&str>, wit
 /// The cell a JSON value makes: strings are read like typing them in the app ("=..." is a
 /// formula, "12" a number, "'12" text), numbers and booleans are taken as they are, null clears.
 /// The cell keeps its existing format.
-fn cell_from_json(wb: &mut Workbook, v: &Json, style: u32, at: (u32, u32)) -> Result<Option<Cell>, String> {
+fn cell_from_json(
+    wb: &mut Workbook,
+    v: &Json,
+    style: u32,
+    at: (u32, u32),
+) -> Result<Option<Cell>, String> {
     let name = || a1::cell_name(at.0, at.1);
     Ok(match v {
         Json::Null => model::cell_from_input(wb, "", style),
-        Json::Bool(b) => Some(Cell { value: Value::Bool(*b), formula: None, style }),
+        Json::Bool(b) => Some(Cell {
+            value: Value::Bool(*b),
+            formula: None,
+            style,
+        }),
         Json::Number(n) => Some(Cell {
-            value: Value::Number(n.as_f64().filter(|f| f.is_finite()).ok_or_else(|| format!("{}: not a usable number", name()))?),
+            value: Value::Number(
+                n.as_f64()
+                    .filter(|f| f.is_finite())
+                    .ok_or_else(|| format!("{}: not a usable number", name()))?,
+            ),
             formula: None,
             style,
         }),
@@ -256,14 +313,24 @@ fn cell_from_json(wb: &mut Workbook, v: &Json, style: u32, at: (u32, u32)) -> Re
             }
             model::cell_from_input(wb, s, style)
         }
-        _ => return Err(format!("{}: a cell is a string, number, boolean or null", name())),
+        _ => {
+            return Err(format!(
+                "{}: a cell is a string, number, boolean or null",
+                name()
+            ));
+        }
     })
 }
 
 /// Writes a grid of values with its top-left cell at the start of `range` (a single cell, or a
 /// range of exactly the grid's size). Nothing is written when any entry is invalid. Returns the
 /// calculated values of what was written.
-pub fn write_range(live: &mut Live, sheet: Option<&str>, range: &str, grid: &[Vec<Json>]) -> Result<Json, String> {
+pub fn write_range(
+    live: &mut Live,
+    sheet: Option<&str>,
+    range: &str,
+    grid: &[Vec<Json>],
+) -> Result<Json, String> {
     need_editor(live)?;
     let p = parse_ref(range)?;
     let name = p.sheet.as_deref().or(sheet);
@@ -274,14 +341,23 @@ pub fn write_range(live: &mut Live, sheet: Option<&str>, range: &str, grid: &[Ve
         return Err("values is empty.".into());
     }
     if u64::from(rows) * u64::from(cols) > MAX_CELLS {
-        return Err(format!("More than {MAX_CELLS} cells; write in smaller pieces."));
+        return Err(format!(
+            "More than {MAX_CELLS} cells; write in smaller pieces."
+        ));
     }
     let at = p.range;
     if !at.is_single() && (at.rows() != rows || at.cols() != cols) {
-        return Err(format!("{} is {}x{} cells but values is {rows}x{cols}.", at.to_a1(), at.rows(), at.cols()));
+        return Err(format!(
+            "{} is {}x{} cells but values is {rows}x{cols}.",
+            at.to_a1(),
+            at.rows(),
+            at.cols()
+        ));
     }
     let (r0, c0) = (at.r1, at.c1);
-    if u64::from(r0) + u64::from(rows) > u64::from(model::MAX_ROWS) || u64::from(c0) + u64::from(cols) > u64::from(model::MAX_COLS) {
+    if u64::from(r0) + u64::from(rows) > u64::from(model::MAX_ROWS)
+        || u64::from(c0) + u64::from(cols) > u64::from(model::MAX_COLS)
+    {
         return Err("That runs off the end of the sheet.".into());
     }
     let uid = live.wb.sheets[si].uid;
@@ -300,7 +376,13 @@ pub fn write_range(live: &mut Live, sheet: Option<&str>, range: &str, grid: &[Ve
             });
             // Unchanged cells make no operations.
             if new.as_deref() != live.cell_data(uid, r, c).as_ref() {
-                ops.push(Op::Cell { s: uid, r, c, v: new, adj: vec![] });
+                ops.push(Op::Cell {
+                    s: uid,
+                    r,
+                    c,
+                    v: new,
+                    adj: vec![],
+                });
             }
         }
     }
@@ -311,7 +393,11 @@ pub fn write_range(live: &mut Live, sheet: Option<&str>, range: &str, grid: &[Ve
     let wb = live.workbook();
     let sh = &wb.sheets[si];
     let values: Vec<Vec<Json>> = (rg.r1..=rg.r2)
-        .map(|r| (rg.c1..=rg.c2).map(|c| value_json(sh.display_value(r, c))).collect())
+        .map(|r| {
+            (rg.c1..=rg.c2)
+                .map(|c| value_json(sh.display_value(r, c)))
+                .collect()
+        })
         .collect();
     Ok(json!({ "sheet": sh.name, "range": rg.to_a1(), "cells_changed": changed, "values": values }))
 }
@@ -324,18 +410,31 @@ pub fn evaluate(live: &mut Live, sheet: Option<&str>, src: &str) -> Result<Json,
     let wb = live.workbook();
     let v = formula::eval_expr(wb, si, 0, 0, &ast);
     let shown = freedom_sheets::numfmt::format_value(&v, "").text;
-    Ok(json!({ "formula": format!("={text}"), "sheet": wb.sheets[si].name, "value": value_json(&v), "display": shown }))
+    Ok(
+        json!({ "formula": format!("={text}"), "sheet": wb.sheets[si].name, "value": value_json(&v), "display": shown }),
+    )
 }
 
 /// Writes the workbook to a local file: .xlsx, or .csv/.tsv of one sheet. Existing files are
 /// kept unless `overwrite`.
-pub fn export(live: &mut Live, path: &Path, sheet: Option<&str>, overwrite: bool) -> Result<Json, String> {
-    let ext = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+pub fn export(
+    live: &mut Live,
+    path: &Path,
+    sheet: Option<&str>,
+    overwrite: bool,
+) -> Result<Json, String> {
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
     if !matches!(ext.as_str(), "xlsx" | "csv" | "tsv") {
         return Err("The file name must end in .xlsx, .csv or .tsv.".into());
     }
     if path.exists() && !overwrite {
-        return Err(format!("{} exists; pass overwrite to replace it.", path.display()));
+        return Err(format!(
+            "{} exists; pass overwrite to replace it.",
+            path.display()
+        ));
     }
     let si = find_sheet(live.workbook(), sheet)?;
     let mut wb = live.workbook().clone();
@@ -366,12 +465,22 @@ pub fn settle(live: &mut Live) -> Result<Option<i64>, String> {
             .or_else(|| live.last_error.clone())
             .unwrap_or_else(|| "The server didn't confirm the changes.".into()));
     }
-    if live.unsaved() && live.editor { live.snapshot().map(Some) } else { Ok(None) }
+    if live.unsaved() && live.editor {
+        live.snapshot().map(Some)
+    } else {
+        Ok(None)
+    }
 }
 
 /// Who is in the session, with the range each is working on.
 pub fn peers(live: &Live) -> Json {
-    let name_of = |s: SheetId| live.wb.sheets.iter().find(|x| x.uid == s).map(|x| x.name.clone());
+    let name_of = |s: SheetId| {
+        live.wb
+            .sheets
+            .iter()
+            .find(|x| x.uid == s)
+            .map(|x| x.name.clone())
+    };
     let one = |p: &cosync::Peer, you: bool| {
         let at = p.presence.as_ref().map(|pr| {
             let rg = Range::new(pr.sel.r1, pr.sel.c1, pr.sel.r2, pr.sel.c2);
@@ -380,7 +489,12 @@ pub fn peers(live: &Live) -> Json {
         json!({ "name": p.name, "user": p.user, "agent": p.agent, "editor": p.editor, "you": you, "working_on": at })
     };
     let mut list: Vec<Json> = live.me.iter().map(|p| one(p, true)).collect();
-    list.extend(live.peers.values().filter(|p| Some(p.id) != live.me.as_ref().map(|m| m.id)).map(|p| one(p, false)));
+    list.extend(
+        live.peers
+            .values()
+            .filter(|p| Some(p.id) != live.me.as_ref().map(|m| m.id))
+            .map(|p| one(p, false)),
+    );
     json!({ "people": list })
 }
 

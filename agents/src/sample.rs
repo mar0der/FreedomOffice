@@ -105,7 +105,11 @@ mod tests {
     fn samples_read_back() {
         for k in SAMPLES {
             let b = load_xlsx_bytes(&make(k).unwrap()).unwrap();
-            let n: usize = b.sheets.iter().map(|s| s.rows.values().map(|r| r.len()).sum::<usize>()).sum();
+            let n: usize = b
+                .sheets
+                .iter()
+                .map(|s| s.rows.values().map(|r| r.len()).sum::<usize>())
+                .sum();
             assert!(n > 10, "{k}");
         }
         let mut b = load_xlsx_bytes(&make("budget").unwrap()).unwrap();

@@ -42,7 +42,8 @@ pub fn split_sheet(s: &str) -> (Option<String>, &str) {
 /// Parses an agent's reference. Errors say what was wrong.
 pub fn parse_ref(s: &str) -> Result<Ref, String> {
     let (sheet, rest) = split_sheet(s);
-    let range = Range::parse(rest).ok_or_else(|| format!("'{rest}' isn't a cell range like B7, A1:C5, A:C or 3:5."))?;
+    let range = Range::parse(rest)
+        .ok_or_else(|| format!("'{rest}' isn't a cell range like B7, A1:C5, A:C or 3:5."))?;
     Ok(Ref { sheet, range })
 }
 
@@ -87,7 +88,10 @@ mod tests {
 
     #[test]
     fn rejects_nonsense() {
-        for bad in ["", "7", "A", "A0", "A1:", ":B2", "A1:B", "1A", "AAAA1", "A1048577", "A1;B2", "'open!A1"] {
+        for bad in [
+            "", "7", "A", "A0", "A1:", ":B2", "A1:B", "1A", "AAAA1", "A1048577", "A1;B2",
+            "'open!A1",
+        ] {
             assert!(parse_ref(bad).is_err(), "{bad}");
         }
     }

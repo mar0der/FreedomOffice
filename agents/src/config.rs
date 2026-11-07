@@ -32,14 +32,25 @@ pub fn token_path(server: &str, user: &str) -> Option<PathBuf> {
         .split_once("://")
         .map(|(_, h)| h.to_string())
         .unwrap_or_default();
-    let clean = |s: &str| s.chars().map(|c| if c.is_ascii_alphanumeric() || "._-".contains(c) { c } else { '_' }).collect::<String>();
+    let clean = |s: &str| {
+        s.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || "._-".contains(c) {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>()
+    };
     Some(config_dir()?.join(format!("{}@{}.token", clean(user), clean(&host))))
 }
 
 /// Refuses a secret file other people can read.
 pub fn check_private(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
-    let meta = std::fs::metadata(path).map_err(|e| format!("Couldn't read {}: {e}", path.display()))?;
+    let meta =
+        std::fs::metadata(path).map_err(|e| format!("Couldn't read {}: {e}", path.display()))?;
     if meta.permissions().mode() & 0o077 != 0 {
         return Err(format!(
             "{} can be read by other users; run `chmod 600 {}` first.",
@@ -53,7 +64,8 @@ pub fn check_private(path: &Path) -> Result<(), String> {
 /// The first line of a private file.
 pub fn read_secret(path: &Path) -> Result<String, String> {
     check_private(path)?;
-    let s = std::fs::read_to_string(path).map_err(|e| format!("Couldn't read {}: {e}", path.display()))?;
+    let s = std::fs::read_to_string(path)
+        .map_err(|e| format!("Couldn't read {}: {e}", path.display()))?;
     let line = s.lines().next().unwrap_or("").to_string();
     if line.is_empty() {
         return Err(format!("{} is empty.", path.display()));
@@ -65,8 +77,15 @@ pub fn read_secret(path: &Path) -> Result<String, String> {
 /// it has to be created).
 pub fn save_token(api: &Api, path: &Path) -> Result<(), String> {
     use std::os::unix::fs::DirBuilderExt;
-    if let Some(d) = path.parent().filter(|d| !d.as_os_str().is_empty() && !d.exists()) {
-        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(d).map_err(|e| e.to_string())?;
+    if let Some(d) = path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty() && !d.exists())
+    {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(d)
+            .map_err(|e| e.to_string())?;
     }
     api.save_token(path)
 }
@@ -84,24 +103,34 @@ fn lone_token() -> Option<PathBuf> {
 /// A signed-in API: a valid cached token, else a fresh sign in with the password file (and the
 /// token is cached for next time).
 pub fn connect(acct: &Account) -> Result<Api, String> {
-    let cache = acct.token_file.clone().or_else(|| match (&acct.server, &acct.user) {
-        (Some(s), Some(u)) => token_path(s, u),
-        _ => lone_token(),
-    });
+    let cache = acct
+        .token_file
+        .clone()
+        .or_else(|| match (&acct.server, &acct.user) {
+            (Some(s), Some(u)) => token_path(s, u),
+            _ => lone_token(),
+        });
     let mut why = None;
     if let Some(path) = cache.as_ref().filter(|p| p.exists()) {
         check_private(path)?;
         let api = Api::from_token_file(path)?;
-        let same_account = acct.server.as_ref().is_none_or(|s| crate::api::normalize_url(s) == api.url)
+        let same_account = acct
+            .server
+            .as_ref()
+            .is_none_or(|s| crate::api::normalize_url(s) == api.url)
             && acct.user.as_ref().is_none_or(|u| *u == api.username);
         if same_account {
             if api.token_valid()? {
                 return Ok(api);
             }
-            why = Some(format!("The saved sign-in in {} is no longer valid.", path.display()));
+            why = Some(format!(
+                "The saved sign-in in {} is no longer valid.",
+                path.display()
+            ));
         }
     }
-    let (Some(server), Some(user), Some(pwf)) = (&acct.server, &acct.user, &acct.password_file) else {
+    let (Some(server), Some(user), Some(pwf)) = (&acct.server, &acct.user, &acct.password_file)
+    else {
         return Err(why.unwrap_or_else(|| {
             "Not signed in: give --server, --user and --password-file (or a token file from `fsheets login`).".into()
         }));
