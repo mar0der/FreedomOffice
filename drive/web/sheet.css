@@ -125,3 +125,14 @@ button:disabled { opacity: .55; }
 .banner[hidden] { display: none; }
 @media (max-width: 520px) { #find-btn { display: inline-flex; } }
 .sheet:focus { outline: none; }
+
+/* Landscape phones: every pixel of height counts. */
+@media (max-height: 500px) {
+  .top { min-height: calc(40px + env(safe-area-inset-top)); padding-top: calc(env(safe-area-inset-top) + 0px); padding-bottom: 0; }
+  .tbtn { min-height: 40px; min-width: 40px; }
+  .fbar, .addr, .fx, .fxin, .fbtn { min-height: 36px; }
+  .fx { padding: .35rem .6rem; }
+  .tools { padding: .1rem .3rem; }
+  .tool { min-height: 36px; }
+  .tab { min-height: 38px; }
+}

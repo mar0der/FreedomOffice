@@ -462,6 +462,68 @@ fn the_current_state_includes_the_live_log() {
     assert_eq!(w["rev"], m2["rev"]);
 }
 
+/// A workbook with a rule, a data bar, a note, a chart and a (1x1) picture.
+fn rich_book() -> Vec<u8> {
+    use rust_xlsxwriter::{Chart, ChartType, ConditionalFormatCell, ConditionalFormatCellRule, ConditionalFormatDataBar, Image, Note};
+    // A 1x1 transparent PNG.
+    let hex = "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000a49444154789c63000100000500010d0a2db40000000049454e44ae426082";
+    let png: Vec<u8> = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect();
+    let mut wb = Workbook::new();
+    let ws = wb.add_worksheet();
+    ws.set_name("Data").unwrap();
+    for i in 0..5u32 {
+        ws.write_number(i, 0, f64::from(i + 1)).unwrap();
+        ws.write_number(i, 1, f64::from(i + 1)).unwrap();
+    }
+    ws.add_conditional_format(0, 0, 4, 0, &ConditionalFormatCell::new().set_rule(ConditionalFormatCellRule::GreaterThan(3)).set_format(Format::new().set_background_color(0xff0000))).unwrap();
+    ws.add_conditional_format(0, 1, 4, 1, &ConditionalFormatDataBar::new()).unwrap();
+    ws.insert_note(0, 3, &Note::new("a note")).unwrap();
+    let mut ch = Chart::new(ChartType::Line);
+    ch.add_series().set_values("Data!$A$1:$A$5").set_name("Line");
+    ws.insert_chart(8, 0, &ch).unwrap();
+    ws.insert_image(8, 5, &Image::new_from_buffer(&png).unwrap()).unwrap();
+    wb.save_to_buffer().unwrap()
+}
+
+#[test]
+fn rules_notes_charts_and_pictures_reach_the_page() {
+    let s = start();
+    let a = s.token("alice");
+    let root = s.root(&a);
+    let id = s.upload(&a, &root, "Rich.xlsx", &rich_book());
+    let m = s.bearer(&url(&id, ""), &a).json();
+    assert_eq!(m["sheets"][0]["charts"], 1);
+    let im = &m["sheets"][0]["images"][0];
+    assert_eq!((im["n"].as_u64(), im["r"].as_u64(), im["c"].as_u64()), (Some(0), Some(8), Some(5)));
+    // The window: the rule's fill is part of the style, the bar and the note are extras.
+    let w = s.bearer(&url(&id, "/cells?sheet=0&r1=0&r2=6&c1=0&c2=4"), &a).json();
+    let styles = w["styles"].as_array().unwrap();
+    let fill_of = |r: u64, c: u64| {
+        let si = cell(&w, r, c).unwrap()[4].as_u64().unwrap();
+        if si == 0 { Value::Null } else { styles[si as usize - 1]["f"].clone() }
+    };
+    assert_eq!(fill_of(4, 0), "#ff0000");
+    assert_eq!(fill_of(1, 0), Value::Null);
+    assert!(cell(&w, 4, 1).unwrap()[6]["bar"].is_array());
+    assert_eq!(cell(&w, 0, 3).unwrap()[6]["note"], 1, "an empty cell with a note is still sent");
+    // Charts with their data; the picture as an image.
+    let c = s.bearer(&url(&id, "/charts?sheet=0"), &a).json();
+    assert_eq!((c[0]["kind"].as_str(), c[0]["series"][0]["name"].as_str()), (Some("line"), Some("Line")));
+    assert_eq!(c[0]["series"][0]["values"], json!([1.0, 2.0, 3.0, 4.0, 5.0]));
+    let img = s.bearer(&url(&id, "/image?sheet=0&n=0"), &a);
+    assert_eq!(img.status, 200);
+    assert_eq!(img.header("content-type"), Some("image/png"));
+    assert_eq!(img.header("x-content-type-options"), Some("nosniff"));
+    assert!(img.header("content-security-policy").unwrap().contains("sandbox"));
+    assert!(img.body.starts_with(&[0x89, b'P', b'N', b'G']));
+    assert_eq!(s.bearer(&url(&id, "/image?sheet=0&n=7"), &a).status, 404);
+    assert_eq!(s.bearer(&url(&id, "/image?sheet=9&n=0"), &a).status, 404);
+    // Access is the viewer's: someone without it learns nothing.
+    let bob = s.token("bob");
+    assert_eq!(s.bearer(&url(&id, "/image?sheet=0&n=0"), &bob).status, 404);
+    assert_eq!(s.bearer(&url(&id, "/charts?sheet=0"), &bob).status, 404);
+}
+
 #[test]
 fn the_pages_are_served_with_a_strict_policy() {
     let s = start();
