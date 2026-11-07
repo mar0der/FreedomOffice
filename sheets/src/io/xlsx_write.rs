@@ -22,6 +22,11 @@ use crate::model::{BorderLine, Cell, HAlign, Range, Sheet, Style, VAlign, Value,
 const MAX_STR: usize = 32_767;
 
 pub fn write(wb: &Workbook, path: &Path) -> Result<(), String> {
+    std::fs::write(path, to_bytes(wb)?).map_err(|e| format!("Could not save: {e}"))
+}
+
+/// The .xlsx file as bytes.
+pub fn to_bytes(wb: &Workbook) -> Result<Vec<u8>, String> {
     let mut explosions = Vec::new();
     let mut book = build(wb, &mut explosions).map_err(|e| e.to_string())?;
     let bytes = book.save_to_buffer().map_err(|e| format!("Could not save: {e}"))?;
@@ -29,8 +34,7 @@ pub fn write(wb: &Workbook, path: &Path) -> Result<(), String> {
     let bytes = fidelity::patch_protection(wb, bytes)?;
     let bytes = charts::patch_explosions(bytes, &explosions)?;
     let bytes = analysis::patch(wb, bytes)?;
-    let bytes = pivot::patch(wb, bytes)?;
-    std::fs::write(path, bytes).map_err(|e| format!("Could not save: {e}"))
+    pivot::patch(wb, bytes)
 }
 
 fn build(wb: &Workbook, explosions: &mut Vec<charts::Explosions>) -> Result<XWorkbook, XlsxError> {

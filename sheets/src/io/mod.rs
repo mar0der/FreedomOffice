@@ -53,6 +53,16 @@ pub fn load(path: &Path) -> Result<Workbook, String> {
     Ok(wb)
 }
 
+/// Reads an .xlsx workbook from memory. Does not recalculate.
+pub fn load_xlsx_bytes(bytes: &[u8]) -> Result<Workbook, String> {
+    xlsx_read::read(std::io::Cursor::new(bytes))
+}
+
+/// A workbook as the bytes of an .xlsx file.
+pub fn xlsx_bytes(wb: &Workbook) -> Result<Vec<u8>, String> {
+    xlsx_write::to_bytes(wb)
+}
+
 /// Saves a workbook, choosing the writer by file extension (.xlsm is written as plain xlsx content).
 pub fn save(wb: &Workbook, path: &Path) -> Result<(), String> {
     match ext(path).as_str() {

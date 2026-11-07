@@ -117,9 +117,9 @@ fn agents_are_marked_and_see_each_other() {
     assert!(a.peers.values().any(|p| p.user == "bob" && !p.agent));
     assert!(b.peers.values().any(|p| p.user == "alice" && p.agent));
     // The starting state comes from the xlsx and an edit reaches the other client.
-    let sheet = a.book.ordered()[0].0;
+    let sheet = a.first_sheet().unwrap();
     assert_eq!(
-        a.book.cell(sheet, 0, 0).map(|c| c.v.clone()),
+        a.cell_data(sheet, 0, 0).map(|c| c.v),
         Some(cosync::Val::Text("Student".into()))
     );
     a.set_cell(
@@ -133,5 +133,5 @@ fn agents_are_marked_and_see_each_other() {
     );
     assert!(a.wait_synced(std::time::Duration::from_secs(5)));
     b.pump(std::time::Duration::from_millis(300));
-    assert_eq!(b.book.cell(sheet, 20, 0), a.book.cell(sheet, 20, 0));
+    assert_eq!(b.cell_data(sheet, 20, 0), a.cell_data(sheet, 20, 0));
 }

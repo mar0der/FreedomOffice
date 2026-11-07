@@ -75,8 +75,8 @@ impl Report {
             self.forced_disconnects, t.reconnects, t.replayed_own, t.presence_sent
         );
         println!(
-            "  server closes {:?}, snapshot requests ignored {}",
-            t.closes, t.snapshot_requests
+            "  server closes {:?}, snapshot requests {}, snapshots uploaded {}",
+            t.closes, t.snapshot_requests, t.snapshots
         );
         println!(
             "  final seq {}, {} cells, digest {}",
@@ -101,6 +101,29 @@ impl Report {
     }
 }
 
+/// A short fingerprint of the synchronised content (the operations that rebuild it).
+fn digest(l: &Live) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for op in freedom_sheets::live::state_ops(&l.wb) {
+        for b in format!("{op:?}").bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    format!("{h:016x}")
+}
+
+/// A value as text (what a cell shows, without number formats).
+pub fn val_text(v: &Val) -> String {
+    match v {
+        Val::Empty => String::new(),
+        Val::Num(n) => format!("{n}"),
+        Val::Text(t) => t.clone(),
+        Val::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
+        Val::Err(e) => e.clone(),
+    }
+}
+
 fn add(a: &mut Stats, b: &Stats) {
     a.batches_sent += b.batches_sent;
     a.ops_sent += b.ops_sent;
@@ -112,13 +135,11 @@ fn add(a: &mut Stats, b: &Stats) {
     a.reconnects += b.reconnects;
     a.closes.extend(b.closes.iter().copied());
     a.snapshot_requests += b.snapshot_requests;
+    a.snapshots += b.snapshots;
 }
 
 fn first_sheet(l: &Live) -> Result<SheetId, String> {
-    l.book
-        .ordered()
-        .first()
-        .map(|(i, _)| *i)
+    l.first_sheet()
         .ok_or_else(|| "The workbook has no sheet.".to_string())
 }
 
@@ -246,26 +267,25 @@ pub fn run(apis: &[Api], item: &str, cfg: &Config) -> Result<Report, String> {
     let mut joiner = Live::open(&apis[0], item, true)?;
     joiner.wait_synced(Duration::from_secs(30));
     let head_seq = lives.iter().map(|l| l.seq()).max().unwrap_or(0);
-    let digest = lives[0].book.digest();
+    let digest = digest(&lives[0]);
     let mut difference = None;
     let mut clients_identical = true;
     for (i, l) in lives.iter().enumerate().skip(1) {
-        if l.book != lives[0].book {
+        let diff = lives[0].differences(l);
+        if !diff.is_empty() {
             clients_identical = false;
             difference = difference.or_else(|| {
-                lives[0]
-                    .book
-                    .first_difference(&l.book)
+                diff.first()
                     .map(|d| format!("client 0 vs client {i}: {d}"))
             });
         }
     }
-    let joiner_identical = joiner.book == lives[0].book && joiner.seq() == head_seq;
+    let joiner_diff = lives[0].differences(&joiner);
+    let joiner_identical = joiner_diff.is_empty() && joiner.seq() == head_seq;
     if !joiner_identical {
         difference = difference.or_else(|| {
-            lives[0]
-                .book
-                .first_difference(&joiner.book)
+            joiner_diff
+                .first()
                 .map(|d| {
                     format!(
                         "client 0 vs fresh joiner (seq {} vs {head_seq}): {d}",
@@ -290,7 +310,7 @@ pub fn run(apis: &[Api], item: &str, cfg: &Config) -> Result<Report, String> {
         totals,
         forced_disconnects: forced,
         head_seq,
-        cells: lives[0].book.cell_count(),
+        cells: lives[0].cell_count(),
         digest,
         clients_identical,
         joiner_identical,
@@ -349,7 +369,10 @@ pub fn probe_conflicts(api_a: &Api, api_b: &Api, item: &str) -> Result<ProbeRepo
         r,
         c,
         Some(CellData {
-            st: Some(serde_json::json!({"bold": true})),
+            st: freedom_sheets::live::style_json(&freedom_sheets::model::Style {
+                bold: true,
+                ..Default::default()
+            }),
             ..Default::default()
         }),
     );
@@ -357,10 +380,10 @@ pub fn probe_conflicts(api_a: &Api, api_b: &Api, item: &str) -> Result<ProbeRepo
     a.wait_synced(Duration::from_secs(10));
     b.connect()?;
     wait(&mut a, &mut b);
-    let end = a.book.cell(s, r, c).cloned().unwrap_or_default();
+    let end = a.cell_data(s, r, c).unwrap_or_default();
     let (value_survived, format_survived) =
         (end.v == Val::Text("typed by A".into()), end.st.is_some());
-    let same = a.book.cell(s, r, c) == b.book.cell(s, r, c);
+    let same = a.cell_data(s, r, c) == b.cell_data(s, r, c);
     let value_vs_format = format!(
         "A typed a value, B made it bold, both offline; A reconnected first: final cell {} (clients agree: {same})",
         serde_json::to_string(&end).unwrap_or_default()
@@ -392,9 +415,8 @@ pub fn probe_conflicts(api_a: &Api, api_b: &Api, item: &str) -> Result<ProbeRepo
     b.connect()?;
     wait(&mut a, &mut b);
     let end2 = a
-        .book
-        .cell(s, r2, c2)
-        .map(|d| crate::book::val_text(&d.v))
+        .cell_data(s, r2, c2)
+        .map(|d| val_text(&d.v))
         .unwrap_or_default();
     let value_vs_value = format!(
         "A and B both typed in one cell, A reconnected first: final value '{end2}' (the later commit wins; B is not told that A's edit was replaced, A is not told that its edit was overwritten)"
@@ -418,10 +440,9 @@ pub fn probe_conflicts(api_a: &Api, api_b: &Api, item: &str) -> Result<ProbeRepo
     b.connect()?;
     wait(&mut a, &mut b);
     let moved = a
-        .book
-        .cell(s, r3 + 1, c3)
+        .cell_data(s, r3 + 1, c3)
         .is_some_and(|d| d.v == Val::Text("below the insert".into()))
-        && a.book.cell(s, r3, c3).is_none();
+        && a.cell_data(s, r3, c3).is_none();
     let insert_vs_edit = format!(
         "A inserted a row at 46, B typed in row 51 concurrently: B's text ends up in row 52: {moved}"
     );
@@ -431,6 +452,6 @@ pub fn probe_conflicts(api_a: &Api, api_b: &Api, item: &str) -> Result<ProbeRepo
         format_survived,
         value_vs_value,
         insert_vs_edit,
-        insert_vs_edit_ok: moved && a.book == b.book,
+        insert_vs_edit_ok: moved && a.differences(&b).is_empty(),
     })
 }

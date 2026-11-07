@@ -99,17 +99,20 @@ pub fn make(kind: &str) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::book::Book;
+    use freedom_sheets::io::load_xlsx_bytes;
 
     #[test]
     fn samples_read_back() {
         for k in SAMPLES {
-            let b = Book::from_xlsx(&make(k).unwrap(), "").unwrap();
-            assert!(b.cell_count() > 10, "{k}");
+            let b = load_xlsx_bytes(&make(k).unwrap()).unwrap();
+            let n: usize = b.sheets.iter().map(|s| s.rows.values().map(|r| r.len()).sum::<usize>()).sum();
+            assert!(n > 10, "{k}");
         }
-        let b = Book::from_xlsx(&make("budget").unwrap(), "").unwrap();
+        let mut b = load_xlsx_bytes(&make("budget").unwrap()).unwrap();
         assert_eq!(b.sheets.len(), 2);
-        let f = b.cell(1, 1, 5).unwrap();
-        assert_eq!(f.f.as_deref(), Some("SUM(B2:E2)"));
+        let f = b.sheets[0].get(1, 5).unwrap();
+        assert_eq!(f.formula.as_ref().unwrap().text, "SUM(B2:E2)");
+        b.recalc();
+        assert!(b.sheets[0].value(1, 5).as_number().is_some());
     }
 }
