@@ -399,7 +399,16 @@ fn organisations_follow_membership_changes_when_the_browser_opens() {
     assert!(org_names(&ben).is_empty() && !ben.cloud.servers[0].checking, "throttled");
     ben.cloud.servers[0].checked = Some(Instant::now() - Duration::from_secs(31));
     until(&ctx, &mut ben, "File > Account shows Lab Team", |a| org_names(a) == ["Lab Team"]);
+
+    // A server that doesn't answer is asked again after 30 s too, not every frame.
     drop(t.server);
+    ben.cloud.servers[0].checked = Some(Instant::now() - Duration::from_secs(31));
+    until(&ctx, &mut ben, "the failed check answered", |a| !a.cloud.servers[0].checking && a.cloud.servers[0].checked.is_some_and(|c| c.elapsed() < Duration::from_secs(10)));
+    for _ in 0..10 {
+        frame(&ctx, &mut ben, vec![]);
+        assert!(!ben.cloud.servers[0].checking, "no new request right after a failed one");
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let _ = std::fs::remove_dir_all(&t.dir);
 }
 

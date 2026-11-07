@@ -765,9 +765,11 @@ impl App {
                 let Some(i) = self.cloud.servers.iter().position(|x| x.session.account.url == url && x.session.account.username == username) else { return };
                 let entry = &mut self.cloud.servers[i];
                 entry.checking = false;
+                // Every answer counts for the 30 s throttle, errors too (or an unreachable or
+                // failing server would be asked again every frame).
+                entry.checked = Some(std::time::Instant::now());
                 match result {
                     Ok(me) => {
-                        entry.checked = Some(std::time::Instant::now());
                         entry.error = None;
                         let old = entry.me.replace(me).map(|m| m.orgs).unwrap_or_default();
                         self.server_orgs_changed(i, &old);

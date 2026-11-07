@@ -654,7 +654,8 @@ async fn verify_sign_in(app: &App, ip: IpAddr, username: &str, password: String,
     let pw = password;
     let user = app
         .argon(move || match found {
-            Some((Ok(hash), u)) if (allow_disabled || !u.disabled) && util::verify_password(&pw, &hash) => Some(u),
+            // The password is always checked first, so a disabled account answers as slowly as any other.
+            Some((Ok(hash), u)) if util::verify_password(&pw, &hash) && (allow_disabled || !u.disabled) => Some(u),
             Some(_) => None,
             None => {
                 util::dummy_verify(&pw);

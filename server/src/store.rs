@@ -1775,7 +1775,10 @@ impl Store {
             return Err(StoreError::Forbidden("This invite is no longer valid (whoever sent it can't add people any more). Ask for a new one.".into()));
         }
         let user = self.user_by_id(user_id)?.ok_or(StoreError::NotFound)?;
-        if user.disabled || user.org_id.is_some() {
+        if user.org_id.is_some() {
+            return Err(StoreError::NotFound);
+        }
+        if user.disabled {
             return Err(StoreError::Forbidden("This account is disabled, so it can't join an organisation. Ask your administrator.".into()));
         }
         if user.must_change_password {
