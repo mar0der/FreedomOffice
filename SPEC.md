@@ -502,9 +502,78 @@ otherwise). Super-admin: every event. Org owner/admin: only events whose `org_id
 manage (an `org` they don't manage: 404). Anyone else: 403. `/admin/audit` shows the same with the same
 rules (filters person / organisation / action group, 50 per page, "Older"/"Newest").
 
+### The Drive web app (D1b, `drive-web` branch) **(exists)**
+
+Crate `drive/` (`freedomoffice-drive`, a library): `drive/web/index.html`, `app.js`, `style.css`,
+`icon.svg`, embedded with `include_str!`; `asset(path) -> Option<(bytes, content type)>` and `version()`
+(a 12-hex-digit hash of the assets). Plain JavaScript: no framework, build step, CDN, external fonts, inline
+scripts, inline styles or `on*=` attributes; every name is rendered with `textContent`, never as HTML (the
+crate's tests scan the sources for `innerHTML`, `insertAdjacentHTML`, `eval`, `style=`, `localStorage`,
+other origins and the like).
+
+Routes (`server/src/drive.rs`):
+
+| Route | Answer |
+|---|---|
+| `GET /drive`, `GET /drive/` | index.html, `Cache-Control: no-store`; it names `/drive/assets/<file>?v=<version()>` |
+| `GET /drive/assets/{app.js,style.css,icon.svg}` | the file (`text/javascript`, `text/css`, `image/svg+xml`); `public, max-age=31536000, immutable` with the current `?v=`, else `public, max-age=300` |
+| anything else under `/drive/assets/` | 404 (also `index.html` there), `no-store` |
+
+Every one of those answers: `Content-Security-Policy: default-src 'none'; script-src 'self'; style-src
+'self'; img-src 'self' data: blob:; connect-src 'self'; form-action 'self'; frame-ancestors 'none';
+base-uri 'none'`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: same-origin` (the API's origin check
+needs `Origin` on POSTs), `X-Frame-Options: DENY`, `Cross-Origin-Resource-Policy: same-origin`. Client
+routing uses the hash: `#/files` (My files), `#/files/<id>` (a folder; a file's id shows its folder with the
+file selected), `#/shared`, `#/recent`, `#/trash`; organisations are `#/files/<org root>`.
+
+`GET /api/me` gained (for the app) `storage: {files, versions, bytes}` (the person's own files, every
+kept version and the trash included) and `server: {max_upload_mb, allow_links}`.
+
+Behaviour:
+- Start: `GET /api/web/session` → the app, or the sign-in (`POST /api/web/login`). `must_change_password`
+  shows "Choose a new password" (`POST /api/me/password`), also reachable as "Change password". Sign out:
+  `POST /api/web/logout`.
+- The CSRF token is kept in a JavaScript variable only (never in a URL, cookie or storage); every request
+  other than GET/HEAD sends `X-FO-CSRF`. 401 anywhere → the sign-in ("Your session has ended"; uploads are
+  aborted, dialogs closed). 403 `csrf_failed` → `GET /api/web/session` and the request once more.
+  403 `password_change_required` → the password screen. 408/409/412/413/423/429/507 and network failures
+  get sentences of their own. sessionStorage holds only the sort order.
+- Nav: My files, Shared with me, Recent, each organisation (from `/api/me`), Recycle bin, storage use, and
+  "Administration" (`/admin`) for the super-admin and org owners/admins.
+- List: name with a type icon, modified (local time; full date as a tooltip), modified by, size; folders
+  first; sort by any column; breadcrumbs (walking `parent` up with `GET /api/items/{id}` until the drive's
+  root or the first folder the person can't see, then "Shared with me"); loading, empty and error states.
+  Select with checkboxes, click, Ctrl/Cmd-click, Shift-click, Shift+arrows, Ctrl/Cmd+A, Escape. Keyboard:
+  rows are one tab stop (arrows, Home/End move), Enter opens, Space selects, Delete deletes (restores in the
+  Recycle bin), F2 renames.
+- Opening: folders browse; images (png/jpg/gif/webp up to 30 MB) preview in a dialog through a `blob:` URL
+  of `fetch(content)` (SVG never previews); PDF opens in a new tab at `content` without `download=1`
+  (the server's PDF CSP); `.xlsx/.xlsm/.csv/.fsheet` open `freedomoffice://open?server=<encodeURIComponent(
+  location.origin)>&item=<id>` with a "Don't have FreedomSheets?" hint; anything else downloads
+  (`?download=1`). Nothing else renders inline.
+- New folder, rename (`PATCH {name}`), move (`PATCH {parent}`, a folder picker that stays inside the
+  item's drive: My files or the organisation), delete (`DELETE`, then a toast with Undo = restore), version
+  history (download `?version=n&download=1`, restore `POST .../versions/{n}/restore`).
+- Recycle bin: `GET /api/trash`, Restore. There is no permanent delete in the API, so the app has none.
+- Uploads: button (multiple) or drag and drop onto the list (folders are refused with a message), one
+  `XMLHttpRequest` per file (`POST /api/files?parent=&name=&conflict=`, `X-FO-CSRF`, the raw file) with a
+  progress bar and Cancel each, at most 3 at once (the server allows 4 per person; a 429 is retried up to 3
+  times after 3/6/9 s). Files over `max_upload_mb` are refused before sending; 413 shows the server's
+  message. A name that exists in the open folder asks first: Replace (`replace`; not for folders),
+  Keep both (`rename`), Skip, optionally for all; a 409 that still happens asks the same. Leaving the page
+  while uploading asks first.
+- Share (edit access): people (`GET /api/users?query=`, which suggests people sharing an organisation and
+  finds anyone else by exact username) with view/edit, each of the person's organisations with view/edit,
+  the current access (owner, people, organisations; inherited ones show their folder and can't be removed
+  here) with Remove; share links (role, expiry, optional password; the URL is shown once with Copy; list and
+  delete) unless `server.allow_links` is false, and a 403 `links_disabled` replaces the section with a note.
+
+Checked with headless Chrome (DevTools protocol over `--remote-debugging-pipe`) against a throwaway server
+on 127.0.0.1: the flows above, no console errors or CSP violations, light/dark/phone screenshots.
+
 ### Open in FreedomSheets
 
-Drive links to `freedomoffice://open?server=<percent-encoded public_url>&item=<id>` for `.xlsx`, `.csv`,
+Drive links to `freedomoffice://open?server=<percent-encoded public_url>&item=<id>` for `.xlsx`, `.xlsm`, `.csv`,
 `.fsheet`. FreedomSheets registers the scheme (Windows: `HKCU\Software\Classes\freedomoffice`, written at
 start only if missing or already pointing at that exe; Linux: `MimeType=x-scheme-handler/freedomoffice;` in
 its .desktop file, see README; macOS: `CFBundleURLTypes` in the app bundle). Sheets accepts only exactly

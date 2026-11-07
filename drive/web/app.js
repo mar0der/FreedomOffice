@@ -118,6 +118,8 @@
         return "Can't reach the server. Check your connection and try again.";
       case 404:
         return msg || "This item doesn't exist any more, or you no longer have access to it.";
+      case 408:
+        return 'The upload stalled for a minute and the server stopped it. Check the connection and try again.';
       case 409:
         return msg || 'An item with that name already exists here.';
       case 412:
