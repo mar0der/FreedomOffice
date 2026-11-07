@@ -376,6 +376,7 @@ fn the_audit_log_records_and_scopes_events() {
     assert_eq!(failed.len(), 1, "only the valid username: {failed:?}");
     assert_eq!(failed[0]["target_user"], "bob");
     assert_eq!(failed[0]["ip"], "127.0.0.1");
+    assert!(all.iter().all(|e| e["ip"] == "127.0.0.1"), "every event has the request's address: {all:?}");
     let dump = serde_json::to_string(&all).unwrap();
     for secret in ["secret-guess", PW, "top secret contents", &inv_url, &link_url, inv_url.rsplit('/').next().unwrap(), link_url.rsplit('/').next().unwrap(), &at, &bt] {
         assert!(!dump.contains(secret), "{secret} must not be in the audit log");
