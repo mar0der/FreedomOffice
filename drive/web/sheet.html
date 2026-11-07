@@ -45,6 +45,8 @@
     <a id="back" class="tbtn" href="/drive" aria-label="Back to Drive">&#8592;</a>
     <h1 id="title" class="title" dir="auto"></h1>
     <span id="status" class="status" role="status"></span>
+    <button type="button" id="undo" class="tbtn edit-only" aria-label="Undo" hidden>&#8630;</button>
+    <button type="button" id="redo" class="tbtn edit-only" aria-label="Redo" hidden>&#8631;</button>
     <button type="button" id="zoom-out" class="tbtn" aria-label="Smaller text">A&#8722;</button>
     <button type="button" id="zoom-in" class="tbtn" aria-label="Larger text">A+</button>
     <button type="button" id="more" class="tbtn" aria-haspopup="true" aria-expanded="false" aria-controls="menu" aria-label="More">&#8943;</button>
@@ -58,6 +60,16 @@
   <div class="fbar">
     <span id="addr" class="addr" aria-label="Selected cell">&#8212;</span>
     <div id="fx" class="fx" tabindex="0" role="textbox" aria-readonly="true" aria-label="Cell value or formula"></div>
+    <input id="fxin" class="fxin" type="text" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="done" aria-label="Edit cell" hidden>
+    <button type="button" id="fx-cancel" class="fbtn" aria-label="Cancel edit" hidden>&#10005;</button>
+    <button type="button" id="fx-ok" class="fbtn ok" aria-label="Enter" hidden>&#10003;</button>
+  </div>
+  <div id="tools" class="tools edit-only" hidden>
+    <button type="button" id="t-bold" class="tool" aria-label="Bold"><b>B</b></button>
+    <button type="button" id="t-italic" class="tool" aria-label="Italic"><i>I</i></button>
+    <button type="button" id="t-fill" class="tool" aria-label="Highlight">&#9646;</button>
+    <button type="button" id="t-num" class="tool" aria-label="Number format">0.00</button>
+    <button type="button" id="t-clear" class="tool" aria-label="Clear cell">Clear</button>
   </div>
   <div id="stage" class="stage">
     <canvas id="cv" aria-hidden="true"></canvas>

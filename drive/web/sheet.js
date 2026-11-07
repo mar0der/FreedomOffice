@@ -37,6 +37,8 @@
     drawQueued: false,
     cellInfo: new Map(), // "rev:sheet:r:c" -> info
     fetchSeq: 0,
+    live: { ws: null, state: 'off', pending: new Map(), seq: 0, retry: 0, timer: 0, role: 'view', peers: [], me: null, save: '', ready: false },
+    palette: ['#0078D4', '#C239B3', '#00A36C', '#CA5010', '#8764B8', '#E3008C', '#038387', '#986F0B'],
   };
 
   // ---------------------------------------------------------------------------
@@ -223,6 +225,7 @@
     switchSheet(S.cur, true);
     setStatus();
     startPolling();
+    connectLive();
   }
 
   function setupChrome() {
@@ -243,11 +246,30 @@
 
   function setStatus(text) {
     const st = $('status');
+    st.className = 'status';
     if (text !== undefined) {
       st.textContent = text;
       return;
     }
-    st.textContent = S.meta && S.meta.live ? 'View · live' : 'View only';
+    const L = S.live;
+    if (L.state === 'open' && L.ready) {
+      if (L.role === 'edit') {
+        const v = L.save === 'saving' ? 'Saving\u2026' : L.save === 'offline' ? 'Offline' : 'Saved';
+        st.textContent = v;
+        if (L.save === 'saving') st.classList.add('saving');
+        if (L.save === 'offline') st.classList.add('offline');
+      } else {
+        st.textContent = 'View only \u00b7 live';
+      }
+    } else if (L.state === 'connecting') {
+      st.textContent = 'Connecting\u2026';
+    } else if (L.state === 'closed') {
+      st.textContent = 'Offline';
+      st.classList.add('offline');
+    } else {
+      st.textContent = S.meta && S.meta.live ? 'View \u00b7 live' : 'View only';
+    }
+    updateEditUi();
   }
 
   function buildTabs() {
@@ -434,10 +456,11 @@
   function startPolling() {
     clearInterval(poll);
     poll = setInterval(() => {
-      if (document.visibilityState === 'visible' && !$('app').hidden) reload();
+      if (document.visibilityState === 'visible' && !$('app').hidden && !S.live.ready) reload();
     }, 10000);
     document.addEventListener('visibilitychange', () => {
-      if (document.visibilityState === 'visible' && !$('app').hidden) reload();
+      if (document.visibilityState === 'visible' && !$('app').hidden && !S.live.ready) reload();
+      if (document.visibilityState === 'visible' && S.live.state === 'closed') connectLive();
     });
   }
 
@@ -511,15 +534,22 @@
       const c1 = bc * BC;
       const c2 = Math.min(L.nc - 1, c1 + BC - 1);
       S.inflight++;
-      get(`${itemPath('/sheet/cells')}?sheet=${sheet}&r1=${r1}&r2=${r2}&c1=${c1}&c2=${c2}`)
+      const via = S.live.ready ? liveCall({ t: 'win', sheet, r1, r2, c1, c2 }) : get(`${itemPath('/sheet/cells')}?sheet=${sheet}&r1=${r1}&r2=${r2}&c1=${c1}&c2=${c2}`);
+      via
         .then((w) => {
-          if (w.rev !== S.rev || rev !== S.rev) {
+          if (S.live.ready && !String(S.rev).startsWith('L')) {
+            S.blocks.delete(k);
+            return;
+          }
+          if (!S.live.ready ? w.rev !== S.rev || rev !== S.rev : false) {
             S.blocks.delete(k);
             reload();
             return;
           }
           const b = S.blocks.get(k);
           if (!b) return;
+          for (const key of b.keys) S.cells.delete(key);
+          b.keys = [];
           absorb(b, w);
           b.loading = false;
           requestDraw();
@@ -743,6 +773,39 @@
       ctx.strokeStyle = P.sel;
       ctx.lineWidth = 2;
       ctx.strokeRect(x + 1, y + 1, Math.max(0, w - 2), Math.max(0, h - 2));
+    }
+    drawPeers(ctx, L, p, z);
+  }
+
+  /** Other people's cursors: a coloured box on their cell with their name on a flag. */
+  function drawPeers(ctx, L, p, z) {
+    for (const q of S.live.peers) {
+      const pr = q.p;
+      if (!pr || pr.sheet !== S.cur || (S.live.me && q.id === S.live.me.id)) continue;
+      if (pr.r >= L.nr || pr.c >= L.nc) continue;
+      const m = L.merges.find((mm) => pr.r >= mm[0] && pr.r <= mm[2] && pr.c >= mm[1] && pr.c <= mm[3]);
+      const [r1, c1, r2, c2] = m || [pr.r, pr.c, pr.r, pr.c];
+      if (r2 < p.ra || r1 > p.rb || c2 < p.ca || c1 > p.cb) continue;
+      const x = px(p, L, c1, z);
+      const y = py(p, L, r1, z);
+      const w = (L.colX[c2 + 1] - L.colX[c1]) * z;
+      const h = (L.rowY[r2 + 1] - L.rowY[r1]) * z;
+      const col = S.palette[q.color % S.palette.length];
+      ctx.strokeStyle = col;
+      ctx.lineWidth = q.p.editing ? 3 : 2;
+      ctx.setLineDash(q.p.editing ? [5, 3] : []);
+      ctx.strokeRect(x + 1, y + 1, Math.max(0, w - 2), Math.max(0, h - 2));
+      ctx.setLineDash([]);
+      const label = stripBidi(q.name || q.user || 'Someone') + (q.agent ? ' (agent)' : '');
+      ctx.font = '600 11px system-ui, -apple-system, sans-serif';
+      const tw = ctx.measureText(label).width + 8;
+      const ly = y >= 16 ? y - 16 : y + h;
+      ctx.fillStyle = col;
+      ctx.fillRect(x, ly, tw, 16);
+      ctx.fillStyle = '#fff';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(label, x + 4, ly + 8.5);
+      ctx.textBaseline = 'alphabetic';
     }
   }
 
@@ -1030,15 +1093,21 @@
     const mine = ++barSeq;
     const cached = S.cell(r, c);
     fx.textContent = cached ? markBidi(cached.input) : '';
+    if (S.live.ready && S.live.role === 'edit' && !editing) $('fxin').value = cached ? (cached.hidden_formula ? '' : cached.input) : '';
+    sendPresence();
     if (!cached) {
       // The shown text is a good first answer while the exact input arrives.
       const quick = S.cells.get(r * KEYC + c);
       fx.textContent = quick ? markBidi(quick.t) : '';
-      get(`${itemPath('/sheet/cell')}?sheet=${S.cur}&r=${r}&c=${c}`)
+      if (S.live.ready && S.live.role === 'edit' && !editing) $('fxin').value = quick ? quick.t : '';
+      const via = S.live.ready ? liveCall({ t: 'cell', sheet: S.cur, r, c }) : get(`${itemPath('/sheet/cell')}?sheet=${S.cur}&r=${r}&c=${c}`);
+      via
         .then((info) => {
-          if (info.rev !== S.rev) return;
+          if (!S.live.ready && info.rev !== S.rev) return;
           S.cellInfo.set(`${S.rev}:${S.cur}:${r}:${c}`, info);
-          if (mine === barSeq) fx.textContent = markBidi(info.hidden_formula ? '(formula hidden)' : info.input || info.text);
+          if (mine !== barSeq) return;
+          fx.textContent = markBidi(info.hidden_formula ? '(formula hidden)' : info.input || info.text);
+          if (S.live.ready && S.live.role === 'edit' && !editing) $('fxin').value = info.hidden_formula ? '' : info.input || '';
         })
         .catch(() => {});
     }
@@ -1221,9 +1290,339 @@
     return k < 0 || k >= n ? i : k;
   }
 
+
+  // ---------------------------------------------------------------------------
+  // Live: the server-side bridge (/api/items/<id>/web-live) and editing
+  // ---------------------------------------------------------------------------
+
+  function liveCall(msg) {
+    return new Promise((resolve, reject) => {
+      const L = S.live;
+      if (!L.ws || L.state !== 'open') return reject(new ApiError(0, { error: 'Offline.' }));
+      const id = ++L.seq;
+      L.pending.set(id, { resolve, reject });
+      L.ws.send(JSON.stringify({ ...msg, id }));
+    });
+  }
+
+  function liveSend(msg) {
+    const L = S.live;
+    if (L.ws && L.state === 'open') L.ws.send(JSON.stringify(msg));
+  }
+
+  async function connectLive() {
+    const L = S.live;
+    if (L.ws || L.state === 'connecting' || !S.csrf) return;
+    L.state = 'connecting';
+    setStatus();
+    let ticket;
+    try {
+      const res = await fetch(itemPath('/live-ticket'), { method: 'POST', credentials: 'same-origin', cache: 'no-store', headers: { 'X-FO-CSRF': S.csrf } });
+      if (res.status === 401) return showSignIn();
+      if (!res.ok) throw new Error(String(res.status));
+      ticket = (await res.json()).ticket;
+    } catch {
+      return liveClosed();
+    }
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    let ws;
+    try {
+      ws = new WebSocket(`${proto}//${location.host}${itemPath('/web-live')}?ticket=${encodeURIComponent(ticket)}`);
+    } catch {
+      return liveClosed();
+    }
+    L.ws = ws;
+    ws.addEventListener('open', () => {
+      L.state = 'open';
+      liveSend({ t: 'meta' });
+    });
+    ws.addEventListener('message', (e) => {
+      let m;
+      try {
+        m = JSON.parse(e.data);
+      } catch {
+        return;
+      }
+      onLive(m);
+    });
+    ws.addEventListener('close', () => {
+      if (L.ws === ws) liveClosed();
+    });
+    ws.addEventListener('error', () => {});
+  }
+
+  function liveClosed() {
+    const L = S.live;
+    L.ws = null;
+    L.ready = false;
+    L.peers = [];
+    for (const { reject } of L.pending.values()) reject(new ApiError(0, { error: 'Offline.' }));
+    L.pending.clear();
+    if (L.state === 'revoked') return;
+    L.state = 'closed';
+    L.save = 'offline';
+    setStatus();
+    requestDraw();
+    clearTimeout(L.timer);
+    L.retry = Math.min(L.retry + 1, 4);
+    L.timer = setTimeout(() => {
+      L.state = 'off';
+      connectLive();
+    }, 1000 * 2 ** L.retry);
+  }
+
+  function onLive(m) {
+    const L = S.live;
+    switch (m.t) {
+      case 'meta': {
+        const first = !L.ready;
+        L.ready = true;
+        L.retry = 0;
+        L.role = m.role;
+        S.meta = { ...S.meta, sheets: m.sheets, role: m.role, cells: m.cells };
+        S.rev = `L${m.rev}`;
+        S.layouts.clear();
+        dropData();
+        if (!S.meta.sheets[S.cur]) S.cur = 0;
+        buildTabs();
+        measure();
+        readScroll();
+        if (first) writeScroll(geo.ox, geo.oy);
+        requestDraw();
+        ensureBlocks();
+        renderBar();
+        setStatus();
+        break;
+      }
+      case 'win':
+      case 'cell': {
+        const p = L.pending.get(m.id);
+        if (p) {
+          L.pending.delete(m.id);
+          p.resolve(m);
+        }
+        break;
+      }
+      case 'hello':
+        L.me = m.you;
+        L.role = m.role;
+        setStatus();
+        break;
+      case 'peers':
+        L.peers = m.peers;
+        requestDraw();
+        break;
+      case 'changed':
+        S.rev = `L${m.rev}`;
+        if (m.sheets) liveSend({ t: 'meta' });
+        else refetchSoon();
+        break;
+      case 'status':
+        L.save = m.state;
+        setStatus();
+        break;
+      case 'role':
+        L.role = m.role;
+        S.meta.role = m.role;
+        showBanner(m.role === 'edit' ? 'You can now edit this workbook.' : 'You now have view-only access to this workbook.');
+        setStatus();
+        break;
+      case 'rejected':
+        showBanner(m.message);
+        break;
+      case 'error':
+        if (m.id !== undefined && L.pending.has(m.id)) {
+          const p = L.pending.get(m.id);
+          L.pending.delete(m.id);
+          p.reject(new ApiError(400, { error: m.message }));
+        }
+        break;
+      case 'revoked':
+        L.state = 'revoked';
+        problem(m.reason || 'Your access to this workbook was removed.', { title: 'Access removed' });
+        break;
+      case 'reload':
+        liveClosed();
+        break;
+      case 'failed':
+        L.state = 'revoked';
+        break;
+      case 'closed':
+        break;
+      default:
+        break;
+    }
+  }
+
+  let refetchTimer = 0;
+  function refetchSoon() {
+    if (refetchTimer) return;
+    refetchTimer = setTimeout(() => {
+      refetchTimer = 0;
+      S.cellInfo.clear();
+      // Everything in view is asked for again; blocks out of view are forgotten.
+      const { L, c0, c1, r0, r1 } = visibleRanges();
+      const keep = new Set();
+      for (let br = Math.floor(Math.max(0, r0 - 12) / BR); br <= Math.floor(Math.min(L.nr - 1, r1 + 12) / BR); br++) {
+        for (let bc = Math.floor(Math.max(0, c0 - 3) / BC); bc <= Math.floor(Math.min(L.nc - 1, c1 + 3) / BC); bc++) keep.add(`${S.cur}:${br}:${bc}`);
+      }
+      if (L.fr > 0) for (let bc = 0; bc <= Math.floor(Math.min(L.nc - 1, c1 + 3) / BC); bc++) keep.add(`${S.cur}:0:${bc}`);
+      for (const [k, b] of [...S.blocks.entries()]) {
+        if (b.loading) continue;
+        if (!keep.has(k)) {
+          for (const key of b.keys) S.cells.delete(key);
+          S.blocks.delete(k);
+        } else {
+          // Asked for again; the old cells stay on screen until the new ones replace them.
+          b.loading = true;
+          b.used = ++S.fetchSeq;
+          queue.push(k);
+        }
+      }
+      pump();
+      ensureBlocks();
+      renderBar();
+    }, 60);
+  }
+
+  function showBanner(text) {
+    let b = $('banner');
+    if (!b) {
+      b = el('div', { id: 'banner', class: 'banner', role: 'status' });
+      $('app').insertBefore(b, $('app').children[2]);
+    }
+    b.textContent = text;
+    b.hidden = false;
+    clearTimeout(showBanner.t);
+    showBanner.t = setTimeout(() => {
+      b.hidden = true;
+    }, 6000);
+  }
+
+  // ---- editing UI
+
+  const canEdit = () => S.live.ready && S.live.state === 'open' && S.live.role === 'edit';
+  let editing = false;
+
+  function updateEditUi() {
+    const edit = S.live.ready && S.live.role === 'edit';
+    for (const e of document.querySelectorAll('.edit-only')) e.hidden = !edit;
+    $('fxin').hidden = !edit;
+    $('fx').hidden = edit;
+    if (!edit) {
+      $('fx-ok').hidden = true;
+      $('fx-cancel').hidden = true;
+    }
+  }
+
+  function enterText() {
+    const info = S.cell(S.sel.r, S.sel.c);
+    const quick = S.cells.get(S.sel.r * KEYC + S.sel.c);
+    if (info) return info.hidden_formula ? '' : info.input;
+    return quick ? quick.t : '';
+  }
+
+  function setEditing(on) {
+    editing = on;
+    $('fx-ok').hidden = !on;
+    $('fx-cancel').hidden = !on;
+    sendPresence();
+  }
+
+  let lastPresence = '';
+  function sendPresence() {
+    const m = { t: 'presence', sheet: S.cur, r: S.sel.r, c: S.sel.c, editing };
+    const k = JSON.stringify(m);
+    if (k === lastPresence) return;
+    lastPresence = k;
+    liveSend(m);
+  }
+
+  function commitEdit(move) {
+    if (!canEdit()) return showBanner("You're offline; reconnecting. Try again in a moment.");
+    const text = $('fxin').value;
+    liveSend({ t: 'edit', sheet: S.cur, r: S.sel.r, c: S.sel.c, text });
+    setEditing(false);
+    $('fxin').blur();
+    if (move) select(Math.min(S.sel.r + 1, layoutOf(S.cur).nr - 1), S.sel.c, true);
+    $('scroller').focus({ preventScroll: true });
+  }
+
+  function cancelEdit() {
+    setEditing(false);
+    $('fxin').value = enterText();
+    $('fxin').blur();
+    $('scroller').focus({ preventScroll: true });
+  }
+
+  function wireEdit() {
+    const inp = $('fxin');
+    inp.addEventListener('focus', () => {
+      if (!editing) setEditing(true);
+    });
+    inp.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        commitEdit(true);
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        cancelEdit();
+      } else if (e.key === 'Tab') {
+        e.preventDefault();
+        commitEdit(false);
+        select(S.sel.r, Math.min(S.sel.c + 1, layoutOf(S.cur).nc - 1), true);
+      }
+    });
+    $('fx-ok').addEventListener('click', () => commitEdit(false));
+    $('fx-cancel').addEventListener('click', cancelEdit);
+    $('undo').addEventListener('click', () => liveSend({ t: 'undo' }));
+    $('redo').addEventListener('click', () => liveSend({ t: 'redo' }));
+    const fmt = (set) => liveSend({ t: 'fmt', sheet: S.cur, r1: S.sel.r, c1: S.sel.c, r2: S.sel.r, c2: S.sel.c, set });
+    $('t-bold').addEventListener('click', () => {
+      const st = (S.cells.get(S.sel.r * KEYC + S.sel.c) || {}).st;
+      fmt({ b: !(st && st.b) });
+    });
+    $('t-italic').addEventListener('click', () => {
+      const st = (S.cells.get(S.sel.r * KEYC + S.sel.c) || {}).st;
+      fmt({ i: !(st && st.i) });
+    });
+    $('t-fill').addEventListener('click', () => {
+      const st = (S.cells.get(S.sel.r * KEYC + S.sel.c) || {}).st;
+      fmt({ fill: st && st.f ? null : '#ffee99' });
+    });
+    $('t-num').addEventListener('click', () => fmt({ nf: '#,##0.00' }));
+    $('t-clear').addEventListener('click', () => liveSend({ t: 'clear', sheet: S.cur, r1: S.sel.r, c1: S.sel.c, r2: S.sel.r, c2: S.sel.c }));
+    // The grid: a printable key starts typing; Enter edits; Delete clears.
+    $('scroller').addEventListener('keydown', (e) => {
+      if (!canEdit() || e.ctrlKey || e.metaKey || e.altKey) return;
+      if (e.key === 'Delete' || e.key === 'Backspace') {
+        e.preventDefault();
+        liveSend({ t: 'clear', sheet: S.cur, r1: S.sel.r, c1: S.sel.c, r2: S.sel.r, c2: S.sel.c });
+      } else if (e.key === 'Enter' || e.key === 'F2') {
+        e.preventDefault();
+        inp.focus();
+      } else if (e.key.length === 1) {
+        e.preventDefault();
+        inp.value = '';
+        inp.focus();
+        inp.value = e.key;
+      }
+    });
+    $('scroller').addEventListener('keydown', (e) => {
+      if (!canEdit() || !(e.ctrlKey || e.metaKey)) return;
+      if (e.key === 'z') {
+        e.preventDefault();
+        liveSend({ t: e.shiftKey ? 'redo' : 'undo' });
+      } else if (e.key === 'y') {
+        e.preventDefault();
+        liveSend({ t: 'redo' });
+      }
+    });
+  }
+
   // Test hook: lets the browser check read the drawn state without touching the canvas.
   window.__fsheet = {
-    state: () => ({ sel: S.sel, z: S.z, cur: S.cur, rev: S.rev, cells: S.cells.size, blocks: S.blocks.size, ox: geo.ox, oy: geo.oy, sheets: S.meta ? S.meta.sheets.map((s) => s.name) : [] }),
+    state: () => ({ sel: S.sel, z: S.z, cur: S.cur, rev: S.rev, cells: S.cells.size, blocks: S.blocks.size, ox: geo.ox, oy: geo.oy, sheets: S.meta ? S.meta.sheets.map((s) => s.name) : [], live: S.live.ready, role: S.live.role, save: S.live.save, peers: S.live.peers.length, editing }),
     cellText: (r, c) => (S.cells.get(r * KEYC + c) || {}).t,
     select: (r, c) => select(r, c, true),
     zoom: (z) => setZoom(z),
@@ -1237,5 +1636,6 @@
   };
 
   wire();
+  wireEdit();
   boot().catch((e) => problem(e && e.message ? e.message : 'Something went wrong.', { retry: true }));
 })();

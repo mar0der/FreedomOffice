@@ -795,6 +795,33 @@ revision every 10 s while visible and reloads what is in view when it changes. A
 canvas after removing bidi embedding/override/isolate controls; the bar shows them as a visible mark; names are
 `<bdi>`.
 
+**Live editing in the browser (W2).** Approach (b), a server-side bridge (DECISIONS W-7). `POST
+/api/items/{id}/live-ticket` (cookie + `X-FO-CSRF`) gives a one-minute single-use ticket; `GET
+/api/items/{id}/web-live?ticket=` upgrades to a same-origin WebSocket (the cookie alone never opens it; 256 KB
+messages). For each such connection the server runs a headless live client (`sheetview::bridge::Bridge`: the
+workbook in the app's model, `cosync::client::Session`, the formula engine) that joins the document's session
+inside the process through `live::run` (made generic over its socket; an in-memory socket pair stands in for the
+WebSocket). Everything the hub does for the app therefore applies unchanged: role checks on every batch, live role
+changes (`role`) and revocation (`revoked`) pushed to the browser, 30 batches/s limit, presence, the merge/OT
+rules, and snapshots (the bridge answers the server's snapshot request with the workbook + lossless live state, so
+browser-only editing still produces versions). Browser to bridge (JSON, `t`): `meta`, `win {id,sheet,r1,c1,r2,c2}`,
+`cell {id,sheet,r,c}`, `edit {sheet,r,c,text}` (typed text parsed like the app: numbers, dates, percentages with
+their implied format, `=formulas`, rejected with `rejected` when a formula can't be read), `clear {sheet,r1..c2}`,
+`fmt {sheet,r1..c2,set:{b,i,u,x,fill,color,h,nf}}`, `undo`, `redo` (per person: only the bridge's own edits),
+`presence {sheet,r,c,editing}`. Bridge to browser: `meta`, `win`, `cell` (replies), `hello {role,you}`, `peers`
+(id, name, user, colour slot, editor, agent, presence cell/selection/editing, sheet index), `changed {rev,sheets}`
+(the browser refetches what is in view), `status {state: saved|saving|offline}`, `role`, `revoked`, `rejected`,
+`reload`, `failed`, `closed`. Windows and cells come from the bridge's workbook, so the browser sees its own and
+other people's edits (and recalculated formulas) at once. UI: the formula bar is a 16 px input for editors (tap
+the bar, type, check mark = enter, cross = cancel; Enter, Tab, Escape on a keyboard; a printable key on the grid
+starts typing), undo/redo in the header, B / I / highlight / `#,##0.00` / Clear buttons for the selected cell, a
+"Saved / Saving... / Offline" indicator, other people's cursors with their names in the app's colours (a dashed box
+while they type; agents are marked "(agent)"), a banner when the role changes. A lost connection reconnects (2, 4,
+8, 16 s) and reloads the workbook; edits are refused while offline (no offline journal in the browser) and the
+`reload` case (the log was cut short while connected) also reconnects from the latest version. Viewers get the same
+live view without edit controls. Not in W2/W3 yet: insert/delete rows and columns, add/rename sheet, range
+selection by touch, copy/paste, column widths; xlsx/CSV export of the current state exists (menu, W1 routes).
+
 **CLI / MCP parity.** The headless client already covers Sheets for agents: `fsheets` (CLI) and its MCP server read
 and edit through the live protocol (agents/README.md). The viewer's JSON is also usable by scripts
 (`curl` with a bearer token against the routes above), which gives agents a rendered-values read without the
