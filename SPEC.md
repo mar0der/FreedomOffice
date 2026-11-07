@@ -122,6 +122,10 @@ crash leaves the old schema). Version 1:
 Version 2 (web admin, §4): `users` + `last_login`; new `admin_sessions(id, user_id, hash UNIQUE, agent,
 created, expires, last_used)`.
 
+Version 3 (Drive, §6): `admin_sessions` + `kind 'admin'|'web'` (existing rows become `admin`); new
+append-only `audit(id, at, actor_id, actor_name, ip, action, org_id, item_id, target_user, detail)` with
+triggers that abort every `UPDATE` and every `DELETE` of a row younger than 365 days.
+
 **No downgrade:** an older server binary can't open a migrated database (version 0 code: its schema
 statements refer to `permissions.user_id`; version 1 code refuses a newer `user_version`). Back up (`freedomoffice-server backup`) before upgrading.
 
@@ -151,6 +155,8 @@ to it and invites are deleted, the org account and any trashed items stay (unrea
 | `POST /api/users/{username}/sign-out` (every device and web admin session) | super-admin |
 | `GET /api/users/{username}/sessions` → `{devices, web}`, `DELETE .../sessions/{device\|web}/{id}` | super-admin |
 | `POST /api/items/{id}/permissions {org, role}`, `DELETE ... {org}` or `DELETE .../permissions/org/{org}`; `GET` lists `orgs` next to `permissions` | edit access; granting needs membership of that org (orgs can't be probed by name) |
+| `POST /api/web/login`, `GET /api/web/session`, `POST /api/web/logout` (browser session cookie for the whole API, §6) | anyone / the browser |
+| `GET /api/admin/audit?before=&limit=&org=&user=&action=` (§6) | super-admin: all; org owner/admin: their orgs' events |
 
 Errors keep the `{"error": "..."}` shape; some add `"code"`: `password_change_required` (403, every
 endpoint except `/api/me`, `/api/me/password`, `/api/logout` while a temporary password is set),
@@ -227,6 +233,11 @@ Not yet: other participants aren't told that someone's role changed (their peer 
   address or browser. Destructive buttons (disable, reset, remove) have no "are you sure" step except
   deleting an organisation. The People page runs a few queries per person (organisations, storage):
   fine for a family or a team, slow with thousands of accounts.
+- Drive (§6): the audit log records file and folder names, also of personal files, which the super-admin
+  can read there (not the contents). Failed sign-ins from very many addresses each add an audit row (the
+  per-address limit bounds each address, not their number; rows go after 365 days). Browsers that send
+  neither `Sec-Fetch-Site` nor `Origin` (very old ones) rely on SameSite=Strict and the CSRF header alone.
+  Web sessions, like admin sessions, aren't bound to an address or browser.
 
 ## 4. Admin UI
 
@@ -274,7 +285,8 @@ anything" and their own change-password form.
 | `POST /admin/orgs/{id}/invites` → link shown once with a prefilled `mailto:`; `.../invites/{iid}/revoke` | | org owner/admin |
 | `GET /admin/people`, `POST /admin/people` (account without org) | status, orgs, last sign-in, storage | super-admin |
 | `GET /admin/people/{user}`; `POST .../disable`, `/enable`, `/reset-password`, `/sign-out`, `/admin` (`on=1/0`) | | super-admin |
-| `POST /admin/people/{user}/sessions/{device\|web}/{id}/revoke` | end one sign-in | super-admin |
+| `POST /admin/people/{user}/sessions/{device\|web}/{id}/revoke` | end one sign-in (`web`: an admin-page or a Drive browser session) | super-admin |
+| `GET /admin/audit?user=&org=&action=&before=` | audit log (§6), 50 per page | super-admin: all; org owners/admins: their orgs |
 
 Every action calls the same functions as the API (`api::create_account_as`, `set_member_as`,
 `remove_member_as`, `patch_org_as`, `create_invite_as`, `set_disabled_as`, `reset_password_as`, ...), which
@@ -352,7 +364,153 @@ freedomoffice-server stays the only thing that touches the data.
 - **Audit log** (D1): append-only table of security-relevant events (sign-in ok/failed, password
   change/reset, account/org/membership/role changes, share/unshare, link create/delete, delete/restore/
   purge, admin actions) with who, when, IP, item/org. Viewable in /admin (super-admin: all; org admin: their
-  org). Never contains passwords, tokens or file contents.
+  org). Never contains passwords, tokens or file contents. **(exists, see below)**
+
+### Server contract for the Drive web app (D1, `drive-server` branch) **(exists)**
+
+The Drive page is served by freedomoffice-server from the same origin as the API (`public_url`), so it
+calls `/api/*` with `fetch(..., { credentials: "same-origin" })`. The server sends no CORS headers: other
+origins can't read anything. Code: `server/src/web.rs` (session), `server/src/content.rs` (bytes),
+`api::audit_as` (audit).
+
+#### Web session (cookie + CSRF header)
+
+| Endpoint | Request | Answer |
+|---|---|---|
+| `POST /api/web/login` | `Content-Type: application/json` (required; 400 otherwise), body `{username, password}`; `Origin` (or `Referer`) must be the server's own and `Sec-Fetch-Site`, if sent, `same-origin`/`none` (else 403 `cross_site`) | 200 `{user, csrf}` + `Set-Cookie`; 401 wrong username or password, or a disabled account (the same answer); 429 limited |
+| `GET /api/web/session` | the cookie | 200 `{user, csrf}`, or 401 `{"error"}` without a valid session (also while a temporary password is set: then `user.must_change_password` is true) |
+| `POST /api/web/logout` | the cookie + `X-FO-CSRF` | 204 and the cookie cleared (also with no session) |
+
+- `user` is the same object as in `/api/login`: `{id, username, display_name, email, is_admin, root,
+  must_change_password}`. `GET /api/me` adds `orgs`.
+- Sign-in runs `api::check_sign_in`, the same path as `/api/login` and `/admin/login`: invalid usernames
+  refused first, the attempt counted up front in the shared limiter (per address and per username: the
+  three sign-ins share their counts), the delay after repeated failures, Argon2 in its semaphore. A browser
+  that signs in again ends the web session of the cookie it sent.
+- Cookie: `__Host-fo_web=<secret>; Path=/; Max-Age=43200; HttpOnly; SameSite=Strict; Secure` (32 random
+  bytes, base64url). On a plain-http loopback setup (as for `/admin`): `fo_web=...` without `Secure`.
+  Stored as `admin_sessions` rows with `kind = 'web'` (only the SHA-256). 12 h absolute, whatever the
+  activity; at most 10 web sessions per person (the oldest end; admin sessions are counted separately). A
+  web session never opens `/admin`; an admin session (`__Host-fo_admin`) never opens the API.
+- `csrf` = base64url(SHA-256("freedomoffice web csrf\0" + secret)): one per session (stable for its life),
+  nothing stored, unknowable without the HttpOnly cookie. Keep it in memory (re-read it with
+  `GET /api/web/session` after a reload).
+- **Every `/api/*` endpoint** accepts the cookie instead of `Authorization: Bearer`. A request that has an
+  `Authorization` header is judged by that header alone, exactly as before (cookie ignored).
+  With the cookie:
+  - every method except GET and HEAD must send `X-FO-CSRF: <csrf>` (constant-time compare; missing or wrong
+    → 403 `{"error", "code": "csrf_failed"}`) and come from the server's origin (`Origin`, or without one
+    `Referer`, must be `public_url`'s origin; `Origin: null` is refused) → else 403 `code: "cross_site"`;
+  - any method with `Sec-Fetch-Site` other than `same-origin` or `none` (`same-site` = a sibling
+    subdomain, `cross-site`) → 403 `code: "cross_site"`;
+  - the live WebSocket (`GET /api/items/{id}/live`) never takes the cookie: get a ticket with
+    `POST /api/items/{id}/live-ticket` (cookie + `X-FO-CSRF`) and connect with `?ticket=` (single use,
+    60 s; the ticket remembers the web session and is re-checked like any live connection);
+  - a temporary password gates the cookie like a token: 403 `password_change_required` everywhere except
+    `/api/me`, `/api/me/password {old_password, new_password}` (cookie + `X-FO-CSRF`), `/api/logout`,
+    `/api/web/session`, `/api/web/logout`.
+- Web sessions end with `/api/web/logout`, `/api/logout` (with the cookie), "sign out of all devices"
+  (`POST /api/users/{u}/sign-out`, admin page), disabling the account, a password reset, any password change
+  (from a device or the admin page: all of them; from the web: all others), and an administrator ending one
+  (`DELETE /api/users/{u}/sessions/web/{id}`; `GET .../sessions` lists them under `web` with
+  `kind: "web"`, next to `kind: "admin"`). The Drive app should treat any 401 as "signed out" (show the
+  sign-in) and any 403 `csrf_failed` as "reload the session" (`GET /api/web/session`).
+- Errors keep `{"error": "<for people>"}`, sometimes with `"code"`: `csrf_failed`, `cross_site`,
+  `password_change_required`, `wrong_password`, `links_disabled`, `invite_required`. 401 = not signed in,
+  404 = doesn't exist or not visible, 403 = visible but not allowed (view-only, not a manager), 409 name
+  taken / conflict, 412 `If-Match` mismatch, 413 too large, 416 bad range, 423 being edited live, 429
+  limited.
+
+#### Downloads (`GET /api/items/{id}/content`, `/l/{token}/download`)
+
+- Query: `version=<n>` (an older version; not for share links), `download=1` (save rather than show).
+- Streamed from disk (never read whole into memory). `Accept-Ranges: bytes`; one range per request
+  (`bytes=a-b`, `bytes=a-`, `bytes=-n`) → 206 with `Content-Range: bytes a-b/len`; outside the file → 416
+  with `Content-Range: bytes */len`; several ranges or a malformed header → 200 with all of it; `If-Range`
+  with another ETag → 200 with all of it.
+- `Content-Type` from the extension, from a fixed list (txt/log/md, csv, json, pdf, png, jpg/jpeg, gif,
+  webp, svg, html/htm, xml, mp3, m4a, wav, ogg/oga, mp4/m4v, webm, mov, zip, xlsx, docx, pptx, xls, doc, ppt,
+  ods, odt, odp); anything else `application/octet-stream`.
+- `Content-Disposition: inline` (or `attachment` with `download=1`, and always for `/l/` downloads)
+  `; filename="<ASCII fallback, other characters as _>"; filename*=UTF-8''<percent-encoded name>`.
+- Always: `X-Content-Type-Options: nosniff`, `Cross-Origin-Resource-Policy: same-origin` (other sites
+  can't embed the bytes with the visitor's cookie), `Referrer-Policy: no-referrer`, `Cache-Control:
+  no-store`, `ETag: "v<version>-<hash12>"`, `X-Version`. `Content-Security-Policy: sandbox; default-src
+  'none'; img-src data:; style-src 'unsafe-inline'; media-src 'self'; frame-ancestors 'self'` for every type
+  except PDF (`frame-ancestors 'self'` only; PDF viewers refuse to run sandboxed): a shared HTML or SVG
+  file renders without script in an opaque origin, never as the server's origin. The Drive page may show
+  previews in an `<iframe>` of its own origin.
+- `/api/items/{id}/content` (current version) also keeps Sheets' live headers (`X-Live-Seq`,
+  `X-Live-Sheets`, `X-Live-State`).
+
+#### Uploads
+
+- `POST /api/files?parent=<folder id or empty for My files>&name=<name>&conflict=fail|rename|replace` with
+  the raw bytes as the body (no multipart; one file per request; send `Content-Length`, chunked works too).
+  201 + item for a new file, 200 + item for a new version (`replace`), 409 name taken (`fail`, checked
+  before the body is read), 423 replacing a workbook that is being edited live.
+- `PUT /api/items/{id}/content` (optional `If-Match: "<etag>"`) → 200 + item (`ETag` header): the next
+  version; 412 `{error, etag, version, modified_by, modified}` when someone saved meanwhile; 423 live.
+- Both: authorization (and `If-Match`, the name, the conflict rule) are checked before the body is read and
+  again before it is stored; the body streams to `<data_dir>/incoming/` (hashed on the way) and is moved
+  into `files/<id>/<version>` with one rename; past `max_upload_mb` the upload stops at once with 413
+  `{"error": "The file is too large (at most N MB)."}` (also when Content-Length says so up front); an
+  interrupted upload stores nothing; `incoming/` is emptied at start. Progress: use `XMLHttpRequest`
+  `upload.onprogress` (fetch has no upload progress).
+- `POST /api/items/{id}/versions/{n}/restore` copies the old version on disk (no memory buffering).
+
+#### Audit log
+
+`audit(id, at, actor_id, actor_name, ip, action, org_id, item_id, target_user, detail)`, append-only (SQLite
+triggers abort updates and deletions of rows younger than 365 days); pruned after 365 days at server start
+and daily. `actor_name`/`target_user` are usernames at the time; `ip` the client address (behind the trusted
+proxy, `X-Forwarded-For`); `org_id` is the organisation the event belongs to (for item events: the item's
+organisation, so org admins see what happens in their org folder); `detail` is one line of at most 500
+characters. **Never** passwords, tokens, invite or link secrets, or file contents (file and folder names
+and the email an invite was made for are recorded).
+
+| Action | When | target_user / org / item / detail |
+|---|---|---|
+| `sign_in` | a sign-in succeeded | self / - / - / `app`, `web`, `admin` or `invite` |
+| `sign_in.failed` | wrong password for a *valid-format* username (existing or not), or a disabled account's right password | the username / - / - / how (text that can't be a username is not recorded) |
+| `sign_out` | `/api/web/logout` | self / - / - / `web` |
+| `password.change` | own password changed | self / - / - / other sign-ins ended (and whether a temporary one was replaced) |
+| `password.reset` | an administrator reset someone's password | that person / - / - / sign-ins ended |
+| `account.create` | account with a temporary password | the new account / org it joins / - / role |
+| `account.disable`, `account.enable` | | that person |
+| `account.admin` | super-admin flag set or removed | that person / - / - / on or off |
+| `account.sign_out` | signed out of every device and browser | that person / - / - / how many |
+| `account.session_end` | an administrator ended one sign-in | that person / - / - / device or browser session |
+| `org.create`, `org.delete` | | - / the org / - / name |
+| `org.rename` | | - / the org / - / old -> new |
+| `org.settings` | `member_role` changed | - / the org / - / new and old |
+| `member.add`, `member.role`, `member.remove` | | the person / the org / - / role (old -> new), `left` or `removed` |
+| `invite.create`, `invite.revoke` | | - / the org / - / the invite's email and role |
+| `invite.accept` | someone joined through an invite | that person / the org / - / new or existing account, role |
+| `permission.grant`, `permission.revoke` | sharing with a person or an organisation | the person (if any) / item's org / item / name, role, the org shared with |
+| `link.create`, `link.delete` | share links | - / item's org / item / name, role, link id, password/expiry |
+| `item.trash`, `item.restore`, `item.rename`, `item.move`, `item.version_restore` | | - / item's org / item / name(s), folders, versions |
+| `file.upload` | a *new* file was uploaded (new versions of existing files are not) | - / item's org / item / name, size, folder |
+
+Share-link holders appear as `actor_id = "link:<link id>"` with an empty `actor_name`.
+
+`GET /api/admin/audit?before=<id>&limit=<1..200, default 50>&org=<id or name>&user=<username>&action=<action
+or group>` → `{events: [{id, at, actor, actor_id, ip, action, org: {id, name} | null, item, target_user,
+detail}], next_before}` newest first; `next_before` (or null) is the `before` of the next page. `user`
+matches actor or target (case-insensitive); `action=org` matches every `org.*` (only `a-z`, `_`, `.`; 400
+otherwise). Super-admin: every event. Org owner/admin: only events whose `org_id` is an organisation they
+manage (an `org` they don't manage: 404). Anyone else: 403. `/admin/audit` shows the same with the same
+rules (filters person / organisation / action group, 50 per page, "Older"/"Newest").
+
+### Open in FreedomSheets
+
+Drive links to `freedomoffice://open?server=<percent-encoded public_url>&item=<id>` for `.xlsx`, `.csv`,
+`.fsheet`. FreedomSheets registers the scheme (Windows: `HKCU\Software\Classes\freedomoffice`, written at
+start only if missing or already pointing at that exe; Linux: `MimeType=x-scheme-handler/freedomoffice;` in
+its .desktop file, see README; macOS: `CFBundleURLTypes` in the app bundle). Sheets accepts only exactly
+`server` (https, or http on 127.0.0.1/localhost) and `item` (32 lowercase hex), uses nothing else from the
+URL, opens the item with the signed-in account for that server (joining live when possible) and otherwise
+shows File > Account with the server filled in; it never signs in or sends credentials by itself.
 
 ### Phases
 | Phase | What |
