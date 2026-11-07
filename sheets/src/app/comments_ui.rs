@@ -676,6 +676,40 @@ mod tests {
         assert!(when(1_000_000_000_000).contains("2001"));
     }
 
+    /// In a file that isn't on a server: the person at this computer comments and manages the file;
+    /// undo takes a comment back; a copy of the sheet starts without the comments.
+    #[test]
+    fn comments_in_a_local_file() {
+        let (_ctx, mut app) = super::super::data_ui::sample_app();
+        let th = app.comment_add(2, 1, "check this @bob").expect("added");
+        let reply = app.comment_reply(&th, "done");
+        assert!(reply);
+        let who = app.comment_who();
+        assert!(who.manager && !who.user.is_empty());
+        let t = app.wb.sheets[0].threads[0].clone();
+        assert_eq!((t.r, t.c, t.comments.len(), t.comments[0].by.as_str()), (2, 1, 2, who.user.as_str()));
+        assert!(app.comment_resolve(&th, true) && app.wb.sheets[0].threads[0].done);
+        assert!(app.comment_edit(&th, &th, "check this again"));
+        assert_eq!(app.wb.sheets[0].threads[0].comments[0].text, "check this again");
+        assert!(!app.comment_add(0, 0, "   ").is_some(), "an empty comment is not added");
+        // Someone else's comment: not editable, a manager may delete it.
+        app.wb.sheets[0].threads[0].comments[1].by = "someone".into();
+        let other = app.wb.sheets[0].threads[0].comments[1].id.clone();
+        assert!(!app.comment_edit(&th, &other, "hijack"));
+        assert!(app.comment_delete(&th, &other));
+        assert_eq!(app.wb.sheets[0].threads[0].comments.len(), 1);
+        // Copying the sheet leaves the comments behind.
+        app.duplicate_sheet(0);
+        assert!(app.wb.sheets[1].threads.is_empty() && app.wb.sheets[0].threads.len() == 1);
+        // Undo takes a comment back (the sheet snapshot).
+        app.wb.active = 0;
+        let before = app.wb.sheets[0].threads.len();
+        app.comment_add(5, 5, "second");
+        assert_eq!(app.wb.sheets[0].threads.len(), before + 1);
+        app.undo();
+        assert_eq!(app.wb.sheets[0].threads.len(), before);
+    }
+
     #[test]
     fn initials_of_names() {
         assert_eq!(initials("Ann Lee"), "AL");

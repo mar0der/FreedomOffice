@@ -732,18 +732,27 @@ fn commit(store: &Mutex<Store>, doc: &Mutex<Doc>, item: &str, conn: u64, (base, 
         d.close(conn, close::READ_ONLY, "You have view-only access to this workbook.");
         return false;
     }
-    let (sheets_before, last_before) = (d.log.sheets.clone(), d.log.last_commit(cid, actor));
     let mut ops = ops;
     let refused = match d.conns.iter().find(|c| c.peer.id == conn) {
         Some(c) => check_threads(&mut ops, &c.peer.user, c.peer.manager, c.proto),
         None => 0,
     };
     if refused > 0 {
-        // Only a stale client gets here (the app doesn't offer what is refused): it reloads.
         tracing::warn!("live: connection {conn} sent {refused} comment operation(s) for item {item} that its user may not make; dropped");
+    }
+    let ok = commit_batch(&mut d, store, item, conn, (base, made), cid, id, actor, ops);
+    if ok && refused > 0 {
+        // Only a stale client gets here (the app doesn't offer what is refused): after its
+        // acknowledgement it is told to reload, which puts it back in step with the others.
         d.send(conn, &ServerMsg::Error { message: "You can't change that comment.".into() });
         d.send(conn, &ServerMsg::Reload);
     }
+    ok
+}
+
+#[allow(clippy::too_many_arguments)]
+fn commit_batch(d: &mut Doc, store: &Mutex<Store>, item: &str, conn: u64, (base, made): (u64, u64), cid: &str, id: u64, actor: &str, ops: Vec<cosync::Op>) -> bool {
+    let (sheets_before, last_before) = (d.log.sheets.clone(), d.log.last_commit(cid, actor));
     match d.log.commit_made(base, made, cid, id, actor, ops) {
         Ok(Commit::New { seq, ops, extra }) => {
             let rec = LiveOp { seq, cid: cid.to_string(), batch: id, actor: actor.to_string(), ops: serde_json::to_string(&ops).unwrap_or_default(), at: now() };

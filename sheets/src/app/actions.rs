@@ -1416,6 +1416,8 @@ impl App {
         self.push_undo(&[Scope::All]);
         let mut copy = self.wb.sheets[i].clone();
         copy.uid = crate::model::new_sheet_uid();
+        // (Comments stay with the original: a copy would carry other people's words under their names.)
+        copy.threads.clear();
         let base = copy.name.clone();
         let mut k = 2;
         loop {
