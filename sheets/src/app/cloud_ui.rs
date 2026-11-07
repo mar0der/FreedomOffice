@@ -14,7 +14,7 @@ use super::chrome::Backstage;
 use super::dialogs::Dialog;
 use super::theme::{self, ic};
 use super::{App, Pending};
-use crate::cloud::open_url::{self, OpenRequest};
+use crate::cloud::open_url::{self, HostName, OpenRequest};
 use crate::cloud::server::{self, Me, OrgInfo, VersionInfo};
 use crate::cloud::{self, graph, CloudDoc, Conn, DriveItem, Kind, Permission, Provider, ServerSession, Session, Target, UploadError, User};
 
@@ -244,6 +244,25 @@ pub struct AddServer {
     pub error: Option<String>,
 }
 
+/// "Open in Sheets" questions (the link comes from a web page).
+pub enum LinkAsk {
+    /// The link's server was never signed in to: Continue shows the prefilled Add server form.
+    Trust { req: OpenRequest, host: HostName },
+    /// Several accounts are signed in to the link's server: which one opens the file
+    /// (url, username, display name).
+    Account { req: OpenRequest, accounts: Vec<(String, String, String)>, chosen: usize },
+}
+
+impl LinkAsk {
+    /// The question of `Trust`, and a warning when the name couldn't be decoded.
+    pub fn trust_text(host: &HostName) -> (String, Option<String>) {
+        let name = if host.shown != host.raw { format!("{} ({})", host.shown, host.raw) } else { host.raw.clone() };
+        let text = format!("This link points to {name}, a server you haven't signed in to. Only continue if you trust it.");
+        let warn = host.undecodable.then(|| "This server name contains an encoded part that couldn't be read. It may imitate another name.".to_string());
+        (text, warn)
+    }
+}
+
 pub struct VersionsState {
     pub doc: CloudDoc,
     pub list: Option<Vec<VersionInfo>>,
@@ -288,8 +307,11 @@ pub struct CloudState {
     /// An "Open in Sheets" link from the command line, handled once the saved accounts are
     /// loaded (`Err`: the link was refused).
     pub link: Option<Result<OpenRequest, String>>,
-    /// A link's file, opened when its server is signed in to (from the prefilled Add server form).
+    /// A link's file, opened when its server is signed in to (from the prefilled Add server form,
+    /// after the person chose Continue in `LinkAsk::Trust`).
     pub link_wait: Option<OpenRequest>,
+    /// A question about a link, asked before anything is sent anywhere.
+    pub link_ask: Option<LinkAsk>,
     /// The frame the Open / Save As places were last drawn in (to notice when they are shown
     /// again).
     places_frame: Option<u64>,
@@ -352,6 +374,7 @@ impl Default for CloudState {
             password: None,
             link: None,
             link_wait: None,
+            link_ask: None,
             places_frame: None,
             #[cfg(test)]
             cache_override: None,
@@ -503,8 +526,10 @@ impl App {
     }
 
     /// Opens a link's file with the account signed in to its server (joining the live session
-    /// like File > Open). Without one, nothing is sent anywhere: File > Account shows the Add
-    /// server form with the address filled in, and the file opens after signing in.
+    /// like File > Open); with several accounts there, asks which one. For a server never signed
+    /// in to, nothing is sent anywhere: the person is asked whether they trust it, and only on
+    /// Continue does File > Account show the Add server form with the address filled in (the
+    /// file opens after they sign in there).
     fn cloud_open_link(&mut self, link: Result<OpenRequest, String>) {
         let req = match link {
             Ok(r) => r,
@@ -513,20 +538,54 @@ impl App {
                 return;
             }
         };
-        let session = self.cloud.servers.iter().find(|e| open_url::same_server(&e.session.account.url, &req.server)).map(|e| e.session.clone());
-        match session {
-            Some(s) => {
-                self.cloud.link_wait = None;
-                let item = DriveItem { kind: Kind::File, id: req.item, drive_id: String::new(), name: "the file".into(), modified: String::new(), modified_by: String::new(), web_url: String::new(), etag: String::new(), parent_id: String::new(), size: 0 };
-                self.cloud_open_with(Conn::Server(s), item);
+        self.cloud.link_wait = None;
+        let accounts: Vec<(String, String, String)> = self
+            .cloud
+            .servers
+            .iter()
+            .filter(|e| open_url::same_server(&e.session.account.url, &req.server))
+            .map(|e| (e.session.account.url.clone(), e.session.account.username.clone(), e.session.account.display_name.clone()))
+            .collect();
+        match accounts.len() {
+            0 => {
+                let host = open_url::host_name(&req.server);
+                self.cloud.link_ask = Some(LinkAsk::Trust { req, host });
             }
-            None => {
+            1 => self.link_open_as(req, &accounts[0].0, &accounts[0].1),
+            _ => self.cloud.link_ask = Some(LinkAsk::Account { req, accounts, chosen: 0 }),
+        }
+    }
+
+    /// Opens a link's file with the account (url, username), if it's still signed in.
+    fn link_open_as(&mut self, req: OpenRequest, url: &str, username: &str) {
+        let Some(s) = self.cloud.servers.iter().find(|e| e.session.account.url == url && e.session.account.username == username).map(|e| e.session.clone()) else { return };
+        let item = DriveItem { kind: Kind::File, id: req.item, drive_id: String::new(), name: "the file".into(), modified: String::new(), modified_by: String::new(), web_url: String::new(), etag: String::new(), parent_id: String::new(), size: 0 };
+        self.cloud_open_with(Conn::Server(s), item);
+    }
+
+    /// Continue in the link question.
+    pub(super) fn link_continue(&mut self) {
+        match self.cloud.link_ask.take() {
+            Some(LinkAsk::Trust { req, .. }) => {
                 self.cloud.add_server = AddServer { open: true, url_input: req.server.clone(), ..Default::default() };
                 self.status = Some(format!("Sign in to {} to open the linked file.", server::host_of(&req.server)));
                 self.cloud.link_wait = Some(req);
                 self.backstage = Some(Backstage::Account);
             }
+            Some(LinkAsk::Account { req, accounts, chosen }) => {
+                if let Some((url, username, _)) = accounts.get(chosen) {
+                    let (url, username) = (url.clone(), username.clone());
+                    self.link_open_as(req, &url, &username);
+                }
+            }
+            None => {}
         }
+    }
+
+    /// Cancel (or Escape) in the link question: the link is dropped.
+    pub(super) fn link_cancel(&mut self) {
+        self.cloud.link_ask = None;
+        self.cloud.link_wait = None;
     }
 
     /// Server accounts from the encrypted cache; tokens are checked in the background.
@@ -1951,7 +2010,10 @@ impl App {
         }
         if cancel {
             *a = AddServer::default();
+            // A link waiting for this sign-in is dropped with it.
+            self.cloud.link_wait = None;
         }
+        let a = &self.cloud.add_server;
         if sign_in && !a.busy {
             self.server_sign_in();
         }
@@ -2104,7 +2166,7 @@ impl App {
 
     /// Share, version history or a save conflict is open.
     pub(super) fn cloud_dialog_open(&self) -> bool {
-        self.cloud.share.is_some() || self.cloud.versions.is_some() || self.cloud.conflict.is_some() || self.cloud.password.is_some()
+        self.cloud.share.is_some() || self.cloud.versions.is_some() || self.cloud.conflict.is_some() || self.cloud.password.is_some() || self.cloud.link_ask.is_some()
     }
 
     pub fn cloud_dialogs_ui(&mut self, ctx: &egui::Context) {
@@ -2112,6 +2174,51 @@ impl App {
         self.share_ui(ctx);
         self.versions_ui(ctx);
         self.password_ui(ctx);
+        self.link_ask_ui(ctx);
+    }
+
+    /// "Open in Sheets": trust a new server / choose the account.
+    fn link_ask_ui(&mut self, ctx: &egui::Context) {
+        let Some(ask) = &mut self.cloud.link_ask else { return };
+        let mut go = false;
+        let mut cancel = false;
+        egui::Window::new("Open link").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, -40.0]).show(ctx, |ui| {
+            ui.set_width(440.0);
+            match ask {
+                LinkAsk::Trust { host, .. } => {
+                    let (text, warn) = LinkAsk::trust_text(host);
+                    ui.add(egui::Label::new(RichText::new(text).color(theme::text())).wrap());
+                    if let Some(w) = warn {
+                        ui.add_space(6.0);
+                        ui.add(egui::Label::new(RichText::new(w).color(error_red())).wrap());
+                    }
+                }
+                LinkAsk::Account { req, accounts, chosen } => {
+                    let host = open_url::host_name(&req.server);
+                    ui.add(egui::Label::new(RichText::new(format!("You're signed in to {} with more than one account. Which one should open the file?", host.shown)).color(theme::text())).wrap());
+                    ui.add_space(6.0);
+                    for (i, (_, username, display)) in accounts.iter().enumerate() {
+                        let label = if display.is_empty() || display == username { username.clone() } else { format!("{display} ({username})") };
+                        ui.radio_value(chosen, i, label);
+                    }
+                }
+            }
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                let b = egui::Button::new(RichText::new("Continue").color(Color32::WHITE)).fill(share_green()).min_size(Vec2::new(100.0, 28.0));
+                if ui.add(b).clicked() {
+                    go = true;
+                }
+                if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    cancel = true;
+                }
+            });
+        });
+        if cancel {
+            self.link_cancel();
+        } else if go {
+            self.link_continue();
+        }
     }
 
     /// "Choose a new password" / "Change password".

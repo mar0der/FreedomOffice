@@ -461,6 +461,20 @@ fn a_revoked_live_session_refreshes_the_organisations() {
 }
 
 #[test]
+fn link_trust_question_shows_decoded_and_raw_host_names() {
+    use crate::cloud::open_url::host_name;
+    let (text, warn) = LinkAsk::trust_text(&host_name("https://xn--80ak6aa92e.com"));
+    assert_eq!(text, "This link points to аррӏе.com (xn--80ak6aa92e.com), a server you haven't signed in to. Only continue if you trust it.");
+    assert!(warn.is_none());
+    let (text, warn) = LinkAsk::trust_text(&host_name("https://files.example.com:8443/office"));
+    assert_eq!(text, "This link points to files.example.com:8443, a server you haven't signed in to. Only continue if you trust it.");
+    assert!(warn.is_none());
+    let (text, warn) = LinkAsk::trust_text(&host_name("https://xn--99999999a.example.com"));
+    assert!(text.starts_with("This link points to xn--99999999a.example.com, a server"), "{text}");
+    assert!(warn.is_some_and(|w| w.contains("may imitate another name")));
+}
+
+#[test]
 fn open_in_sheets_links_open_the_file_with_the_signed_in_account() {
     let t = setup();
     let (ctx, mut app, ann) = client(&t, "ann", PW);
@@ -492,21 +506,75 @@ fn open_in_sheets_links_open_the_file_with_the_signed_in_account() {
     assert!(matches!(&ben2.dialog, Some(Dialog::Message { text, .. }) if text.contains("couldn't open the link")));
     assert!(ben2.cloud.opening.is_none());
 
-    // No account for that server: File > Account with the address filled in; nothing opens
-    // until the person signs in there.
+    // Two accounts on that server: asked which one opens it.
+    ben2.dialog = None;
+    ben2.cloud.servers.push(ServerEntry::new(ann.clone(), None));
+    ben2.open_link(&link(&t.url));
+    frame(&bctx2, &mut ben2, vec![]);
+    match &ben2.cloud.link_ask {
+        Some(LinkAsk::Account { accounts, chosen: 0, .. }) => {
+            assert_eq!(accounts.iter().map(|a| a.1.as_str()).collect::<Vec<_>>(), ["ben", "ann"]);
+        }
+        _ => panic!("expected the account question"),
+    }
+    assert!(ben2.cloud.opening.is_none(), "nothing opens before the choice");
+    ben2.link_cancel();
+    frame(&bctx2, &mut ben2, vec![]);
+    assert!(ben2.cloud.link_ask.is_none() && ben2.cloud.opening.is_none());
+    ben2.open_link(&link(&t.url));
+    frame(&bctx2, &mut ben2, vec![]);
+    if let Some(LinkAsk::Account { chosen, .. }) = &mut ben2.cloud.link_ask {
+        *chosen = 1;
+    }
+    ben2.link_continue();
+    until(&bctx2, &mut ben2, "opened as ann", |a| a.cloud.doc.is_some());
+    assert_eq!(ben2.cloud.doc.as_ref().map(|d| d.item_id.clone()), Some(doc.item_id.clone()));
+
+    // A server never signed in to: first a question naming the host; nothing is filled in or
+    // sent before Continue.
     let cctx = egui::Context::default();
     let mut cara = App::with_context(&cctx, 0, None);
     cara.dialog = None;
     cara.no_cloud_for_test();
     cara.open_link(&link(&t.url));
     frame(&cctx, &mut cara, vec![]);
+    let host = crate::cloud::server::host_of(&t.url);
+    match &cara.cloud.link_ask {
+        Some(LinkAsk::Trust { host: h, .. }) => {
+            let (text, warn) = LinkAsk::trust_text(h);
+            assert_eq!(text, format!("This link points to {host}, a server you haven't signed in to. Only continue if you trust it."));
+            assert!(warn.is_none());
+        }
+        _ => panic!("expected the trust question"),
+    }
+    assert!(cara.backstage.is_none() && !cara.cloud.add_server.open && cara.cloud.link_wait.is_none());
+    assert!(cara.modal_open());
+    let sign_in = || {
+        let session = Arc::new(ServerSession::login(Box::new(Http::new()), &t.url, "ben", PW, "test").unwrap());
+        let me = session.me_info().ok();
+        super::Event::ServerSignedIn(Ok((session, me)))
+    };
+    // Cancel: signing in to that server later on doesn't open the link.
+    cara.link_cancel();
+    frame(&cctx, &mut cara, vec![]);
+    assert!(cara.cloud.link_ask.is_none() && cara.cloud.link_wait.is_none() && !cara.cloud.add_server.open);
+    cara.cloud_event(sign_in());
+    for _ in 0..20 {
+        frame(&cctx, &mut cara, vec![]);
+    }
+    assert!(cara.cloud.opening.is_none() && cara.cloud.doc.is_none(), "a cancelled link never opens");
+    cara.cloud.servers.clear();
+
+    // Continue: File > Account with the address filled in; the file opens after signing in.
+    cara.open_link(&link(&t.url));
+    frame(&cctx, &mut cara, vec![]);
+    cara.link_continue();
+    frame(&cctx, &mut cara, vec![]);
     assert!(matches!(cara.backstage, Some(Backstage::Account)));
     let a = &cara.cloud.add_server;
     assert!(a.open && a.stage == 0 && a.url_input == t.url && a.password.is_empty() && a.username.is_empty());
     assert!(cara.cloud.servers.is_empty() && cara.cloud.opening.is_none() && cara.cloud.doc.is_none());
-    let session = Arc::new(ServerSession::login(Box::new(Http::new()), &t.url, "ben", PW, "test").unwrap());
-    let me = session.me_info().ok();
-    cara.cloud_event(super::Event::ServerSignedIn(Ok((session, me))));
+    cara.cloud_event(sign_in());
     until(&cctx, &mut cara, "opened after signing in", |a| a.cloud.doc.is_some());
     assert_eq!(cara.cloud.doc.as_ref().map(|d| d.item_id.clone()), Some(doc.item_id.clone()));
     assert!(cara.cloud.link_wait.is_none());

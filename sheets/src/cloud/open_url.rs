@@ -183,6 +183,104 @@ pub fn same_server(a: &str, b: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Host names as people read them (punycode, RFC 3492)
+// ---------------------------------------------------------------------------
+
+/// A server's host name for a confirmation: as read (`xn--` labels decoded) and as sent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostName {
+    /// Decoded form (same as `raw` when there's nothing to decode or decoding failed).
+    pub shown: String,
+    /// The ASCII form, with the port.
+    pub raw: String,
+    /// An `xn--` label couldn't be decoded: the name may imitate another one.
+    pub undecodable: bool,
+}
+
+/// The host (and port) of a base URL, `xn--` labels decoded.
+pub fn host_name(url: &str) -> HostName {
+    let raw = super::server::host_of(url).to_ascii_lowercase();
+    let (host, port) = match raw.rsplit_once(':') {
+        Some((h, p)) if p.bytes().all(|b| b.is_ascii_digit()) => (h, Some(p)),
+        _ => (raw.as_str(), None),
+    };
+    let mut undecodable = false;
+    let labels: Vec<String> = host
+        .split('.')
+        .map(|l| match l.strip_prefix("xn--") {
+            Some(enc) => punycode_decode(enc).unwrap_or_else(|| {
+                undecodable = true;
+                l.to_string()
+            }),
+            None => l.to_string(),
+        })
+        .collect();
+    let mut shown = if undecodable { host.to_string() } else { labels.join(".") };
+    if let Some(p) = port {
+        shown = format!("{shown}:{p}");
+    }
+    HostName { shown, raw, undecodable }
+}
+
+/// Decodes the part of an IDNA label after `xn--`. `None` for anything malformed, overflowing,
+/// with control characters, or that decodes to plain ASCII (never a valid `xn--` label).
+pub fn punycode_decode(input: &str) -> Option<String> {
+    const BASE: u32 = 36;
+    const TMIN: u32 = 1;
+    const TMAX: u32 = 26;
+    const SKEW: u32 = 38;
+    const DAMP: u32 = 700;
+    fn adapt(delta: u32, points: u32, first: bool) -> u32 {
+        let mut delta = if first { delta / DAMP } else { delta / 2 };
+        delta += delta / points;
+        let mut k = 0;
+        while delta > ((BASE - TMIN) * TMAX) / 2 {
+            delta /= BASE - TMIN;
+            k += BASE;
+        }
+        k + (BASE - TMIN + 1) * delta / (delta + SKEW)
+    }
+    if input.is_empty() || input.len() > 63 || !input.is_ascii() {
+        return None;
+    }
+    let (basic, digits) = match input.rfind('-') {
+        Some(i) => (&input[..i], &input[i + 1..]),
+        None => ("", input),
+    };
+    let mut out: Vec<char> = basic.chars().collect();
+    let (mut n, mut i, mut bias) = (128u32, 0u32, 72u32);
+    let mut it = digits.bytes().peekable();
+    while it.peek().is_some() {
+        let old = i;
+        let mut w = 1u32;
+        let mut k = BASE;
+        loop {
+            let d = match it.next()? {
+                c @ b'a'..=b'z' => (c - b'a') as u32,
+                c @ b'A'..=b'Z' => (c - b'A') as u32,
+                c @ b'0'..=b'9' => (c - b'0') as u32 + 26,
+                _ => return None,
+            };
+            i = i.checked_add(d.checked_mul(w)?)?;
+            let t = if k <= bias { TMIN } else if k >= bias + TMAX { TMAX } else { k - bias };
+            if d < t {
+                break;
+            }
+            w = w.checked_mul(BASE - t)?;
+            k += BASE;
+        }
+        let len = out.len() as u32 + 1;
+        bias = adapt(i - old, len, old == 0);
+        n = n.checked_add(i / len)?;
+        i %= len;
+        out.insert(i as usize, char::from_u32(n)?);
+        i += 1;
+    }
+    let s: String = out.into_iter().collect();
+    (!s.is_ascii() && !s.chars().any(char::is_control)).then_some(s)
+}
+
+// ---------------------------------------------------------------------------
 // Windows: HKCU\Software\Classes\freedomoffice
 // ---------------------------------------------------------------------------
 
@@ -209,15 +307,59 @@ fn same_path(a: &str, b: &str) -> bool {
     !a.trim().is_empty() && n(a) == n(b)
 }
 
-/// Whether to (re)write the scheme registration: only when no handler is registered at all, or
-/// the registered one is this same program (moved files re-register; another installed handler
-/// is never taken over). `existing`: `None` when the key is missing, else its command (`None`
-/// when it has none or it can't be read).
+/// The programs a `shell\open\command` may run: the quoted path, or for an unquoted command
+/// every prefix ending at a space, with and without ".exe" (Windows tries them in turn), up to
+/// the first argument (`%1`, `"%1"`).
 #[cfg_attr(not(windows), allow(dead_code))]
-pub fn should_register(existing: Option<Option<&str>>, exe: &str) -> bool {
+fn command_candidates(cmd: &str) -> Vec<String> {
+    let cmd = cmd.trim();
+    if cmd.starts_with('"') {
+        return vec![command_program(cmd).to_string()];
+    }
+    let mut out = Vec::new();
+    let mut end = 0;
+    for (n, tok) in cmd.split(' ').enumerate() {
+        if n > 0 && (tok.starts_with('%') || tok.starts_with('"')) {
+            break;
+        }
+        end += usize::from(n > 0) + tok.len();
+        if tok.is_empty() {
+            continue;
+        }
+        let p = &cmd[..end];
+        out.push(p.to_string());
+        if !p.to_ascii_lowercase().ends_with(".exe") {
+            out.push(format!("{p}.exe"));
+        }
+    }
+    out
+}
+
+/// `C:\...`, `C:/...` or `\\server\...` (relative names are looked up on PATH).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn absolute_windows_path(p: &str) -> bool {
+    let b = p.as_bytes();
+    (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')) || p.starts_with("\\\\")
+}
+
+/// The registered program is gone: every program the command may run is an absolute path
+/// (no environment variables) that `exists` says isn't there.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn handler_missing(cmd: &str, exists: &dyn Fn(&str) -> bool) -> bool {
+    let c = command_candidates(cmd);
+    !c.is_empty() && c.iter().all(|p| !p.is_empty() && !p.contains('%') && absolute_windows_path(p) && !exists(p))
+}
+
+/// Whether to (re)write the scheme registration: only when no handler is registered, the
+/// registered one is this same program (moved files re-register), or the registered program no
+/// longer exists (uninstalled). Another installed handler is never taken over. `existing`:
+/// `None` when the key is missing, else its command (`None` when it has none or it can't be
+/// read). `exists`: whether a file is there (the disk on Windows; a stand-in in tests).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn should_register(existing: Option<Option<&str>>, exe: &str, exists: &dyn Fn(&str) -> bool) -> bool {
     match existing {
         None => true,
-        Some(Some(cmd)) => same_path(command_program(cmd), exe),
+        Some(Some(cmd)) => same_path(command_program(cmd), exe) || handler_missing(cmd, exists),
         Some(None) => false,
     }
 }
@@ -259,7 +401,7 @@ pub fn register_windows_handler() {
             }
         }
     };
-    if !should_register(existing.as_ref().map(|o| o.as_deref()), &exe) {
+    if !should_register(existing.as_ref().map(|o| o.as_deref()), &exe, &|p| std::path::Path::new(p).is_file()) {
         return;
     }
     let base = format!("Software\\Classes\\{SCHEME}");
@@ -409,15 +551,57 @@ mod tests {
     #[test]
     fn windows_registration_never_takes_over_another_handler() {
         let exe = r"C:\Program Files\FreedomOffice\FreedomSheets.exe";
-        assert!(should_register(None, exe), "nothing registered");
-        assert!(should_register(Some(Some(&handler_command(exe))), exe), "ours");
-        assert!(should_register(Some(Some(r#""c:/program files/freedomoffice/freedomsheets.exe" "%1""#)), exe), "ours, other spelling");
-        assert!(should_register(Some(Some(r"C:\Tools\FreedomSheets.exe %1")), r"c:\tools\freedomsheets.exe"), "unquoted");
-        assert!(!should_register(Some(Some(r#""C:\Other\FreedomSheets.exe" "%1""#)), exe), "another copy");
-        assert!(!should_register(Some(Some(r#""C:\Program Files\Evil\handler.exe" "%1""#)), exe));
-        assert!(!should_register(Some(Some(r"C:\Program")), exe), "unquoted prefix isn't ours");
-        assert!(!should_register(Some(Some("")), exe));
-        assert!(!should_register(Some(None), exe), "key without a readable command");
+        let all = |_: &str| true;
+        assert!(should_register(None, exe, &all), "nothing registered");
+        assert!(should_register(Some(Some(&handler_command(exe))), exe, &all), "ours");
+        assert!(should_register(Some(Some(r#""c:/program files/freedomoffice/freedomsheets.exe" "%1""#)), exe, &all), "ours, other spelling");
+        assert!(should_register(Some(Some(r"C:\Tools\FreedomSheets.exe %1")), r"c:\tools\freedomsheets.exe", &all), "unquoted");
+        assert!(!should_register(Some(Some(r#""C:\Other\FreedomSheets.exe" "%1""#)), exe, &all), "another copy");
+        assert!(!should_register(Some(Some(r#""C:\Program Files\Evil\handler.exe" "%1""#)), exe, &all));
+        assert!(!should_register(Some(Some(r"C:\Program")), exe, &all), "unquoted prefix isn't ours");
+        assert!(!should_register(Some(Some("")), exe, &all));
+        assert!(!should_register(Some(None), exe, &all), "key without a readable command");
         assert_eq!(handler_command(exe), r#""C:\Program Files\FreedomOffice\FreedomSheets.exe" "%1""#);
+    }
+
+    #[test]
+    fn punycode_labels_are_decoded() {
+        assert_eq!(punycode_decode("mnchen-3ya").as_deref(), Some("münchen"));
+        assert_eq!(punycode_decode("bcher-kva").as_deref(), Some("bücher"));
+        assert_eq!(punycode_decode("tda").as_deref(), Some("ü"));
+        assert_eq!(punycode_decode("a-b--3ra").as_deref(), Some("a-b-ü"));
+        assert_eq!(punycode_decode("80ak6aa92e").as_deref(), Some("аррӏе"), "Cyrillic look-alike of apple");
+        assert_eq!(punycode_decode("ihqwcrb4cv8a8dqg056pqjye").as_deref(), Some("他们为什么不说中文"), "RFC 3492 sample");
+        for bad in ["", "abc-", "a", "99999999a", "999999999999999999a", "99999999999", "mnchen-3y!", "-", "mnchen-3ya\u{e9}"] {
+            assert_eq!(punycode_decode(bad), None, "{bad:?}");
+        }
+        let h = host_name("https://xn--80ak6aa92e.com:8443");
+        assert_eq!((h.shown.as_str(), h.raw.as_str(), h.undecodable), ("аррӏе.com:8443", "xn--80ak6aa92e.com:8443", false));
+        let h = host_name("https://files.example.com/office");
+        assert_eq!((h.shown.as_str(), h.raw.as_str(), h.undecodable), ("files.example.com", "files.example.com", false));
+        let h = host_name("https://xn--99999999a.example.com");
+        assert_eq!((h.shown.as_str(), h.undecodable), ("xn--99999999a.example.com", true));
+    }
+
+    #[test]
+    fn windows_registration_replaces_a_handler_that_is_gone() {
+        let exe = r"C:\Users\ann\FreedomSheets.exe";
+        let none = |_: &str| false;
+        let only = |there: &'static str| move |p: &str| p.eq_ignore_ascii_case(there);
+        // The registered program was uninstalled (quoted, unquoted, UNC).
+        assert!(should_register(Some(Some(r#""C:\Old\FreedomSheets.exe" "%1""#)), exe, &none));
+        assert!(should_register(Some(Some(r"C:\Old\Sheets.exe %1")), exe, &none));
+        assert!(should_register(Some(Some(r#""\\nas\apps\handler.exe" "%1""#)), exe, &none));
+        // Still installed: kept.
+        assert!(!should_register(Some(Some(r#""C:\Old\FreedomSheets.exe" "%1""#)), exe, &only(r"C:\Old\FreedomSheets.exe")));
+        // Unquoted with spaces: Windows also tries "C:\Program Files\Other\h.exe"; it's there.
+        assert!(!should_register(Some(Some(r"C:\Program Files\Other\h.exe %1")), exe, &only(r"C:\Program Files\Other\h.exe")));
+        assert!(!should_register(Some(Some(r"C:\Program Files\Other\h %1")), exe, &only(r"C:\Program Files\Other\h.exe")));
+        // Can't tell: names looked up on PATH, environment variables, empty or unreadable.
+        assert!(!should_register(Some(Some("rundll32 url.dll,FileProtocolHandler %1")), exe, &none));
+        assert!(!should_register(Some(Some(r#""%ProgramFiles%\Other\h.exe" "%1""#)), exe, &none));
+        assert!(!should_register(Some(Some(r#""" "%1""#)), exe, &none));
+        assert!(!should_register(Some(Some("")), exe, &none));
+        assert!(!should_register(Some(None), exe, &none));
     }
 }
