@@ -31,6 +31,11 @@ pub struct Config {
     /// Chance (percent) per action that the client is killed (dropped without leaving, right
     /// after its edit was sent, before any answer was read) and started again from its journal.
     pub restart_pct: f64,
+    /// Chance (percent) per action of undoing the client's latest text edit that is still its
+    /// own: undo runs like the app's, per person: the cell is found by the unique text the
+    /// client typed (wherever others' row/column changes moved it) and is put back only when it
+    /// still holds exactly that; when someone else changed it since, the undo is blocked.
+    pub undo_pct: f64,
     /// Where the clients keep their journals (a fresh temporary folder, removed afterwards,
     /// when not given).
     pub journal_dir: Option<PathBuf>,
@@ -49,6 +54,7 @@ impl Default for Config {
             hot_rows: 12,
             hot_cols: 6,
             restart_pct: 2.0,
+            undo_pct: 8.0,
             journal_dir: None,
         }
     }
@@ -63,6 +69,10 @@ pub struct Report {
     pub forced_disconnects: u64,
     /// Clients killed on purpose and restarted from their journal.
     pub restarts: u64,
+    /// Undos applied (the client's own text put back to what it replaced) and undos blocked
+    /// because someone else had changed the cell since.
+    pub undos: u64,
+    pub undos_blocked: u64,
     /// Journal files still there at the end (everything was acknowledged: must be 0).
     pub journals_left: usize,
     pub head_seq: u64,
@@ -98,6 +108,10 @@ impl Report {
         println!(
             "  clients killed and restarted from their journal: {} (journals put back: {}, left behind: {})",
             self.restarts, t.journal_restores, self.journals_left
+        );
+        println!(
+            "  undos applied {}, blocked because someone else changed the cell {}",
+            self.undos, self.undos_blocked
         );
         println!(
             "  own edits replaced by someone's concurrent edit (told to the editor): {}",
@@ -184,10 +198,43 @@ fn first_sheet(l: &Live) -> Result<SheetId, String> {
 
 /// One client's script. Returns the session (so the caller can compare it) and the number of
 /// disconnects it caused on purpose.
-fn client(api: Api, item: String, cfg: Config, idx: usize, jdir: Option<PathBuf>) -> Result<(Live, u64, u64), String> {
+/// What a client's soak run produced.
+struct Done {
+    live: Live,
+    forced: u64,
+    restarts: u64,
+    undos: u64,
+    blocked: u64,
+}
+
+/// The text of a cell, if it holds exactly plain text.
+fn plain_text(d: &CellData) -> Option<&str> {
+    match (&d.v, &d.f) {
+        (Val::Text(t), None) => Some(t),
+        _ => None,
+    }
+}
+
+/// Where a client's text is now (others' row/column inserts and deletes move it).
+fn find_text(l: &Live, sheet: SheetId, text: &str) -> Option<(u32, u32)> {
+    let i = freedom_sheets::live::index_of(&l.wb, sheet)?;
+    for (r, row) in &l.wb.sheets[i].rows {
+        for c in row.keys() {
+            if l.cell_data(sheet, *r, *c).as_ref().and_then(plain_text) == Some(text) {
+                return Some((*r, *c));
+            }
+        }
+    }
+    None
+}
+
+fn client(api: Api, item: String, cfg: Config, idx: usize, jdir: Option<PathBuf>) -> Result<Done, String> {
     let mut rng = Rng::new(cfg.seed ^ (idx as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
     let mut live = Live::open_in(&api, &item, true, jdir.as_deref())?;
     let mut restarts = 0u64;
+    let (mut undone, mut blocked) = (0u64, 0u64);
+    // (the unique text typed, what the cell held before)
+    let mut undos: Vec<(String, Option<CellData>)> = Vec::new();
     let sheet = first_sheet(&live)?;
     let pause = Duration::from_millis(cfg.interval_ms);
     let mut forced = 0u64;
@@ -213,7 +260,16 @@ fn client(api: Api, item: String, cfg: Config, idx: usize, jdir: Option<PathBuf>
             rng.below(cfg.hot_rows as u64) as u32,
             rng.below(cfg.hot_cols as u64) as u32,
         );
-        if roll < cfg.structure_pct {
+        if !undos.is_empty() && rng.chance(cfg.undo_pct) {
+            let (text, before) = undos.pop().expect("one");
+            match find_text(&live, sheet, &text) {
+                Some((r, c)) => {
+                    live.set_content(sheet, r, c, before);
+                    undone += 1;
+                }
+                None => blocked += 1,
+            }
+        } else if roll < cfg.structure_pct {
             let n = if rng.chance(70.0) {
                 1 + rng.below(2) as i32
             } else {
@@ -246,6 +302,11 @@ fn client(api: Api, item: String, cfg: Config, idx: usize, jdir: Option<PathBuf>
                 ..Default::default()
             };
             if rng.chance(90.0) {
+                if let Val::Text(t) = &data.v {
+                    let before = live.cell_data(sheet, r, c).map(|d| CellData { st: None, ..d });
+                    undos.push((t.clone(), before));
+                    undos.drain(..undos.len().saturating_sub(20));
+                }
                 live.set_content(sheet, r, c, Some(data));
             } else {
                 // Now and then a whole cell with a format, like an older client or a paste.
@@ -294,7 +355,7 @@ fn client(api: Api, item: String, cfg: Config, idx: usize, jdir: Option<PathBuf>
         }
         live.pump(Duration::from_millis(20));
     }
-    Ok((live, forced, restarts))
+    Ok(Done { live, forced, restarts, undos: undone, blocked })
 }
 
 /// Runs the harness: client `i` signs in with `apis[i % apis.len()]`.
@@ -317,11 +378,14 @@ pub fn run(apis: &[Api], item: &str, cfg: &Config) -> Result<Report, String> {
     let mut lives = Vec::new();
     let mut forced = 0;
     let mut restarts = 0;
+    let (mut undos, mut undos_blocked) = (0, 0);
     for (i, h) in handles.into_iter().enumerate() {
-        let (l, f, r) = h.join().map_err(|_| format!("client {i} panicked"))??;
-        lives.push(l);
-        forced += f;
-        restarts += r;
+        let d = h.join().map_err(|_| format!("client {i} panicked"))??;
+        lives.push(d.live);
+        forced += d.forced;
+        restarts += d.restarts;
+        undos += d.undos;
+        undos_blocked += d.blocked;
     }
     // Settle: everyone has the server's last sequence number and nothing is pending.
     let end = Instant::now() + Duration::from_secs(30);
@@ -390,6 +454,8 @@ pub fn run(apis: &[Api], item: &str, cfg: &Config) -> Result<Report, String> {
         totals,
         forced_disconnects: forced,
         restarts,
+        undos,
+        undos_blocked,
         journals_left,
         head_seq,
         cells: lives[0].cell_count(),

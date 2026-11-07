@@ -25,7 +25,7 @@ describes what the server implements (Phase 1).
 | `freedomoffice.db` (+ `-wal`, `-shm`) | SQLite: users, orgs, folders/files metadata, permissions, links, live session state |
 | `files/<item-id>/<version>` | the bytes of every kept document version (never changed once written) |
 
-Versions kept: the newest `versions_to_keep` (default 25) plus the first version of each day.
+Versions kept: the newest `versions_to_keep` (default 25) plus the first version of each day, plus every named version.
 
 ### Backup and restore
 
@@ -338,6 +338,25 @@ ending, offline or in the middle of sending (`cosync::journal`, used by the app 
 - *Not covered:* the cell being typed in and the frame's last command are in the journal only from the next
   frame; two app instances on one document and account share a journal file.
 
+### Presence, save state and history in the app (M4)
+
+- **Colour from the user:** a person's colour is a hash of the user name over 12 colours, the same on every
+  screen and session (the server's per-session slot is only used for people with a link). Agents
+  (`Peer.agent`) are slate grey, drawn with a dashed cursor border, a rounded-square "AI" avatar and
+  "(bot)" after the name.
+- **People strip** (next to Share): one avatar per person (several windows of one user count once), yourself
+  last, an orange dot while they type, dimmed after 60 s without moving. Click an avatar to **follow**: the
+  view (sheet and cell) goes where they go until you move yourself, click the avatar again, or they leave.
+  Joiners fade in (0.3 s), leavers fade out (0.4 s), and a dropped connection or a reload clears everyone
+  at once (no stale cursors). Presence is still per sheet and relayed, never stored.
+- **Save state** (title bar and status bar): "Saving..." while a change is unacknowledged, "Saved to server",
+  "Offline" / "Offline (N waiting)" (N = changes in the journal not yet sent), "Read-only", "Not connected".
+- **Version history dialog:** time, name (click to edit; Enter saves), who changed (contributors, else
+  modified-by), size; Restore also works in a live session (the unsaved-changes guard doesn't apply there).
+- **Per-user undo** under concurrency is covered by the app tests and by the soak's `undo` action
+  (`--undo-pct`, default 8): a client puts its latest text back only while the cell still holds exactly that
+  text (found wherever others' row/column changes moved it), else the undo is blocked.
+
 ### Known limits
 
 - Anyone can lock a username out for 15 minutes with 10 wrong passwords (per-username lockout DoS).
@@ -600,6 +619,19 @@ origins can't read anything. Code: `server/src/web.rs` (session), `server/src/co
   (the Drive app should queue: upload 4 at a time); an upload that sends nothing for 60 s is stopped →
   408 and nothing is kept; before staging, the data disk must have `max_upload_mb` + 1 GB free → else 507.
 - `POST /api/items/{id}/versions/{n}/restore` copies the old version on disk (no memory buffering).
+  **M4:** restoring is allowed while people are connected (423 stays only when nobody is connected but
+  committed live changes aren't in a version yet): every open session of the file is retired, each
+  connection gets `reload` and closes, a late batch of the old session is answered with `reload` and
+  stored nowhere, and the restored file starts a new live base (clients keep their unsent changes and
+  rebase them on the restored file). Changes committed since the last snapshot are not in any version
+  and are not recoverable after a restore while connected (known limit; the last snapshot is at most
+  15 s to 2 min old).
+- `GET /api/items/{id}/versions` entries gained (additive) `label` ("" = none) and `contributors`
+  (display names of the users whose live batches are in a live snapshot, in order of first change; `[]` for
+  uploads, saves and restores, which only have `modified_by`). `PUT /api/items/{id}/versions/{n}` with
+  `{"label": "..."}` (editors; 404 unknown version, 400 without `label`) names a version (trimmed, control
+  characters dropped, 80 characters; empty clears). Named versions are never pruned; they don't count
+  towards `versions_to_keep`. Stored in `version_meta` (schema 5; an older server refuses a v5 database).
 
 #### Audit log
 

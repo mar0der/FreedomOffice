@@ -26,6 +26,31 @@ fn rg(s: &str) -> Range {
 }
 
 #[test]
+fn colours_follow_the_user_and_agents_look_different() {
+    use super::live_ui::{presence_alpha, presence_label, user_color};
+    let peer = |user: &str, color: u8, agent: bool| cosync::Peer { id: color as u64, name: user.into(), user: user.into(), color, editor: true, agent, presence: None };
+    // Same user: same colour whatever the session's slot or window; case doesn't matter.
+    assert_eq!(user_color(&peer("ann", 0, false)), user_color(&peer("ann", 5, false)));
+    assert_eq!(user_color(&peer("Ann", 1, false)), user_color(&peer("ann", 2, false)));
+    // Different users mostly differ (12 colours): the four test accounts are all distinct.
+    let cols: std::collections::HashSet<_> = ["test-a", "test-b", "test-c", "test-d"].iter().map(|u| user_color(&peer(u, 0, false))).collect();
+    assert!(cols.len() >= 3, "{cols:?}");
+    // Agents: their own colour, labelled.
+    assert_ne!(user_color(&peer("agent-claude", 0, true)), user_color(&peer("ann", 0, false)));
+    assert_eq!(user_color(&peer("agent-claude", 0, true)), user_color(&peer("other-bot", 3, true)));
+    assert_eq!(presence_label(&peer("agent-claude", 0, true)), "agent-claude (bot)");
+    assert_eq!(presence_label(&peer("ann", 0, false)), "ann");
+    // Link guests keep the server's slot.
+    assert_ne!(user_color(&peer("", 0, false)), user_color(&peer("", 1, false)));
+    // Fade in, stay, dim when idle (never fully gone).
+    let s = std::time::Duration::from_secs;
+    assert!(presence_alpha(std::time::Duration::ZERO, s(0)) < 0.1);
+    assert_eq!(presence_alpha(s(5), s(10)), 1.0);
+    assert!(presence_alpha(s(500), s(70)) < 1.0 && presence_alpha(s(500), s(70)) > 0.5);
+    assert!((presence_alpha(s(500), s(600)) - 0.45).abs() < 0.01);
+}
+
+#[test]
 fn commands_round_trip_as_operations() {
     let (ctx, mut app) = super::data_ui::sample_app();
     app.live_for_test();
@@ -231,6 +256,27 @@ fn undo_never_overwrites_someone_elses_later_value() {
     app.undo();
     app.undo();
     assert_eq!(crate::numfmt::value_to_text(app.wb.sheets[0].display_value(0, 0)), "theirs");
+}
+
+/// Undo is per person: another person's concurrent format of the same cell and edit of another
+/// cell survive our undo, and our undo only takes back our own value.
+#[test]
+fn undo_reverts_only_my_value_and_keeps_others_concurrent_changes() {
+    let (_ctx, mut app) = super::data_ui::sample_app();
+    app.live_for_test();
+    app.switch_sheet(0);
+    let at = |app: &App, r: u32, c: u32| crate::numfmt::value_to_text(app.wb.sheets[0].display_value(r, c));
+    let old = at(&app, 0, 0);
+    type_at(&mut app, 0, 0, "mine");
+    let s = app.wb.sheets[0].uid;
+    let bold = crate::live::style_json(&crate::model::Style { bold: true, ..Default::default() });
+    let other = cosync::Op::Content { s, r: 3, c: 3, v: Some(Box::new(cosync::CellData { v: cosync::Val::Text("theirs".into()), ..Default::default() })), adj: vec![] };
+    app.live_remote_for_test(&[cosync::Op::Format { s, r: 0, c: 0, st: bold }, other]);
+    app.undo();
+    check(&mut app, "undo");
+    assert_eq!(at(&app, 0, 0), old, "my value is taken back");
+    assert!(app.wb.sheets[0].get(0, 0).is_some_and(|x| app.wb.style(x.style).bold), "their format stays");
+    assert_eq!(at(&app, 3, 3), "theirs", "their other edit stays");
 }
 
 /// A value and a format change are different operations (so they can't overwrite each other);
@@ -726,7 +772,7 @@ mod e2e {
         a.app.switch_sheet(plan);
         type_at(&mut a.app, 20, 1, "while ben was away");
         pump(&mut [&mut a, &mut b], "ann's change", |cs| cs[0].app.live_quiet());
-        assert!(b.app.cloud_title_suffix().contains("Reconnecting"));
+        assert!(b.app.cloud_title_suffix().contains("Offline"));
         b.app.live_reconnect_for_test();
         settle(&mut [&mut a, &mut b], "reconnect");
         assert_same(&a, &b, "after reconnecting");
@@ -1573,6 +1619,132 @@ mod e2e {
         settle(&mut [&mut a, &mut b], "back online");
         assert!(b.app.live_offline_text().is_none());
         assert_eq!(text(&a, "Sheet1", 8, 2), "and another");
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The save state in words follows the acknowledgements and the journal's count.
+    #[test]
+    fn the_save_state_says_saving_saved_or_offline_with_a_count() {
+        let (server, dir, mut a, mut b, _) = two_people("save-state");
+        assert_eq!(b.app.live_save_text().as_deref(), Some("Saved to server"));
+        assert!(b.app.cloud_title_suffix().ends_with("Saved to server"), "{}", b.app.cloud_title_suffix());
+        type_at(&mut b.app, 6, 2, "x");
+        b.app.live_flush();
+        assert_eq!(b.app.live_save_text().as_deref(), Some("Saving..."), "sent, not acknowledged yet");
+        settle(&mut [&mut a, &mut b], "acknowledged");
+        assert_eq!(b.app.live_save_text().as_deref(), Some("Saved to server"));
+        b.app.live_drop_for_test();
+        assert_eq!(b.app.live_save_text().as_deref(), Some("Offline"));
+        type_at(&mut b.app, 7, 2, "y");
+        type_at(&mut b.app, 8, 2, "z");
+        b.app.live_flush();
+        assert_eq!(b.app.live_save_text().as_deref(), Some("Offline (2 waiting)"));
+        assert!(b.app.cloud_title_suffix().ends_with("Offline (2 waiting)"));
+        // The status bar draws it.
+        let _ = b.ctx.run(egui::RawInput::default(), |ctx| b.app.frame(ctx));
+        b.app.live_reconnect_for_test();
+        settle(&mut [&mut a, &mut b], "back online");
+        assert_eq!(b.app.live_save_text().as_deref(), Some("Saved to server"));
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Colours come from the user, the same on both sides and in every session; an agent has
+    /// its own style; a person who leaves has no cursor left.
+    #[test]
+    fn presence_colours_are_stable_and_nobody_is_left_behind() {
+        let (server, dir, mut a, mut b, _) = two_people("presence-m4");
+        let colour_of = |c: &Client, name: &str| c.app.live.as_ref().unwrap().peers.values().find(|p| p.peer.name == name).map(|p| super::super::live_ui::user_color(&p.peer)).unwrap();
+        let ben_seen_by_ann = colour_of(&a, "Ben Ode");
+        let ann_seen_by_ben = colour_of(&b, "Ann Lee");
+        let own = |c: &Client| super::super::live_ui::user_color(c.app.live.as_ref().unwrap().me.as_ref().unwrap());
+        assert_eq!(ben_seen_by_ann, own(&b), "Ben looks the same to Ann as to himself");
+        assert_eq!(ann_seen_by_ben, own(&a));
+        // Moving shows a cursor on the other side, and a name flag source.
+        b.app.select(3, 1, false);
+        pump(&mut [&mut a, &mut b], "Ann sees Ben's cursor", |cs| cs[0].app.live.as_ref().unwrap().peers.values().any(|p| p.peer.presence.as_ref().is_some_and(|x| (x.r, x.c) == (3, 1))));
+        let _ = a.ctx.run(egui::RawInput::default(), |ctx| a.app.frame(ctx));
+        // Ben leaves: Ann has no peer and no cursor for him, and the avatar list is empty.
+        b.app.live_leave(true);
+        pump(&mut [&mut a, &mut b], "Ann sees Ben leave", |cs| cs[0].app.live_peer_names().is_empty());
+        assert!(a.app.live.as_ref().unwrap().peers.is_empty());
+        std::thread::sleep(Duration::from_millis(450));
+        a.app.poll_live();
+        assert!(a.app.live.as_ref().unwrap().gone.is_empty(), "the fade-out is over");
+        // A dropped connection clears everyone at once.
+        let mut b2 = client(&server.url(), "ben", &dir);
+        let id = a.app.cloud.doc.as_ref().unwrap().item_id.clone();
+        open(&mut b2, &id);
+        pump(&mut [&mut a, &mut b2], "Ann sees Ben again", |cs| !cs[0].app.live_peer_names().is_empty());
+        a.app.live_drop_for_test();
+        assert!(a.app.live_peer_names().is_empty(), "no stale cursors while disconnected");
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Following a person moves the view with them; moving yourself stops it.
+    #[test]
+    fn following_someone_stops_when_you_move() {
+        let (server, dir, mut a, mut b, _) = two_people("follow");
+        a.app.live_toggle_follow("ben", "Ben Ode");
+        assert_eq!(a.app.live_following().as_deref(), Some("Ben Ode"));
+        b.app.select(5, 2, false);
+        pump(&mut [&mut a, &mut b], "Ann's view follows Ben", |cs| {
+            let sh = &cs[0].app.wb.sheets[cs[0].app.wb.active];
+            sh.view.active == (5, 2)
+        });
+        assert_eq!(a.app.live_following().as_deref(), Some("Ben Ode"));
+        a.app.select(1, 1, false);
+        a.app.poll_live();
+        assert!(a.app.live_following().is_none(), "moving on your own stops following");
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Restoring an old version while both are connected: both windows reload the restored file,
+    /// and what the other typed but had not sent yet is put back on top of it.
+    #[test]
+    fn a_restore_with_people_connected_reloads_them_and_keeps_unsent_changes() {
+        let (server, dir, mut a, mut b, id) = two_people("restore-live");
+        type_at(&mut a.app, 2, 1, "from a");
+        settle(&mut [&mut a, &mut b], "a's change everywhere");
+        a.app.live_snapshot();
+        let seq = a.app.live_seq();
+        pump(&mut [&mut a, &mut b], "snapshot", |cs| cs[0].app.live_snap_seq() == seq);
+        let versions = a.session.versions(&id).unwrap();
+        assert!(versions.len() >= 2, "{versions:?}");
+        // Ben has typed something that is still in his window when the restore happens.
+        type_at(&mut b.app, 6, 2, "ben unsent");
+        a.session.restore_version(&id, 1).unwrap();
+        let reloads = (a.app.live_reloads(), b.app.live_reloads());
+        pump(&mut [&mut a, &mut b], "both reloaded", |cs| cs[0].app.live_reloads() > reloads.0 && cs[1].app.live_reloads() > reloads.1 && cs.iter().all(|c| c.app.live_quiet()));
+        settle(&mut [&mut a, &mut b], "caught up after the restore");
+        assert_same(&a, &b, "after the restore");
+        for c in [&a, &b] {
+            assert_eq!(text(c, "Sheet1", 2, 1), "", "version 1 has no 'from a'");
+            assert_eq!(text(c, "Sheet1", 6, 2), "ben unsent", "unsent changes are kept");
+        }
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A version can be named from the app's side of the API and the list shows who contributed.
+    #[test]
+    fn version_names_and_contributors_reach_the_client() {
+        let (server, dir, mut a, mut b, id) = two_people("version-names");
+        type_at(&mut a.app, 2, 1, "from a");
+        type_at(&mut b.app, 3, 1, "from b");
+        settle(&mut [&mut a, &mut b], "changes everywhere");
+        a.app.live_snapshot();
+        let seq = a.app.live_seq();
+        pump(&mut [&mut a, &mut b], "snapshot", |cs| cs[0].app.live_snap_seq() == seq);
+        let list = a.session.versions(&id).unwrap();
+        let mut who = list[0].contributors.clone();
+        who.sort();
+        assert_eq!(who, ["Ann Lee", "Ben Ode"], "{list:?}");
+        assert_eq!(b.session.label_version(&id, list[0].version, "  Budget v1 ").unwrap(), "Budget v1");
+        assert_eq!(a.session.versions(&id).unwrap()[0].label, "Budget v1");
         drop(server);
         let _ = std::fs::remove_dir_all(&dir);
     }

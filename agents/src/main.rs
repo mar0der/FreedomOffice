@@ -47,7 +47,7 @@ USAGE:
                                   MCP server on standard input/output for AI agents
     fsheets soak --server URL --item ID --users a,b,c --secrets-dir DIR
                  [--clients 4] [--edits 150] [--seed N] [--interval-ms 40]
-                 [--restart-pct 2] [--journal-dir DIR]
+                 [--restart-pct 2] [--undo-pct 8] [--journal-dir DIR]
                                   Several clients edit at random, disconnect and reconnect; all must converge
     fsheets probe --server URL --item ID --users a,b --secrets-dir DIR
                                   Show what concurrent edits of one cell do
@@ -411,6 +411,9 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
             }
             if let Some(v) = opt(&mut args, "--interval-ms") {
                 cfg.interval_ms = v.parse().map_err(|_| "--interval-ms must be a number")?;
+            }
+            if let Some(v) = opt(&mut args, "--undo-pct") {
+                cfg.undo_pct = v.parse().map_err(|_| "--undo-pct must be a number")?;
             }
             if let Some(v) = opt(&mut args, "--restart-pct") {
                 cfg.restart_pct = v.parse().map_err(|_| "--restart-pct must be a number")?;

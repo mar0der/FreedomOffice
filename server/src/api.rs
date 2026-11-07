@@ -645,6 +645,7 @@ pub fn router(app: App) -> Router {
         .route("/api/items/{id}/content", get(get_content).put(put_content).layer(upload_limit))
         .route("/api/items/{id}/restore", post(restore_item))
         .route("/api/items/{id}/versions", get(versions))
+        .route("/api/items/{id}/versions/{n}", axum::routing::put(label_version))
         .route("/api/items/{id}/versions/{n}/restore", post(restore_version))
         .route("/api/items/{id}/permissions", get(permissions).post(grant).delete(revoke_body))
         .route("/api/items/{id}/permissions/{username}", axum::routing::delete(revoke_path))
@@ -2319,10 +2320,28 @@ async fn versions(State(app): State<App>, headers: HeaderMap, Path(id): Path<Str
                     "modified": iso(v.modified),
                     "modified_by": display_of(s, &v.modified_by),
                     "current": v.version == it.version,
+                    "label": v.label,
+                    "contributors": v.contributors.iter().map(|c| display_of(s, c)).collect::<Vec<_>>(),
                 })
             })
             .collect();
         ok_json(json!({ "versions": list }))
+    })
+    .await
+}
+
+/// `PUT /api/items/{id}/versions/{n}` with `{"label": "..."}`: names a version (editors).
+/// An empty label clears it. Named versions are exempt from pruning.
+async fn label_version(State(app): State<App>, headers: HeaderMap, Path((id, n)): Path<(String, i64)>, body: Bytes) -> ApiResult {
+    let body: Value = parse_body(&body)?;
+    app.run(move |s| {
+        let who = auth(s, &headers)?;
+        user_of(&who)?;
+        let (it, role) = visible(s, &who, &id, false)?;
+        need_edit(role)?;
+        let label: String = body.get("label").and_then(|v| v.as_str()).ok_or_else(|| ApiError::bad("label is required."))?.trim().chars().filter(|c| !c.is_control()).take(80).collect();
+        s.set_version_label(&it.id, n, &label)?;
+        ok_json(json!({ "version": n, "label": label }))
     })
     .await
 }
@@ -2334,10 +2353,14 @@ async fn restore_version(State(app): State<App>, headers: HeaderMap, Path((id, n
         user_of(&who)?;
         let (it, role) = visible(s, &who, &id, false)?;
         need_edit(role)?;
-        if live_busy(s, &hub, &it)? {
+        // Allowed while others are connected: their sessions are retired below and they
+        // reload the restored file (keeping what they hadn't sent yet). With nobody
+        // connected and changes not in a version yet, they'd be lost with no one to ask.
+        if !hub.connected(&it.id) && live_busy(s, &hub, &it)? {
             return Err(locked());
         }
         let saved = s.restore_version(&it, n, &actor(&who))?;
+        hub.retire(&it.id);
         s.audit_item(audit_by(&who, "item.version_restore").detail(format!("{}: version {n} saved as version {}", saved.name, saved.version)), &saved)?;
         ok_json(item_json(s, &saved, role))
     })

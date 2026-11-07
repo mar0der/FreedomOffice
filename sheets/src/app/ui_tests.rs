@@ -98,7 +98,7 @@ fn typing_in_other_cloud_dialogs_stays_out_of_the_sheet() {
     let (ctx, mut app) = app();
     app.select(0, 0, false);
     app.cloud.doc = Some(server_doc());
-    app.cloud.versions = Some(super::cloud_ui::VersionsState { doc: server_doc(), list: Some(Vec::new()), busy: false, error: None });
+    app.cloud.versions = Some(super::cloud_ui::VersionsState { doc: server_doc(), list: Some(Vec::new()), busy: false, error: None, naming: None });
     assert_sheet_untouched(&ctx, &mut app, "version history");
     app.cloud.versions = None;
 
