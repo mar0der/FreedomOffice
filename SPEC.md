@@ -106,7 +106,7 @@ the super-admin can still add themselves to an org — that is a policy matter, 
 
 ### Schema and migration
 
-`PRAGMA user_version` (0 = the schema before organisations, 1 = now). `Store::open` runs the migration in
+`PRAGMA user_version` (0 = the schema before organisations, 1 = organisations, 2 = now). `Store::open` runs the migration in
 one `BEGIN IMMEDIATE` transaction (a second process opening the database waits and then finds it done; a
 crash leaves the old schema). Version 1:
 
@@ -117,8 +117,11 @@ crash leaves the old schema). Version 1:
 - `permissions` rebuilt as `(item_id, grantee_kind 'user'|'org', grantee_id, role, granted_by, created,
   PK(item_id, grantee_kind, grantee_id))`; existing rows are copied as user grants.
 
-**No downgrade:** an older server binary can't open a migrated database (its schema statements refer to
-`permissions.user_id`). Back up (`freedomoffice-server backup`) before upgrading.
+Version 2 (web admin, §4): `users` + `last_login`; new `admin_sessions(id, user_id, hash UNIQUE, agent,
+created, expires, last_used)`.
+
+**No downgrade:** an older server binary can't open a migrated database (version 0 code: its schema
+statements refer to `permissions.user_id`; version 1 code refuses a newer `user_version`). Back up (`freedomoffice-server backup`) before upgrading.
 
 Deleting an organisation requires its folder to be empty (trashed items don't count); members, grants
 to it and invites are deleted, the org account and any trashed items stay (unreachable).
@@ -130,7 +133,7 @@ to it and invites are deleted, the org account and any trashed items stay (unrea
 | `GET /api/me` → also `must_change_password`, `orgs: [{id, name, root, role, member_role, members}]` | anyone signed in |
 | `POST /api/me/password {old_password, new_password}` (signs out the other devices) | the user |
 | `POST /api/users {username, display_name?, email?, org?, role?}` → `{user, temporary_password}` | super-admin; org owner/admin with `org` |
-| `POST /api/users/{username}/reset-password` → `{user, temporary_password}` | super-admin |
+| `POST /api/users/{username}/reset-password` → `{user, temporary_password}` | super-admin (not for themselves) |
 | `POST /api/users/{username}/disable`, `/enable` | super-admin |
 | `GET /api/orgs` (super-admin: all), `POST /api/orgs {name}` | members / super-admin |
 | `GET /api/orgs/{org}` (id or name; with `member_list`), `PATCH {name?, member_role?}`, `DELETE` | rename/delete: super-admin; member_role: org owner/admin |
@@ -140,6 +143,9 @@ to it and invites are deleted, the org account and any trashed items stay (unrea
 | `GET /api/invites/{token}`, `POST {username, password, display_name?, device?}` → `{token, user, org}` | anyone with the link |
 | `GET/POST /i/{token}`: the same as a plain HTML form for browsers | anyone with the link |
 | `GET /api/orgs/{org}/storage`, `GET /api/admin/storage` (sum of kept version sizes, trash included) | org owner/admin; super-admin |
+| `POST /api/users/{username}/admin {is_admin}` (the last enabled super-admin can't step down, 409) | super-admin |
+| `POST /api/users/{username}/sign-out` (every device and web admin session) | super-admin |
+| `GET /api/users/{username}/sessions` → `{devices, web}`, `DELETE .../sessions/{device\|web}/{id}` | super-admin |
 | `POST /api/items/{id}/permissions {org, role}`, `DELETE ... {org}` or `DELETE .../permissions/org/{org}`; `GET` lists `orgs` next to `permissions` | edit access; granting needs membership of that org (orgs can't be probed by name) |
 
 Errors keep the `{"error": "..."}` shape; some add `"code"`: `password_change_required` (403, every
@@ -202,17 +208,81 @@ Not yet: other participants aren't told that someone's role changed (their peer 
 - Share-link (`/l/`) and invite (`/i/`) tokens are in URL paths: the server redacts them in its log, but a
   reverse proxy logs them unless told not to (the deploy notes must say so for nginx/Caddy).
 - No storage quotas yet (usage is reported only).
+- Web admin (§4): the sign-in form has no CSRF token (there is no session yet), only the origin check;
+  a POST with neither Origin nor Referer is judged by its CSRF token alone. Sessions aren't bound to an
+  address or browser. Destructive buttons (disable, reset, remove) have no "are you sure" step except
+  deleting an organisation. The People page runs a few queries per person (organisations, storage):
+  fine for a family or a team, slow with thousands of accounts.
 
 ## 4. Admin UI
 
-- **Web admin** at `/admin`, served by freedomoffice-server, plain HTML (no external scripts):
-  organisations, people (add / invite / disable / reset password / roles), storage use per person and
-  org, active sign-ins. Sign-in with a separate session cookie (`HttpOnly; Secure; SameSite=Strict`,
-  12 h), CSRF token on every form, CSP `default-src 'self'; frame-ancestors 'none'`. Only super-admin
-  and org owners/admins (for their orgs).
 - **Sheets**: org folders in Open/Save, "Share with <org>" in the Share dialog, change password, and
   read-only switch on live role changes. A full admin screen in Sheets comes later; the web page links
   from File → Account.
+
+### Web admin (`/admin`, `server/src/admin.rs`)
+
+Plain server-rendered HTML forms served by freedomoffice-server; no JavaScript, no external scripts, fonts
+or CDNs; one stylesheet `/admin/style.css` (light, plus `prefers-color-scheme: dark`; usable on phones).
+Super-admin and org owners/admins (for their orgs); anyone else who signs in sees "You don't administer
+anything" and their own change-password form.
+
+| Route | What | Who |
+|---|---|---|
+| `GET/POST /admin/login`, `POST /admin/logout` | sign in / out | anyone |
+| `GET/POST /admin/password` | change own password (forced first while a temporary one is set) | signed in |
+| `GET /admin` | overview: organisations, people, storage (an org admin: of their orgs) | signed in |
+| `GET /admin/orgs`, `POST /admin/orgs` | list; create | managers; super-admin |
+| `GET /admin/orgs/{id}` | members, add/create/invite, open invites, storage, settings | org owner/admin, super-admin |
+| `POST /admin/orgs/{id}/settings` (`member_role`), `/rename`, `/delete` (empty folder, confirm box) | | owner/admin; super-admin; super-admin |
+| `POST /admin/orgs/{id}/members` (`username, role`), `.../members/{user}/role`, `.../members/{user}/remove` | | org owner/admin |
+| `POST /admin/orgs/{id}/accounts` → temporary password shown once | | org owner/admin |
+| `POST /admin/orgs/{id}/invites` → link shown once with a prefilled `mailto:`; `.../invites/{iid}/revoke` | | org owner/admin |
+| `GET /admin/people`, `POST /admin/people` (account without org) | status, orgs, last sign-in, storage | super-admin |
+| `GET /admin/people/{user}`; `POST .../disable`, `/enable`, `/reset-password`, `/sign-out`, `/admin` (`on=1/0`) | | super-admin |
+| `POST /admin/people/{user}/sessions/{device\|web}/{id}/revoke` | end one sign-in | super-admin |
+
+Every action calls the same functions as the API (`api::create_account_as`, `set_member_as`,
+`remove_member_as`, `patch_org_as`, `create_invite_as`, `set_disabled_as`, `reset_password_as`, ...), which
+hold the authorization rules (`org_for`, `need_manage`, `need_owner_for`, `need_admin`, `invite_required`,
+last owner, last super-admin), and re-checks the live sessions (`App::changed`) before answering. Errors
+are shown as a page with the API's message and status (403, 404, 409, ...). After a change the browser is
+sent on (303) to the page with a fixed message code (`?m=saved`; no text from the URL is shown).
+
+**Session.** Sign-in goes through `api::check_sign_in`, the same code as `/api/login`: names that can't be
+usernames are refused before anything, then the attempt is counted up front in the shared limiter (per
+address and username), the delay after repeated failures, Argon2 in its semaphore. Success creates an
+`admin_sessions` row (only the SHA-256 of a 32-byte random secret is stored) and sets
+`__Host-fo_admin=<secret>; Path=/; Max-Age=43200; HttpOnly; SameSite=Strict; Secure`. It expires 12 h after
+sign-in whatever the activity, isn't a bearer token for the API (device tokens aren't admin sessions
+either), is checked on every request (disabled account, demoted admin, temporary password), and ends with
+sign-out, "sign out of all devices", disable, password reset, and any password change (from the API: all
+web sessions end; from the page: all others). Signing in again from a browser ends the session of the
+cookie it sent; a person keeps at most 10 sessions (the oldest end). A temporary password allows only
+`/admin/password` and sign-out. Nobody resets their own password (web and API, 400 "Use Change password
+for your own account."): the reset would sign them out before they saw the new one. Plain-http setups (only possible on loopback or with `allow_insecure_http`, and with an
+`http://` public URL) get `fo_admin` without `Secure`, since browsers wouldn't send a Secure cookie back;
+anything with TLS or an `https://` `public_url` always gets the `__Host-`/`Secure` cookie. Set `public_url`
+behind a reverse proxy: the origin check compares against it.
+
+**CSRF.** Every POST form has a hidden `csrf` field = base64url(SHA-256("freedomoffice admin csrf\0" +
+session secret)): one per session, nothing stored, unknowable without the HttpOnly cookie; compared in
+constant time (403 when missing or wrong). Before that, a POST whose `Origin` isn't `public_url`'s origin
+(`null` included), or that has no Origin and a `Referer` from elsewhere, is refused (403); the sign-in form
+has this check (no session yet) and SameSite=Strict. With neither header the token decides.
+
+**Headers** on every response under `/admin` (a router-wide middleware, so also on 400 from a bad path
+parameter, 404, 405 and 413): `Content-Security-Policy: default-src 'none'; style-src 'self';
+img-src 'self' data:; form-action 'self'; frame-ancestors 'none'; base-uri 'none'`,
+`X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Cache-Control: no-store`,
+`Referrer-Policy: same-origin` (not `no-referrer`: with that, browsers send `Origin: null` on form POSTs,
+which would leave the origin check nothing to compare; no referrer leaves the site either way).
+
+**Shown once.** Temporary passwords (create account, reset) and invite links appear only in the response
+to the POST that made them (no-store), selectable with one click (`user-select: all`); they are never
+logged or stored in clear. Resets are logged as warnings (who reset whom). All user text (names, emails,
+device and browser names, org names) is HTML-escaped; an unknown username in a URL is answered with a
+fixed "No such user." (API too), never echoed.
 
 ## 5. Security baseline (required for any public test)
 
