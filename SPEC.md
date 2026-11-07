@@ -126,6 +126,9 @@ Version 3 (Drive, §6): `admin_sessions` + `kind 'admin'|'web'` (existing rows b
 append-only `audit(id, at, actor_id, actor_name, ip, action, org_id, item_id, target_user, detail)` with
 triggers that abort every `UPDATE` and every `DELETE` of a row younger than 365 days.
 
+Version 4 (Drive review): `audit` + `count`, `last_at`, `agg_key` (repeats within a minute are one row);
+the update trigger now allows only `count` going up (and `last_at` with it), nothing else.
+
 **No downgrade:** an older server binary can't open a migrated database (version 0 code: its schema
 statements refer to `permissions.user_id`; version 1 code refuses a newer `user_version`). Back up (`freedomoffice-server backup`) before upgrading.
 
@@ -187,8 +190,11 @@ Sign-in: after 3 failures for a username within 15 minutes, every attempt for it
 waits 1 s, 2 s, 4 s, then 8 s (async sleep); the 10-failure lockout per address and username stays. Each
 attempt counts as a failure in the same step as the limit check (taken back when it succeeds), so
 parallel attempts can't get past the limit. Text that can't be a username is refused before the limiter,
-the database and Argon2. Failures are logged as `failed sign-in for user '<name>' from <ip>` (or
-`... with an invalid username from <ip>`; never the password). The limiter keeps at most 100 000 keys.
+the database and Argon2. The per-address key is the address itself for IPv4 and its /64 for IPv6 (one
+host or household usually has a whole /64). Failures are logged as `failed sign-in for user '<name>' from
+<ip>` only when such an account exists (`... with an unknown username from <ip>` otherwise, since people
+sometimes type their password into the username field; `... with an invalid username ...` for text that
+can't be one; never the password). The limiter keeps at most 100 000 keys.
 
 Argon2 (about 19 MiB and one core per run) runs at most once per core at a time, never under the store
 lock; requests waiting for it hold no thread.
@@ -234,8 +240,9 @@ Not yet: other participants aren't told that someone's role changed (their peer 
   deleting an organisation. The People page runs a few queries per person (organisations, storage):
   fine for a family or a team, slow with thousands of accounts.
 - Drive (§6): the audit log records file and folder names, also of personal files, which the super-admin
-  can read there (not the contents). Failed sign-ins from very many addresses each add an audit row (the
-  per-address limit bounds each address, not their number; rows go after 365 days). Browsers that send
+  can read there (not the contents). Repeated events are counted per minute (§6), so one actor adds at
+  most about one row a minute per item or account; failed sign-ins from very many different networks
+  still add a row per network and minute (rows go after 365 days, or with `audit-prune`). Browsers that send
   neither `Sec-Fetch-Site` nor `Origin` (very old ones) rely on SameSite=Strict and the CSRF header alone.
   Web sessions, like admin sessions, aren't bound to an address or browser.
 
@@ -409,7 +416,8 @@ origins can't read anything. Code: `server/src/web.rs` (session), `server/src/co
   - a temporary password gates the cookie like a token: 403 `password_change_required` everywhere except
     `/api/me`, `/api/me/password {old_password, new_password}` (cookie + `X-FO-CSRF`), `/api/logout`,
     `/api/web/session`, `/api/web/logout`.
-- Web sessions end with `/api/web/logout`, `/api/logout` (with the cookie), "sign out of all devices"
+- Web sessions end with `/api/web/logout`, `/api/logout` (with the cookie; it then also clears the
+  cookie with `Set-Cookie`), "sign out of all devices"
   (`POST /api/users/{u}/sign-out`, admin page), disabling the account, a password reset, any password change
   (from a device or the admin page: all of them; from the web: all others), and an administrator ending one
   (`DELETE /api/users/{u}/sessions/web/{id}`; `GET .../sessions` lists them under `web` with
@@ -418,8 +426,12 @@ origins can't read anything. Code: `server/src/web.rs` (session), `server/src/co
 - Errors keep `{"error": "<for people>"}`, sometimes with `"code"`: `csrf_failed`, `cross_site`,
   `password_change_required`, `wrong_password`, `links_disabled`, `invite_required`. 401 = not signed in,
   404 = doesn't exist or not visible, 403 = visible but not allowed (view-only, not a manager), 409 name
-  taken / conflict, 412 `If-Match` mismatch, 413 too large, 416 bad range, 423 being edited live, 429
-  limited.
+  taken / conflict, 408 an upload stalled, 412 `If-Match` mismatch, 413 too large, 416 bad range, 423
+  being edited live, 429 limited (sign-in attempts, or more than 4 uploads at once), 507 the server's disk
+  is nearly full.
+- Every request's store work is one SQLite transaction (nested savepoints): a change and its audit row
+  are kept together or not at all, so an error answer never follows a change that was made (version
+  files that a save prunes are deleted only after the commit).
 
 #### Downloads (`GET /api/items/{id}/content`, `/l/{token}/download`)
 
@@ -440,6 +452,12 @@ origins can't read anything. Code: `server/src/web.rs` (session), `server/src/co
   except PDF (`frame-ancestors 'self'` only; PDF viewers refuse to run sandboxed): a shared HTML or SVG
   file renders without script in an opaque origin, never as the server's origin. The Drive page may show
   previews in an `<iframe>` of its own origin.
+- **Trust boundary (accepted for now):** HTML, SVG and XML that people upload are served from the
+  server's own (trusted) origin, protected only by the sandbox CSP, nosniff and CORP. PDF gets no sandbox
+  (Chrome and Firefox refuse to show a PDF in a sandboxed document; their viewers run PDF scripts
+  isolated from the page). A browser that ignored CSP `sandbox` would run uploaded HTML as the server's
+  origin. **Long term:** serve user content from a separate origin (e.g. `usercontent.<domain>`, with
+  signed short-lived URLs and no cookies), as Google Drive and GitHub do.
 - `/api/items/{id}/content` (current version) also keeps Sheets' live headers (`X-Live-Seq`,
   `X-Live-Sheets`, `X-Live-State`).
 
@@ -457,6 +475,9 @@ origins can't read anything. Code: `server/src/web.rs` (session), `server/src/co
   `{"error": "The file is too large (at most N MB)."}` (also when Content-Length says so up front); an
   interrupted upload stores nothing; `incoming/` is emptied at start. Progress: use `XMLHttpRequest`
   `upload.onprogress` (fetch has no upload progress).
+- Limits: at most 4 uploads streaming at once per person (or share link) → 429 `{"error"}` for the fifth
+  (the Drive app should queue: upload 4 at a time); an upload that sends nothing for 60 s is stopped →
+  408 and nothing is kept; before staging, the data disk must have `max_upload_mb` + 1 GB free → else 507.
 - `POST /api/items/{id}/versions/{n}/restore` copies the old version on disk (no memory buffering).
 
 #### Audit log
@@ -465,15 +486,28 @@ origins can't read anything. Code: `server/src/web.rs` (session), `server/src/co
 triggers abort updates and deletions of rows younger than 365 days); pruned after 365 days at server start
 and daily. `actor_name`/`target_user` are usernames at the time; `ip` the client address (behind the trusted
 proxy, `X-Forwarded-For`); `org_id` is the organisation the event belongs to (for item events: the item's
-organisation, so org admins see what happens in their org folder); `detail` is one line of at most 500
+organisation, so org admins see what happens in their org folder); `detail` is one line of at most 200
 characters. **Never** passwords, tokens, invite or link secrets, or file contents (file and folder names
-and the email an invite was made for are recorded).
+and the email an invite was made for are recorded). A username that was typed at a failed sign-in is
+recorded only if that account exists (people type passwords into the username field).
+
+**Counting repeats.** Some events are counted instead of stored one by one: a repeat with the same key
+within 60 s of the row's first event adds 1 to its `count` (and sets `last_at`); the row keeps the first
+event's details. Keys: `sign_in.failed` per network (IPv4 address, IPv6 /64) and account (all unknown
+usernames from one network share one key); `item.rename`, `item.move` and `file.version` per actor and
+item. So a rename loop or a password-guessing run adds about one row a minute, not one per request.
+
+**Erasing.** `freedomoffice-server --config <cfg> audit-prune --before YYYY-MM-DD [--user USERNAME]` (CLI,
+stop the server first) deletes the events before that date (UTC), or only those done by or to that person.
+In one transaction it drops the early-deletion trigger, deletes, recreates the trigger and records an
+`audit.erase` event (count and date, never the person's name). This is also how a request to erase
+someone's personal data from the log is honoured.
 
 | Action | When | target_user / org / item / detail |
 |---|---|---|
 | `sign_in` | a sign-in succeeded | self / - / - / `app`, `web`, `admin` or `invite` |
-| `sign_in.failed` | wrong password for a *valid-format* username (existing or not), or a disabled account's right password | the username / - / - / how (text that can't be a username is not recorded) |
-| `sign_out` | `/api/web/logout` | self / - / - / `web` |
+| `sign_in.failed` | wrong password for a *valid-format* username, or a disabled account's right password (counted per network and account) | the username if the account exists, else empty / - / - / how, `wrong password` or `unknown username` (text that can't be a username is not recorded) |
+| `sign_out` | `/api/web/logout`, `/api/logout`, the admin page's sign-out | self / - / - / `web`, `app` or `admin` |
 | `password.change` | own password changed | self / - / - / other sign-ins ended (and whether a temporary one was replaced) |
 | `password.reset` | an administrator reset someone's password | that person / - / - / sign-ins ended |
 | `account.create` | account with a temporary password | the new account / org it joins / - / role |
@@ -490,13 +524,18 @@ and the email an invite was made for are recorded).
 | `permission.grant`, `permission.revoke` | sharing with a person or an organisation | the person (if any) / item's org / item / name, role, the org shared with |
 | `link.create`, `link.delete` | share links | - / item's org / item / name, role, link id, password/expiry |
 | `item.trash`, `item.restore`, `item.rename`, `item.move`, `item.version_restore` | | - / item's org / item / name(s), folders, versions |
-| `file.upload` | a *new* file was uploaded (new versions of existing files are not) | - / item's org / item / name, size, folder |
+| `file.upload` | a *new* file was uploaded | - / item's org / item / name, size, folder |
+| `file.version` | a new version was saved: upload with `replace`, `PUT .../content`, a live snapshot (counted per actor and item) | - / item's org / item / name, version, `upload`/`save`/`live` |
+| `folder.create` | | - / item's org / item / name, parent |
+| `audit.erase` | `audit-prune` ran | - / - / - / how many, before which date |
+
+`item.rename` and `item.move` are counted per actor and item as well.
 
 Share-link holders appear as `actor_id = "link:<link id>"` with an empty `actor_name`.
 
 `GET /api/admin/audit?before=<id>&limit=<1..200, default 50>&org=<id or name>&user=<username>&action=<action
 or group>` → `{events: [{id, at, actor, actor_id, ip, action, org: {id, name} | null, item, target_user,
-detail}], next_before}` newest first; `next_before` (or null) is the `before` of the next page. `user`
+detail, count, last_at}], next_before}` newest first (`count` ≥ 1; `last_at` = `at` when 1); `next_before` (or null) is the `before` of the next page. `user`
 matches actor or target (case-insensitive); `action=org` matches every `org.*` (only `a-z`, `_`, `.`; 400
 otherwise). Super-admin: every event. Org owner/admin: only events whose `org_id` is an organisation they
 manage (an `org` they don't manage: 404). Anyone else: 403. `/admin/audit` shows the same with the same
@@ -506,11 +545,16 @@ rules (filters person / organisation / action group, 50 per page, "Older"/"Newes
 
 Drive links to `freedomoffice://open?server=<percent-encoded public_url>&item=<id>` for `.xlsx`, `.csv`,
 `.fsheet`. FreedomSheets registers the scheme (Windows: `HKCU\Software\Classes\freedomoffice`, written at
-start only if missing or already pointing at that exe; Linux: `MimeType=x-scheme-handler/freedomoffice;` in
+start only if missing, already pointing at that exe, or pointing at an absolute exe path that no longer
+exists; Linux: `MimeType=x-scheme-handler/freedomoffice;` in
 its .desktop file, see README; macOS: `CFBundleURLTypes` in the app bundle). Sheets accepts only exactly
-`server` (https, or http on 127.0.0.1/localhost) and `item` (32 lowercase hex), uses nothing else from the
-URL, opens the item with the signed-in account for that server (joining live when possible) and otherwise
-shows File > Account with the server filled in; it never signs in or sends credentials by itself.
+`server` (https, or http on 127.0.0.1/localhost) and `item` (32 lowercase hex) and uses nothing else from
+the URL. With one signed-in account for that server it opens the item (joining live when possible); with
+two or more it asks which account. For a server with no signed-in account it first asks "This link points
+to <host>, a server you haven't signed in to. Only continue if you trust it." (the host decoded from
+punycode, with the `xn--` form next to it, or the raw host plus a look-alike warning when it can't be
+decoded); only Continue leads to File > Account with the server filled in, and only then does the file open
+after that sign-in. It never signs in or sends credentials by itself.
 
 ### Phases
 | Phase | What |
