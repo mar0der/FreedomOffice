@@ -1844,12 +1844,13 @@ impl App {
             }
             job.append("Share", if g.is_empty() { 0.0 } else { 6.0 }, egui::TextFormat { font_id: theme::ui_font(13.0), color: Color32::WHITE, valign: Align::Center, ..Default::default() });
             let galley = ui.painter().layout_job(job);
-            let share_ok = self.cloud_share_enabled();
+            let share_off = self.cloud_share_off();
+            let share_ok = share_off.is_none();
             let (rect, resp) = ui.allocate_exact_size(Vec2::new(galley.size().x + 24.0, 26.0), if share_ok { Sense::click() } else { Sense::hover() });
             let fill = if !share_ok { share_green().gamma_multiply(0.45) } else if resp.hovered() { share_green().gamma_multiply(0.85) } else { share_green() };
             ui.painter().rect_filled(rect, 4.0, fill);
             ui.painter().galley(Pos2::new(rect.center().x - galley.size().x / 2.0, rect.center().y - galley.size().y / 2.0), galley, Color32::WHITE);
-            let tip = if share_ok { "Share this workbook with others" } else { "This window is no longer connected to the workbook on the server, so it can't be shared from here. Save a copy to share that." };
+            let tip = share_off.unwrap_or("Share this workbook with others");
             if resp.on_hover_text(tip).clicked() && share_ok {
                 self.commit_edit(false);
                 self.cloud_open_share();
@@ -1887,9 +1888,22 @@ impl App {
         });
     }
 
-    /// Share works unless the window's live session has ended (access removed, signed out).
+    /// Share works unless the window's live session has ended (access removed, signed out)
+    /// or the person may only view the workbook (the server lets only editors share).
     pub(super) fn cloud_share_enabled(&self) -> bool {
-        self.live.as_ref().is_none_or(|l| l.stopped.is_none())
+        self.cloud_share_off().is_none()
+    }
+
+    /// Why Share is greyed out (its tooltip), or `None` when it works.
+    pub(super) fn cloud_share_off(&self) -> Option<&'static str> {
+        let l = self.live.as_ref()?;
+        if l.stopped.is_some() {
+            Some("Not connected: this window is no longer connected to the workbook on the server. Save a copy to share that.")
+        } else if !l.editor {
+            Some("Only editors can share")
+        } else {
+            None
+        }
     }
 
     /// The AutoSave label, whether the switch shows on, and its tooltip. A live window that is

@@ -901,6 +901,8 @@ impl App {
         // A cloud document stays attached only when its downloaded copy is what was opened.
         self.cloud.doc = self.cloud.pending_open.take().filter(|d| Some(&d.local) == self.wb.path.as_ref());
         self.cloud.upload_failed = false;
+        // Messages about the previous workbook ("Ann joined.", "Saved ...") don't carry over.
+        self.status = None;
         // Join the live session of a server document (or leave the previous one).
         self.live_reset();
     }
@@ -919,7 +921,6 @@ impl App {
                 self.wb = wb;
                 self.reset_doc();
                 self.add_recent(p);
-                self.status = None;
             }
             Err(e) => {
                 self.dialog = Some(dialogs::Dialog::Message {

@@ -287,7 +287,8 @@ fn live_role_changes_switch_read_only_and_back() {
     assert_eq!(app.live_stopped(), (None, false), "the session goes on");
     let (label, on, tip) = app.cloud_autosave_state();
     assert!(label == "Read-only" && !on && tip.contains("only view"), "AutoSave doesn't claim to be on: {label} / {tip}");
-    assert!(app.cloud_share_enabled(), "a viewer can still share (the server decides)");
+    assert!(!app.cloud_share_enabled(), "only editors can share (the server refuses viewers)");
+    assert_eq!(app.cloud_share_off(), Some("Only editors can share"));
     let before = app.wb.clone();
     app.select_range(rg("2:3"));
     app.delete_rows();
@@ -298,6 +299,7 @@ fn live_role_changes_switch_read_only_and_back() {
 
     app.live_event_for_test(Event::Msg(cosync::ServerMsg::Role { role: "edit".into() }));
     assert!(app.live_editor() && app.live_notice_for_test().is_none());
+    assert!(app.cloud_share_enabled(), "editors share again");
     type_at(&mut app, 0, 0, "editable again");
     app.live_flush();
     assert!(!app.live_pending_ops().is_empty());
@@ -380,6 +382,7 @@ fn signed_out_while_live_is_read_only() {
     let (label, on, _) = app.cloud_autosave_state();
     assert!(label == "Not connected" && !on);
     assert!(!app.cloud_share_enabled(), "Share is off once the session ended");
+    assert!(app.cloud_share_off().is_some_and(|t| t.starts_with("Not connected")));
 }
 
 /// Access removed (the `revoked` message, or only the 4401 close, or a refused reconnect): the
@@ -452,6 +455,30 @@ fn view_only_participants_change_nothing() {
     app.live_flush();
     assert!(app.live_pending_ops().is_empty());
     assert!(crate::live::compare(&before, &app.wb).is_empty(), "{:?}", crate::live::compare(&before, &app.wb));
+}
+
+/// "Ann joined." and other passing live messages belong to the workbook they were about: a
+/// New workbook or another opened file starts with a clean status bar.
+#[test]
+fn live_messages_are_cleared_by_new_or_open() {
+    use crate::live::conn::Event;
+    let join = Event::Msg(cosync::ServerMsg::Join { peer: cosync::Peer { id: 7, name: "PO Client B".into(), user: "pob".into(), color: 1, editor: true, presence: None } });
+    let (_ctx, mut app) = super::data_ui::sample_app();
+    app.live_for_test();
+    app.live_event_for_test(join);
+    assert_eq!(app.status.as_deref(), Some("PO Client B joined."));
+    app.run_pending(super::Pending::New);
+    assert!(app.live.is_none() && app.status.is_none(), "New: {:?}", app.status);
+
+    let dir = super::cloud_ui::TestDir::new("fo-sheets-status");
+    std::fs::create_dir_all(&dir.0).unwrap();
+    let file = dir.0.join("Other.xlsx");
+    crate::io::save(&app.wb, &file).unwrap();
+    let (_ctx, mut app) = super::data_ui::sample_app();
+    app.live_for_test();
+    app.status = Some("PO Client B left.".into());
+    app.open_path(file);
+    assert!(app.live.is_none() && app.status.is_none(), "Open: {:?}", app.status);
 }
 
 // ---------------------------------------------------------------------------
