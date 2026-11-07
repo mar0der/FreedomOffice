@@ -212,7 +212,17 @@ Not yet: other participants aren't told that someone's role changed (their peer 
   and org owners/admins (for their orgs).
 - **Sheets**: org folders in Open/Save, "Share with <org>" in the Share dialog, change password, and
   read-only switch on live role changes. A full admin screen in Sheets comes later; the web page links
-  from File → Account.
+  from File → Account. **(exists, `sheets-orgs` branch)**:
+  - Open / Save As: each organisation from `/api/me` is a place next to My files and Shared with me.
+  - Share: "Everyone in an organisation" (view/edit); Manage access lists and removes org grants.
+  - "Choose a new password" opens on any 403 `password_change_required` (or when the sign-in or
+    `/api/me` says so); File → Account → Change password… and, for the super-admin and org
+    owners/admins, Manage organisations… (opens `<server>/admin`).
+  - Live: `role: view` → read-only at once with a yellow bar "<file>: you can now only view this
+    workbook" (still live); with unsent changes, the session ends and the bar offers Save a copy (the
+    same for 4403 and a viewer Welcome). `role: edit` → editable again. `revoked` / 4401 (or 404 on
+    reconnect) → no reconnect, "Your access to this file was removed (<reason>)", read-only, Save a copy.
+  - Save As to a server joins the new file's live session at once.
 
 ## 5. Security baseline (required for any public test)
 

@@ -680,11 +680,12 @@ impl App {
                         entry.me = Some(me);
                         entry.error = None;
                         for p in [&mut self.cloud.open_place, &mut self.cloud.save_place] {
-                            if let Place::Server(i, ServerView::Org(k)) = *p {
-                                if self.cloud.servers.get(i).is_some_and(|e| e.session.account.url == url) && (k >= n || changed) {
-                                    *p = Place::Server(i, ServerView::MyFiles);
-                                    self.cloud.browser.root = None;
-                                }
+                            if let Place::Server(i, ServerView::Org(k)) = *p
+                                && self.cloud.servers.get(i).is_some_and(|e| e.session.account.url == url)
+                                && (k >= n || changed)
+                            {
+                                *p = Place::Server(i, ServerView::MyFiles);
+                                self.cloud.browser.root = None;
                             }
                         }
                     }
@@ -713,7 +714,11 @@ impl App {
                         }
                         self.cloud.browser.root = None;
                     }
-                    Err(e) => f.error = Some(e),
+                    Err(e) => {
+                        // The typed passwords are gone: start again in the first box.
+                        f.error = Some(e);
+                        f.focused = false;
+                    }
                 }
             }
             Event::OrgShared(result) => {
