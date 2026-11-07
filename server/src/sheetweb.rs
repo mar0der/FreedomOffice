@@ -127,7 +127,7 @@ fn probe(s: &Store, headers: &HeaderMap, id: &str) -> Result<Probe, ApiError> {
     if link {
         json["parent"] = Value::Null;
     }
-    if let (Principal::User { user, .. }, true) = (&who, true) {
+    if let Principal::User { user, .. } = &who {
         // Opening a workbook counts as using it (Recent).
         s.touch_recent(&user.id, &item.id)?;
     }

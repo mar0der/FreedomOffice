@@ -247,8 +247,7 @@
       st.textContent = text;
       return;
     }
-    st.textContent = S.meta && S.meta.role === 'edit' ? 'Read only (live editing comes next)' : 'Read only';
-    if (S.meta && S.meta.live) st.textContent += ' · live';
+    st.textContent = S.meta && S.meta.live ? 'View · live' : 'View only';
   }
 
   function buildTabs() {
@@ -386,6 +385,7 @@
       if (!first) $('tabs').children[pos].scrollIntoView({ inline: 'nearest', block: 'nearest' });
     }
     updateCsvLink();
+    dropData();
     const sc = $('scroller');
     sc.scrollLeft = 0;
     sc.scrollTop = 0;
@@ -808,8 +808,15 @@
     let aw = w;
     if (tw > avail) {
       if (cell.k === 'n') {
-        shown = '#'.repeat(Math.max(1, Math.floor(avail / Math.max(1, ctx.measureText('#').width))));
-        tw = ctx.measureText(shown).width;
+        // A number that doesn't fit is drawn a little smaller (down to 70%), else as hashes.
+        const f = avail / tw;
+        if (f >= 0.7) {
+          ctx.font = ctx.font.replace(/([\d.]+)px/, (m, n) => `${(Number(n) * f).toFixed(2)}px`);
+          tw = ctx.measureText(text).width;
+        } else {
+          shown = '#'.repeat(Math.max(1, Math.floor(avail / Math.max(1, ctx.measureText('#').width))));
+          tw = ctx.measureText(shown).width;
+        }
       } else if (align === 'l') {
         aw = w + spareRight(L, r, c, z, tw - avail);
       } else if (align === 'r') {
@@ -883,6 +890,7 @@
     let top = y + 2;
     if (st && st.v === 'c') top = y + (h - total) / 2;
     else if (!st || st.v === 'b') top = y + h - total - 2;
+    if (total > h) top = y + 2; // more text than room: show the start
     ctx.save();
     ctx.beginPath();
     ctx.rect(x, y, w, h);
@@ -1125,7 +1133,7 @@
     $('zoom-in').addEventListener('click', () => setZoom(S.z * 1.15));
     $('zoom-out').addEventListener('click', () => setZoom(S.z / 1.15));
     $('fx').addEventListener('click', () => $('fx').classList.toggle('one'));
-    $('more').addEventListener('click', toggleMenu);
+    $('more').addEventListener('click', () => toggleMenu());
     $('m-refresh').addEventListener('click', () => {
       toggleMenu(false);
       reload();

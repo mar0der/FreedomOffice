@@ -79,6 +79,7 @@ pub struct LiveInput {
 pub struct Book {
     wb: Workbook,
     cells: usize,
+    meta: Json,
 }
 
 fn extension(name: &str) -> String {
@@ -155,7 +156,9 @@ impl Book {
             live::apply_ops(&mut wb, b, true, &mut st);
         }
         wb.recalc();
-        Ok(Book { wb, cells })
+        let sheets: Vec<Json> = wb.sheets.iter().enumerate().map(|(i, s)| sheet_meta(&wb, i, s)).collect();
+        let meta = json!({ "sheets": sheets, "active": wb.active.min(wb.sheets.len().saturating_sub(1)) });
+        Ok(Book { wb, cells, meta })
     }
 
     /// Number of non-empty cells.
@@ -169,8 +172,7 @@ impl Book {
 
     /// The sheets and what the viewer needs to lay each one out (no cells).
     pub fn meta(&self) -> Json {
-        let sheets: Vec<Json> = self.wb.sheets.iter().enumerate().map(|(i, s)| sheet_meta(i, s)).collect();
-        json!({ "sheets": sheets, "active": self.wb.active.min(self.wb.sheets.len().saturating_sub(1)) })
+        self.meta.clone()
     }
 
     /// [`Book::window`] for a rectangle given as numbers (checked).
@@ -239,11 +241,9 @@ impl Book {
         let hidden = cell.is_some_and(|x| x.formula.is_some()) && sh.protection.is_some() && st.hide_formula;
         let mut input = String::new();
         let mut formula = false;
-        if !hidden {
-            if let Some(x) = cell {
-                formula = x.formula.is_some();
-                input = cut(&self.edit_text(x, st), 32_768);
-            }
+        if !hidden && let Some(x) = cell {
+            formula = x.formula.is_some();
+            input = cut(&self.edit_text(x, st), 32_768);
         }
         let mut out = json!({ "r": ar, "c": ac, "input": input, "text": cut(&shown, 32_768), "formula": formula, "hidden_formula": hidden });
         if let Some(note) = sh.notes.get(&(ar, ac)) {
@@ -257,12 +257,12 @@ impl Book {
 
     /// What the formula bar shows (dates as dates).
     fn edit_text(&self, cell: &freedom_sheets::model::Cell, st: &Style) -> String {
-        if cell.formula.is_none() {
-            if let Value::Number(n) = cell.value {
-                if numfmt::is_date_format(&st.num_fmt) && n >= 0.0 {
-                    return numfmt::edit_date(n);
-                }
-            }
+        if cell.formula.is_none()
+            && let Value::Number(n) = cell.value
+            && numfmt::is_date_format(&st.num_fmt)
+            && n >= 0.0
+        {
+            return numfmt::edit_date(n);
         }
         cell.input_text()
     }
@@ -448,7 +448,26 @@ fn runs(mut v: Vec<u32>) -> Vec<Json> {
     out.into_iter().take(MAX_LIST).map(|(a, b)| json!([a, b])).collect()
 }
 
-fn sheet_meta(i: usize, s: &Sheet) -> Json {
+/// Rows whose height Excel would grow to fit larger text (no custom height set): (row, px).
+fn auto_heights(wb: &Workbook, s: &Sheet) -> Vec<(u32, f32)> {
+    let mut out = Vec::new();
+    for (r, row) in &s.rows {
+        if s.row_h.contains_key(r) {
+            continue;
+        }
+        let biggest = row.values().map(|c| wb.style(c.style).size10).max().unwrap_or(0);
+        if biggest > 110 {
+            // 11 pt is the 20 px default row.
+            out.push((*r, (f32::from(biggest) / 10.0 * 20.0 / 11.0).ceil()));
+        }
+        if out.len() >= MAX_LIST {
+            break;
+        }
+    }
+    out
+}
+
+fn sheet_meta(wb: &Workbook, i: usize, s: &Sheet) -> Json {
     let (mut rows, mut cols) = s.extent_with_spills().map_or((0, 0), |(r, c)| (r + 1, c + 1));
     for m in &s.merges {
         rows = rows.max(m.r2 + 1);
@@ -457,6 +476,7 @@ fn sheet_meta(i: usize, s: &Sheet) -> Json {
     let mut col_w: Vec<(u32, f32)> = s.col_w.iter().map(|(c, w)| (*c, *w)).collect();
     col_w.sort_unstable_by_key(|x| x.0);
     let mut row_h: Vec<(u32, f32)> = s.row_h.iter().map(|(r, h)| (*r, *h)).collect();
+    row_h.extend(auto_heights(wb, s));
     row_h.sort_unstable_by_key(|x| x.0);
     let merges: Vec<Json> = s.merges.iter().take(20_000).map(|m| json!([m.r1, m.c1, m.r2, m.c2])).collect();
     json!({

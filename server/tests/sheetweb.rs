@@ -153,7 +153,7 @@ fn book() -> Vec<u8> {
     wb.save_to_buffer().unwrap()
 }
 
-fn cell<'a>(w: &'a Value, r: u64, c: u64) -> Option<&'a Value> {
+fn cell(w: &Value, r: u64, c: u64) -> Option<&Value> {
     w["cells"].as_array().unwrap().iter().find(|x| x[0] == r && x[1] == c)
 }
 
