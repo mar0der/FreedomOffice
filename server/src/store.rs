@@ -1172,6 +1172,13 @@ impl Store {
         if item.deleted == 0 {
             return Ok(item.clone());
         }
+        // Files of a deleted organisation stay where nobody can reach them.
+        if let Some(owner) = self.user_by_id(&item.owner_id)?
+            && let Some(org) = &owner.org_id
+            && self.org(org)?.is_none()
+        {
+            return Err(StoreError::Invalid("The organisation these files belonged to was deleted.".into()));
+        }
         let parent_ok = match &item.parent_id {
             Some(p) => match self.item(p)? {
                 Some(pi) => self.chain(&pi)?.iter().all(|i| i.deleted == 0),
@@ -1209,7 +1216,10 @@ impl Store {
         if user.id == item.owner_id {
             return Err(StoreError::Invalid(format!("{} owns this item.", user.display_name)));
         }
-        if user.disabled || user.org_id.is_some() {
+        if user.org_id.is_some() {
+            return Err(StoreError::Invalid(format!("{} is an organisation; share with the organisation instead.", user.display_name)));
+        }
+        if user.disabled {
             return Err(StoreError::Invalid(format!("The user '{}' is disabled.", user.username)));
         }
         self.conn.execute(
@@ -1979,6 +1989,10 @@ mod tests {
         assert_eq!(s.trash_of(&ann.id).unwrap().len(), 1, "org admins see the org's trash");
         s.delete_org(&org).unwrap();
         assert!(s.org(&org.id).unwrap().is_none());
+        let trashed = s.item(&folder.id).unwrap().unwrap();
+        assert!(s.restore(&trashed).is_err(), "nothing comes back into a deleted organisation");
+        let account = s.user_by_id(&org.account_id).unwrap().unwrap();
+        assert!(s.grant(&mine, &account, Role::View, &cat.id).unwrap_err().to_string().contains("organisation"));
         assert_eq!(s.role(&p(&ann), &file, true).unwrap(), None);
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
