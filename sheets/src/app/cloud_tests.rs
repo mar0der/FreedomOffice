@@ -64,10 +64,12 @@ fn setup() -> Setup {
     Setup { server, url, dir, org_id, org_root }
 }
 
-fn client(url: &str, user: &str, pw: &str) -> (egui::Context, App, Arc<ServerSession>) {
+fn client(t: &Setup, user: &str, pw: &str) -> (egui::Context, App, Arc<ServerSession>) {
+    let url = t.url.as_str();
     let ctx = egui::Context::default();
     let mut app = App::with_context(&ctx, 0, None);
     app.dialog = None;
+    app.cloud.cache_override = Some(t.dir.join(format!("{user}-cache-{}", crate::model::new_sheet_uid())));
     let session = Arc::new(ServerSession::login(Box::new(Http::new()), url, user, pw, "test").unwrap());
     app.cloud_for_test(session.clone());
     (ctx, app, session)
@@ -76,7 +78,7 @@ fn client(url: &str, user: &str, pw: &str) -> (egui::Context, App, Arc<ServerSes
 #[test]
 fn organisation_folders_are_places_in_open_and_save_as() {
     let t = setup();
-    let (ctx, mut app, ann) = client(&t.url, "ann", PW);
+    let (ctx, mut app, ann) = client(&t, "ann", PW);
     let place = Place::Server(0, ServerView::Org(0));
     assert_eq!(app.place_root(place), (Target::Folder(t.org_root.clone()), "Lab Team".to_string()));
     assert_eq!(app.place_root(Place::Server(0, ServerView::Org(5))).0, Target::MyFiles, "a stale organisation shows My files");
@@ -94,9 +96,16 @@ fn organisation_folders_are_places_in_open_and_save_as() {
     until(&ctx, &mut app, "saved", |a| !a.cloud.uploading);
     let doc = app.cloud.doc.clone().expect("the window is now the server file");
     assert_eq!((doc.name.as_str(), doc.parent.as_deref()), ("Lab plan.xlsx", Some(t.org_root.as_str())));
+    // Saved to the server: the window joins the file's live session right away, as when it is
+    // opened from the server (the local copy is where Open keeps it).
+    assert!(doc.live.is_some() && app.live.is_some(), "live after Save As");
+    assert!(doc.local.starts_with(app.cloud.cache_override.as_ref().unwrap()) && doc.local.ends_with(std::path::Path::new(&doc.item_id).join("Lab plan.xlsx")));
+    assert_eq!(app.wb.path.as_ref(), Some(&doc.local));
+    until(&ctx, &mut app, "ann is live", |a| a.live_quiet());
+    assert!(app.cloud_title_suffix().contains("Saved to"), "{}", app.cloud_title_suffix());
 
     // Ben finds it in Open, under the organisation, and opens it.
-    let (bctx, mut ben, _) = client(&t.url, "ben", PW);
+    let (bctx, mut ben, _) = client(&t, "ben", PW);
     ben.cloud.open_place = place;
     ben.backstage = Some(Backstage::Open);
     frame(&bctx, &mut ben, vec![]);
@@ -107,6 +116,20 @@ fn organisation_folders_are_places_in_open_and_save_as() {
     ben.cloud_open_item(item);
     until(&bctx, &mut ben, "opened", |a| a.cloud.doc.is_some());
     assert_eq!(ben.cloud.doc.as_ref().map(|d| d.item_id.clone()), Some(doc.item_id.clone()));
+    until(&bctx, &mut ben, "ben is live", |a| a.live_quiet());
+
+    // What Ben types reaches Ann's window (she never reopened the file).
+    ben.select(4, 2, false);
+    ben.begin_edit(Some("from ben".into()), super::super::EditMode::Enter);
+    assert!(ben.commit_edit(false));
+    let c5 = |a: &App| crate::numfmt::value_to_text(a.wb.sheets[0].display_value(4, 2));
+    let end = Instant::now() + Duration::from_secs(20);
+    while c5(&app) != "from ben" {
+        assert!(Instant::now() < end, "Ben's change didn't reach Ann");
+        frame(&bctx, &mut ben, vec![]);
+        frame(&ctx, &mut app, vec![]);
+        std::thread::sleep(Duration::from_millis(5));
+    }
     let _ = ann;
     drop(t.server);
     let _ = std::fs::remove_dir_all(&t.dir);
@@ -115,7 +138,7 @@ fn organisation_folders_are_places_in_open_and_save_as() {
 #[test]
 fn sharing_with_an_organisation_from_the_share_dialog() {
     let t = setup();
-    let (ctx, mut app, ann) = client(&t.url, "ann", PW);
+    let (ctx, mut app, ann) = client(&t, "ann", PW);
     let item = ann.upload_new("root", "Mine.xlsx", b"mine", "fail").unwrap();
     let local = t.dir.join("mine");
     let doc = ann.open(&item, &local).unwrap();
@@ -150,7 +173,7 @@ fn sharing_with_an_organisation_from_the_share_dialog() {
 #[test]
 fn a_temporary_password_asks_for_a_new_one() {
     let t = setup();
-    let (ctx, mut app, dan) = client(&t.url, "dan", TEMP);
+    let (ctx, mut app, dan) = client(&t, "dan", TEMP);
     assert!(app.cloud.servers[0].me.as_ref().is_some_and(|m| m.must_change_password && m.orgs.len() == 1));
     frame(&ctx, &mut app, vec![]);
     let f = app.cloud.password.as_ref().expect("the dialog opens by itself");

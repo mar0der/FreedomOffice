@@ -114,7 +114,8 @@ enum Event {
     Session { result: Result<Option<(Arc<Session>, User)>, String>, interactive: bool },
     Listing(u64, Result<Vec<DriveItem>, String>),
     Opened(Result<CloudDoc, String>),
-    Uploaded { kind: UploadKind, local: PathBuf, conn: Conn, result: Result<DriveItem, UploadError> },
+    /// `opened`: a new server file downloaded again as Open does (where its live session starts).
+    Uploaded { kind: UploadKind, local: PathBuf, conn: Conn, result: Result<DriveItem, UploadError>, opened: Option<Result<CloudDoc, String>> },
     Invited(Result<usize, String>),
     Link(Result<String, String>),
     Permissions(Result<Vec<Permission>, String>),
@@ -270,6 +271,8 @@ pub struct CloudState {
     pub add_server: AddServer,
     pub versions: Option<VersionsState>,
     pub password: Option<PasswordForm>,
+    /// Tests: local copies of cloud documents go here instead of the user's data folder.
+    pub cache_override: Option<PathBuf>,
 }
 
 impl Default for CloudState {
@@ -305,6 +308,7 @@ impl Default for CloudState {
             add_server: AddServer::default(),
             versions: None,
             password: None,
+            cache_override: None,
         }
     }
 }
@@ -373,6 +377,14 @@ impl App {
         match self.cloud.doc.as_ref().map(|d| &d.provider) {
             Some(Provider::FreedomServer(url)) => self.server_index(url).map(|i| self.cloud.servers[i].session.clone()),
             _ => None,
+        }
+    }
+
+    /// Where documents of this connection are kept on this computer.
+    fn cache_root_of(&self, conn: &Conn) -> Option<PathBuf> {
+        match &self.cloud.cache_override {
+            Some(d) => Some(d.join(cloud::place_name(&conn.provider()).replace(':', "_"))),
+            None => conn.cache_root(),
         }
     }
 
@@ -572,7 +584,7 @@ impl App {
                     Err(e) => self.dialog = Some(Dialog::Message { title: "Open".into(), text: format!("Sorry, we couldn't open the file from the cloud.\n\n{e}") }),
                 }
             }
-            Event::Uploaded { kind, local, conn, result } => self.cloud_uploaded(kind, local, conn, result),
+            Event::Uploaded { kind, local, conn, result, opened } => self.cloud_uploaded(kind, local, conn, result, opened),
             Event::Invited(result) => {
                 if let Some(sh) = &mut self.cloud.share {
                     sh.busy = false;
@@ -780,9 +792,36 @@ impl App {
         }
     }
 
-    fn cloud_uploaded(&mut self, kind: UploadKind, local: PathBuf, conn: Conn, result: Result<DriveItem, UploadError>) {
+    fn cloud_uploaded(&mut self, kind: UploadKind, local: PathBuf, conn: Conn, result: Result<DriveItem, UploadError>, opened: Option<Result<CloudDoc, String>>) {
         self.cloud.uploading = false;
         let place = cloud::place_name(&conn.provider());
+        // A new server file joins its live session at once, as if opened from the server: the
+        // downloaded copy is exactly what was uploaded (else someone changed it in between and
+        // it is joined when reopened).
+        let joinable = match (&result, opened) {
+            (Ok(item), Some(Ok(doc))) if doc.live.is_some() && server::version_of_etag(&doc.etag) == server::version_of_etag(&item.etag) => Some(doc),
+            _ => None,
+        };
+        if let (Some(doc), UploadKind::Copy | UploadKind::New { .. }) = (joinable, &kind) {
+            if matches!(kind, UploadKind::New { .. }) && doc.local != local {
+                // The Save As copy is replaced by the server's (in the folder Open uses).
+                let _ = std::fs::remove_file(&local);
+                for d in local.ancestors().skip(1).take(2) {
+                    let _ = std::fs::remove_dir(d);
+                }
+            }
+            self.live_leave(false);
+            self.wb.path = Some(doc.local.clone());
+            let name = doc.name.clone();
+            self.cloud.doc = Some(doc);
+            self.cloud.upload_failed = false;
+            self.live_reset();
+            self.status = Some(format!("Saved to {place} as {name}. Connecting for live editing..."));
+            if self.cloud.upload_again {
+                self.cloud.upload_again = false;
+            }
+            return;
+        }
         match (kind, result) {
             (UploadKind::Save, Ok(item)) => {
                 if let Some(doc) = &mut self.cloud.doc {
@@ -995,6 +1034,7 @@ impl App {
         };
         self.cloud.uploading = true;
         self.status = Some(format!("Saving to {place} ({})...", size_label(data.len())));
+        let root = self.cache_root_of(&conn);
         self.cloud_spawn(move || {
             let result = match &kind {
                 UploadKind::Save => conn.upload(&doc, check.then_some(doc.etag.as_str()), &data),
@@ -1004,7 +1044,8 @@ impl App {
                 },
                 UploadKind::New { folder, name } => conn.upload_new(folder, name, &data, if check { "fail" } else { "replace" }),
             };
-            Event::Uploaded { kind, local: doc.local.clone(), conn, result }
+            let opened = if matches!(kind, UploadKind::Save) { None } else { reopen_new(&conn, root.as_deref(), &result) };
+            Event::Uploaded { kind, local: doc.local.clone(), conn, result, opened }
         });
     }
 
@@ -1015,7 +1056,7 @@ impl App {
         if !name.to_lowercase().ends_with(".xlsx") && !name.to_lowercase().ends_with(".xlsm") {
             name.push_str(".xlsx");
         }
-        let Some(dir) = conn.cache_root().map(|d| d.join(format!("new-{}", cloud::auth::now_secs()))) else {
+        let Some(dir) = self.cache_root_of(&conn).map(|d| d.join(format!("new-{}", cloud::auth::now_secs()))) else {
             self.status = Some(cloud::NO_SETTINGS_DIR.to_string());
             return;
         };
@@ -1045,9 +1086,11 @@ impl App {
         };
         self.cloud.uploading = true;
         self.status = Some(format!("Saving {name} to {}...", cloud::place_name(&conn.provider())));
+        let root = self.cache_root_of(&conn);
         self.cloud_spawn(move || {
             let result = conn.upload_new(&folder, &name, &data, if replace { "replace" } else { "fail" });
-            Event::Uploaded { kind: UploadKind::New { folder, name }, local, conn, result }
+            let opened = reopen_new(&conn, root.as_deref(), &result);
+            Event::Uploaded { kind: UploadKind::New { folder, name }, local, conn, result, opened }
         });
     }
 
@@ -1085,7 +1128,7 @@ impl App {
     }
 
     fn cloud_open_with(&mut self, conn: Conn, item: DriveItem) {
-        let Some(root) = conn.cache_root() else {
+        let Some(root) = self.cache_root_of(&conn) else {
             self.status = Some(cloud::NO_SETTINGS_DIR.to_string());
             return;
         };
@@ -2424,6 +2467,13 @@ impl App {
     }
 }
 
+/// After a new file was uploaded to a FreedomOffice server: downloads it as Open does, for the
+/// live session it can join (worker thread).
+fn reopen_new(conn: &Conn, root: Option<&std::path::Path>, result: &Result<DriveItem, UploadError>) -> Option<Result<CloudDoc, String>> {
+    let (Conn::Server(s), Ok(item), Some(root)) = (conn, result, root) else { return None };
+    Some(s.open(item, root))
+}
+
 /// Manage access rows; returns the id of a row whose Remove button was clicked.
 fn permissions_list_ui(ui: &mut egui::Ui, sh: &ShareState) -> Option<String> {
     let mut remove: Option<String> = None;
@@ -2498,6 +2548,9 @@ impl App {
     /// Signed in to a server without touching the saved accounts (tests).
     pub(super) fn cloud_for_test(&mut self, session: Arc<ServerSession>) {
         self.cloud.started = true;
+        if self.cloud.cache_override.is_none() {
+            self.cloud.cache_override = Some(std::env::temp_dir().join(format!("fo-sheets-cache-{}", std::process::id())));
+        }
         let me = session.me_info().ok();
         self.cloud.servers.push(ServerEntry { session, error: None, me });
     }
@@ -2505,6 +2558,7 @@ impl App {
     /// No saved accounts or sign-ins are read from this PC (tests).
     pub(super) fn no_cloud_for_test(&mut self) {
         self.cloud.started = true;
+        self.cloud.cache_override = Some(std::env::temp_dir().join(format!("fo-sheets-cache-{}", std::process::id())));
     }
 
     /// As if the cloud browser had downloaded `doc` (tests).
