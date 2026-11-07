@@ -3,6 +3,8 @@
 use freedomoffice_server::config::Config;
 use freedomoffice_server::store::Store;
 use freedomoffice_server::{Running, spawn};
+mod common;
+
 use fsheets::api::Api;
 use fsheets::live::Live;
 use fsheets::{sample, soak};
@@ -203,4 +205,11 @@ fn protocol_1_mode_sends_only_whole_cells_and_converges() {
     assert!(a.synced() && b.synced());
     assert!(a.differences(&b).is_empty(), "{:?}", a.differences(&b));
     assert!(a.take_replaced().is_empty());
+}
+
+#[test]
+fn a_reload_request_is_followed_and_pending_changes_survive() {
+    let s = start();
+    let (apis, item) = shared_workbook(&s, "tasks");
+    common::reload_keeps_pending_changes(&apis[0], &item);
 }

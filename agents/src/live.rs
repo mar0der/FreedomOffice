@@ -51,6 +51,8 @@ pub struct Stats {
     pub snapshots: u64,
     /// Own edits that someone else's concurrent edit replaced.
     pub replaced: u64,
+    /// Times the server asked this client to start again from the file's latest version.
+    pub reloads: u64,
 }
 
 /// One of this client's own cell edits that a concurrent edit by someone else replaced (the
@@ -125,6 +127,8 @@ pub struct Live {
     /// The server speaks protocol 1 (its Welcome has no `proto`): only whole `Cell` operations
     /// are sent, without `made`, and nothing is reported as replaced.
     pub legacy: bool,
+    /// Set by a reload: the connection was dropped on purpose and should be reopened.
+    reconnect: bool,
 }
 
 fn version_of_etag(etag: &str) -> Option<i64> {
@@ -150,8 +154,10 @@ impl Live {
         Ok(live)
     }
 
-    /// Like `open`, without connecting.
-    pub fn prepare(api: &Api, item: &str, agent: bool) -> Result<Live, String> {
+    /// The latest version of the file as the app joins from it: the workbook (with the lossless
+    /// live state when the version has one), the sequence number the session starts at and the
+    /// version.
+    fn download(api: &Api, item: &str) -> Result<(Workbook, u64, i64), String> {
         let r = api.content(item)?;
         let seq: u64 = r
             .header("x-live-seq")
@@ -174,6 +180,12 @@ impl Live {
         }
         live::sort_sheets(&mut wb);
         wb.recalc();
+        Ok((wb, seq, version))
+    }
+
+    /// Like `open`, without connecting.
+    pub fn prepare(api: &Api, item: &str, agent: bool) -> Result<Live, String> {
+        let (wb, seq, version) = Live::download(api, item)?;
         let notes = Vec::new();
         let mut cid = [0u8; 6];
         getrandom::fill(&mut cid).map_err(|e| e.to_string())?;
@@ -211,6 +223,7 @@ impl Live {
             last_snapshot: None,
             replaced: Vec::new(),
             legacy: false,
+            reconnect: false,
         })
     }
 
@@ -265,6 +278,7 @@ impl Live {
         }
         .map_err(|e| e.to_string())?;
         self.ws = Some(ws);
+        self.reconnect = false;
         self.caught_up = false;
         self.sess.offline();
         if self.stats.connects > 0 {
@@ -372,6 +386,10 @@ impl Live {
                 return true;
             }
             if self.ws.is_none() {
+                // After a reload the connection is ours to reopen.
+                if self.reconnect && self.stopped.is_none() && self.connect().is_ok() {
+                    continue;
+                }
                 return false;
             }
             self.pump(Duration::from_millis(20));
@@ -433,8 +451,13 @@ impl Live {
                 self.snapshot_wanted = true;
             }
             ServerMsg::Reload => {
-                self.stopped = Some("The server no longer has the changes since this copy was downloaded: open the item again.".into());
+                // The file got a newer version (someone's snapshot) or the log was cut short
+                // while we were away: start again from the latest version, with our
+                // unacknowledged changes on top, as the app does.
                 self.disconnect();
+                if let Err(e) = self.reload() {
+                    self.stopped = Some(format!("Couldn't get the latest version after the server asked for a reload: {e}"));
+                }
             }
             ServerMsg::Error { message } => self.last_error = Some(message),
             ServerMsg::Role { role } => self.editor = role == "edit",
@@ -443,6 +466,21 @@ impl Live {
                 self.disconnect();
             }
         }
+    }
+
+    /// Replaces the workbook by the latest version of the file and puts the changes the server
+    /// has not acknowledged on top of it; the next `connect` joins from there.
+    fn reload(&mut self) -> Result<(), String> {
+        let (mut wb, seq, version) = Live::download(&self.api, &self.item)?;
+        let pending = self.sess.rebase_on_reload(seq);
+        live::apply_ops(&mut wb, &pending, false, &mut self.apply_state);
+        self.wb = wb;
+        self.needs_recalc = true;
+        self.version = Some(version);
+        self.welcomed = false;
+        self.reconnect = true;
+        self.stats.reloads += 1;
+        Ok(())
     }
 
     fn note_replaced(&mut self, replaced: &[Replaced], who: &str) {
