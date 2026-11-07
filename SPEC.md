@@ -809,9 +809,9 @@ for at most 25 s (504 `timeout`), at most 3 at once (the rest wait up to 10 s, t
 slot is given back only when it really ends, so a hanging file can occupy at most 3 slots, never the server.
 Results (success or failure) are cached per (item, version, live seq), 5 books, 10 minutes unused, single-flight;
 older versions of the same item are dropped. Permissions are checked on every request, cached book or not
-(revoking access is immediate). Windows are cut from the cached book (no re-reading the file). Not shown yet
-(documented gaps): conditional formatting, charts, images, sparklines, data-validation lists, rich-text runs
-(shown plain), column auto-fit, merged-cell borders per edge, protection beyond hidden formulas.
+(revoking access is immediate). Windows are cut from the cached book (no re-reading the file). Not shown (documented gaps): icon-set conditional formats, sparklines, data-validation lists and their drop-downs, rich-text
+runs (shown plain), column auto-fit, merged-cell borders per edge, protection beyond hidden formulas, chart data labels/
+trendlines/secondary axes/combo charts, pivot tables, threaded comments (notes are read-only markers).
 
 **Viewer UI** (`sheet.js`, no framework): touch-first. A canvas draws the visible cells and follows a native
 scroller (iOS momentum, scroll bars, keyboard), so sheets of a million rows scroll smoothly: only the windows in
@@ -827,7 +827,7 @@ revision every 10 s while visible and reloads what is in view when it changes. A
 canvas after removing bidi embedding/override/isolate controls; the bar shows them as a visible mark; names are
 `<bdi>`.
 
-**Live editing in the browser (W2).** Approach (b), a server-side bridge (DECISIONS W-7). `POST
+**Live editing in the browser (W2, extended by web2).** Approach (b), a server-side bridge (DECISIONS W-7). `POST
 /api/items/{id}/live-ticket` (cookie + `X-FO-CSRF`) gives a one-minute single-use ticket; `GET
 /api/items/{id}/web-live?ticket=` upgrades to a same-origin WebSocket (the cookie alone never opens it; 256 KB
 messages). For each such connection the server runs a headless live client (`sheetview::bridge::Bridge`: the
@@ -836,23 +836,73 @@ inside the process through `live::run` (made generic over its socket; an in-memo
 WebSocket). Everything the hub does for the app therefore applies unchanged: role checks on every batch, live role
 changes (`role`) and revocation (`revoked`) pushed to the browser, 30 batches/s limit, presence, the merge/OT
 rules, and snapshots (the bridge answers the server's snapshot request with the workbook + lossless live state, so
-browser-only editing still produces versions). Browser to bridge (JSON, `t`): `meta`, `win {id,sheet,r1,c1,r2,c2}`,
-`cell {id,sheet,r,c}`, `edit {sheet,r,c,text}` (typed text parsed like the app: numbers, dates, percentages with
-their implied format, `=formulas`, rejected with `rejected` when a formula can't be read), `clear {sheet,r1..c2}`,
-`fmt {sheet,r1..c2,set:{b,i,u,x,fill,color,h,nf}}`, `undo`, `redo` (per person: only the bridge's own edits),
-`presence {sheet,r,c,editing}`. Bridge to browser: `meta`, `win`, `cell` (replies), `hello {role,you}`, `peers`
-(id, name, user, colour slot, editor, agent, presence cell/selection/editing, sheet index), `changed {rev,sheets}`
-(the browser refetches what is in view), `status {state: saved|saving|offline}`, `role`, `revoked`, `rejected`,
-`reload`, `failed`, `closed`. Windows and cells come from the bridge's workbook, so the browser sees its own and
-other people's edits (and recalculated formulas) at once. UI: the formula bar is a 16 px input for editors (tap
-the bar, type, check mark = enter, cross = cancel; Enter, Tab, Escape on a keyboard; a printable key on the grid
-starts typing), undo/redo in the header, B / I / highlight / `#,##0.00` / Clear buttons for the selected cell, a
-"Saved / Saving... / Offline" indicator, other people's cursors with their names in the app's colours (a dashed box
-while they type; agents are marked "(agent)"), a banner when the role changes. A lost connection reconnects (2, 4,
-8, 16 s) and reloads the workbook; edits are refused while offline (no offline journal in the browser) and the
-`reload` case (the log was cut short while connected) also reconnects from the latest version. Viewers get the same
-live view without edit controls. Not in W2/W3 yet: insert/delete rows and columns, add/rename sheet, range
-selection by touch, copy/paste, column widths; xlsx/CSV export of the current state exists (menu, W1 routes).
+browser-only editing still produces versions).
+
+Browser to bridge (JSON, `t`; a sheet is named by `suid`, its live id as a string, or by `sheet`, its index; `id`
+makes a reply carry the same `id`). Every change becomes ordinary cosync operations, so it merges with what
+desktop users do at the same time by the protocol's rules, and each has its undo. Editors only (a viewer gets
+`rejected`):
+
+| Message | Does |
+|---|---|
+| `edit {r,c,text}` | typed like the app: numbers, dates, percentages with their implied format, `=formulas` (unreadable ones are `rejected`) |
+| `clear {r1..c2}` | contents only |
+| `fmt {r1..c2, set}` | `set` keys: `b i u x` (bool), `fill color` (`#rrggbb` or null), `h` l/c/r/g, `v` t/c/b, `w` wrap, `z` points 6-72, `ind` 0-15, `nf` number format, `bd` border preset (`none all outer thick_outer top bottom left right`), `reset`. One `Format` operation per cell carrying the whole new style, so concurrent formats of one cell are last-writer-wins as in the app |
+| `ins`/`del {axis r|c, at, n}` | `Rows`/`Cols` (n <= 1000); deleting remembers the cells, formats, sizes and hidden flags for undo |
+| `size {axis, a, b, px}` | `ColW`/`RowH` (px null = default); `hide {axis, a, b, on}`; `freeze {r, c}`; `merge {r1..c2, on}` (keeps the upper-left value; undo restores the rest) |
+| `sheet_add {name?}`, `sheet_rename`, `sheet_del`, `sheet_move {to}`, `sheet_hide {on}`, `sheet_color {color}` | `AddSheet`, `Rename`, `DelSheet` (undo brings the sheet back with its content; formulas elsewhere that pointed at it stay `#REF!`), `Place` (order key between the new neighbours), `Prop hidden`, `Prop tab_color`; names: 1-31 characters, none of `[]:*?/\`, unique ignoring case, never the last visible sheet |
+| `copy {r1..c2, cut}` | answered with `clip {clip, text, cut}`: the page keeps the cells (content, format, value) in the bridge for exactly one clipboard and gets TSV (displayed text; tab/newline/quote cells quoted) for the system clipboard. Viewers may copy |
+| `paste {r, c, r2?, c2?, clip?, grid?, what}` | with `clip`: formulas move by the offset like a copy (a cut keeps them), formats come along, a target that is a whole multiple of the copy is tiled, `what` all/values/formats, a cut empties its source and can be pasted once. With `grid` (cells split by the page): typed like the keyboard, formula-looking text that does not parse stays text, text-direction overrides and control characters are removed; at most 20 000 cells and 4 MB |
+| `fill {r1..c2, dir down|right}`, `autofill {r1..c2, r2n, c2n}` | repeat the first row/column with relative references shifted; the fill handle also continues a series of two or more plain numbers |
+| `undo`, `redo` | per person, bounded (200 steps / 300 000 operations) |
+| `find {q, case, whole, formulas, all}` | displayed text (and formula text) over the workbook or one sheet, at most 500 hits in reading order, scanning at most 600 000 cells or 1.5 s; answered with `found {hits: [[sheet,r,c,text]], more}`. Viewers may search |
+| `charts {sheet}` | the charts of a sheet with their data (see below) |
+| `meta`, `win`, `cell`, `presence {sheet,r,c,editing}` | as in W2 |
+
+A range operation on a whole row, column or sheet is sent with `clamp: true` and cut to the cells in use; other
+ranges are limited to 20 000 cells (`rejected` with "too many cells at once"). Bridge to browser: `meta`, `win`,
+`cell`, `clip`, `found`, `charts`, `focus {uid}` (after `sheet_add`: show that sheet), `hello {role,you}`, `peers`,
+`changed {rev,sheets}`, `status {state: saved|saving|offline}`, `role`, `revoked`, `rejected {message}`, `error`,
+`reload`, `failed`, `closed`.
+
+**Display parity.** A window's cells carry the conditional formats of the sheet evaluated by the app's own engine
+(`condfmt::CfFrame`): cell-value/text/duplicate/top-bottom/average/expression rules and colour scales are folded into
+the cell's style (fill, text colour, bold...), data bars come as a per-cell `bar [from, to, colour, gradient]`; cells
+with a note carry `note` (a red corner; the text shows under the formula bar when selected; notes are read-only in
+the browser). Cells are `[r, c, text, kind, style, link?, extra?]`. `GET /api/items/{id}/sheet/image?sheet=&n=`
+serves a picture (png, jpeg, gif, bmp only, `nosniff`, sandboxed) that the sheet description lists with its
+anchor and size, and the canvas draws it. Charts are resolved on the server (`chart::resolve`: categories, series,
+colours, titles) and painted by the page: column, bar, line, area, pie, doughnut, scatter and radar, clustered,
+stacked and 100%; data labels, trendlines, secondary axes, combo charts and per-point formats are not drawn.
+`GET /api/items/{id}/sheet/charts?sheet=` gives the same data to a page without a live session.
+
+**Editing UI** (`sheet.js` core, `sheet-ui.js` interface). The formula bar is a 16 px input for editors (tap the
+bar, type, check mark = enter, cross = cancel; a printable key on the grid starts typing). Selection: tap a
+cell; tap it again to get the cell menu (Edit, Cut, Copy, Paste, Paste values, Clear, Fill down/right, Insert/Delete
+row/column, Select row/column, Find), or tap twice quickly to edit; long-press a cell for range handles (two round
+handles, drag to extend, edge auto-scroll); the mouse drags a range, Shift+click / Shift+arrows extend, Ctrl+arrows
+jump over data. Tapping a column/row header selects it and opens its menu (Cut/Copy/Paste, Insert 1..n left/right or
+above/below, Delete, Hide, Unhide next to hidden ones, width/height with a - / + stepper and live preview, Clear,
+Freeze up to here); a size handle on the selected header drags the width/height, its end handle extends the run;
+the corner tap selects all. The tool row (scrolls sideways, 44 px targets) has bold, italic, underline, strike, text
+and fill colour palettes (48 swatches plus `#rrggbb`), alignment (horizontal buttons, a sheet for vertical/indent),
+wrap, borders presets, number formats (General, Number, Thousands, Whole, Currency, Percent, Dates, Time, Scientific,
+Text), text size, merge/unmerge, freeze panes (top row, first column, at selection, off) and Clear contents/formats/
+all. Desktop: Ctrl/Cmd+C X V (system clipboard as TSV, paste also from other programs), A, D, R, B, I, U, F (find),
+G (go to), Z/Y, Delete; a fill handle at the selection's corner (a pointer device only). Tabs: tap to switch, `+`
+to add, long-press for a menu (Rename, Move left/right, Tab colour, Hide, Show a hidden sheet, Add, Delete with a
+confirmation), or long-press and drag to reorder. Search (magnifier or Ctrl/Cmd+F): live results, "n of m",
+next/previous, options (case, whole cell, formulas, workbook/sheet); tapping the address box (Ctrl+G) goes to
+`B7`, `A1:C5`, `Sheet2!C3`, `B:D` or `3:5`.
+
+**Phones.** If the connection drops, edits made meanwhile (cell entries, format, structure) wait in an in-memory
+queue (not persisted; at most 300 changes / 2 MB; typed text stays visible), the status says "Offline - n
+waiting", and after the automatic reconnect they are re-sent in order and a toast says "Reconnected. n changes
+re-sent." Queued changes name their sheet by id so a reordered sheet list doesn't misdirect them; the undo history
+belongs to the connection and starts empty after a reconnect. Every refusal (view-only, limits, unreadable formula,
+duplicate sheet name...) shows as a toast. The page follows the visual viewport (on-screen keyboard) so the
+formula bar stays visible, uses safe-area insets, 16 px inputs, and menus open as bottom sheets. The grid ignores
+long-press callouts and text selection; pinch still zooms.
 
 **CLI / MCP parity.** The headless client already covers Sheets for agents: `fsheets` (CLI) and its MCP server read
 and edit through the live protocol (agents/README.md). The viewer's JSON is also usable by scripts

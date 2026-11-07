@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
 <meta name="color-scheme" content="light dark">
 <meta name="referrer" content="same-origin">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -10,6 +10,7 @@
 <link rel="icon" type="image/svg+xml" href="/drive/assets/icon.svg?v={{v}}">
 <link rel="stylesheet" href="/drive/assets/sheet.css?v={{v}}">
 <script src="/drive/assets/sheet.js?v={{v}}" defer></script>
+<script src="/drive/assets/sheet-ui.js?v={{v}}" defer></script>
 </head>
 <body>
 <noscript><p class="note">FreedomOffice Sheets needs JavaScript. Turn it on for this site and reload the page.</p></noscript>
@@ -47,6 +48,7 @@
     <span id="status" class="status" role="status"></span>
     <button type="button" id="undo" class="tbtn edit-only" aria-label="Undo" hidden>&#8630;</button>
     <button type="button" id="redo" class="tbtn edit-only" aria-label="Redo" hidden>&#8631;</button>
+    <button type="button" id="find-btn" class="tbtn" aria-label="Find">&#128269;&#65038;</button>
     <button type="button" id="zoom-out" class="tbtn" aria-label="Smaller text">A&#8722;</button>
     <button type="button" id="zoom-in" class="tbtn" aria-label="Larger text">A+</button>
     <button type="button" id="more" class="tbtn" aria-haspopup="true" aria-expanded="false" aria-controls="menu" aria-label="More">&#8943;</button>
@@ -64,21 +66,30 @@
     <button type="button" id="fx-cancel" class="fbtn" aria-label="Cancel edit" hidden>&#10005;</button>
     <button type="button" id="fx-ok" class="fbtn ok" aria-label="Enter" hidden>&#10003;</button>
   </div>
-  <div id="tools" class="tools edit-only" hidden>
-    <button type="button" id="t-bold" class="tool" aria-label="Bold"><b>B</b></button>
-    <button type="button" id="t-italic" class="tool" aria-label="Italic"><i>I</i></button>
-    <button type="button" id="t-fill" class="tool" aria-label="Highlight">&#9646;</button>
-    <button type="button" id="t-num" class="tool" aria-label="Number format">0.00</button>
-    <button type="button" id="t-clear" class="tool" aria-label="Clear cell">Clear</button>
+  <div id="notechip" class="notechip" hidden></div>
+  <div id="findbar" class="findbar" hidden>
+    <input id="find-q" type="search" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="search" aria-label="Find in workbook" placeholder="Find">
+    <span id="find-n" class="find-n" role="status"></span>
+    <button type="button" id="find-prev" class="tool" aria-label="Previous match">&#8593;</button>
+    <button type="button" id="find-next" class="tool" aria-label="Next match">&#8595;</button>
+    <button type="button" id="find-opt" class="tool" aria-label="Search options">Aa</button>
+    <button type="button" id="find-x" class="tool" aria-label="Close search">&#10005;</button>
   </div>
+  <div id="tools" class="tools edit-only" hidden></div>
   <div id="stage" class="stage">
     <canvas id="cv" aria-hidden="true"></canvas>
     <div id="scroller" class="scroller" tabindex="0" role="application" aria-label="Spreadsheet grid. Tap a cell to see its value.">
       <div id="spacer"></div>
     </div>
     <div id="busy" class="busy" hidden>Loading…</div>
+    <div id="hdl-a" class="hdl" hidden></div>
+    <div id="hdl-b" class="hdl" hidden></div>
+    <div id="rsz" class="rsz" hidden></div>
+    <div id="fillh" class="fillh" hidden></div>
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
   </div>
   <nav id="tabs" class="tabs" aria-label="Sheets"></nav>
+  <div id="dlg-root"></div>
 </div>
 </body>
 </html>

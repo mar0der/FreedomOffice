@@ -14,6 +14,7 @@ const ICON: &str = include_str!("../web/icon.svg");
 const SHEET: &str = include_str!("../web/sheet.html");
 const SHEET_JS: &str = include_str!("../web/sheet.js");
 const SHEET_CSS: &str = include_str!("../web/sheet.css");
+const SHEET_UI_JS: &str = include_str!("../web/sheet-ui.js");
 
 /// The files under `/drive/assets/`, with their content types (index.html is served at `/drive`).
 const ASSETS: &[(&str, &str, &str)] = &[
@@ -22,6 +23,7 @@ const ASSETS: &[(&str, &str, &str)] = &[
     ("icon.svg", ICON, "image/svg+xml"),
     ("sheet.js", SHEET_JS, "text/javascript; charset=utf-8"),
     ("sheet.css", SHEET_CSS, "text/css; charset=utf-8"),
+    ("sheet-ui.js", SHEET_UI_JS, "text/javascript; charset=utf-8"),
 ];
 
 /// A short hash of every asset (FNV-1a, 64 bit): changes whenever any of them does.
@@ -72,7 +74,7 @@ mod tests {
 
     #[test]
     fn assets_are_there() {
-        for p in ["index.html", "sheet.html", "app.js", "style.css", "sheet.js", "sheet.css", "icon.svg"] {
+        for p in ["index.html", "sheet.html", "app.js", "style.css", "sheet.js", "sheet.css", "sheet-ui.js", "icon.svg"] {
             let (body, ct) = asset(p).unwrap_or_else(|| panic!("{p}"));
             assert!(!body.is_empty() && !ct.is_empty(), "{p}");
         }
@@ -148,12 +150,15 @@ mod tests {
         }
         // sheet.js draws on a canvas and sizes two elements through CSSOM (allowed by the CSP,
         // unlike style attributes), so `.style.` is fine there; the rest applies.
-        for bad in ["innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(", "new Function", "setAttribute(\"on", "setAttribute('on", "setAttribute('style", "setAttribute(\"style", "style=", "javascript:", "localStorage", "sessionStorage", "createContextualFragment", "DOMParser", "srcdoc", "XMLHttpRequest", "importScripts"] {
-            assert!(!SHEET_JS.contains(bad), "sheet.js contains `{bad}`");
-        }
-        for (n, line) in SHEET_JS.lines().enumerate() {
-            for bad in ["http://", "https://", "//cdn", "fonts.googleapis"] {
-                assert!(!line.contains(bad), "sheet.js line {} refers to another origin: {line}", n + 1);
+        for (name, src) in [("sheet.js", SHEET_JS), ("sheet-ui.js", SHEET_UI_JS)] {
+            for bad in ["innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(", "new Function", "setAttribute(\"on", "setAttribute('on", "setAttribute('style", "setAttribute(\"style", "style=", "javascript:", "localStorage", "sessionStorage", "createContextualFragment", "DOMParser", "srcdoc", "XMLHttpRequest", "importScripts"] {
+                assert!(!src.contains(bad), "{name} contains `{bad}`");
+            }
+            for (n, line) in src.lines().enumerate() {
+                // The SVG namespace is an identifier, not a request.
+                for bad in ["http://", "https://", "//cdn", "fonts.googleapis"] {
+                    assert!(!line.contains(bad) || line.contains("www.w3.org/2000/svg"), "{name} line {} refers to another origin: {line}", n + 1);
+                }
             }
         }
         // No other origins: requests, links and resources are relative to this server (the
