@@ -7,21 +7,32 @@ description = "FreedomOffice Sheets - a lightweight, open source spreadsheet app
 license = "MIT"
 repository = "https://github.com/mar0der/FreedomOffice"
 
+[lib]
+name = "freedom_sheets"
+path = "src/lib.rs"
+
 [[bin]]
 name = "FreedomSheets"
 path = "src/main.rs"
+required-features = ["ui"]
+
+[features]
+default = ["ui"]
+# The egui application. Without it the package is the headless workbook engine (formulas,
+# xlsx/csv, live-session state) used by the `fsheets` agent client.
+ui = ["dep:eframe", "dep:rfd", "dep:image", "dep:raw-window-handle", "dep:winit"]
 
 [dependencies]
-eframe = { version = "0.33", default-features = false, features = ["glow", "default_fonts"] }
+eframe = { version = "0.33", default-features = false, features = ["glow", "default_fonts"], optional = true }
 calamine = "0.38"
 rust_xlsxwriter = "0.102"
-rfd = "0.17"
+rfd = { version = "0.17", optional = true }
 zip = { version = "9", default-features = false, features = ["deflate"] }
 quick-xml = "0.42"
 csv = "1.3"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-raw-window-handle = "0.6"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"] }
+raw-window-handle = { version = "0.6", optional = true }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"], optional = true }
 ureq = { version = "3", default-features = false, features = ["native-tls-no-default"] }
 serde_json = "1"
 regex-lite = "0.1.9"
@@ -33,8 +44,8 @@ tungstenite = { version = "0.29", default-features = false, features = ["handsha
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Graphics_Printing", "Win32_Security_Cryptography", "Win32_Storage_Xps", "Win32_Globalization", "Win32_UI_WindowsAndMessaging", "Win32_System_Registry", "Win32_Storage_FileSystem"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-eframe = { version = "0.33", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
-winit = { version = "0.30", default-features = false, features = ["x11", "wayland"] }
+eframe = { version = "0.33", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"], optional = true }
+winit = { version = "0.30", default-features = false, features = ["x11", "wayland"], optional = true }
 
 [dev-dependencies]
 # End-to-end tests of the server client against a real server on 127.0.0.1 (tests only).

@@ -3,29 +3,10 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
 mod app;
-mod chart;
-mod cloud;
-mod condfmt;
 mod crash;
-mod datatools;
-mod filter;
-mod formula;
-mod hash;
 mod icon;
-mod iconset;
-mod io;
-mod live;
-mod model;
-mod numfmt;
-mod page;
-mod pivot;
-mod print;
-mod solver;
-mod sparkline;
-mod structure;
-mod table;
-mod validation;
-mod whatif;
+
+use freedom_sheets::{chart, cloud, condfmt, datatools, filter, formula, iconset, io, live, model, numfmt, page, pivot, print, solver, sparkline, structure, table, validation, whatif};
 
 use eframe::egui;
 

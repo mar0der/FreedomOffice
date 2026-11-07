@@ -4,6 +4,8 @@
 
 pub mod engine;
 pub mod style;
+#[doc(hidden)]
+pub mod sample;
 #[cfg(test)]
 pub(crate) mod tests;
 

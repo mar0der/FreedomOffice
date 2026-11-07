@@ -6,23 +6,40 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use cosync::{CellData, Val};
 use fsheets::api::Api;
-use fsheets::book::{a1, parse_a1, val_text};
+use fsheets::config::{self, Account};
 use fsheets::live::Live;
-use fsheets::{sample, soak};
+use fsheets::{sample, soak, work};
+use serde_json::{Value as Json, json};
 
-const USAGE: &str = "fsheets - headless FreedomOffice client
+const USAGE: &str = "fsheets - headless FreedomOffice client (command line and MCP server for agents)
+
+Accounts: --token-file FILE (a token saved by `login`; default: the only *.token in
+~/.config/freedomsheets-agents/). Passwords are only ever read from a file (mode 0600) or
+standard input, never from arguments.
 
 USAGE:
-    fsheets login --server URL --user NAME --token-file FILE [--password-file FILE]
+    fsheets login --server URL --user NAME [--token-file FILE] [--password-file FILE]
                                   Sign in (password from the file or standard input) and save a token
-    fsheets ls --token-file FILE [--folder ID]
-                                  List organisation folders, or the items of a folder
-    fsheets cat --token-file FILE --item ID [--sheet NAME]
-                                  Open the live session and print the sheet as tab separated text
-    fsheets set --token-file FILE --item ID [--sheet NAME] --cell A1 (--value TEXT | --clear)
-                                  Edit one cell through the live session
+    fsheets ls [--folder ID]      List the places to start from (My files, organisation folders,
+                                  shared with you), or the items of a folder
+    fsheets new --folder ID --name NAME [--sheets A,B]
+                                  Create an empty workbook in a folder
+    fsheets cat --item ID [--sheet NAME] [--range A1:C5] [--formulas]
+                                  Print cells as tab separated text (calculated values, or formulas)
+    fsheets set --item ID [--sheet NAME] --cell A1 (--value TEXT | --clear)
+                                  Edit one cell through the live session (=formulas allowed)
+    fsheets write --item ID [--sheet NAME] --range A1 --values JSON
+                                  Write a 2D JSON array, e.g. '[[1,2],[\"=A1+B1\",3]]'
+    fsheets eval --item ID [--sheet NAME] FORMULA
+                                  Calculate a formula against the workbook
+    fsheets export --item ID --out FILE [--sheet NAME] [--overwrite]
+                                  Save as .xlsx, or one sheet as .csv / .tsv
+    fsheets add-sheet --item ID --name NAME
+                                  Add a sheet
+    fsheets versions --item ID    The version history
+    fsheets mcp [--server URL --user NAME --password-file FILE] [--token-file FILE]
+                                  MCP server on standard input/output for AI agents
     fsheets soak --server URL --item ID --users a,b,c --secrets-dir DIR
                  [--clients 4] [--edits 150] [--seed N] [--interval-ms 40]
                                   Several clients edit at random, disconnect and reconnect; all must converge
@@ -86,6 +103,36 @@ fn logins(server: &str, users: &str, dir: &str) -> Result<Vec<Api>, String> {
         .collect()
 }
 
+/// Joins the item's live session (so the current state, including what was edited live since
+/// the last saved version, is replayed) and waits until caught up.
+fn join(api: &Api, item: &str) -> Result<Live, String> {
+    let mut live = Live::open(api, item, true)?;
+    if !live.wait_synced(Duration::from_secs(20)) {
+        return Err(live
+            .stopped
+            .clone()
+            .unwrap_or_else(|| "Couldn't join the live session.".into()));
+    }
+    Ok(live)
+}
+
+/// A change through the live session; the version it was saved as is reported.
+fn change<T>(
+    api: &Api,
+    item: &str,
+    f: impl FnOnce(&mut Live) -> Result<T, String>,
+) -> Result<(T, Option<i64>), String> {
+    let mut live = join(api, item)?;
+    let out = f(&mut live)?;
+    let version = work::settle(&mut live)?;
+    live.disconnect();
+    Ok((out, version))
+}
+
+fn print_json(v: &Json) {
+    println!("{}", serde_json::to_string_pretty(v).unwrap_or_default());
+}
+
 fn run(mut args: Vec<String>) -> Result<(), String> {
     if args.is_empty() || args.iter().any(|a| a == "-h" || a == "--help") {
         print!("{USAGE}");
@@ -93,19 +140,22 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
     }
     let cmd = args.remove(0);
     let token = |a: &mut Vec<String>| -> Result<Api, String> {
-        Api::from_token_file(&PathBuf::from(need(
-            opt(a, "--token-file"),
-            "--token-file",
-        )?))
+        config::connect(&Account {
+            token_file: opt(a, "--token-file").map(PathBuf::from),
+            ..Default::default()
+        })
     };
     match cmd.as_str() {
         "login" => {
             let server = need(opt(&mut args, "--server"), "--server")?;
             let user = need(opt(&mut args, "--user"), "--user")?;
-            let file = PathBuf::from(need(opt(&mut args, "--token-file"), "--token-file")?);
+            let file = opt(&mut args, "--token-file")
+                .map(PathBuf::from)
+                .or_else(|| config::token_path(&server, &user))
+                .ok_or("Missing --token-file (no home directory to keep it in).")?;
             let pw = read_password(opt(&mut args, "--password-file"))?;
             let api = Api::login(&server, &user, &pw, "fsheets")?;
-            api.save_token(&file)?;
+            config::save_token(&api, &file)?;
             println!(
                 "Signed in as {} on {}; token saved to {}.",
                 api.username,
@@ -122,7 +172,8 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
                     for (name, root) in api.org_roots()? {
                         println!("org {name}\tfolder {root}");
                     }
-                    api.children(&api.root()?)?
+                    println!("my files\tfolder {}", api.root()?);
+                    api.shared_with_me()?
                 }
             };
             for i in items {
@@ -136,35 +187,67 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
                 );
             }
         }
+        "new" => {
+            let api = token(&mut args)?;
+            let folder = need(opt(&mut args, "--folder"), "--folder")?;
+            let name = need(opt(&mut args, "--name"), "--name")?;
+            let sheets: Vec<String> = opt(&mut args, "--sheets")
+                .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
+                .unwrap_or_default();
+            let it = work::create_file(&api, &folder, &name, &sheets)?;
+            println!("{}\t{}", it.id, it.name);
+        }
         "cat" => {
             let api = token(&mut args)?;
             let item = need(opt(&mut args, "--item"), "--item")?;
             let sheet = opt(&mut args, "--sheet");
-            let mut live = Live::open(&api, &item, true)?;
-            live.wait_synced(Duration::from_secs(15));
-            for n in &live.notes {
-                eprintln!("note: {n}");
-            }
-            for (id, sh) in live.book.ordered() {
-                if sheet
-                    .as_ref()
-                    .is_some_and(|s| live.book.find(s) != Some(id))
-                {
-                    continue;
+            let range = opt(&mut args, "--range");
+            let formulas = flag(&mut args, "--formulas");
+            let mut live = join(&api, &item)?;
+            let names: Vec<String> = match (&sheet, &range) {
+                (None, None) => live.wb.sheets.iter().map(|s| s.name.clone()).collect(),
+                (Some(s), _) => vec![s.clone()],
+                (None, Some(_)) => vec![String::new()],
+            };
+            let multi = names.len() > 1;
+            for name in names {
+                let sheet = (!name.is_empty()).then_some(name.as_str());
+                let r = work::read_range(&mut live, sheet, range.as_deref(), true);
+                let r = match r {
+                    Ok(r) => r,
+                    // An empty sheet has nothing to print.
+                    Err(e) if range.is_none() && e == "The sheet is empty." => continue,
+                    Err(e) => return Err(e),
+                };
+                if multi {
+                    println!(
+                        "# {} ({})",
+                        r["sheet"].as_str().unwrap_or(""),
+                        r["range"].as_str().unwrap_or("")
+                    );
                 }
-                println!("# {} (sheet {id})", sh.name);
-                let (rows, cols) = sh
-                    .cells
-                    .keys()
-                    .fold((0, 0), |(r, c), k| (r.max(k.0 + 1), c.max(k.1 + 1)));
-                for r in 0..rows {
-                    let line: Vec<String> = (0..cols)
-                        .map(|c| match sh.cells.get(&(r, c)) {
-                            Some(d) => match &d.f {
-                                Some(f) => format!("={f}"),
-                                None => val_text(&d.v),
-                            },
-                            None => String::new(),
+                let cells = |k: &str| r[k].as_array().cloned().unwrap_or_default();
+                for (row, f) in cells(if formulas { "formulas" } else { "display" })
+                    .iter()
+                    .zip(cells("formulas"))
+                {
+                    let line: Vec<String> = row
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .zip(f.as_array().into_iter().flatten())
+                        .map(|(shown, formula)| {
+                            if formulas && !formula.is_null() {
+                                formula.as_str().unwrap_or("").to_string()
+                            } else {
+                                shown.as_str().map(str::to_string).unwrap_or_else(|| {
+                                    if shown.is_null() {
+                                        String::new()
+                                    } else {
+                                        shown.to_string()
+                                    }
+                                })
+                            }
                         })
                         .collect();
                     println!("{}", line.join("\t"));
@@ -175,41 +258,120 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
             let api = token(&mut args)?;
             let item = need(opt(&mut args, "--item"), "--item")?;
             let cell = need(opt(&mut args, "--cell"), "--cell")?;
-            let (r, c) = parse_a1(&cell).ok_or("--cell must look like B7.")?;
             let clear = flag(&mut args, "--clear");
             let value = opt(&mut args, "--value");
             let sheet = opt(&mut args, "--sheet");
-            let mut live = Live::open(&api, &item, true)?;
-            live.wait_synced(Duration::from_secs(15));
-            let s = match sheet {
-                Some(n) => live.book.find(&n).ok_or("No such sheet.")?,
-                None => live
-                    .book
-                    .ordered()
-                    .first()
-                    .map(|x| x.0)
-                    .ok_or("No sheet.")?,
-            };
-            let data = if clear {
-                None
+            let v = if clear {
+                Json::Null
             } else {
-                let v = need(value, "--value or --clear")?;
-                Some(match v.strip_prefix('=') {
-                    Some(f) => CellData {
-                        f: Some(f.to_string()),
-                        ..Default::default()
-                    },
-                    None => CellData {
-                        v: v.parse::<f64>().map(Val::Num).unwrap_or(Val::Text(v)),
-                        ..Default::default()
-                    },
-                })
+                json!(need(value, "--value or --clear")?)
             };
-            live.set_cell(s, r, c, data);
-            if !live.wait_synced(Duration::from_secs(15)) {
-                return Err("The server didn't confirm the change.".into());
+            let (out, saved) = change(&api, &item, |l| {
+                work::write_range(l, sheet.as_deref(), &cell, &[vec![v]])
+            })?;
+            println!(
+                "Set {} to {} (confirmed{}).",
+                cell,
+                out["values"][0][0],
+                saved
+                    .map(|v| format!(", saved as version {v}"))
+                    .unwrap_or_default()
+            );
+        }
+        "write" => {
+            let api = token(&mut args)?;
+            let item = need(opt(&mut args, "--item"), "--item")?;
+            let range = need(opt(&mut args, "--range"), "--range")?;
+            let sheet = opt(&mut args, "--sheet");
+            let values = need(opt(&mut args, "--values"), "--values")?;
+            let grid: Json =
+                serde_json::from_str(&values).map_err(|e| format!("--values isn't JSON: {e}"))?;
+            let grid = match grid {
+                Json::Array(rows) if rows.iter().all(Json::is_array) => rows
+                    .iter()
+                    .map(|r| r.as_array().cloned().unwrap_or_default())
+                    .collect::<Vec<_>>(),
+                _ => return Err("--values must be a 2D JSON array like [[1,2],[3,4]].".into()),
+            };
+            let (out, saved) = change(&api, &item, |l| {
+                work::write_range(l, sheet.as_deref(), &range, &grid)
+            })?;
+            print_json(&out);
+            if let Some(v) = saved {
+                eprintln!("saved as version {v}");
             }
-            println!("Set {} (confirmed at seq {}).", a1(r, c), live.seq());
+        }
+        "eval" => {
+            let api = token(&mut args)?;
+            let item = need(opt(&mut args, "--item"), "--item")?;
+            let sheet = opt(&mut args, "--sheet");
+            let [formula] = args.as_slice() else {
+                return Err(
+                    "Expected one formula, e.g. fsheets eval --item ID \"=SUM(A1:A5)\".".into(),
+                );
+            };
+            let mut live = join(&api, &item)?;
+            let out = work::evaluate(&mut live, sheet.as_deref(), formula)?;
+            println!("{}", out["display"].as_str().unwrap_or(""));
+        }
+        "export" => {
+            let api = token(&mut args)?;
+            let item = need(opt(&mut args, "--item"), "--item")?;
+            let out = PathBuf::from(need(opt(&mut args, "--out"), "--out")?);
+            let sheet = opt(&mut args, "--sheet");
+            let overwrite = flag(&mut args, "--overwrite");
+            let mut live = join(&api, &item)?;
+            let r = work::export(&mut live, &out, sheet.as_deref(), overwrite)?;
+            println!("Wrote {} ({} bytes).", out.display(), r["bytes"]);
+        }
+        "add-sheet" => {
+            let api = token(&mut args)?;
+            let item = need(opt(&mut args, "--item"), "--item")?;
+            let name = need(opt(&mut args, "--name"), "--name")?;
+            let (out, saved) = change(&api, &item, |l| work::add_sheet(l, &name))?;
+            println!(
+                "Added sheet {}{}.",
+                out["added"].as_str().unwrap_or(""),
+                saved
+                    .map(|v| format!(" (saved as version {v})"))
+                    .unwrap_or_default()
+            );
+        }
+        "versions" => {
+            let api = token(&mut args)?;
+            let item = need(opt(&mut args, "--item"), "--item")?;
+            for v in work::versions(&api, &item)?["versions"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                println!(
+                    "v{}\t{}\t{}\t{} bytes{}",
+                    v["version"],
+                    v["modified"].as_str().unwrap_or(""),
+                    v["modified_by"].as_str().unwrap_or(""),
+                    v["size"],
+                    if v["current"].as_bool().unwrap_or(false) {
+                        "\tcurrent"
+                    } else {
+                        ""
+                    }
+                );
+            }
+        }
+        "mcp" => {
+            let acct = Account {
+                server: opt(&mut args, "--server"),
+                user: opt(&mut args, "--user"),
+                password_file: opt(&mut args, "--password-file").map(PathBuf::from),
+                token_file: opt(&mut args, "--token-file").map(PathBuf::from),
+            };
+            let api = config::connect(&acct)?;
+            fsheets::mcp::serve(
+                api,
+                std::io::BufReader::new(std::io::stdin()),
+                std::io::stdout(),
+            )?;
         }
         "soak" => {
             let server = need(opt(&mut args, "--server"), "--server")?;

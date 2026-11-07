@@ -1,13 +1,16 @@
 //! One live editing session, driven by the caller: connect, `pump` incoming messages, make
 //! edits, disconnect and reconnect. The OT bookkeeping is `cosync::client::Session`, the same
-//! code the app runs; remote operations are applied to an in-memory [`Book`].
+//! code the app runs; remote operations are applied to an in-memory `Workbook` of the app's own
+//! model (formats, merges, formulas and all), exactly as the app applies them.
 //!
 //! Flow (as in the app): download the file (`X-Live-Seq`, `X-Live-Sheets`, `ETag` say where the
 //! session starts), open the WebSocket with `since=<seq>&v=<version>&cid=<client>` and the
 //! bearer token, send `Hello` with the sheet ids, get `Welcome` and the replay of everything
 //! committed since, then exchange `Ops` / `Ack` / `Presence`. After a lost connection the client
 //! keeps editing offline and reconnects with `since=<last seq applied>`; its unacknowledged
-//! batch is sent again and the server recognises it by (cid, batch id).
+//! batch is sent again and the server recognises it by (cid, batch id). The server's `Snapshot`
+//! request is answered like the app does: the workbook as .xlsx plus its lossless live state go
+//! to `/live/snapshot` once everything is acknowledged, which becomes a version.
 
 use std::collections::BTreeMap;
 use std::net::TcpStream;
@@ -15,12 +18,13 @@ use std::time::{Duration, Instant};
 
 use cosync::client::{Batch, Session, Step};
 use cosync::{CellData, ClientMsg, Op, Peer, Presence, Rect, ServerMsg, SheetId, close};
+use freedom_sheets::live::{self, ApplyState};
+use freedom_sheets::model::{Sheet, Workbook};
 use tungstenite::client::IntoClientRequest;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
 
 use crate::api::Api;
-use crate::book::Book;
 
 type Ws = WebSocket<MaybeTlsStream<TcpStream>>;
 
@@ -41,6 +45,8 @@ pub struct Stats {
     pub reconnects: u64,
     pub closes: Vec<u16>,
     pub snapshot_requests: u64,
+    /// Snapshots uploaded (each normally becomes a version).
+    pub snapshots: u64,
 }
 
 pub struct Live {
@@ -48,7 +54,10 @@ pub struct Live {
     pub item: String,
     pub cid: String,
     pub agent: bool,
-    pub book: Book,
+    /// The workbook (read it through [`Live::workbook`] to have formulas calculated).
+    pub wb: Workbook,
+    apply_state: ApplyState,
+    needs_recalc: bool,
     pub sess: Session,
     /// Version the file was downloaded at (sent on the first join only).
     version: Option<i64>,
@@ -57,6 +66,8 @@ pub struct Live {
     caught_up: bool,
     catch_target: u64,
     pub me: Option<Peer>,
+    /// The presence last sent (the server doesn't echo it back to us).
+    pub my_presence: Option<Presence>,
     pub peers: BTreeMap<u64, Peer>,
     pub editor: bool,
     pub stats: Stats,
@@ -65,6 +76,12 @@ pub struct Live {
     /// Things worth telling the caller (e.g. the base was read from the xlsx only).
     pub notes: Vec<String>,
     pub last_error: Option<String>,
+    /// The server asked for a snapshot and it hasn't been uploaded yet.
+    snapshot_wanted: bool,
+    /// Local changes made since the last snapshot was uploaded.
+    unsaved: bool,
+    /// The last version uploaded as a snapshot.
+    pub last_snapshot: Option<i64>,
 }
 
 fn version_of_etag(etag: &str) -> Option<i64> {
@@ -101,11 +118,20 @@ impl Live {
             Some(v) => v,
             None => api.item(item)?.version,
         };
-        let book = Book::from_xlsx(&r.body, r.header("x-live-sheets").unwrap_or(""))?;
-        let mut notes = Vec::new();
-        if r.header("x-live-state").is_some() {
-            notes.push("The file was last saved by a live app session: the starting state is read from the .xlsx (values and formulas only, no formats).".to_string());
+        // As the app joins: the file, the sheets' live ids and, when the version has one, its
+        // lossless live state.
+        let mut wb = freedom_sheets::io::load_xlsx_bytes(&r.body)?;
+        if wb.sheets.is_empty() {
+            wb.sheets.push(Sheet::new("Sheet1"));
         }
+        live::assign_ids(&mut wb, r.header("x-live-sheets").unwrap_or(""));
+        if r.header("x-live-state").is_some() {
+            let state = api.live_state(item, version)?;
+            wb = live::join_workbook(wb, Some(&state));
+        }
+        live::sort_sheets(&mut wb);
+        wb.recalc();
+        let notes = Vec::new();
         let mut cid = [0u8; 6];
         getrandom::fill(&mut cid).map_err(|e| e.to_string())?;
         let cid = format!(
@@ -120,7 +146,9 @@ impl Live {
             item: item.to_string(),
             cid,
             agent,
-            book,
+            wb,
+            apply_state: ApplyState::default(),
+            needs_recalc: false,
             sess,
             version: Some(version),
             ws: None,
@@ -128,12 +156,16 @@ impl Live {
             caught_up: false,
             catch_target: 0,
             me: None,
+            my_presence: None,
             peers: BTreeMap::new(),
             editor: true,
             stats: Stats::default(),
             stopped: None,
             notes,
             last_error: None,
+            snapshot_wanted: false,
+            unsaved: false,
+            last_snapshot: None,
         })
     }
 
@@ -195,7 +227,7 @@ impl Live {
         }
         self.stats.connects += 1;
         self.send(ClientMsg::Hello {
-            sheets: self.book.sheet_ids(),
+            sheets: self.wb.sheets.iter().map(|s| s.uid).collect(),
         });
         Ok(())
     }
@@ -254,6 +286,11 @@ impl Live {
 
     /// Reads and handles messages for up to `wait` (at least one read attempt).
     pub fn pump(&mut self, wait: Duration) {
+        self.pump_messages(wait);
+        self.answer_snapshot_request();
+    }
+
+    fn pump_messages(&mut self, wait: Duration) {
         let end = Instant::now() + wait;
         loop {
             let Some(ws) = &mut self.ws else { return };
@@ -328,8 +365,8 @@ impl Live {
                 }
             }
             ServerMsg::Snapshot => {
-                // Writing a snapshot needs the app's workbook engine (see agents/README.md).
                 self.stats.snapshot_requests += 1;
+                self.snapshot_wanted = true;
             }
             ServerMsg::Reload => {
                 self.stopped = Some("The server no longer has the changes since this copy was downloaded: open the item again.".into());
@@ -345,7 +382,7 @@ impl Live {
     }
 
     fn stepped(&mut self, step: Step) {
-        self.book.apply_all(&step.apply);
+        self.apply(&step.apply, true);
         if !step.own {
             self.stats.remote_batches += 1;
         }
@@ -374,10 +411,54 @@ impl Live {
         if ops.is_empty() {
             return;
         }
-        self.book.apply_all(&ops);
+        self.apply(&ops, false);
+        self.unsaved = true;
         if let Some(b) = self.sess.local(ops) {
             self.send_batch(b, false);
         }
+    }
+
+    fn apply(&mut self, ops: &[Op], remote: bool) {
+        let applied = live::apply_ops(&mut self.wb, ops, remote, &mut self.apply_state);
+        if applied.full || !applied.cells.is_empty() {
+            self.needs_recalc = true;
+        }
+    }
+
+    /// The workbook with every formula calculated.
+    pub fn workbook(&mut self) -> &Workbook {
+        if self.needs_recalc {
+            self.wb.recalc();
+            self.needs_recalc = false;
+        }
+        &self.wb
+    }
+
+    /// The first sheet in tab order.
+    pub fn first_sheet(&self) -> Option<SheetId> {
+        self.wb.sheets.first().map(|s| s.uid)
+    }
+
+    /// What a cell holds as it travels (value, formula text, style content).
+    pub fn cell_data(&self, s: SheetId, r: u32, c: u32) -> Option<CellData> {
+        let i = live::index_of(&self.wb, s)?;
+        let sh = &self.wb.sheets[i];
+        sh.get(r, c)
+            .map(|cell| live::cell_data(&self.wb, sh, r, c, cell))
+    }
+
+    /// Number of non-empty cells.
+    pub fn cell_count(&self) -> usize {
+        self.wb
+            .sheets
+            .iter()
+            .map(|s| s.rows.values().map(|r| r.len()).sum::<usize>())
+            .sum()
+    }
+
+    /// Differences from another session's workbook in everything that is synchronised.
+    pub fn differences(&self, other: &Live) -> Vec<String> {
+        live::compare(&self.wb, &other.wb)
     }
 
     pub fn set_cell(&mut self, s: SheetId, r: u32, c: u32, data: Option<CellData>) {
@@ -391,20 +472,69 @@ impl Live {
     }
 
     pub fn send_presence(&mut self, s: SheetId, r: u32, c: u32, editing: bool) {
+        let sel = Rect {
+            r1: r,
+            c1: c,
+            r2: r,
+            c2: c,
+        };
+        self.send_selection(s, r, c, sel, editing);
+    }
+
+    /// Presence with a selected range (the cell `r`,`c` is the active one inside it).
+    pub fn send_selection(&mut self, s: SheetId, r: u32, c: u32, sel: Rect, editing: bool) {
         self.stats.presence_sent += 1;
         let p = Presence {
             s,
             r,
             c,
-            sel: Rect {
-                r1: r,
-                c1: c,
-                r2: r,
-                c2: c,
-            },
+            sel,
             editing,
         };
+        self.my_presence = Some(p.clone());
         self.send(ClientMsg::Presence { p });
+    }
+
+    /// Whether the session holds changes no snapshot has covered yet.
+    pub fn unsaved(&self) -> bool {
+        self.unsaved
+    }
+
+    /// Uploads the workbook and its live state as a snapshot (a version of the file). Needs the
+    /// connection to be caught up with nothing waiting for an acknowledgement, because the
+    /// snapshot claims to hold exactly the changes up to the sequence number it names. Returns
+    /// the version the file has afterwards.
+    pub fn snapshot(&mut self) -> Result<i64, String> {
+        if !self.editor {
+            return Err("You have view-only access to this workbook.".into());
+        }
+        if !self.synced() {
+            return Err("The session isn't caught up with the server yet.".into());
+        }
+        let seq = self.sess.seq;
+        self.workbook();
+        let data = freedom_sheets::io::xlsx_bytes(&self.wb)?;
+        let state = live::encode_state(&live::state_ops(&self.wb))?;
+        let item =
+            self.api
+                .live_snapshot(&self.item, seq, &live::sheets_meta(&self.wb), &data, &state)?;
+        self.snapshot_wanted = false;
+        self.unsaved = false;
+        self.stats.snapshots += 1;
+        self.last_snapshot = Some(item.version);
+        Ok(item.version)
+    }
+
+    fn answer_snapshot_request(&mut self) {
+        if self.snapshot_wanted
+            && self.synced()
+            && self.editor
+            && let Err(e) = self.snapshot()
+        {
+            self.last_error = Some(format!("Snapshot failed: {e}"));
+            // Ask again when the server does, rather than at every pump.
+            self.snapshot_wanted = false;
+        }
     }
 }
 

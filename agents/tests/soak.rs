@@ -95,6 +95,34 @@ fn three_clients_converge_with_disconnects() {
     assert!(report.head_seq > 0);
 }
 
+/// Past 200 batches the server asks an editor for a snapshot; the clients answer it, the
+/// file gets a new version, and a client joining afterwards (file + live state + the log since)
+/// holds exactly what the others hold.
+#[test]
+fn clients_answer_the_servers_snapshot_requests() {
+    let s = start();
+    let (apis, item) = shared_workbook(&s, "budget");
+    let before = apis[0].versions(&item).unwrap().len();
+    let cfg = soak::Config {
+        clients: 3,
+        edits: 120,
+        seed: 0x5eed,
+        interval_ms: 40,
+        disconnect_pct: 2.0,
+        ..Default::default()
+    };
+    let report = soak::run(&apis, &item, &cfg).unwrap();
+    report.print();
+    assert!(report.converged(), "{:?}", report.difference);
+    assert!(report.totals.batches_sent > 200, "{report:?}");
+    assert!(
+        report.totals.snapshot_requests > 0,
+        "the server never asked: {report:?}"
+    );
+    assert!(report.totals.snapshots > 0, "nobody answered: {report:?}");
+    assert!(apis[0].versions(&item).unwrap().len() > before);
+}
+
 #[test]
 fn concurrent_edits_of_one_cell() {
     let s = start();
@@ -117,9 +145,9 @@ fn agents_are_marked_and_see_each_other() {
     assert!(a.peers.values().any(|p| p.user == "bob" && !p.agent));
     assert!(b.peers.values().any(|p| p.user == "alice" && p.agent));
     // The starting state comes from the xlsx and an edit reaches the other client.
-    let sheet = a.book.ordered()[0].0;
+    let sheet = a.first_sheet().unwrap();
     assert_eq!(
-        a.book.cell(sheet, 0, 0).map(|c| c.v.clone()),
+        a.cell_data(sheet, 0, 0).map(|c| c.v),
         Some(cosync::Val::Text("Student".into()))
     );
     a.set_cell(
@@ -133,5 +161,5 @@ fn agents_are_marked_and_see_each_other() {
     );
     assert!(a.wait_synced(std::time::Duration::from_secs(5)));
     b.pump(std::time::Duration::from_millis(300));
-    assert_eq!(b.book.cell(sheet, 20, 0), a.book.cell(sheet, 20, 0));
+    assert_eq!(b.cell_data(sheet, 20, 0), a.cell_data(sheet, 20, 0));
 }

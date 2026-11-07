@@ -310,6 +310,88 @@ impl Api {
         Ok(Item::from_json(&r.json()))
     }
 
+    /// Whether the token is still accepted (false: signed out or revoked).
+    pub fn token_valid(&self) -> Result<bool, String> {
+        let r = self.send("GET", "/api/me", &[], None)?;
+        match r.status {
+            401 => Ok(false),
+            _ if r.ok() => Ok(true),
+            _ => Err(r.error()),
+        }
+    }
+
+    /// Files and folders other people shared with the signed-in person.
+    pub fn shared_with_me(&self) -> Result<Vec<Item>, String> {
+        let v = self.get_json("/api/shared-with-me")?;
+        Ok(v["items"]
+            .as_array()
+            .map(|a| a.iter().map(Item::from_json).collect())
+            .unwrap_or_default())
+    }
+
+    /// Creates a folder.
+    pub fn create_folder(&self, parent: &str, name: &str) -> Result<Item, String> {
+        let r = self.send(
+            "POST",
+            "/api/folders",
+            &[("Content-Type", "application/json")],
+            Some(
+                json!({ "parent": parent, "name": name })
+                    .to_string()
+                    .into_bytes(),
+            ),
+        )?;
+        if !r.ok() {
+            return Err(r.error());
+        }
+        Ok(Item::from_json(&r.json()))
+    }
+
+    /// The version history as the server lists it.
+    pub fn versions(&self, id: &str) -> Result<Vec<Value>, String> {
+        let v = self.get_json(&format!("/api/items/{}/versions", pct_encode(id)))?;
+        Ok(v["versions"].as_array().cloned().unwrap_or_default())
+    }
+
+    /// The lossless live state stored with a version (the content response says when there is one).
+    pub fn live_state(&self, id: &str, version: i64) -> Result<Vec<u8>, String> {
+        let r = self.send(
+            "GET",
+            &format!("/api/items/{}/live/state?version={version}", pct_encode(id)),
+            &[],
+            None,
+        )?;
+        if !r.ok() {
+            return Err(r.error());
+        }
+        Ok(r.body)
+    }
+
+    /// Uploads a copy that holds every change up to `seq` as a new version, with its live state.
+    pub fn live_snapshot(
+        &self,
+        id: &str,
+        seq: u64,
+        sheets: &str,
+        data: &[u8],
+        state: &[u8],
+    ) -> Result<Item, String> {
+        let r = self.send(
+            "POST",
+            &format!("/api/items/{}/live/snapshot?seq={seq}", pct_encode(id)),
+            &[
+                ("Content-Type", "application/octet-stream"),
+                ("X-Live-Sheets", sheets),
+                ("X-Live-State-Offset", &data.len().to_string()),
+            ],
+            Some([data, state].concat()),
+        )?;
+        if !r.ok() {
+            return Err(r.error());
+        }
+        Ok(Item::from_json(&r.json()))
+    }
+
     /// The WebSocket URL of an item's live session.
     pub fn live_url(
         &self,

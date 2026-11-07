@@ -1262,8 +1262,8 @@ dependencies = [
 name = "freedomsheets-agents"
 version = "26.45.2"
 dependencies = [
- "calamine",
  "cosync",
+ "freedom-sheets",
  "freedomoffice-server",
  "getrandom 0.3.4",
  "rust_xlsxwriter",
