@@ -72,9 +72,13 @@ impl App {
         }
     }
 
+    pub(crate) fn cfg(&self) -> &Config {
+        &self.cfg
+    }
+
     /// Password hashing or checking (Argon2): never under the store lock, at most one per core
     /// at a time (waiting requests hold no thread and no memory).
-    async fn argon<T: Send + 'static>(&self, f: impl FnOnce() -> T + Send + 'static) -> Result<T, ApiError> {
+    pub(crate) async fn argon<T: Send + 'static>(&self, f: impl FnOnce() -> T + Send + 'static) -> Result<T, ApiError> {
         // The permit lives in the blocking task: a client that disconnects drops this future,
         // but the hashing it started keeps its slot until it really ends.
         let permit = self.argon.clone().acquire_owned().await.map_err(|_| ApiError::internal())?;
@@ -87,20 +91,20 @@ impl App {
     }
 
     /// Checks a new password against the policy, then hashes it (see `argon`).
-    async fn new_password_hash(&self, password: String, username: String) -> Result<String, ApiError> {
+    pub(crate) async fn new_password_hash(&self, password: String, username: String) -> Result<String, ApiError> {
         util::check_new_password(&password, &username).map_err(ApiError::bad)?;
         self.argon(move || util::hash_password(&password)).await
     }
 
     /// After a change that can affect who may see or edit what: re-checks every live session
     /// (they are told about a new role, or closed), before the response goes out.
-    async fn changed(&self) {
+    pub(crate) async fn changed(&self) {
         let (hub, store) = (self.hub.clone(), self.store.clone());
         let _ = tokio::task::spawn_blocking(move || hub.recheck(&store)).await;
     }
 
     /// `run` followed by `changed` when the work succeeded.
-    async fn run_changing<T: Send + 'static>(&self, f: impl FnOnce(&Store) -> Result<T, ApiError> + Send + 'static) -> Result<T, ApiError> {
+    pub(crate) async fn run_changing<T: Send + 'static>(&self, f: impl FnOnce(&Store) -> Result<T, ApiError> + Send + 'static) -> Result<T, ApiError> {
         let r = self.run(f).await;
         if r.is_ok() {
             self.changed().await;
@@ -109,7 +113,7 @@ impl App {
     }
 
     /// Runs blocking store work (SQLite, disk) on the blocking pool, one request at a time.
-    async fn run<T: Send + 'static>(&self, f: impl FnOnce(&Store) -> Result<T, ApiError> + Send + 'static) -> Result<T, ApiError> {
+    pub(crate) async fn run<T: Send + 'static>(&self, f: impl FnOnce(&Store) -> Result<T, ApiError> + Send + 'static) -> Result<T, ApiError> {
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || {
             let s = store.lock().unwrap_or_else(|e| e.into_inner());
@@ -237,7 +241,7 @@ impl ApiError {
         ApiError { status, body: json!({ "error": msg.into() }) }
     }
 
-    fn not_found() -> Self {
+    pub(crate) fn not_found() -> Self {
         Self::new(StatusCode::NOT_FOUND, "Not found.")
     }
 
@@ -250,16 +254,33 @@ impl ApiError {
         ApiError { status, body: json!({ "error": msg.into(), "code": code }) }
     }
 
-    fn forbidden(msg: impl Into<String>) -> Self {
+    pub(crate) fn forbidden(msg: impl Into<String>) -> Self {
         Self::new(StatusCode::FORBIDDEN, msg)
     }
 
-    fn bad(msg: impl Into<String>) -> Self {
+    pub(crate) fn bad(msg: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, msg)
     }
 
-    fn internal() -> Self {
+    pub(crate) fn internal() -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong on the server.")
+    }
+
+    pub(crate) fn password_change_required() -> Self {
+        Self::coded(StatusCode::FORBIDDEN, "password_change_required", "Choose a new password to continue (you signed in with a temporary one).")
+    }
+
+    pub(crate) fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    /// The message for people.
+    pub(crate) fn message(&self) -> &str {
+        self.body["error"].as_str().unwrap_or("Something went wrong.")
+    }
+
+    pub(crate) fn code(&self) -> Option<&str> {
+        self.body["code"].as_str()
     }
 }
 
@@ -311,7 +332,7 @@ fn auth(s: &Store, headers: &HeaderMap) -> Result<Principal, ApiError> {
     if let Principal::User { user, .. } = &who
         && user.must_change_password
     {
-        return Err(ApiError::coded(StatusCode::FORBIDDEN, "password_change_required", "Choose a new password to continue (you signed in with a temporary one)."));
+        return Err(ApiError::password_change_required());
     }
     Ok(who)
 }
@@ -321,6 +342,45 @@ fn auth(s: &Store, headers: &HeaderMap) -> Result<Principal, ApiError> {
 fn auth_any(s: &Store, headers: &HeaderMap) -> Result<Principal, ApiError> {
     let token = bearer(headers).ok_or_else(ApiError::unauthorized)?;
     s.authenticate(&token)?.ok_or_else(ApiError::unauthorized)
+}
+
+/// What a person signed in with: an API device token or a web admin session (`/admin`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SignIn {
+    Device(i64),
+    Admin(i64),
+}
+
+/// How a request authenticates a person: the API's bearer device token, or the web admin
+/// session cookie (its secret). The administration flows below take this (or the `User` it
+/// gives), so the API and the admin page share every rule; flows that hash a password
+/// outside the store lock authenticate again before they store.
+#[derive(Clone)]
+pub(crate) enum Caller {
+    Bearer(HeaderMap),
+    Admin(String),
+}
+
+impl Caller {
+    /// The person, even one who still has to change a temporary password.
+    pub(crate) fn person_any(&self, s: &Store) -> Result<(User, SignIn), ApiError> {
+        match self {
+            Caller::Bearer(h) => match auth_any(s, h)? {
+                Principal::User { user, token_id } => Ok((user, SignIn::Device(token_id))),
+                Principal::Link { .. } => Err(ApiError::unauthorized()),
+            },
+            Caller::Admin(secret) => s.admin_session(secret)?.map(|(u, sess)| (u, SignIn::Admin(sess.id))).ok_or_else(ApiError::unauthorized),
+        }
+    }
+
+    /// The person; 403 `password_change_required` while a temporary password is set.
+    pub(crate) fn person(&self, s: &Store) -> Result<User, ApiError> {
+        let (u, _) = self.person_any(s)?;
+        if u.must_change_password {
+            return Err(ApiError::password_change_required());
+        }
+        Ok(u)
+    }
 }
 
 /// Endpoints for accounts only (share-link tokens can't use them).
@@ -428,21 +488,21 @@ fn org_json(s: &Store, o: &Org, mine: Option<OrgRole>) -> Result<Value, ApiError
 }
 
 /// The client address; behind a loopback reverse proxy, the last X-Forwarded-For entry.
-fn client_ip(cfg: &Config, peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
-    if cfg.trust_proxy && peer.ip().is_loopback() {
-        if let Some(ip) = headers
+pub(crate) fn client_ip(cfg: &Config, peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
+    if cfg.trust_proxy
+        && peer.ip().is_loopback()
+        && let Some(ip) = headers
             .get("x-forwarded-for")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.rsplit(',').next())
             .and_then(|v| v.trim().parse::<IpAddr>().ok())
-        {
-            return ip;
-        }
+    {
+        return ip;
     }
     peer.ip()
 }
 
-fn too_many() -> ApiError {
+pub(crate) fn too_many() -> ApiError {
     ApiError::new(StatusCode::TOO_MANY_REQUESTS, "Too many failed attempts. Try again in 15 minutes.")
 }
 
@@ -466,6 +526,10 @@ pub fn router(app: App) -> Router {
         .route("/api/users/{username}/reset-password", post(reset_password))
         .route("/api/users/{username}/disable", post(disable_user))
         .route("/api/users/{username}/enable", post(enable_user))
+        .route("/api/users/{username}/admin", post(set_user_admin))
+        .route("/api/users/{username}/sign-out", post(sign_out_user))
+        .route("/api/users/{username}/sessions", get(user_sessions))
+        .route("/api/users/{username}/sessions/{kind}/{id}", axum::routing::delete(end_user_session))
         .route("/api/orgs", get(list_orgs).post(create_org))
         .route("/api/orgs/{org}", get(get_org).patch(patch_org).delete(delete_org))
         .route("/api/orgs/{org}/members", get(org_members).post(add_member))
@@ -496,8 +560,10 @@ pub fn router(app: App) -> Router {
         .route("/api/links/{token}", get(open_link).post(open_link_password))
         .route("/l/{token}", get(link_page))
         .route("/l/{token}/download", get(link_download).post(link_download_form))
+        .merge(crate::admin::routes())
         .fallback(|| async { ApiError::not_found() })
         .layer(DefaultBodyLimit::max(JSON_LIMIT))
+        .layer(middleware::from_fn(crate::admin::harden_admin))
         .layer(middleware::from_fn(log_requests))
         .with_state(app)
 }
@@ -541,12 +607,25 @@ struct LoginBody {
 async fn login(State(app): State<App>, ConnectInfo(Peer(peer)): ConnectInfo<Peer>, headers: HeaderMap, body: Bytes) -> ApiResult {
     let b: LoginBody = parse_body(&body)?;
     let ip = client_ip(&app.cfg, peer, &headers);
+    let user = check_sign_in(&app, ip, &b.username, b.password).await?;
+    let device = b.device;
+    app.run(move |s| {
+        let token = s.create_token(&user.id, &device)?;
+        ok_json(json!({ "token": token, "user": user_json(&user) }))
+    })
+    .await
+}
+
+/// Checks a username and password for a sign-in from `ip` (the API's and the admin page's):
+/// the per-address and per-username limits, the delay after repeated failures, Argon2 in its
+/// slots. The enabled person, or 401 (429 when limited).
+pub(crate) async fn check_sign_in(app: &App, ip: IpAddr, username: &str, password: String) -> Result<User, ApiError> {
     let ip_key = format!("ip:{ip}");
     let wrong = || ApiError::new(StatusCode::UNAUTHORIZED, "The username or password is incorrect.");
-    let name = b.username.trim().to_string();
+    let name = username.trim().to_string();
     // Something that can't be a username (or an absurd password) never reaches the limiter's
     // username keys, the database or Argon2, and isn't logged as typed.
-    if !util::valid_username(&name) || b.password.len() > 1024 {
+    if !util::valid_username(&name) || password.len() > 1024 {
         if app.attempt(std::slice::from_ref(&ip_key)).is_none() {
             return Err(too_many());
         }
@@ -565,7 +644,7 @@ async fn login(State(app): State<App>, ConnectInfo(Peer(peer)): ConnectInfo<Peer
     }
     let n = name.clone();
     let found = app.run(move |s| Ok(s.user_by_name(&n)?.map(|u| (s.password_hash(&u.id), u)))).await?;
-    let pw = b.password;
+    let pw = password;
     let user = app
         .argon(move || match found {
             Some((Ok(hash), u)) if util::verify_password(&pw, &hash) && !u.disabled => Some(u),
@@ -581,12 +660,7 @@ async fn login(State(app): State<App>, ConnectInfo(Peer(peer)): ConnectInfo<Peer
         return Err(wrong());
     };
     app.succeeded(&ip_key, &user_key);
-    let device = b.device;
-    app.run(move |s| {
-        let token = s.create_token(&user.id, &device)?;
-        ok_json(json!({ "token": token, "user": user_json(&user) }))
-    })
-    .await
+    Ok(user)
 }
 
 async fn logout(State(app): State<App>, headers: HeaderMap) -> ApiResult {
@@ -626,22 +700,31 @@ struct PasswordBody {
 /// password. Signs the user's other devices out.
 async fn change_password(State(app): State<App>, headers: HeaderMap, body: Bytes) -> ApiResult {
     let b: PasswordBody = parse_body(&body)?;
-    let (user, token_id, hash) = app
+    let (fresh, n) = change_own_password(&app, Caller::Bearer(headers), b.old_password, b.new_password).await?;
+    ok_json(json!({ "user": user_json(&fresh), "signed_out_devices": n }))
+}
+
+/// A person changes their own password (the API's and the admin page's): the current one is
+/// checked (counted for the username's limit), the new one follows the policy. Every other
+/// sign-in ends (devices and web admin sessions; the one in use stays). The updated person and
+/// how many sign-ins ended.
+pub(crate) async fn change_own_password(app: &App, caller: Caller, old_password: String, new_password: String) -> Result<(User, usize), ApiError> {
+    let c = caller.clone();
+    let (user, sign_in, hash) = app
         .run(move |s| {
-            let who = auth_any(s, &headers)?;
-            let Principal::User { user, token_id } = who else { return Err(ApiError::unauthorized()) };
+            let (user, sign_in) = c.person_any(s)?;
             let hash = s.password_hash(&user.id)?;
-            Ok((user, token_id, hash))
+            Ok((user, sign_in, hash))
         })
         .await?;
     let key = format!("user:{}", user.username.to_lowercase());
-    if b.old_password.len() > 1024 {
+    if old_password.len() > 1024 {
         return Err(ApiError::coded(StatusCode::FORBIDDEN, "wrong_password", "The current password is incorrect."));
     }
     if app.attempt(std::slice::from_ref(&key)).is_none() {
         return Err(too_many());
     }
-    let (old, new, current) = (b.old_password, b.new_password.clone(), hash.clone());
+    let (old, new, current) = (old_password, new_password.clone(), hash.clone());
     let (ok, same) = app.argon(move || (util::verify_password(&old, &current), util::verify_password(&new, &current))).await?;
     if !ok {
         tracing::warn!("wrong current password in a password change for user '{}'", user.username);
@@ -651,17 +734,24 @@ async fn change_password(State(app): State<App>, headers: HeaderMap, body: Bytes
     if same {
         return Err(ApiError::bad("The new password must be different from the current one."));
     }
-    let new_hash = app.new_password_hash(b.new_password, user.username.clone()).await?;
+    let new_hash = app.new_password_hash(new_password, user.username.clone()).await?;
     app.run_changing(move |s| {
-        // Still the same password (no other change won the race) and the same device.
-        if s.password_hash(&user.id)? != hash || !s.token_exists(token_id)? {
+        // Still the same password (no other change won the race) and the same sign-in.
+        let still = match sign_in {
+            SignIn::Device(id) => s.token_exists(id)?,
+            SignIn::Admin(id) => s.admin_session_exists(id)?,
+        };
+        if s.password_hash(&user.id)? != hash || !still {
             return Err(ApiError::new(StatusCode::CONFLICT, "Your password was changed meanwhile. Sign in again."));
         }
         s.set_password_hash(&user.id, &new_hash)?;
-        let n = s.revoke_other_tokens(&user.id, token_id)?;
-        tracing::info!("user '{}' changed their password ({n} other device(s) signed out)", user.username);
+        let n = match sign_in {
+            SignIn::Device(id) => s.revoke_other_tokens(&user.id, id)?,
+            SignIn::Admin(id) => s.revoke_all_but_admin_session(&user.id, id)?,
+        };
+        tracing::info!("user '{}' changed their password ({n} other sign-in(s) ended)", user.username);
         let fresh = s.user_by_id(&user.id)?.ok_or_else(ApiError::not_found)?;
-        ok_json(json!({ "user": user_json(&fresh), "signed_out_devices": n }))
+        Ok((fresh, n))
     })
     .await
 }
@@ -671,13 +761,13 @@ async fn change_password(State(app): State<App>, headers: HeaderMap, body: Bytes
 // ---------------------------------------------------------------------------
 
 /// The server administrator (manages accounts and organisations; sees no documents).
-fn need_admin(me: &User) -> Result<(), ApiError> {
+pub(crate) fn need_admin(me: &User) -> Result<(), ApiError> {
     if me.is_admin { Ok(()) } else { Err(ApiError::forbidden("Only the server administrator can do that.")) }
 }
 
 /// The organisation (by id or name) and the caller's role in it; 404 unless the caller is a
 /// member or the server administrator.
-fn org_for(s: &Store, me: &User, org: &str) -> Result<(Org, Option<OrgRole>), ApiError> {
+pub(crate) fn org_for(s: &Store, me: &User, org: &str) -> Result<(Org, Option<OrgRole>), ApiError> {
     let o = s.find_org(org)?.ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "There's no such organisation."))?;
     let mine = s.member_role(&o.id, &me.id)?;
     if mine.is_none() && !me.is_admin {
@@ -687,7 +777,7 @@ fn org_for(s: &Store, me: &User, org: &str) -> Result<(Org, Option<OrgRole>), Ap
 }
 
 /// Org owners and admins (and the server administrator) manage an organisation.
-fn need_manage(me: &User, mine: Option<OrgRole>) -> Result<(), ApiError> {
+pub(crate) fn need_manage(me: &User, mine: Option<OrgRole>) -> Result<(), ApiError> {
     if me.is_admin || mine.is_some_and(OrgRole::manages) { Ok(()) } else { Err(ApiError::forbidden("Only the organisation's owners and admins can do that.")) }
 }
 
@@ -700,22 +790,22 @@ fn need_owner_for(me: &User, mine: Option<OrgRole>, involved: &[Option<OrgRole>]
     Ok(())
 }
 
-fn person_by_name(s: &Store, username: &str) -> Result<User, ApiError> {
-    s.user_by_name(username)?.ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, format!("There's no user named '{}'.", username.trim())))
+pub(crate) fn person_by_name(s: &Store, username: &str) -> Result<User, ApiError> {
+    s.user_by_name(username)?.ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "No such user."))
 }
 
 #[derive(Deserialize)]
-struct AccountBody {
-    username: String,
+pub(crate) struct AccountBody {
+    pub(crate) username: String,
     #[serde(default)]
-    display_name: String,
+    pub(crate) display_name: String,
     #[serde(default)]
-    email: String,
+    pub(crate) email: String,
     /// Join this organisation (required unless the caller is the server administrator).
     #[serde(default)]
-    org: Option<String>,
+    pub(crate) org: Option<String>,
     #[serde(default)]
-    role: Option<String>,
+    pub(crate) role: Option<String>,
 }
 
 /// Who may create the account in `b` and into which organisation (checked before the password
@@ -723,9 +813,8 @@ struct AccountBody {
 /// (the caller, the organisation and role the account joins, the checked username)
 type AccountTarget = (User, Option<(Org, OrgRole)>, String);
 
-fn account_target(s: &Store, headers: &HeaderMap, b: &AccountBody) -> Result<AccountTarget, ApiError> {
-    let who = auth(s, headers)?;
-    let me = user_of(&who)?.clone();
+fn account_target(s: &Store, caller: &Caller, b: &AccountBody) -> Result<AccountTarget, ApiError> {
+    let me = caller.person(s)?;
     let org = match b.org.as_deref().filter(|o| !o.trim().is_empty()) {
         Some(o) => {
             let (org, mine) = org_for(s, &me, o)?;
@@ -748,58 +837,93 @@ fn account_target(s: &Store, headers: &HeaderMap, b: &AccountBody) -> Result<Acc
 /// a new one when they first sign in. Org owners/admins create accounts into their org.
 async fn create_account(State(app): State<App>, headers: HeaderMap, body: Bytes) -> ApiResult {
     let b: AccountBody = parse_body(&body)?;
+    let (u, pw) = create_account_as(&app, Caller::Bearer(headers), b).await?;
+    Ok((StatusCode::CREATED, axum::Json(json!({ "user": user_json(&u), "temporary_password": pw }))).into_response())
+}
+
+/// Creates the account in `b` with a temporary password (the API's and the admin page's):
+/// the account and the password, which the caller shows once.
+pub(crate) async fn create_account_as(app: &App, caller: Caller, b: AccountBody) -> Result<(User, String), ApiError> {
     let b = Arc::new(b);
-    let (h, bb) = (headers.clone(), b.clone());
-    let (_, _, username) = app.run(move |s| account_target(s, &h, &bb)).await?;
+    let (c, bb) = (caller.clone(), b.clone());
+    let (_, _, username) = app.run(move |s| account_target(s, &c, &bb)).await?;
     let pw = util::temp_password_for(&username);
     let p = pw.clone();
     let hash = app.argon(move || util::hash_password(&p)).await?;
-    app.run(move |s| {
-        let (me, org, _) = account_target(s, &headers, &b)?;
-        let u = s.create_temp_account(&b.username, &b.display_name, &b.email, &hash, org.as_ref().map(|(o, r)| (o, *r, me.id.as_str())))?;
-        tracing::info!("user '{}' created the account '{}'{}", me.username, u.username, org.as_ref().map(|(o, _)| format!(" in {}", o.name)).unwrap_or_default());
-        Ok((StatusCode::CREATED, axum::Json(json!({ "user": user_json(&u), "temporary_password": pw }))).into_response())
-    })
-    .await
+    let u = app
+        .run(move |s| {
+            let (me, org, _) = account_target(s, &caller, &b)?;
+            let u = s.create_temp_account(&b.username, &b.display_name, &b.email, &hash, org.as_ref().map(|(o, r)| (o, *r, me.id.as_str())))?;
+            tracing::info!("user '{}' created the account '{}'{}", me.username, u.username, org.as_ref().map(|(o, _)| format!(" in {}", o.name)).unwrap_or_default());
+            Ok(u)
+        })
+        .await?;
+    Ok((u, pw))
 }
 
 /// `POST /api/users/{username}/reset-password` (server administrator): a new temporary
 /// password (returned once; accepted policy, SPEC §2), all devices signed out.
 async fn reset_password(State(app): State<App>, headers: HeaderMap, Path(username): Path<String>) -> ApiResult {
-    let (h, n) = (headers.clone(), username.clone());
+    let (u, pw) = reset_password_as(&app, Caller::Bearer(headers), username).await?;
+    ok_json(json!({ "user": user_json(&u), "temporary_password": pw }))
+}
+
+/// The server administrator gives `username` a new temporary password (returned, for showing
+/// once) and signs them out everywhere; logged as a warning, never the password.
+pub(crate) async fn reset_password_as(app: &App, caller: Caller, username: String) -> Result<(User, String), ApiError> {
+    let (c, n) = (caller.clone(), username.clone());
     let target = app
         .run(move |s| {
-            let who = auth(s, &h)?;
-            need_admin(user_of(&who)?)?;
-            person_by_name(s, &n)
+            let me = c.person(s)?;
+            need_admin(&me)?;
+            let u = person_by_name(s, &n)?;
+            not_self_reset(&me, &u)?;
+            Ok(u)
         })
         .await?;
     let pw = util::temp_password_for(&target.username);
     let p = pw.clone();
     let hash = app.argon(move || util::hash_password(&p)).await?;
-    app.run_changing(move |s| {
-        let who = auth(s, &headers)?;
-        let me = user_of(&who)?;
-        need_admin(me)?;
-        let u = person_by_name(s, &username)?;
-        let n = s.set_temp_password_hash(&u.id, &hash)?;
-        tracing::warn!("administrator '{}' reset the password of '{}' ({n} device(s) signed out)", me.username, u.username);
-        ok_json(json!({ "user": user_json(&s.user_by_id(&u.id)?.ok_or_else(ApiError::not_found)?), "temporary_password": pw }))
-    })
-    .await
+    let u = app
+        .run_changing(move |s| {
+            let me = caller.person(s)?;
+            need_admin(&me)?;
+            let u = person_by_name(s, &username)?;
+            not_self_reset(&me, &u)?;
+            let n = s.set_temp_password_hash(&u.id, &hash)?;
+            tracing::warn!("administrator '{}' reset the password of '{}' ({n} sign-in(s) ended)", me.username, u.username);
+            s.user_by_id(&u.id)?.ok_or_else(ApiError::not_found)
+        })
+        .await?;
+    Ok((u, pw))
+}
+
+/// A reset signs the person out everywhere, so resetting your own password would lock you out
+/// before you saw the new one: change it instead.
+fn not_self_reset(me: &User, target: &User) -> Result<(), ApiError> {
+    if me.id == target.id {
+        return Err(ApiError::bad("Use Change password for your own account."));
+    }
+    Ok(())
+}
+
+/// The server administrator disables (signs out everywhere, ends live sessions) or enables an
+/// account; nobody disables themselves.
+pub(crate) fn set_disabled_as(s: &Store, me: &User, username: &str, disabled: bool) -> Result<User, ApiError> {
+    need_admin(me)?;
+    let u = person_by_name(s, username)?;
+    if u.id == me.id && disabled {
+        return Err(ApiError::bad("You can't disable your own account."));
+    }
+    s.set_disabled(&u.id, disabled)?;
+    tracing::info!("user '{}' {} the account '{}'", me.username, if disabled { "disabled" } else { "enabled" }, u.username);
+    s.user_by_id(&u.id)?.ok_or_else(ApiError::not_found)
 }
 
 async fn set_disabled(app: App, headers: HeaderMap, username: String, disabled: bool) -> ApiResult {
     app.run_changing(move |s| {
         let who = auth(s, &headers)?;
-        let me = user_of(&who)?;
-        need_admin(me)?;
-        let u = person_by_name(s, &username)?;
-        if u.id == me.id && disabled {
-            return Err(ApiError::bad("You can't disable your own account."));
-        }
-        s.set_disabled(&u.id, disabled)?;
-        tracing::info!("user '{}' {} the account '{}'", me.username, if disabled { "disabled" } else { "enabled" }, u.username);
+        set_disabled_as(s, user_of(&who)?, &username, disabled)?;
         Ok(StatusCode::NO_CONTENT.into_response())
     })
     .await
@@ -815,22 +939,132 @@ async fn enable_user(State(app): State<App>, headers: HeaderMap, Path(username):
     set_disabled(app, headers, username, false).await
 }
 
+/// The server administrator makes `username` a server administrator too, or takes that away.
+/// The last enabled administrator can't step down.
+pub(crate) fn set_super_admin_as(s: &Store, me: &User, username: &str, on: bool) -> Result<User, ApiError> {
+    need_admin(me)?;
+    let u = person_by_name(s, username)?;
+    if !on && u.is_admin && !u.disabled && s.admin_count()? <= 1 {
+        return Err(ApiError::new(StatusCode::CONFLICT, "This is the last server administrator. Make someone else an administrator first."));
+    }
+    s.set_admin(&u.id, on)?;
+    tracing::warn!("administrator '{}' {} '{}' {} server administrator", me.username, if on { "made" } else { "removed" }, u.username, if on { "a" } else { "as" });
+    s.user_by_id(&u.id)?.ok_or_else(ApiError::not_found)
+}
+
+#[derive(Deserialize)]
+struct AdminFlagBody {
+    is_admin: bool,
+}
+
+/// `POST /api/users/{username}/admin {is_admin}` (server administrator).
+async fn set_user_admin(State(app): State<App>, headers: HeaderMap, Path(username): Path<String>, body: Bytes) -> ApiResult {
+    let b: AdminFlagBody = parse_body(&body)?;
+    app.run_changing(move |s| {
+        let who = auth(s, &headers)?;
+        let u = set_super_admin_as(s, user_of(&who)?, &username, b.is_admin)?;
+        ok_json(json!({ "user": user_json(&u) }))
+    })
+    .await
+}
+
+/// A person with their sign-ins: devices (API tokens) and web admin sessions.
+pub(crate) type SignIns = (User, Vec<crate::store::DeviceToken>, Vec<crate::store::AdminSession>);
+
+/// The server administrator lists a person's sign-ins.
+pub(crate) fn sign_ins_as(s: &Store, me: &User, username: &str) -> Result<SignIns, ApiError> {
+    need_admin(me)?;
+    let u = person_by_name(s, username)?;
+    let (devices, web) = (s.tokens_of(&u.id)?, s.admin_sessions_of(&u.id)?);
+    Ok((u, devices, web))
+}
+
+/// The server administrator ends one of a person's sign-ins (404 when it isn't theirs).
+pub(crate) fn end_sign_in_as(s: &Store, me: &User, username: &str, which: SignIn) -> Result<User, ApiError> {
+    need_admin(me)?;
+    let u = person_by_name(s, username)?;
+    let ended = match which {
+        SignIn::Device(id) => s.revoke_token_of(&u.id, id)?,
+        SignIn::Admin(id) => s.end_admin_session_of(&u.id, id)?,
+    };
+    if !ended {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "That sign-in has ended already."));
+    }
+    tracing::info!("administrator '{}' ended a sign-in of '{}'", me.username, u.username);
+    Ok(u)
+}
+
+/// The server administrator signs a person out of every device and web admin session.
+pub(crate) fn sign_out_everywhere_as(s: &Store, me: &User, username: &str) -> Result<(User, usize), ApiError> {
+    need_admin(me)?;
+    let u = person_by_name(s, username)?;
+    let n = s.revoke_user_tokens(&u.id)?;
+    tracing::info!("administrator '{}' signed '{}' out everywhere ({n} sign-in(s) ended)", me.username, u.username);
+    Ok((u, n))
+}
+
+/// `GET /api/users/{username}/sessions` (server administrator).
+async fn user_sessions(State(app): State<App>, headers: HeaderMap, Path(username): Path<String>) -> ApiResult {
+    app.run(move |s| {
+        let who = auth(s, &headers)?;
+        let (_, devices, web) = sign_ins_as(s, user_of(&who)?, &username)?;
+        let devices: Vec<Value> = devices.iter().map(|t| json!({ "id": t.id, "device": t.device, "created": iso(t.created), "last_used": iso(t.last_used) })).collect();
+        let web: Vec<Value> = web.iter().map(|w| json!({ "id": w.id, "agent": w.agent, "created": iso(w.created), "last_used": iso(w.last_used), "expires": iso(w.expires) })).collect();
+        ok_json(json!({ "devices": devices, "web": web }))
+    })
+    .await
+}
+
+/// `DELETE /api/users/{username}/sessions/{device|web}/{id}` (server administrator).
+async fn end_user_session(State(app): State<App>, headers: HeaderMap, Path((username, kind, id)): Path<(String, String, i64)>) -> ApiResult {
+    let which = match kind.as_str() {
+        "device" => SignIn::Device(id),
+        "web" => SignIn::Admin(id),
+        _ => return Err(ApiError::not_found()),
+    };
+    app.run_changing(move |s| {
+        let who = auth(s, &headers)?;
+        end_sign_in_as(s, user_of(&who)?, &username, which)?;
+        Ok(StatusCode::NO_CONTENT.into_response())
+    })
+    .await
+}
+
+/// `POST /api/users/{username}/sign-out` (server administrator): every device and web admin
+/// session of the person ends (live sessions too).
+async fn sign_out_user(State(app): State<App>, headers: HeaderMap, Path(username): Path<String>) -> ApiResult {
+    app.run_changing(move |s| {
+        let who = auth(s, &headers)?;
+        let (_, n) = sign_out_everywhere_as(s, user_of(&who)?, &username)?;
+        ok_json(json!({ "signed_out": n }))
+    })
+    .await
+}
+
+/// The organisations `me` sees, with their role in each: their own (the server administrator:
+/// all of them).
+pub(crate) fn visible_orgs(s: &Store, me: &User) -> Result<Vec<(Org, Option<OrgRole>)>, ApiError> {
+    let mine = s.orgs_of(&me.id)?;
+    Ok(if me.is_admin {
+        s.orgs()?
+            .into_iter()
+            .map(|o| {
+                let r = mine.iter().find(|(m, _)| m.id == o.id).map(|(_, r)| *r);
+                (o, r)
+            })
+            .collect()
+    } else {
+        mine.into_iter().map(|(o, r)| (o, Some(r))).collect()
+    })
+}
+
 /// `GET /api/orgs`: the caller's organisations (the server administrator: all of them).
 async fn list_orgs(State(app): State<App>, headers: HeaderMap) -> ApiResult {
     app.run(move |s| {
         let who = auth(s, &headers)?;
         let me = user_of(&who)?;
-        let mine = s.orgs_of(&me.id)?;
-        let orgs: Vec<(Org, Option<OrgRole>)> = if me.is_admin {
-            s.orgs()?.into_iter().map(|o| {
-                let r = mine.iter().find(|(m, _)| m.id == o.id).map(|(_, r)| *r);
-                (o, r)
-            }).collect()
-        } else {
-            mine.into_iter().map(|(o, r)| (o, Some(r))).collect()
-        };
         let mut list = Vec::new();
-        for (o, r) in &orgs {
+        for (o, r) in &visible_orgs(s, me)? {
             list.push(org_json(s, o, *r)?);
         }
         ok_json(json!({ "orgs": list }))
@@ -843,14 +1077,21 @@ struct OrgBody {
     name: String,
 }
 
+/// The server administrator creates an organisation.
+pub(crate) fn create_org_as(s: &Store, me: &User, name: &str) -> Result<Org, ApiError> {
+    need_admin(me)?;
+    let o = s.create_org(name, &me.id)?;
+    tracing::info!("user '{}' created the organisation '{}'", me.username, o.name);
+    Ok(o)
+}
+
 async fn create_org(State(app): State<App>, headers: HeaderMap, body: Bytes) -> ApiResult {
     app.run(move |s| {
         let who = auth(s, &headers)?;
         let me = user_of(&who)?;
         need_admin(me)?;
         let b: OrgBody = parse_body(&body)?;
-        let o = s.create_org(&b.name, &me.id)?;
-        tracing::info!("user '{}' created the organisation '{}'", me.username, o.name);
+        let o = create_org_as(s, me, &b.name)?;
         Ok((StatusCode::CREATED, axum::Json(org_json(s, &o, None)?)).into_response())
     })
     .await
@@ -892,6 +1133,32 @@ struct PatchOrgBody {
     member_role: Option<String>,
 }
 
+/// Renames an organisation (the server administrator) and/or sets its members' default role
+/// ("edit"/"view"; an org owner/admin). The organisation afterwards and the caller's role.
+pub(crate) fn patch_org_as(s: &Store, me: &User, org: &str, name: Option<&str>, member_role: Option<&str>) -> Result<(Org, Option<OrgRole>), ApiError> {
+    let (o, mine) = org_for(s, me, org)?;
+    // Every check before any change: a request that may not do all of it changes nothing.
+    let role = match member_role {
+        Some(r) => {
+            need_manage(me, mine)?;
+            Some(Role::parse(r).filter(|r| *r != Role::Owner).ok_or_else(|| ApiError::bad("member_role must be view or edit."))?)
+        }
+        None => None,
+    };
+    if name.is_some() {
+        need_admin(me)?;
+    }
+    // The rename can still be refused (taken, invalid name); it goes first, so then nothing
+    // has changed either.
+    if let Some(n) = name {
+        s.rename_org(&o, n)?;
+    }
+    if let Some(r) = role {
+        s.set_org_member_role(&o, r)?;
+    }
+    Ok((s.org(&o.id)?.ok_or_else(ApiError::not_found)?, mine))
+}
+
 /// `PATCH /api/orgs/{org} {name?, member_role?}`: renaming takes the server administrator;
 /// the members' default role ("edit"/"view") takes an org owner/admin.
 async fn patch_org(State(app): State<App>, headers: HeaderMap, Path(org): Path<String>, body: Bytes) -> ApiResult {
@@ -899,31 +1166,26 @@ async fn patch_org(State(app): State<App>, headers: HeaderMap, Path(org): Path<S
         let who = auth(s, &headers)?;
         let me = user_of(&who)?;
         let b: PatchOrgBody = parse_body(&body)?;
-        let (mut o, mine) = org_for(s, me, &org)?;
-        if let Some(r) = &b.member_role {
-            need_manage(me, mine)?;
-            let r = Role::parse(r).ok_or_else(|| ApiError::bad("member_role must be view or edit."))?;
-            s.set_org_member_role(&o, r)?;
-        }
-        if let Some(n) = &b.name {
-            need_admin(me)?;
-            o = s.rename_org(&o, n)?;
-        }
-        let o = s.org(&o.id)?.ok_or_else(ApiError::not_found)?;
+        let (o, mine) = patch_org_as(s, me, &org, b.name.as_deref(), b.member_role.as_deref())?;
         ok_json(org_json(s, &o, mine)?)
     })
     .await
+}
+
+/// The server administrator deletes an organisation whose folder is empty.
+pub(crate) fn delete_org_as(s: &Store, me: &User, org: &str) -> Result<Org, ApiError> {
+    need_admin(me)?;
+    let (o, _) = org_for(s, me, org)?;
+    s.delete_org(&o)?;
+    tracing::info!("user '{}' deleted the organisation '{}'", me.username, o.name);
+    Ok(o)
 }
 
 /// `DELETE /api/orgs/{org}` (server administrator): only when its folder is empty.
 async fn delete_org(State(app): State<App>, headers: HeaderMap, Path(org): Path<String>) -> ApiResult {
     app.run_changing(move |s| {
         let who = auth(s, &headers)?;
-        let me = user_of(&who)?;
-        need_admin(me)?;
-        let (o, _) = org_for(s, me, &org)?;
-        s.delete_org(&o)?;
-        tracing::info!("user '{}' deleted the organisation '{}'", me.username, o.name);
+        delete_org_as(s, user_of(&who)?, &org)?;
         Ok(StatusCode::NO_CONTENT.into_response())
     })
     .await
@@ -947,9 +1209,11 @@ struct MemberBody {
     role: Option<String>,
 }
 
-fn set_member(s: &Store, headers: &HeaderMap, org: &str, username: &str, role: Option<&str>) -> ApiResult {
-    let who = auth(s, headers)?;
-    let me = user_of(&who)?;
+/// Adds a person to an organisation (default role member) or changes their role, with every
+/// rule of the API: org owners/admins only, owners for owners, `invite_required` for people
+/// an org admin doesn't share an organisation with, the last owner stays. The organisation
+/// and whether the person was added (rather than changed).
+pub(crate) fn set_member_as(s: &Store, me: &User, org: &str, username: &str, role: Option<&str>) -> Result<(Org, bool), ApiError> {
     let (o, mine) = org_for(s, me, org)?;
     need_manage(me, mine)?;
     let role = OrgRole::parse(role.unwrap_or("member")).ok_or_else(|| ApiError::bad("role must be member, admin or owner."))?;
@@ -969,8 +1233,17 @@ fn set_member(s: &Store, headers: &HeaderMap, org: &str, username: &str, role: O
     }
     let added = s.set_member(&o, &target, role, &me.id)?;
     tracing::info!("user '{}' {} '{}' as {} of '{}'", me.username, if added { "added" } else { "set" }, target.username, role.as_str(), o.name);
-    let status = if added { StatusCode::CREATED } else { StatusCode::OK };
-    Ok((status, axum::Json(json!({ "members": members_json(s, &o, me.is_admin)? }))).into_response())
+    Ok((o, added))
+}
+
+/// Changes the role of someone who is a member already (404 otherwise); see `set_member_as`.
+pub(crate) fn change_member_as(s: &Store, me: &User, org: &str, username: &str, role: &str) -> Result<Org, ApiError> {
+    let (o, _) = org_for(s, me, org)?;
+    let target = person_by_name(s, username)?;
+    if s.member_role(&o.id, &target.id)?.is_none() {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, format!("{} isn't a member of {}.", target.username, o.name)));
+    }
+    Ok(set_member_as(s, me, org, username, Some(role))?.0)
 }
 
 /// An organisation keeps at least one owner: its last owner can't leave or step down.
@@ -986,7 +1259,11 @@ fn last_owner_check(s: &Store, o: &Org) -> Result<(), ApiError> {
 async fn add_member(State(app): State<App>, headers: HeaderMap, Path(org): Path<String>, body: Bytes) -> ApiResult {
     app.run_changing(move |s| {
         let b: MemberBody = parse_body(&body)?;
-        set_member(s, &headers, &org, &b.username, b.role.as_deref())
+        let who = auth(s, &headers)?;
+        let me = user_of(&who)?;
+        let (o, added) = set_member_as(s, me, &org, &b.username, b.role.as_deref())?;
+        let status = if added { StatusCode::CREATED } else { StatusCode::OK };
+        Ok((status, axum::Json(json!({ "members": members_json(s, &o, me.is_admin)? }))).into_response())
     })
     .await
 }
@@ -997,14 +1274,30 @@ async fn patch_member(State(app): State<App>, headers: HeaderMap, Path((org, use
         let b: MemberBody = parse_body(&body)?;
         let who = auth(s, &headers)?;
         let me = user_of(&who)?;
-        let (o, _) = org_for(s, me, &org)?;
-        let target = person_by_name(s, &username)?;
-        if s.member_role(&o.id, &target.id)?.is_none() {
-            return Err(ApiError::new(StatusCode::NOT_FOUND, format!("{} isn't a member of {}.", target.username, o.name)));
-        }
-        set_member(s, &headers, &org, &username, Some(b.role.as_deref().ok_or_else(|| ApiError::bad("role is required."))?))
+        let role = b.role.as_deref().ok_or_else(|| ApiError::bad("role is required."))?;
+        let o = change_member_as(s, me, &org, &username, role)?;
+        ok_json(json!({ "members": members_json(s, &o, me.is_admin)? }))
     })
     .await
+}
+
+/// Removes a person from an organisation: anyone may leave (not the last owner); removing
+/// others takes an org owner/admin (an owner for owners).
+pub(crate) fn remove_member_as(s: &Store, me: &User, org: &str, username: &str) -> Result<Org, ApiError> {
+    let (o, mine) = org_for(s, me, org)?;
+    let target = person_by_name(s, username)?;
+    let theirs = s.member_role(&o.id, &target.id)?;
+    if target.id != me.id {
+        need_manage(me, mine)?;
+        need_owner_for(me, mine, &[theirs])?;
+    } else if theirs == Some(OrgRole::Owner) {
+        last_owner_check(s, &o)?;
+    }
+    if theirs.is_none() || !s.remove_member(&o.id, &target.id)? {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, format!("{} isn't a member of {}.", target.username, o.name)));
+    }
+    tracing::info!("user '{}' removed '{}' from '{}'", me.username, target.username, o.name);
+    Ok(o)
 }
 
 /// `DELETE /api/orgs/{org}/members/{username}`: anyone may leave; removing others takes an
@@ -1012,20 +1305,7 @@ async fn patch_member(State(app): State<App>, headers: HeaderMap, Path((org, use
 async fn remove_member(State(app): State<App>, headers: HeaderMap, Path((org, username)): Path<(String, String)>) -> ApiResult {
     app.run_changing(move |s| {
         let who = auth(s, &headers)?;
-        let me = user_of(&who)?;
-        let (o, mine) = org_for(s, me, &org)?;
-        let target = person_by_name(s, &username)?;
-        let theirs = s.member_role(&o.id, &target.id)?;
-        if target.id != me.id {
-            need_manage(me, mine)?;
-            need_owner_for(me, mine, &[theirs])?;
-        } else if theirs == Some(OrgRole::Owner) {
-            last_owner_check(s, &o)?;
-        }
-        if theirs.is_none() || !s.remove_member(&o.id, &target.id)? {
-            return Err(ApiError::new(StatusCode::NOT_FOUND, format!("{} isn't a member of {}.", target.username, o.name)));
-        }
-        tracing::info!("user '{}' removed '{}' from '{}'", me.username, target.username, o.name);
+        remove_member_as(s, user_of(&who)?, &org, &username)?;
         Ok(StatusCode::NO_CONTENT.into_response())
     })
     .await
@@ -1043,6 +1323,18 @@ struct InviteBody {
     role: Option<String>,
 }
 
+/// An org owner/admin makes a one-time invite (an owner for owner invites): the invite and its
+/// URL, which is shown once (only the token's hash is stored).
+pub(crate) fn create_invite_as(s: &Store, me: &User, base_url: &str, org: &str, email: &str, role: Option<&str>) -> Result<(crate::store::Invite, Org, String), ApiError> {
+    let (o, mine) = org_for(s, me, org)?;
+    need_manage(me, mine)?;
+    let role = OrgRole::parse(role.unwrap_or("member")).ok_or_else(|| ApiError::bad("role must be member, admin or owner."))?;
+    need_owner_for(me, mine, &[Some(role)])?;
+    let (inv, token) = s.create_invite(&o, email, role, &me.id)?;
+    tracing::info!("user '{}' created an invite to '{}'", me.username, o.name);
+    Ok((inv, o, format!("{base_url}/i/{token}")))
+}
+
 /// `POST /api/orgs/{org}/invites {email, role?}`: a one-time link (valid 7 days), returned
 /// once in `url` for the admin to send. Only its hash is stored.
 async fn create_invite(State(app): State<App>, headers: HeaderMap, Path(org): Path<String>, body: Bytes) -> ApiResult {
@@ -1051,44 +1343,49 @@ async fn create_invite(State(app): State<App>, headers: HeaderMap, Path(org): Pa
         let who = auth(s, &headers)?;
         let me = user_of(&who)?;
         let b: InviteBody = parse_body(&body)?;
-        let (o, mine) = org_for(s, me, &org)?;
-        need_manage(me, mine)?;
-        let role = OrgRole::parse(b.role.as_deref().unwrap_or("member")).ok_or_else(|| ApiError::bad("role must be member, admin or owner."))?;
-        need_owner_for(me, mine, &[Some(role)])?;
-        let (inv, token) = s.create_invite(&o, &b.email, role, &me.id)?;
-        tracing::info!("user '{}' created an invite to '{}'", me.username, o.name);
+        let (inv, _, url) = create_invite_as(s, me, &base, &org, &b.email, b.role.as_deref())?;
         let mut v = invite_json(s, &inv);
-        v["url"] = json!(format!("{base}/i/{token}"));
+        v["url"] = json!(url);
         Ok((StatusCode::CREATED, axum::Json(v)).into_response())
     })
     .await
 }
 
+/// An organisation's open invites (org owners/admins).
+pub(crate) fn invites_as(s: &Store, me: &User, org: &str) -> Result<Vec<crate::store::Invite>, ApiError> {
+    let (o, mine) = org_for(s, me, org)?;
+    need_manage(me, mine)?;
+    Ok(s.invites_of(&o.id)?)
+}
+
 async fn list_invites(State(app): State<App>, headers: HeaderMap, Path(org): Path<String>) -> ApiResult {
     app.run(move |s| {
         let who = auth(s, &headers)?;
-        let me = user_of(&who)?;
-        let (o, mine) = org_for(s, me, &org)?;
-        need_manage(me, mine)?;
-        let list: Vec<Value> = s.invites_of(&o.id)?.iter().map(|i| invite_json(s, i)).collect();
+        let list: Vec<Value> = invites_as(s, user_of(&who)?, &org)?.iter().map(|i| invite_json(s, i)).collect();
         ok_json(json!({ "invites": list }))
     })
     .await
 }
 
+/// Revokes an open invite of an organisation (org owners/admins; 404 for another org's).
+pub(crate) fn delete_invite_as(s: &Store, me: &User, org: &str, id: &str) -> Result<(), ApiError> {
+    let (o, mine) = org_for(s, me, org)?;
+    need_manage(me, mine)?;
+    match s.invite(id)? {
+        Some(i) if i.org_id == o.id => {
+            s.delete_invite(&i.id)?;
+            tracing::info!("user '{}' revoked an invite to '{}'", me.username, o.name);
+            Ok(())
+        }
+        _ => Err(ApiError::not_found()),
+    }
+}
+
 async fn delete_invite(State(app): State<App>, headers: HeaderMap, Path((org, id)): Path<(String, String)>) -> ApiResult {
     app.run(move |s| {
         let who = auth(s, &headers)?;
-        let me = user_of(&who)?;
-        let (o, mine) = org_for(s, me, &org)?;
-        need_manage(me, mine)?;
-        match s.invite(&id)? {
-            Some(i) if i.org_id == o.id => {
-                s.delete_invite(&i.id)?;
-                Ok(StatusCode::NO_CONTENT.into_response())
-            }
-            _ => Err(ApiError::not_found()),
-        }
+        delete_invite_as(s, user_of(&who)?, &org, &id)?;
+        Ok(StatusCode::NO_CONTENT.into_response())
     })
     .await
 }
@@ -1381,14 +1678,12 @@ async fn upload_file(State(app): State<App>, headers: HeaderMap, Query(q): Query
         };
         let (p, role) = visible(s, &who, &parent, false)?;
         need_edit(role)?;
-        if on_conflict == OnConflict::Replace {
-            if let Ok(clean) = util::clean_name(&name) {
-                if let Some(existing) = s.find_child(&p.id, &clean)? {
-                    if live_busy(s, &hub, &existing)? {
-                        return Err(locked());
-                    }
-                }
-            }
+        if on_conflict == OnConflict::Replace
+            && let Ok(clean) = util::clean_name(&name)
+            && let Some(existing) = s.find_child(&p.id, &clean)?
+            && live_busy(s, &hub, &existing)?
+        {
+            return Err(locked());
         }
         let (it, created) = s.create_file(&p.id, &name, &body, &actor(&who), on_conflict)?;
         if let Principal::User { user, .. } = &who {
@@ -1463,17 +1758,18 @@ async fn put_content(State(app): State<App>, headers: HeaderMap, Path(id): Path<
         if live_busy(s, &hub, &it)? {
             return Err(locked());
         }
-        if let Some(want) = headers.get(header::IF_MATCH).and_then(|v| v.to_str().ok()).map(norm_etag) {
-            if want != "*" && want != it.etag() {
-                let body = json!({
-                    "error": "Someone else saved changes to this file.",
-                    "etag": it.etag(),
-                    "version": it.version,
-                    "modified_by": display_of(s, &it.modified_by),
-                    "modified": iso(it.modified),
-                });
-                return Ok((StatusCode::PRECONDITION_FAILED, axum::Json(body)).into_response());
-            }
+        if let Some(want) = headers.get(header::IF_MATCH).and_then(|v| v.to_str().ok()).map(norm_etag)
+            && want != "*"
+            && want != it.etag()
+        {
+            let body = json!({
+                "error": "Someone else saved changes to this file.",
+                "etag": it.etag(),
+                "version": it.version,
+                "modified_by": display_of(s, &it.modified_by),
+                "modified": iso(it.modified),
+            });
+            return Ok((StatusCode::PRECONDITION_FAILED, axum::Json(body)).into_response());
         }
         let saved = s.write_content(&it, &body, &actor(&who))?;
         if let Principal::User { user, .. } = &who {
@@ -1885,7 +2181,7 @@ fn live_link(s: &Store, token: &str) -> Result<Link, ApiError> {
     Ok(link)
 }
 
-fn html_escape(s: &str) -> String {
+pub(crate) fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&#39;")
 }
 
@@ -1976,7 +2272,7 @@ async fn link_download(State(app): State<App>, Path(token): Path<String>) -> Api
 }
 
 /// `password=...` from an HTML form body.
-fn form_value(body: &[u8], key: &str) -> String {
+pub(crate) fn form_value(body: &[u8], key: &str) -> String {
     let text = String::from_utf8_lossy(body);
     for pair in text.split('&') {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));

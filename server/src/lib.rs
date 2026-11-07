@@ -1,6 +1,7 @@
 //! FreedomOffice document server: accounts, document storage with version history,
 //! sharing and share links for FreedomOffice Sheets.
 
+pub mod admin;
 pub mod api;
 pub mod config;
 pub mod live;

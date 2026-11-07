@@ -1,0 +1,84 @@
+# nginx in front of freedomoffice-server (listen = "127.0.0.1:8080", trust_proxy = true).
+# Install as /etc/nginx/sites-available/freedomoffice, link into sites-enabled, `nginx -t && systemctl reload nginx`.
+# Replace files.example.com and the certificate paths (e.g. from certbot).
+# public_url in server.toml must be exactly "https://files.example.com" (no port, no trailing slash),
+# or web admin forms are refused (origin check).
+
+# Sign-in endpoints: a few attempts per minute per address (the server also locks out after 10
+# failures in 15 minutes per address and per username).
+limit_req_zone $binary_remote_addr zone=fo_login:10m rate=5r/m;
+limit_req_zone $binary_remote_addr zone=fo_api:10m rate=20r/s;
+limit_conn_zone $binary_remote_addr zone=fo_conn:10m;
+
+map $http_upgrade $fo_connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+# Share-link (/l/) and invite (/i/, /api/invites/, /api/links/) paths and the live ticket
+# (?ticket= on .../live) carry secrets: keep them out of the access log.
+map $uri $fo_loggable {
+    ~^/(l|i)/               0;
+    ~^/api/(invites|links)/ 0;
+    ~^/api/items/[^/]+/live$ 0;
+    default                 1;
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name files.example.com;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name files.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/files.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/files.example.com/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    server_tokens off;
+
+    access_log /var/log/nginx/freedomoffice.access.log combined if=$fo_loggable;
+
+    # Same as max_upload_mb (snapshots of live workbooks can be up to 4x; keep in step).
+    client_max_body_size 400m;
+    limit_conn fo_conn 50;
+
+    location ~ ^/(api/login|admin/login|api/invites/|i/) {
+        limit_req zone=fo_login burst=5 nodelay;
+        limit_req_status 429;
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+
+    # Live co-editing (WebSocket).
+    location ~ ^/api/items/[^/]+/live$ {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $fo_connection_upgrade;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+
+    location / {
+        limit_req zone=fo_api burst=100 nodelay;
+        limit_req_status 429;
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        # Overwrite (not append): the server takes the last address from loopback proxies.
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_request_buffering off;
+    }
+}
