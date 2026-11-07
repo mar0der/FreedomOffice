@@ -348,7 +348,7 @@ impl App {
     // ------------------------------------------------------------------
 
     pub(super) fn live_can_undo(&self, redo: bool) -> bool {
-        self.live.as_ref().is_some_and(|l| if redo { !l.redo.is_empty() } else { !l.undo.is_empty() })
+        self.live.as_ref().is_some_and(|l| l.editor && if redo { !l.redo.is_empty() } else { !l.undo.is_empty() })
     }
 
     pub(super) fn live_can_redo(&self) -> bool {
@@ -374,6 +374,10 @@ impl App {
 
     /// Undoes (or redoes) this user's last change; others' changes stay.
     pub(super) fn live_undo(&mut self, redo: bool) {
+        if self.live_read_only() {
+            // Nothing can change, so nothing is taken off the stacks either.
+            return;
+        }
         self.live_flush();
         self.cancel_edit();
         let Some(l) = &mut self.live else { return };
@@ -696,7 +700,18 @@ impl App {
                 l.sess.offline();
                 l.peers.clear();
                 let fatal = match (code, http) {
-                    (_, Some(401)) => Some("Your sign-in has expired. Sign in again (File > Account) to keep editing live.".to_string()),
+                    (_, Some(401)) => {
+                        // Signed out (elsewhere, or the token was revoked): nothing more reaches the
+                        // server, so nothing more is typed here either.
+                        let url = l.url.clone();
+                        let host = crate::cloud::server::host_of(&url);
+                        let msg = format!("Your sign-in to {host} has expired or was revoked. Sign in again (File > Account) and reopen the workbook; Save a copy keeps what is in this window.");
+                        if let Some(e) = self.cloud.servers.iter_mut().find(|e| e.session.account.url == url) {
+                            e.error = Some(format!("Your sign-in to {host} has expired or was revoked. Sign in again (File > Account)."));
+                        }
+                        self.live_ended(msg);
+                        return;
+                    }
                     (_, Some(404)) => {
                         // Reconnecting after the access was removed (or the file deleted).
                         self.live_revoked("The workbook is no longer shared with you, or it was deleted.");
@@ -724,7 +739,11 @@ impl App {
                     return;
                 }
                 l.backoff = (l.backoff + 1).min(RETRY_MAX_SHIFT);
-                l.retry_at = Some(Instant::now() + Duration::from_secs(1 << l.backoff));
+                // 75-100% of 2, 4, 8 s, so windows that lost the server together don't all
+                // come back in the same instant.
+                let full = 1000u64 << l.backoff;
+                let jitter = crate::model::new_sheet_uid() % (full / 4 + 1);
+                l.retry_at = Some(Instant::now() + Duration::from_millis(full - jitter));
                 if was_online {
                     self.status = Some("Reconnecting... You can keep editing; your changes are sent when the connection is back.".into());
                 }
@@ -741,6 +760,10 @@ impl App {
                     self.live_view_only(false);
                 }
                 let Some(l) = &mut self.live else { return };
+                if l.stopped.is_some() {
+                    // A cell being typed in counted as unsent: the session ended.
+                    return;
+                }
                 if you.editor && !l.editor && l.stopped.is_none() {
                     l.notice = None;
                 }
@@ -843,8 +866,13 @@ impl App {
     /// because sending them would only be refused (`refused`: the server already did).
     fn live_view_only(&mut self, refused: bool) {
         let name = self.live_doc_name();
-        self.cancel_edit();
+        // A cell being typed in and a drag not recorded yet count as unsent changes: they stay
+        // in the window (and in Save a copy) and end the session like other unsent changes.
+        let conn = self.live_keep_local_changes();
         let Some(l) = &mut self.live else { return };
+        if l.conn.is_none() && !refused {
+            l.conn = conn;
+        }
         l.editor = false;
         if let Some(me) = &mut l.me {
             me.editor = false;
@@ -867,9 +895,15 @@ impl App {
     /// Access to the workbook ended: no reconnecting; the window keeps the workbook, read-only,
     /// and offers to save a copy (with any changes the server didn't get).
     fn live_revoked(&mut self, reason: &str) {
-        self.cancel_edit();
+        self.live_ended(access_removed(reason));
+    }
+
+    /// The session can't go on (access removed, signed out): no reconnecting; the window keeps
+    /// the workbook, read-only, with `text` and "Save a copy" (with any changes the server
+    /// didn't get, a cell being typed in included).
+    fn live_ended(&mut self, text: String) {
+        let _ = self.live_keep_local_changes();
         let Some(l) = &mut self.live else { return };
-        let text = access_removed(reason);
         l.conn = None;
         l.online = false;
         l.sess.offline();
@@ -879,6 +913,25 @@ impl App {
         l.stopped = Some(text.clone());
         l.notice = Some(Notice { text: text.clone(), save_copy: true });
         self.status = Some(text);
+    }
+
+    /// Before access changes: the cell being typed in is committed and what a drag changed so
+    /// far is recorded, as this person's changes (still as an editor), without sending them;
+    /// returns the connection, taken while that happens. A rejected entry is dropped.
+    fn live_keep_local_changes(&mut self) -> Option<Conn> {
+        let Some(l) = &mut self.live else { return None };
+        let conn = l.conn.take();
+        let was = l.editor;
+        l.editor = true;
+        if self.edit.is_some() && !self.commit_edit(false) {
+            self.cancel_edit();
+            self.dialog = None;
+        }
+        self.live_flush();
+        if let Some(l) = &mut self.live {
+            l.editor = was;
+        }
+        conn
     }
 
     /// The yellow message bar above the grid, when access to the live workbook changed.

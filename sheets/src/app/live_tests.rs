@@ -280,12 +280,14 @@ fn live_role_changes_switch_read_only_and_back() {
     let (_ctx, mut app) = super::data_ui::sample_app();
     app.live_for_test();
     let name = app.wb.file_name();
-    app.select(0, 0, false);
-    app.begin_edit(Some("half typed".into()), EditMode::Enter);
+    assert_eq!(app.cloud_autosave_state().0, "AutoSave On");
     app.live_event_for_test(Event::Msg(cosync::ServerMsg::Role { role: "view".into() }));
-    assert!(!app.live_editor() && app.edit.is_none(), "read-only at once (the open editor is closed)");
+    assert!(!app.live_editor(), "read-only at once");
     assert_eq!(app.live_notice_for_test(), Some(super::live_ui::Notice { text: format!("{name}: you can now only view this workbook"), save_copy: false }));
     assert_eq!(app.live_stopped(), (None, false), "the session goes on");
+    let (label, on, tip) = app.cloud_autosave_state();
+    assert!(label == "Read-only" && !on && tip.contains("only view"), "AutoSave doesn't claim to be on: {label} / {tip}");
+    assert!(app.cloud_share_enabled(), "a viewer can still share (the server decides)");
     let before = app.wb.clone();
     app.select_range(rg("2:3"));
     app.delete_rows();
@@ -299,6 +301,85 @@ fn live_role_changes_switch_read_only_and_back() {
     type_at(&mut app, 0, 0, "editable again");
     app.live_flush();
     assert!(!app.live_pending_ops().is_empty());
+}
+
+/// A cell being typed in, or a drag not recorded yet, when access changes: kept in the window
+/// as an unsent change (never thrown away), so the session ends and Save a copy is offered —
+/// for view-only and for removed access alike.
+#[test]
+fn typing_or_dragging_when_access_changes_is_kept() {
+    use crate::live::conn::Event;
+    let at = |app: &App, r: u32, c: u32| crate::numfmt::value_to_text(app.wb.sheets[app.wb.active].display_value(r, c));
+    for ev in [
+        Event::Msg(cosync::ServerMsg::Role { role: "view".into() }),
+        Event::Msg(cosync::ServerMsg::Revoked { reason: "Your access to this workbook was removed.".into() }),
+        Event::Closed { code: None, http: Some(401), reason: "HTTP 401".into() },
+    ] {
+        let what = format!("{ev:?}");
+        let (_ctx, mut app) = super::data_ui::sample_app();
+        app.live_for_test();
+        assert!(app.live_pending_ops().is_empty());
+        app.select(0, 0, false);
+        app.begin_edit(Some("half typed".into()), EditMode::Enter);
+        app.live_event_for_test(ev);
+        assert!(app.edit.is_none() && !app.live_editor(), "{what}");
+        assert_eq!(at(&app, 0, 0), "half typed", "the typed text is in the cell ({what})");
+        assert!(!app.live_pending_ops().is_empty(), "and counts as unsent ({what})");
+        assert!(app.live_stopped().0.is_some() && !app.live_stopped().1, "{what}");
+        assert!(app.live_notice_for_test().is_some_and(|n| n.save_copy), "Save a copy is offered ({what})");
+    }
+
+    // A drag in progress (recorded, not yet turned into operations) counts too.
+    let (_ctx, mut app) = super::data_ui::sample_app();
+    app.live_for_test();
+    let si = app.wb.active;
+    app.live_record(&[super::Scope::Range(si, Range::cell(5, 5))]);
+    let c = crate::model::cell_from_input(&mut app.wb, "dragged", 0);
+    app.wb.sheets[si].set(5, 5, c);
+    app.live_event_for_test(Event::Msg(cosync::ServerMsg::Role { role: "view".into() }));
+    assert_eq!(at(&app, 5, 5), "dragged");
+    assert!(!app.live_pending_ops().is_empty() && app.live_notice_for_test().is_some_and(|n| n.save_copy));
+}
+
+/// Undo and redo change nothing while view-only, and the undo stack stays as it was.
+#[test]
+fn undo_while_view_only_keeps_the_stack() {
+    use crate::live::conn::Event;
+    let (_ctx, mut app) = super::data_ui::sample_app();
+    app.live_for_test();
+    type_at(&mut app, 0, 0, "one");
+    type_at(&mut app, 1, 0, "two");
+    app.undo();
+    assert!(app.live_can_undo(false) && app.live_can_redo());
+    let (undo, before) = (app.live_undo_len(), app.wb.clone());
+    app.live_event_for_test(Event::Msg(cosync::ServerMsg::Role { role: "view".into() }));
+    assert!(!app.live_can_undo(false) && !app.live_can_redo(), "nothing to undo for a viewer");
+    for _ in 0..3 {
+        app.undo();
+        app.redo();
+    }
+    assert_eq!(app.live_undo_len(), undo, "the stack isn't drained");
+    assert!(crate::live::compare(&before, &app.wb).is_empty());
+}
+
+/// Signed out while live (401 on reconnecting): read-only with "Sign in again" and Save a copy,
+/// instead of piling up edits that can't be sent; AutoSave and Share say it isn't connected.
+#[test]
+fn signed_out_while_live_is_read_only() {
+    use crate::live::conn::Event;
+    let (_ctx, mut app) = super::data_ui::sample_app();
+    app.live_for_test();
+    type_at(&mut app, 0, 0, "before");
+    app.live_event_for_test(Event::Closed { code: None, http: Some(401), reason: "HTTP 401".into() });
+    let (stopped, retry) = app.live_stopped();
+    assert!(stopped.as_deref().is_some_and(|s| s.contains("Sign in again")) && !retry, "{stopped:?}");
+    assert!(!app.live_editor() && app.live_notice_for_test().is_some_and(|n| n.save_copy));
+    app.select(2, 2, false);
+    app.begin_edit(Some("x".into()), EditMode::Enter);
+    assert!(app.edit.is_none(), "no more edits");
+    let (label, on, _) = app.cloud_autosave_state();
+    assert!(label == "Not connected" && !on);
+    assert!(!app.cloud_share_enabled(), "Share is off once the session ended");
 }
 
 /// Access removed (the `revoked` message, or only the 4401 close, or a refused reconnect): the
@@ -325,6 +406,8 @@ fn removed_access_ends_the_session_read_only() {
         app.select(3, 3, false);
         app.begin_edit(Some("x".into()), EditMode::Enter);
         assert!(app.edit.is_none(), "read-only");
+        assert_eq!(app.cloud_autosave_state().0, "Not connected");
+        assert!(!app.cloud_share_enabled());
         // A later close or reconnect attempt changes nothing.
         app.poll_live();
         assert_eq!(app.live_stopped().1, false);
@@ -334,18 +417,23 @@ fn removed_access_ends_the_session_read_only() {
     }
 }
 
-/// A lost connection is retried after 2, 4, then 8 s, never longer.
+/// A lost connection is retried after about 2, 4, then 8 s (75-100% of that, so windows don't
+/// all come back at once), never longer.
 #[test]
 fn reconnecting_waits_at_most_8_seconds() {
     use crate::live::conn::Event;
     let (_ctx, mut app) = super::data_ui::sample_app();
     app.live_for_test();
     let mut waits = Vec::new();
-    for _ in 0..8 {
+    for _ in 0..40 {
         app.live_event_for_test(Event::Closed { code: None, http: None, reason: "Connection lost".into() });
-        waits.push(app.live_retry_in().expect("a reconnect is scheduled").as_secs_f64().round() as u64);
+        waits.push(app.live_retry_in().expect("a reconnect is scheduled").as_millis() as u64);
     }
-    assert_eq!(waits, [2, 4, 8, 8, 8, 8, 8, 8]);
+    for (i, w) in waits.iter().enumerate() {
+        let full = 1000u64 << (i + 1).min(3);
+        assert!(*w <= full && *w + 50 >= full * 3 / 4, "attempt {i}: {w} ms (of {full})");
+    }
+    assert!(waits[2..].iter().any(|w| *w != waits[2]), "jitter: {waits:?}");
 }
 
 #[test]
