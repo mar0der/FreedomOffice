@@ -32,10 +32,13 @@ futures-util = { version = "0.3", default-features = false, features = ["sink", 
 rpassword = "7"
 cosync = { path = "../cosync" }
 freedomoffice-drive = { path = "../drive" }
+freedomoffice-sheetview = { path = "../sheetview" }
 
 [dev-dependencies]
 ureq = { version = "3", default-features = false }
 tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
+rust_xlsxwriter = "0.102"
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

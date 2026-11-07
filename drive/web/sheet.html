@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="same-origin">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>FreedomOffice Sheets</title>
+<link rel="icon" type="image/svg+xml" href="/drive/assets/icon.svg?v={{v}}">
+<link rel="stylesheet" href="/drive/assets/sheet.css?v={{v}}">
+<script src="/drive/assets/sheet.js?v={{v}}" defer></script>
+</head>
+<body>
+<noscript><p class="note">FreedomOffice Sheets needs JavaScript. Turn it on for this site and reload the page.</p></noscript>
+
+<div id="boot" class="note" role="status">Loading…</div>
+
+<main id="signin" class="center" hidden>
+  <form id="signin-form" class="card stack" novalidate>
+    <h1>Sign in</h1>
+    <p id="signin-error" class="msg error" role="alert" hidden></p>
+    <label for="signin-user">Username</label>
+    <input id="signin-user" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required>
+    <label for="signin-pass">Password</label>
+    <input id="signin-pass" name="password" type="password" autocomplete="current-password" required>
+    <button type="submit" id="signin-submit">Sign in</button>
+  </form>
+</main>
+
+<main id="problem" class="center" hidden>
+  <div class="card stack">
+    <h1 id="problem-title">This workbook can't be shown</h1>
+    <p id="problem-text" class="msg" role="alert"></p>
+    <div class="buttons">
+      <a id="problem-download" class="button" href="/drive" hidden>Download</a>
+      <a id="problem-back" class="button secondary" href="/drive">Back to Drive</a>
+      <button type="button" id="problem-retry" class="secondary" hidden>Try again</button>
+    </div>
+  </div>
+</main>
+
+<div id="app" class="app" hidden>
+  <header class="top">
+    <a id="back" class="tbtn" href="/drive" aria-label="Back to Drive">&#8592;</a>
+    <h1 id="title" class="title" dir="auto"></h1>
+    <span id="status" class="status" role="status"></span>
+    <button type="button" id="undo" class="tbtn edit-only" aria-label="Undo" hidden>&#8630;</button>
+    <button type="button" id="redo" class="tbtn edit-only" aria-label="Redo" hidden>&#8631;</button>
+    <button type="button" id="zoom-out" class="tbtn" aria-label="Smaller text">A&#8722;</button>
+    <button type="button" id="zoom-in" class="tbtn" aria-label="Larger text">A+</button>
+    <button type="button" id="more" class="tbtn" aria-haspopup="true" aria-expanded="false" aria-controls="menu" aria-label="More">&#8943;</button>
+  </header>
+  <div id="menu" class="menu" hidden>
+    <a id="m-xlsx" class="mitem" href="/drive" download>Download .xlsx</a>
+    <a id="m-csv" class="mitem" href="/drive" download>Download this sheet as CSV</a>
+    <a id="m-native" class="mitem" href="/drive">Open in FreedomSheets</a>
+    <button type="button" id="m-refresh" class="mitem">Refresh</button>
+  </div>
+  <div class="fbar">
+    <span id="addr" class="addr" aria-label="Selected cell">&#8212;</span>
+    <div id="fx" class="fx" tabindex="0" role="textbox" aria-readonly="true" aria-label="Cell value or formula"></div>
+    <input id="fxin" class="fxin" type="text" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="done" aria-label="Edit cell" hidden>
+    <button type="button" id="fx-cancel" class="fbtn" aria-label="Cancel edit" hidden>&#10005;</button>
+    <button type="button" id="fx-ok" class="fbtn ok" aria-label="Enter" hidden>&#10003;</button>
+  </div>
+  <div id="tools" class="tools edit-only" hidden>
+    <button type="button" id="t-bold" class="tool" aria-label="Bold"><b>B</b></button>
+    <button type="button" id="t-italic" class="tool" aria-label="Italic"><i>I</i></button>
+    <button type="button" id="t-fill" class="tool" aria-label="Highlight">&#9646;</button>
+    <button type="button" id="t-num" class="tool" aria-label="Number format">0.00</button>
+    <button type="button" id="t-clear" class="tool" aria-label="Clear cell">Clear</button>
+  </div>
+  <div id="stage" class="stage">
+    <canvas id="cv" aria-hidden="true"></canvas>
+    <div id="scroller" class="scroller" tabindex="0" role="application" aria-label="Spreadsheet grid. Tap a cell to see its value.">
+      <div id="spacer"></div>
+    </div>
+    <div id="busy" class="busy" hidden>Loading…</div>
+  </div>
+  <nav id="tabs" class="tabs" aria-label="Sheets"></nav>
+</div>
+</body>
+</html>

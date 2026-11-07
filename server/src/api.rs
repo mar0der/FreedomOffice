@@ -51,10 +51,12 @@ impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, crat
 
 #[derive(Clone)]
 pub struct App {
-    store: Arc<Mutex<Store>>,
+    pub(crate) store: Arc<Mutex<Store>>,
     cfg: Arc<Config>,
     limiter: Arc<Mutex<Limiter>>,
-    hub: Arc<crate::live::Hub>,
+    pub(crate) hub: Arc<crate::live::Hub>,
+    /// Workbooks the browser viewer has open (`sheetweb`).
+    pub(crate) sheets: Arc<crate::sheetweb::Cache>,
     /// Argon2 runs (about 19 MiB and a core each) at most this many at once.
     argon: Arc<tokio::sync::Semaphore>,
     /// Where uploads are staged while they stream in (`Store::incoming_dir`).
@@ -95,6 +97,7 @@ impl App {
             cfg: Arc::new(cfg),
             limiter: Arc::new(Mutex::new(Limiter::default())),
             hub: Arc::default(),
+            sheets: Arc::default(),
             argon: Arc::new(tokio::sync::Semaphore::new(cores)),
             incoming,
             uploads: Arc::default(),
@@ -399,7 +402,7 @@ fn bearer(headers: &HeaderMap) -> Option<String> {
 
 /// The caller. A user who signed in with a temporary password gets 403 with code
 /// `password_change_required` until they chose a new one (`auth_any` allows that).
-fn auth(s: &Store, headers: &HeaderMap) -> Result<Principal, ApiError> {
+pub(crate) fn auth(s: &Store, headers: &HeaderMap) -> Result<Principal, ApiError> {
     let who = auth_any(s, headers)?;
     if let Principal::User { user, .. } = &who
         && user.must_change_password
@@ -471,7 +474,7 @@ fn user_of(p: &Principal) -> Result<&User, ApiError> {
 }
 
 /// Who a change is recorded as: a user id or `link:<id>`.
-fn actor(p: &Principal) -> String {
+pub(crate) fn actor(p: &Principal) -> String {
     match p {
         Principal::User { user, .. } => user.id.clone(),
         Principal::Link { link } => format!("link:{}", link.id),
@@ -488,19 +491,19 @@ fn audit_by(who: &Principal, action: &'static str) -> Audit {
 
 /// A new version of a file was saved (`how`: upload, save, live): one `file.version` row a
 /// minute per person and file, with the count of saves.
-fn audit_version(s: &Store, who: &Principal, it: &Item, how: &str) -> Result<(), ApiError> {
+pub(crate) fn audit_version(s: &Store, who: &Principal, it: &Item, how: &str) -> Result<(), ApiError> {
     let a = audit_by(who, "file.version").detail(format!("{}: version {} ({how})", it.name, it.version)).aggregate(format!("file.version|{}|{}", actor(who), it.id));
     Ok(s.audit_item(a, it)?)
 }
 
 /// The item and the caller's role, or 404 when the caller can't see it.
-fn visible(s: &Store, who: &Principal, id: &str, include_deleted: bool) -> Result<(Item, Role), ApiError> {
+pub(crate) fn visible(s: &Store, who: &Principal, id: &str, include_deleted: bool) -> Result<(Item, Role), ApiError> {
     let item = s.item(id)?.ok_or_else(ApiError::not_found)?;
     let role = s.role(who, &item, include_deleted)?.ok_or_else(ApiError::not_found)?;
     Ok((item, role))
 }
 
-fn need_edit(role: Role) -> Result<(), ApiError> {
+pub(crate) fn need_edit(role: Role) -> Result<(), ApiError> {
     if role >= Role::Edit { Ok(()) } else { Err(ApiError::new(StatusCode::FORBIDDEN, "You have view-only access to this item.")) }
 }
 
@@ -520,7 +523,7 @@ fn person(u: &User) -> Value {
     }
 }
 
-fn item_json(s: &Store, it: &Item, role: Role) -> Value {
+pub(crate) fn item_json(s: &Store, it: &Item, role: Role) -> Value {
     let owner = s.user_by_id(&it.owner_id).ok().flatten();
     let mut v = json!({
         "id": it.id,
@@ -652,6 +655,11 @@ pub fn router(app: App) -> Router {
         .route("/api/items/{id}/permissions/org/{org}", axum::routing::delete(revoke_org_path))
         .route("/api/items/{id}/links", get(list_links).post(create_link))
         .route("/api/items/{id}/links/{link}", axum::routing::delete(delete_link))
+        .route("/api/items/{id}/sheet", get(crate::sheetweb::meta))
+        .route("/api/items/{id}/sheet/cells", get(crate::sheetweb::cells))
+        .route("/api/items/{id}/sheet/cell", get(crate::sheetweb::cell))
+        .route("/api/items/{id}/sheet/csv", get(crate::sheetweb::csv))
+        .route("/api/items/{id}/web-live", get(crate::webbridge::handler))
         .route("/api/items/{id}/live", get(live))
         .route("/api/items/{id}/live-ticket", post(live_ticket))
         .route("/api/items/{id}/live/snapshot", post(live_snapshot).layer(DefaultBodyLimit::max(app.cfg.max_upload_bytes().saturating_mul(4))))

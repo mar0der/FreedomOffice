@@ -743,7 +743,8 @@ Behaviour:
   name can't reorder the text around it.
 - Opening: folders browse; images (png/jpg/gif/webp up to 30 MB) preview in a dialog through a `blob:` URL
   of `fetch(content)` (SVG never previews); PDF opens in a new tab at `content` without `download=1`
-  (the server's PDF CSP); `.xlsx/.xlsm/.csv/.fsheet` open `freedomoffice://open?server=<encodeURIComponent(
+  (the server's PDF CSP); `.xlsx/.xlsm/.csv/.fsheet` open in the browser at `/drive/sheet/<id>` (web Sheets, below); the
+  toolbar button "Open in FreedomSheets" opens `freedomoffice://open?server=<encodeURIComponent(
   location.origin)>&item=<id>` with a "Don't have FreedomSheets?" hint; anything else downloads
   (`?download=1`, also each version in the history): a `HEAD` first, so a missing item shows an error
   toast, then a hidden `<a download>`. An image that fails to decode says it can't be previewed. Nothing
@@ -772,6 +773,91 @@ Behaviour:
 
 Checked with headless Chrome (DevTools protocol over `--remote-debugging-pipe`) against a throwaway server
 on 127.0.0.1: the flows above, no console errors or CSP violations, light/dark/phone screenshots.
+
+### Web Sheets: workbooks in the browser (`collab-365-web` branch) **(W1 exists: read-only)**
+
+Petar's iPhone has no FreedomSheets app, so Drive opens a workbook in the browser: `.xlsx/.xlsm/.csv` (a
+double-click or Open in Drive) go to `/drive/sheet/<item id>`; "Open in FreedomSheets" (the `freedomoffice://`
+link) stays as a secondary action. `.xls/.xlsb/.ods/.fsheet` and anything else say so and offer Download.
+
+**Page.** `GET /drive/sheet/{id}` serves `sheet.html` (same for every id, `no-store`, same strict headers and CSP
+as `/drive`: no inline script or style, same-origin only; `sheet.js` and `sheet.css` come from
+`/drive/assets/`). The page reads the id from its address, uses the Drive web-session cookie (HttpOnly; the CSRF
+token only in memory; nothing in URLs or storage), shows its own sign-in when there is no session, and asks the
+API for everything. A person without access (or a missing file) gets "doesn't exist or you don't have access".
+
+**Data endpoints** (any `/api` authentication: bearer token, web session, share-link access token; the item must
+be visible, a viewer role is enough, folders are 400; answers are `private, no-store`):
+
+| Route | Answer |
+|---|---|
+| `GET /api/items/{id}/sheet` | `{item, role, live, link, rev, cells, active, sheets:[{i, name, hidden, tab, rows, cols, freeze:[r,c], col_w:[[c,px]], row_h:[[r,px]], default_col_w, default_row_h, hidden_rows:[[a,b]], hidden_cols:[[a,b]], merges:[[r1,c1,r2,c2]], gridlines, protected}]}`; `rows`/`cols` are the used extent; `rev` = `<version>.<live seq>` changes with every committed live batch; `item.parent` is null for link holders |
+| `GET /api/items/{id}/sheet/cells?sheet=&r1=&r2=&c1=&c2=` | window (0-based, inclusive; at most 1000 rows and 40 000 cells, else 400): `{sheet, r1.., rev, styles:[{b,i,u,x,c,f,h,v,w,z,n,d}], cells:[[r,c,text,kind,style,link?]], merges}`; `text` is the displayed text (the app's engine, number formats and their colours applied, at most 1000 chars); `kind` n/s/b/e; `style` is 0 (default) or index+1 into `styles`; merged areas touching the window come with their anchor cell |
+| `GET /api/items/{id}/sheet/cell?sheet=&r=&c=` | one cell for the formula bar: `{r, c, input, text, formula, hidden_formula, note?, link?}`; a cell inside a merge answers as its anchor; the formula is shown to viewers as in the app, except `hide_formula` cells of a protected sheet |
+| `GET /api/items/{id}/sheet/csv?sheet=` | the sheet as CSV (displayed values; text that spreadsheets would run as a formula starts with `'`), `attachment`, sandboxed |
+
+**Current state.** The workbook is the saved version plus the live log: exactly what a joining client builds
+(`assign_ids` from `live_state.sheets`, `join_workbook` with the version's live-state blob, `sort_sheets`), then
+every committed batch after `live_state.seq` applied with `apply_ops`, then `recalc()`. Read-only and without side
+effects (`live_state` / `live_head` / `live_ops_after`, never `live_base`). Opening counts as use (Recent).
+
+**Limits and safety** (`sheetview` + `server/src/sheetweb.rs`): files above 60 MB, archives that would unpack to
+more than 120 MB or hold more than 4000 parts (checked on the zip directory before reading) and workbooks of
+more than 3 million cells are refused (413 `too_large`); other formats 415 `unsupported`; damaged files 422
+`unreadable`; each message names Download. A conversion runs on a thread of its own (128 MB stack, panics caught)
+for at most 25 s (504 `timeout`), at most 3 at once (the rest wait up to 10 s, then 503 `busy`); the thread's
+slot is given back only when it really ends, so a hanging file can occupy at most 3 slots, never the server.
+Results (success or failure) are cached per (item, version, live seq), 5 books, 10 minutes unused, single-flight;
+older versions of the same item are dropped. Permissions are checked on every request, cached book or not
+(revoking access is immediate). Windows are cut from the cached book (no re-reading the file). Not shown yet
+(documented gaps): conditional formatting, charts, images, sparklines, data-validation lists, rich-text runs
+(shown plain), column auto-fit, merged-cell borders per edge, protection beyond hidden formulas.
+
+**Viewer UI** (`sheet.js`, no framework): touch-first. A canvas draws the visible cells and follows a native
+scroller (iOS momentum, scroll bars, keyboard), so sheets of a million rows scroll smoothly: only the windows in
+view (blocks of 100 rows x 20 columns, at most 4 requests at once, about 70-90 blocks kept) are fetched, and a
+spacer larger than 8 million px scrolls proportionally. Sticky row/column headers, frozen panes, hidden
+rows/columns, merges, widths/heights, fills, text colours (contrast-corrected in dark mode), bold/italic/
+underline/strike, alignment (numbers right, text left, booleans/errors centred), wrap, indent, borders, text
+overflowing into empty neighbours, numbers that don't fit shrink to 70% and then show `#`. Tap a cell: address
+and value/formula in the bar (tap the bar to expand); arrow keys, PageUp/Down on desktop. Sheet tabs along the
+bottom (44 px targets, tab colours), A-/A+ and pinch (touch events; 0.5x-3x), `viewport-fit=cover` with safe-area
+insets, 16 px inputs (no Safari zoom), landscape and desktop, dark mode follows the system. The page polls the
+revision every 10 s while visible and reloads what is in view when it changes. All cell text is painted on the
+canvas after removing bidi embedding/override/isolate controls; the bar shows them as a visible mark; names are
+`<bdi>`.
+
+**Live editing in the browser (W2).** Approach (b), a server-side bridge (DECISIONS W-7). `POST
+/api/items/{id}/live-ticket` (cookie + `X-FO-CSRF`) gives a one-minute single-use ticket; `GET
+/api/items/{id}/web-live?ticket=` upgrades to a same-origin WebSocket (the cookie alone never opens it; 256 KB
+messages). For each such connection the server runs a headless live client (`sheetview::bridge::Bridge`: the
+workbook in the app's model, `cosync::client::Session`, the formula engine) that joins the document's session
+inside the process through `live::run` (made generic over its socket; an in-memory socket pair stands in for the
+WebSocket). Everything the hub does for the app therefore applies unchanged: role checks on every batch, live role
+changes (`role`) and revocation (`revoked`) pushed to the browser, 30 batches/s limit, presence, the merge/OT
+rules, and snapshots (the bridge answers the server's snapshot request with the workbook + lossless live state, so
+browser-only editing still produces versions). Browser to bridge (JSON, `t`): `meta`, `win {id,sheet,r1,c1,r2,c2}`,
+`cell {id,sheet,r,c}`, `edit {sheet,r,c,text}` (typed text parsed like the app: numbers, dates, percentages with
+their implied format, `=formulas`, rejected with `rejected` when a formula can't be read), `clear {sheet,r1..c2}`,
+`fmt {sheet,r1..c2,set:{b,i,u,x,fill,color,h,nf}}`, `undo`, `redo` (per person: only the bridge's own edits),
+`presence {sheet,r,c,editing}`. Bridge to browser: `meta`, `win`, `cell` (replies), `hello {role,you}`, `peers`
+(id, name, user, colour slot, editor, agent, presence cell/selection/editing, sheet index), `changed {rev,sheets}`
+(the browser refetches what is in view), `status {state: saved|saving|offline}`, `role`, `revoked`, `rejected`,
+`reload`, `failed`, `closed`. Windows and cells come from the bridge's workbook, so the browser sees its own and
+other people's edits (and recalculated formulas) at once. UI: the formula bar is a 16 px input for editors (tap
+the bar, type, check mark = enter, cross = cancel; Enter, Tab, Escape on a keyboard; a printable key on the grid
+starts typing), undo/redo in the header, B / I / highlight / `#,##0.00` / Clear buttons for the selected cell, a
+"Saved / Saving... / Offline" indicator, other people's cursors with their names in the app's colours (a dashed box
+while they type; agents are marked "(agent)"), a banner when the role changes. A lost connection reconnects (2, 4,
+8, 16 s) and reloads the workbook; edits are refused while offline (no offline journal in the browser) and the
+`reload` case (the log was cut short while connected) also reconnects from the latest version. Viewers get the same
+live view without edit controls. Not in W2/W3 yet: insert/delete rows and columns, add/rename sheet, range
+selection by touch, copy/paste, column widths; xlsx/CSV export of the current state exists (menu, W1 routes).
+
+**CLI / MCP parity.** The headless client already covers Sheets for agents: `fsheets` (CLI) and its MCP server read
+and edit through the live protocol (agents/README.md). The viewer's JSON is also usable by scripts
+(`curl` with a bearer token against the routes above), which gives agents a rendered-values read without the
+live engine; no new CLI or MCP verb is needed for W1.
 
 ### Open in FreedomSheets
 
