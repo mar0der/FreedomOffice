@@ -175,9 +175,21 @@ pub struct ServerEntry {
     pub error: Option<String>,
     /// Who is signed in, with their organisations (once `/api/me` answered).
     pub me: Option<Me>,
+    /// An `/api/me` request is on its way (at most one per account).
+    checking: bool,
+    /// When `/api/me` last answered (throttles the re-reads of File > Account).
+    checked: Option<std::time::Instant>,
 }
 
+/// File > Account re-reads an account's organisations at most this often.
+const ACCOUNT_RECHECK: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl ServerEntry {
+    fn new(session: Arc<ServerSession>, me: Option<Me>) -> Self {
+        let checked = me.is_some().then(std::time::Instant::now);
+        ServerEntry { session, error: None, me, checking: false, checked }
+    }
+
     fn orgs(&self) -> &[OrgInfo] {
         self.me.as_ref().map_or(&[], |m| m.orgs.as_slice())
     }
@@ -272,6 +284,9 @@ pub struct CloudState {
     pub add_server: AddServer,
     pub versions: Option<VersionsState>,
     pub password: Option<PasswordForm>,
+    /// The frame the Open / Save As places were last drawn in (to notice when they are shown
+    /// again).
+    places_frame: Option<u64>,
     /// Tests: local copies of cloud documents go here instead of the user's data folder
     /// (removed with the app).
     #[cfg(test)]
@@ -329,6 +344,7 @@ impl Default for CloudState {
             add_server: AddServer::default(),
             versions: None,
             password: None,
+            places_frame: None,
             #[cfg(test)]
             cache_override: None,
         }
@@ -470,7 +486,9 @@ impl App {
         for account in server::load_accounts() {
             let session = Arc::new(ServerSession::new(account, Box::new(cloud::Http::new())));
             self.server_check(&session);
-            self.cloud.servers.push(ServerEntry { session, error: None, me: None });
+            let mut e = ServerEntry::new(session, None);
+            e.checking = true;
+            self.cloud.servers.push(e);
         }
     }
 
@@ -478,6 +496,49 @@ impl App {
     fn server_check(&self, session: &Arc<ServerSession>) {
         let s = session.clone();
         self.cloud_spawn(move || Event::ServerChecked { url: s.account.url.clone(), username: s.account.username.clone(), result: s.me_info() });
+    }
+
+    /// Re-reads the organisations of the account on `url` in the background (never blocks the
+    /// window; one request per account at a time). `throttle`: not if it answered in the last
+    /// 30 s. Organisations that are gone lose their place, new ones get one (see
+    /// `Event::ServerChecked`).
+    pub(super) fn server_refresh_orgs(&mut self, url: &str, throttle: bool) {
+        let Some(e) = self.cloud.servers.iter_mut().find(|e| e.session.account.url == url) else { return };
+        if e.checking || e.error.is_some() || (throttle && e.checked.is_some_and(|t| t.elapsed() < ACCOUNT_RECHECK)) {
+            return;
+        }
+        e.checking = true;
+        let s = e.session.clone();
+        self.server_check(&s);
+    }
+
+    /// Account `i` has a new list of organisations (it had `old`). Open / Save As places keep
+    /// pointing at the same organisation; one that is gone falls back to My files, with a
+    /// short message. A new organisation simply gets its place.
+    fn server_orgs_changed(&mut self, i: usize, old: &[OrgInfo]) {
+        let new = self.cloud.servers[i].orgs().to_vec();
+        let gone: Vec<&str> = old.iter().filter(|o| !new.iter().any(|n| n.id == o.id)).map(|o| o.name.as_str()).collect();
+        let remap = |p: Place| match p {
+            Place::Server(j, ServerView::Org(k)) if j == i => {
+                let k = match old.get(k) {
+                    Some(o) => new.iter().position(|n| n.id == o.id),
+                    None => (k < new.len()).then_some(k),
+                };
+                Place::Server(i, k.map_or(ServerView::MyFiles, ServerView::Org))
+            }
+            p => p,
+        };
+        self.cloud.open_place = remap(self.cloud.open_place);
+        self.cloud.save_place = remap(self.cloud.save_place);
+        if let Some(r) = self.cloud.browser.root {
+            match remap(r) {
+                Place::Server(_, ServerView::MyFiles) if r != Place::Server(i, ServerView::MyFiles) => self.cloud.browser.root = None,
+                p => self.cloud.browser.root = Some(p),
+            }
+        }
+        if !gone.is_empty() {
+            self.status = Some(format!("You're no longer in {}.", gone.join(", ")));
+        }
     }
 
     /// The server asked one of the accounts for a new password: ask the person.
@@ -591,6 +652,13 @@ impl App {
                         Err(e) => {
                             self.cloud.browser.items.clear();
                             self.cloud.browser.error = Some(e);
+                            // Refused or not found (removed from an organisation, unshared):
+                            // the account's organisations may have changed.
+                            if let Some(Place::Server(i, _)) = self.cloud.browser.root {
+                                if let Some(url) = self.cloud.servers.get(i).map(|e| e.session.account.url.clone()) {
+                                    self.server_refresh_orgs(&url, false);
+                                }
+                            }
                         }
                     }
                 }
@@ -663,7 +731,7 @@ impl App {
                     Ok((session, me)) => {
                         let host = session.host();
                         let (url, username) = (session.account.url.clone(), session.account.username.clone());
-                        let entry = ServerEntry { session, error: None, me };
+                        let entry = ServerEntry::new(session, me);
                         let i = match self.cloud.servers.iter().position(|e| e.session.account.url == url && e.session.account.username == username) {
                             Some(i) => {
                                 self.cloud.servers[i] = entry;
@@ -694,23 +762,15 @@ impl App {
                 }
             }
             Event::ServerChecked { url, username, result } => {
-                let Some(entry) = self.cloud.servers.iter_mut().find(|x| x.session.account.url == url && x.session.account.username == username) else { return };
+                let Some(i) = self.cloud.servers.iter().position(|x| x.session.account.url == url && x.session.account.username == username) else { return };
+                let entry = &mut self.cloud.servers[i];
+                entry.checking = false;
                 match result {
                     Ok(me) => {
-                        // A view of an organisation that is gone shows My files.
-                        let n = me.orgs.len();
-                        let changed = entry.me.as_ref().is_some_and(|m| m.orgs != me.orgs);
-                        entry.me = Some(me);
+                        entry.checked = Some(std::time::Instant::now());
                         entry.error = None;
-                        for p in [&mut self.cloud.open_place, &mut self.cloud.save_place] {
-                            if let Place::Server(i, ServerView::Org(k)) = *p
-                                && self.cloud.servers.get(i).is_some_and(|e| e.session.account.url == url)
-                                && (k >= n || changed)
-                            {
-                                *p = Place::Server(i, ServerView::MyFiles);
-                                self.cloud.browser.root = None;
-                            }
-                        }
+                        let old = entry.me.replace(me).map(|m| m.orgs).unwrap_or_default();
+                        self.server_orgs_changed(i, &old);
                     }
                     // Offline is fine (the token is checked again on use); a rejected token isn't.
                     Err(e) if e.contains("expired or was revoked") => entry.error = Some(e),
@@ -998,6 +1058,16 @@ impl App {
         }
     }
 
+    /// Where "Save a copy" of a server workbook goes: My files of the same server account
+    /// (always writable, unlike the folder the person may have lost access to).
+    pub(super) fn copy_place(&self) -> Option<Place> {
+        let url = match self.cloud.doc.as_ref().map(|d| &d.provider) {
+            Some(Provider::FreedomServer(url)) => url.clone(),
+            _ => self.live.as_ref()?.url.clone(),
+        };
+        self.server_index(&url).map(|i| Place::Server(i, ServerView::MyFiles))
+    }
+
     /// Ctrl+S on a cloud document: write the local copy, then upload in the background.
     pub fn cloud_save(&mut self) -> bool {
         let Some(doc) = self.cloud.doc.clone() else { return false };
@@ -1237,11 +1307,28 @@ impl App {
                 }
             }
         });
+        // Shown again (File > Open or Save As was closed, or this is the first time): the
+        // account's organisations are re-read and the folder shown is listed again, so neither
+        // is stale (an organisation left or joined meanwhile, files changed).
+        let frame = ui.ctx().cumulative_frame_nr();
+        let reopened = self.cloud.places_frame.is_none_or(|f| f + 1 < frame);
+        self.cloud.places_frame = Some(frame);
         if let Some(p) = picked {
             if save_as { self.cloud.save_place = p } else { self.cloud.open_place = p }
             self.cloud.browser.root = None;
         }
         let place = if save_as { self.cloud.save_place } else { self.cloud.open_place };
+        if let Place::Server(i, _) = place
+            && (reopened || picked.is_some())
+            && let Some(url) = self.cloud.servers.get(i).map(|e| e.session.account.url.clone())
+        {
+            self.server_refresh_orgs(&url, false);
+            if reopened && self.cloud.browser.root == Some(place) && !self.cloud.browser.loading {
+                if let Some((_, t)) = self.cloud.browser.crumbs.last().cloned() {
+                    self.cloud_navigate(t, String::new(), false);
+                }
+            }
+        }
         if place == Place::Local {
             return true;
         }
@@ -1659,6 +1746,11 @@ impl App {
         let mut sign_out = None;
         let mut again = None;
         let mut password = None;
+        // The organisations listed here are re-read now and then while the page is shown.
+        let urls: Vec<String> = self.cloud.servers.iter().map(|e| e.session.account.url.clone()).collect();
+        for url in urls {
+            self.server_refresh_orgs(&url, true);
+        }
         for (i, e) in self.cloud.servers.iter().enumerate() {
             let u = server_user(&e.session);
             ui.horizontal(|ui| {
@@ -2661,7 +2753,7 @@ impl App {
             self.cloud.cache_override = Some(TestDir::new("fo-sheets-cache"));
         }
         let me = session.me_info().ok();
-        self.cloud.servers.push(ServerEntry { session, error: None, me });
+        self.cloud.servers.push(ServerEntry::new(session, me));
     }
 
     /// No saved accounts or sign-ins are read from this PC (tests).

@@ -895,7 +895,12 @@ impl App {
     /// Access to the workbook ended: no reconnecting; the window keeps the workbook, read-only,
     /// and offers to save a copy (with any changes the server didn't get).
     fn live_revoked(&mut self, reason: &str) {
+        let url = self.live.as_ref().map(|l| l.url.clone());
         self.live_ended(access_removed(reason));
+        // Often because the person left an organisation: its place in Open / Save As goes.
+        if let Some(url) = url {
+            self.server_refresh_orgs(&url, false);
+        }
     }
 
     /// The session can't go on (access removed, signed out): no reconnecting; the window keeps
@@ -973,6 +978,10 @@ impl App {
     /// this window, including changes the server refused or never got.
     pub(super) fn live_save_copy(&mut self) {
         self.cloud.save_name = format!("{} (copy).xlsx", self.wb.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "Book1".into()));
+        // On the same server account, in My files (where the person can always save).
+        if let Some(p) = self.copy_place() {
+            self.cloud.save_place = p;
+        }
         self.cloud.browser.root = None;
         self.backstage = Some(super::chrome::Backstage::SaveAs);
     }

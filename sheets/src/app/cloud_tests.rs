@@ -311,3 +311,142 @@ fn edits_during_a_save_as_upload_are_not_lost() {
     drop(t.server);
     let _ = std::fs::remove_dir_all(&t.dir);
 }
+
+/// A request to the test server's API as `who` (or nobody); status and JSON body.
+fn api(t: &Setup, who: Option<&ServerSession>, method: &'static str, path: &str, body: Option<serde_json::Value>) -> (u16, serde_json::Value) {
+    use crate::cloud::Transport;
+    let mut req = crate::cloud::Request::new(method, format!("{}{path}", t.url));
+    if let Some(s) = who {
+        req = req.header("Authorization", format!("Bearer {}", s.token()));
+    }
+    if let Some(b) = &body {
+        req = req.json(b);
+    }
+    let r = Http::new().send(req).unwrap();
+    (r.status, serde_json::from_slice(&r.body).unwrap_or_default())
+}
+
+/// Ann (owner) takes Ben out of Lab Team.
+fn remove_ben(t: &Setup, ann: &ServerSession) {
+    assert_eq!(api(t, Some(ann), "DELETE", &format!("/api/orgs/{}/members/ben", t.org_id), None).0, 204);
+}
+
+/// Ann invites Ben back; he accepts with his existing account (as on the invite page).
+fn readd_ben(t: &Setup, ann: &ServerSession) {
+    let (st, v) = api(t, Some(ann), "POST", &format!("/api/orgs/{}/invites", t.org_id), Some(serde_json::json!({ "email": "" })));
+    assert_eq!(st, 201, "{v}");
+    let token = v["url"].as_str().unwrap().rsplit('/').next().unwrap().to_string();
+    let (st, v) = api(t, None, "POST", &format!("/api/invites/{token}"), Some(serde_json::json!({ "existing": true, "username": "ben", "password": PW })));
+    assert_eq!(st, 201, "{v}");
+}
+
+fn org_names(app: &App) -> Vec<String> {
+    app.cloud.servers[0].orgs().iter().map(|o| o.name.clone()).collect()
+}
+
+/// Open / Save As show the organisations the account is in now: one Ben was taken out of
+/// goes when the browser is shown again (falling back to My files, with a message), and
+/// comes back after he accepts an invite, without restarting.
+#[test]
+fn organisations_follow_membership_changes_when_the_browser_opens() {
+    let t = setup();
+    let (_actx, _a, ann) = client(&t, "ann", PW);
+    ann.upload_new(&t.org_root, "Team.xlsx", &std::fs::read(save_sample(&t.dir)).unwrap(), "fail").unwrap();
+    let (ctx, mut ben, _) = client(&t, "ben", PW);
+    let place = Place::Server(0, ServerView::Org(0));
+    ben.cloud.open_place = place;
+    ben.backstage = Some(Backstage::Open);
+    frame(&ctx, &mut ben, vec![]);
+    until(&ctx, &mut ben, "the org folder is listed", |a| a.cloud.browser.root == Some(place) && !a.cloud.browser.loading && a.cloud.servers[0].checked.is_some() && !a.cloud.servers[0].checking);
+    assert_eq!(ben.cloud.browser.items.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(), ["Team.xlsx"]);
+    ben.backstage = None;
+    frame(&ctx, &mut ben, vec![]);
+
+    remove_ben(&t, &ann);
+    ben.backstage = Some(Backstage::Open);
+    frame(&ctx, &mut ben, vec![]);
+    until(&ctx, &mut ben, "Lab Team is gone", |a| org_names(a).is_empty());
+    assert_eq!(ben.cloud.open_place, Place::Server(0, ServerView::MyFiles), "back to My files");
+    assert_eq!(ben.status.as_deref(), Some("You're no longer in Lab Team."));
+    until(&ctx, &mut ben, "My files listed", |a| a.cloud.browser.root == Some(Place::Server(0, ServerView::MyFiles)) && !a.cloud.browser.loading);
+    assert!(ben.cloud.browser.error.is_none(), "{:?}", ben.cloud.browser.error);
+
+    // Back in: the place returns when Open is shown again.
+    readd_ben(&t, &ann);
+    ben.backstage = None;
+    frame(&ctx, &mut ben, vec![]);
+    ben.backstage = Some(Backstage::SaveAs);
+    ben.cloud.save_place = Place::Server(0, ServerView::MyFiles);
+    frame(&ctx, &mut ben, vec![]);
+    until(&ctx, &mut ben, "Lab Team is back", |a| org_names(a) == ["Lab Team"]);
+
+    // A listing that fails (the folder was shown before the change) re-reads the account.
+    ben.cloud.save_place = place;
+    until(&ctx, &mut ben, "the org folder is listed", |a| a.cloud.browser.root == Some(place) && !a.cloud.browser.loading);
+    remove_ben(&t, &ann);
+    let crumb = ben.cloud.browser.crumbs.last().unwrap().1.clone();
+    ben.cloud_navigate(crumb, String::new(), false);
+    until(&ctx, &mut ben, "Lab Team is gone again", |a| org_names(a).is_empty() && a.cloud.save_place == Place::Server(0, ServerView::MyFiles));
+    until(&ctx, &mut ben, "My files listed", |a| a.cloud.browser.root == Some(Place::Server(0, ServerView::MyFiles)) && !a.cloud.browser.loading);
+
+    // File > Account re-reads too, but at most every 30 s.
+    readd_ben(&t, &ann);
+    ben.backstage = Some(Backstage::Account);
+    for _ in 0..5 {
+        frame(&ctx, &mut ben, vec![]);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(org_names(&ben).is_empty() && !ben.cloud.servers[0].checking, "throttled");
+    ben.cloud.servers[0].checked = Some(Instant::now() - Duration::from_secs(31));
+    until(&ctx, &mut ben, "File > Account shows Lab Team", |a| org_names(a) == ["Lab Team"]);
+    drop(t.server);
+    let _ = std::fs::remove_dir_all(&t.dir);
+}
+
+/// Taken out of the organisation while a workbook of it is open live: the session ends
+/// (revoked) and the organisation's place goes at once; Save a copy offers My files on the
+/// same server; after an invite is accepted, the place is back without a restart.
+#[test]
+fn a_revoked_live_session_refreshes_the_organisations() {
+    let t = setup();
+    let (_actx, _a, ann) = client(&t, "ann", PW);
+    ann.upload_new(&t.org_root, "Team.xlsx", &std::fs::read(save_sample(&t.dir)).unwrap(), "fail").unwrap();
+    let (ctx, mut ben, _) = client(&t, "ben", PW);
+    let place = Place::Server(0, ServerView::Org(0));
+    ben.cloud.open_place = place;
+    ben.backstage = Some(Backstage::Open);
+    frame(&ctx, &mut ben, vec![]);
+    until(&ctx, &mut ben, "listed", |a| a.cloud.browser.root == Some(place) && !a.cloud.browser.loading && !a.cloud.servers[0].checking);
+    let item = ben.cloud.browser.items[0].clone();
+    ben.cloud_open_item(item);
+    until(&ctx, &mut ben, "opened", |a| a.cloud.doc.is_some());
+    until(&ctx, &mut ben, "ben is live", |a| a.live_quiet());
+    ben.status = Some("PO Client B joined.".into());
+    assert!(ben.cloud_share_enabled());
+
+    remove_ben(&t, &ann);
+    until(&ctx, &mut ben, "the session ended", |a| a.live_stopped().0.is_some());
+    until(&ctx, &mut ben, "Lab Team is gone", |a| org_names(a).is_empty());
+    assert_eq!(ben.cloud.open_place, Place::Server(0, ServerView::MyFiles));
+    assert!(ben.cloud_share_off().is_some_and(|t| t.starts_with("Not connected")));
+    // Save a copy: Save As on the same account's My files, not This PC.
+    ben.cloud.save_place = Place::Local;
+    ben.live_save_copy();
+    assert!(ben.backstage == Some(Backstage::SaveAs));
+    assert_eq!(ben.cloud.save_place, Place::Server(0, ServerView::MyFiles));
+    frame(&ctx, &mut ben, vec![]);
+    until(&ctx, &mut ben, "My files listed", |a| a.cloud.browser.root == Some(Place::Server(0, ServerView::MyFiles)) && !a.cloud.browser.loading);
+
+    readd_ben(&t, &ann);
+    ben.backstage = None;
+    frame(&ctx, &mut ben, vec![]);
+    ben.backstage = Some(Backstage::Open);
+    frame(&ctx, &mut ben, vec![]);
+    until(&ctx, &mut ben, "Lab Team is back", |a| org_names(a) == ["Lab Team"]);
+    // A New workbook starts with a clean status bar.
+    ben.status = Some("PO Client B joined.".into());
+    ben.run_pending(super::super::Pending::New);
+    assert!(ben.status.is_none() && ben.live.is_none());
+    drop(t.server);
+    let _ = std::fs::remove_dir_all(&t.dir);
+}

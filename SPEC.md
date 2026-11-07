@@ -242,6 +242,15 @@ Not yet: other participants aren't told that someone's role changed (their peer 
     workbook" (still live); with unsent changes, the session ends and the bar offers Save a copy (the
     same for 4403 and a viewer Welcome). `role: edit` → editable again. `revoked` / 4401 (or 404 on
     reconnect) → no reconnect, "Your access to this file was removed (<reason>)", read-only, Save a copy; a 401 on reconnect does the same with "Sign in again". A cell being typed in counts as an unsent change in all of these.
+  - The organisations (`/api/me`) are re-read in the background (one request per account at a
+    time, never blocking the window) at startup, after a password change, when File > Open / Save As
+    is shown (and the folder shown is listed again), when a server place is picked, when a server
+    listing fails, when a live session ends with `revoked` / 4401 / 404, and while File > Account is
+    shown (at most every 30 s per account). Places follow the organisation (by id); one that is gone
+    falls back to My files with "You're no longer in <org>."; a new one gets its place at once.
+  - "Save a copy…" (after access was lost) opens Save As on the same server account's My files.
+  - Share is greyed out for viewers ("Only editors can share") and once the session ended ("Not
+    connected…"). New and Open clear the status bar (no "<name> joined." left from the last file).
   - Save As to a server joins the new file's live session at once (if the window changed during the
     upload, those changes are saved to the new file instead and it joins live when reopened).
 
