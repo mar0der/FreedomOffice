@@ -32,12 +32,22 @@
     cells: new Map(), // key -> {t, k, st, l}
     blocks: new Map(), // "sheet:br:bc" -> {keys, used, loading}
     sel: { r: 0, c: 0 },
+    ext: null, // the moving corner while a range is extended from the active cell
+    rng: { r1: 0, c1: 0, r2: 0, c2: 0 },
+    kind: 'cell', // cell | rows | cols | all
+    handles: false,
+    fillPrev: null,
+    focusUid: null,
+    charts: new Map(), // sheet index -> charts with their data
+    imgs: new Map(),
+    queue: [], // edits made while offline (memory only)
+    queueBytes: 0,
     dark: false,
     inflight: 0,
     drawQueued: false,
     cellInfo: new Map(), // "rev:sheet:r:c" -> info
     fetchSeq: 0,
-    live: { ws: null, state: 'off', pending: new Map(), seq: 0, retry: 0, timer: 0, role: 'view', peers: [], me: null, save: '', ready: false },
+    live: { ws: null, state: 'off', pending: new Map(), seq: 0, retry: 0, timer: 0, role: 'view', peers: [], me: null, save: '', ready: false, everReady: false },
     palette: ['#0078D4', '#C239B3', '#00A36C', '#CA5010', '#8764B8', '#E3008C', '#038387', '#986F0B'],
   };
 
@@ -269,10 +279,15 @@
     } else {
       st.textContent = S.meta && S.meta.live ? 'View \u00b7 live' : 'View only';
     }
+    if (S.queue.length) {
+      st.textContent = `Offline \u00b7 ${S.queue.length} waiting`;
+      st.classList.add('offline');
+    }
     updateEditUi();
   }
 
   function buildTabs() {
+    if (ui().buildTabs) return ui().buildTabs();
     const nav = $('tabs');
     nav.replaceChildren();
     nav.setAttribute('role', 'tablist');
@@ -301,18 +316,23 @@
     for (const [a, b] of sh.hidden_cols) for (let c = a; c <= b && c < nc; c++) cw[c] = 0;
     for (const [a, b] of sh.hidden_rows) for (let r = a; r <= b && r < nr; r++) rh[r] = 0;
     const colX = new Float64Array(nc + 1);
-    for (let c = 0; c < nc; c++) colX[c + 1] = colX[c] + cw[c];
     const rowY = new Float64Array(nr + 1);
-    for (let r = 0; r < nr; r++) rowY[r + 1] = rowY[r] + rh[r];
     const fr = clamp(sh.freeze[0], 0, Math.min(nr, 200));
     const fc = clamp(sh.freeze[1], 0, Math.min(nc, 50));
     // Merged areas: by anchor, and a list for drawing.
     const merges = sh.merges.filter((m) => m[0] < nr && m[1] < nc);
     const anchor = new Map();
     for (const m of merges) anchor.set(m[0] * KEYC + m[1], m);
-    L = { rev: S.rev, nc, nr, colX, rowY, fr, fc, merges, anchor, sh };
+    L = { rev: S.rev, nc, nr, colX, rowY, cw, rh, fr, fc, merges, anchor, sh };
+    rebuildOffsets(L);
     S.layouts.set(i, L);
     return L;
+  }
+
+  /** Column x / row y offsets from the widths and heights. */
+  function rebuildOffsets(L) {
+    for (let c = 0; c < L.nc; c++) L.colX[c + 1] = L.colX[c] + L.cw[c];
+    for (let r = 0; r < L.nr; r++) L.rowY[r + 1] = L.rowY[r] + L.rh[r];
   }
 
   /** Largest index i with off[i] <= u (off has n + 1 entries). */
@@ -399,6 +419,10 @@
     if (!S.meta.sheets[i]) return;
     S.cur = i;
     S.sel = { r: 0, c: 0 };
+    S.rng = { r1: 0, c1: 0, r2: 0, c2: 0 };
+    S.kind = 'cell';
+    S.ext = null;
+    S.handles = false;
     for (const b of $('tabs').children) b.setAttribute('aria-selected', 'false');
     const visible = S.meta.sheets.map((s, k) => [s, k]).filter(([s]) => !s.hidden);
     const pos = visible.findIndex(([, k]) => k === i);
@@ -416,6 +440,7 @@
     renderBar();
     requestDraw();
     ensureBlocks();
+    loadCharts();
     sc.focus({ preventScroll: true });
   }
 
@@ -553,6 +578,7 @@
           absorb(b, w);
           b.loading = false;
           requestDraw();
+          if (ui().onSelect) ui().onSelect();
         })
         .catch((e) => {
           S.blocks.delete(k);
@@ -571,9 +597,9 @@
   function absorb(b, w) {
     const styles = w.styles.map(prepStyle);
     for (const row of w.cells) {
-      const [r, c, t, k, si, link] = row;
+      const [r, c, t, k, si, link, extra] = row;
       const key = r * KEYC + c;
-      S.cells.set(key, { t: stripBidi(t), k, st: si ? styles[si - 1] : null, l: !!link });
+      S.cells.set(key, { t: stripBidi(t), k, st: si ? styles[si - 1] : null, l: !!link, bar: extra && extra.bar ? extra.bar : null, note: !!(extra && extra.note) });
       b.keys.push(key);
     }
   }
@@ -668,6 +694,7 @@
       }
       ctx.stroke();
     }
+    positionOverlays();
   }
 
   const px = (p, L, c, z) => p.ox + (L.colX[c] - p.ux) * z;
@@ -759,22 +786,86 @@
       const ch = (L.rowY[m[2] + 1] - L.rowY[m[0]]) * z;
       drawCell(ctx, L, p, cell, m[0], m[1], px(p, L, m[1], z), py(p, L, m[0], z), cw, ch, P, z);
     }
-    // Selection.
-    const sel = S.sel;
-    const m = L.merges.find((mm) => sel.r >= mm[0] && sel.r <= mm[2] && sel.c >= mm[1] && sel.c <= mm[3]);
-    const [sr1, sc1, sr2, sc2] = m || [sel.r, sel.c, sel.r, sel.c];
-    if (sr2 >= p.ra && sr1 <= p.rb && sc2 >= p.ca && sc1 <= p.cb) {
-      const x = px(p, L, sc1, z);
-      const y = py(p, L, sr1, z);
-      const w = (L.colX[sc2 + 1] - L.colX[sc1]) * z;
-      const h = (L.rowY[sr2 + 1] - L.rowY[sr1]) * z;
+    drawObjects(ctx, L, p, P, z);
+    // Selection: the range shaded, the active cell open.
+    const g = normRange(S.rng);
+    const sr2 = Math.min(g.r2, L.nr - 1);
+    const sc2 = Math.min(g.c2, L.nc - 1);
+    if (sr2 >= p.ra && g.r1 <= p.rb && sc2 >= p.ca && g.c1 <= p.cb) {
+      const x = px(p, L, g.c1, z);
+      const y = py(p, L, g.r1, z);
+      const w = (L.colX[sc2 + 1] - L.colX[g.c1]) * z;
+      const h = (L.rowY[sr2 + 1] - L.rowY[g.r1]) * z;
+      const am = L.merges.find((mm) => S.sel.r >= mm[0] && S.sel.r <= mm[2] && S.sel.c >= mm[1] && S.sel.c <= mm[3]) || [S.sel.r, S.sel.c, S.sel.r, S.sel.c];
+      const ax = px(p, L, am[1], z);
+      const ay = py(p, L, am[0], z);
+      const aw = (L.colX[am[3] + 1] - L.colX[am[1]]) * z;
+      const ah = (L.rowY[am[2] + 1] - L.rowY[am[0]]) * z;
+      const multi = !(am[0] === g.r1 && am[1] === g.c1 && am[2] === sr2 && am[3] === sc2);
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(x, y, w, h);
+      if (multi) ctx.rect(ax, ay, aw, ah);
+      ctx.clip('evenodd');
       ctx.fillStyle = P.selFill;
       ctx.fillRect(x, y, w, h);
+      ctx.restore();
       ctx.strokeStyle = P.sel;
       ctx.lineWidth = 2;
       ctx.strokeRect(x + 1, y + 1, Math.max(0, w - 2), Math.max(0, h - 2));
+      if (multi) {
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(ax + 1.5, ay + 1.5, Math.max(0, aw - 3), Math.max(0, ah - 3));
+      }
+    }
+    if (S.fillPrev) {
+      const f = S.fillPrev;
+      const x = px(p, L, f.c1, z);
+      const y = py(p, L, f.r1, z);
+      ctx.save();
+      ctx.setLineDash([5, 4]);
+      ctx.strokeStyle = P.sel;
+      ctx.lineWidth = 2;
+      ctx.strokeRect(x + 1, y + 1, (L.colX[f.c2 + 1] - L.colX[f.c1]) * z - 2, (L.rowY[f.r2 + 1] - L.rowY[f.r1]) * z - 2);
+      ctx.restore();
     }
     drawPeers(ctx, L, p, z);
+  }
+
+  /** Pictures and charts floating over the cells of a pane. */
+  function drawObjects(ctx, L, p, P, z) {
+    for (const im of L.sh.images || []) {
+      if (im.c >= L.nc || im.r >= L.nr) continue;
+      const x = px(p, L, im.c, z) + im.dx * z;
+      const y = py(p, L, im.r, z) + im.dy * z;
+      const w = im.w * z;
+      const h = im.h * z;
+      if (x > p.x + p.w || y > p.y + p.h || x + w < p.x || y + h < p.y) continue;
+      const e = pictureFor(S.cur, im);
+      if (e.ok) {
+        ctx.drawImage(e.img, x, y, w, h);
+      } else {
+        ctx.fillStyle = P.hbg;
+        ctx.fillRect(x, y, w, h);
+        ctx.strokeStyle = P.hline;
+        ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
+        ctx.fillStyle = P.hfg;
+        ctx.font = `${12 * z}px system-ui, sans-serif`;
+        ctx.fillText(e.bad ? 'Picture not available' : 'Picture', x + 8, y + 18 * z);
+      }
+    }
+    const charts = S.charts.get(S.cur);
+    if (charts && ui().drawChart) {
+      for (const ch of charts) {
+        if (ch.c >= L.nc || ch.r >= L.nr) continue;
+        const x = px(p, L, ch.c, z) + ch.dx * z;
+        const y = py(p, L, ch.r, z) + ch.dy * z;
+        const w = ch.w * z;
+        const h = ch.h * z;
+        if (x > p.x + p.w || y > p.y + p.h || x + w < p.x || y + h < p.y) continue;
+        ui().drawChart(ctx, ch, x, y, w, h, P, z);
+      }
+    }
   }
 
   /** Other people's cursors: a coloured box on their cell with their name on a flag. */
@@ -784,7 +875,13 @@
       if (!pr || pr.sheet !== S.cur || (S.live.me && q.id === S.live.me.id)) continue;
       if (pr.r >= L.nr || pr.c >= L.nc) continue;
       const m = L.merges.find((mm) => pr.r >= mm[0] && pr.r <= mm[2] && pr.c >= mm[1] && pr.c <= mm[3]);
-      const [r1, c1, r2, c2] = m || [pr.r, pr.c, pr.r, pr.c];
+      let [r1, c1, r2, c2] = m || [pr.r, pr.c, pr.r, pr.c];
+      if (pr.sel && pr.sel.length === 4) {
+        r1 = Math.min(pr.sel[0], L.nr - 1);
+        c1 = Math.min(pr.sel[1], L.nc - 1);
+        r2 = Math.min(pr.sel[2], L.nr - 1);
+        c2 = Math.min(pr.sel[3], L.nc - 1);
+      }
       if (r2 < p.ra || r1 > p.rb || c2 < p.ca || c1 > p.cb) continue;
       const x = px(p, L, c1, z);
       const y = py(p, L, r1, z);
@@ -840,6 +937,29 @@
 
   function drawCell(ctx, L, p, cell, r, c, x, y, w, h, P, z) {
     const st = cell.st;
+    if (cell.bar) {
+      const [a, b, col, grad] = cell.bar;
+      const bx = x + 2 + a * (w - 4);
+      const bw = Math.max(1, (b - a) * (w - 4));
+      if (grad) {
+        const g = ctx.createLinearGradient(bx, 0, bx + bw, 0);
+        g.addColorStop(0, `${col}cc`);
+        g.addColorStop(1, `${col}33`);
+        ctx.fillStyle = g;
+      } else {
+        ctx.fillStyle = `${col}cc`;
+      }
+      ctx.fillRect(bx, y + 3, bw, Math.max(1, h - 6));
+    }
+    if (cell.note) {
+      ctx.fillStyle = '#d93025';
+      ctx.beginPath();
+      ctx.moveTo(x + w - 7, y);
+      ctx.lineTo(x + w, y);
+      ctx.lineTo(x + w, y + 7);
+      ctx.closePath();
+      ctx.fill();
+    }
     // Borders first (they sit on the cell edge).
     if (st && st.d) {
       const bc = S.dark ? '#c9d1cd' : '#222';
@@ -973,8 +1093,7 @@
     ctx.font = `600 ${hs}px system-ui, -apple-system, sans-serif`;
     ctx.textBaseline = 'middle';
     ctx.textAlign = 'center';
-    const selC = S.sel.c;
-    const selR = S.sel.r;
+    const rg = normRange(S.rng);
     // Column header strip.
     ctx.fillStyle = P.hbg;
     ctx.fillRect(0, 0, geo.vw, HH);
@@ -990,7 +1109,7 @@
         const w = (L.colX[c + 1] - L.colX[c]) * z;
         if (w <= 0) continue;
         const x = px(p, L, c, z);
-        if (c === selC) {
+        if (c >= rg.c1 && c <= rg.c2) {
           ctx.fillStyle = P.hsel;
           ctx.fillRect(x, 0, w, HH);
         }
@@ -1010,7 +1129,7 @@
         const h = (L.rowY[r + 1] - L.rowY[r]) * z;
         if (h <= 0) continue;
         const y = py(p, L, r, z);
-        if (r === selR) {
+        if (r >= rg.r1 && r <= rg.r2) {
           ctx.fillStyle = P.hsel;
           ctx.fillRect(0, y, geo.hw, h);
         }
@@ -1033,34 +1152,139 @@
   }
 
   // ---------------------------------------------------------------------------
-  // Selecting a cell, the formula bar
+  // Selecting cells and ranges, the formula bar
   // ---------------------------------------------------------------------------
 
-  function hit(x, y) {
+  function colAt(x) {
     const L = layoutOf(S.cur);
-    if (x < geo.hw || y < HH) return null;
+    if (x < geo.hw) return -1;
     const z = S.z;
     const sx = geo.hw + geo.fw;
+    const u = x < sx && L.fc > 0 ? (x - geo.hw) / z : L.colX[L.fc] + geo.ox + (x - sx) / z;
+    if (u >= L.colX[L.nc]) return -1;
+    return indexAt(L.colX, L.nc, u);
+  }
+
+  function rowAt(y) {
+    const L = layoutOf(S.cur);
+    if (y < HH) return -1;
+    const z = S.z;
     const sy = HH + geo.fh;
-    let u;
-    let v;
-    if (x < sx && L.fc > 0) u = (x - geo.hw) / z;
-    else u = L.colX[L.fc] + geo.ox + (x - sx) / z;
-    if (y < sy && L.fr > 0) v = (y - HH) / z;
-    else v = L.rowY[L.fr] + geo.oy + (y - sy) / z;
-    const c = indexAt(L.colX, L.nc, u);
-    const r = indexAt(L.rowY, L.nr, v);
-    if (u >= L.colX[L.nc] || v >= L.rowY[L.nr]) return null;
-    return { r, c };
+    const v = y < sy && L.fr > 0 ? (y - HH) / z : L.rowY[L.fr] + geo.oy + (y - sy) / z;
+    if (v >= L.rowY[L.nr]) return -1;
+    return indexAt(L.rowY, L.nr, v);
+  }
+
+  function hit(x, y) {
+    if (x < geo.hw || y < HH) return null;
+    const c = colAt(x);
+    const r = rowAt(y);
+    return c < 0 || r < 0 ? null : { r, c };
+  }
+
+  /** Where a point of the scroller is: a cell, a column or row header, or the corner. */
+  function areaAt(x, y) {
+    if (x < geo.hw && y < HH) return { k: 'corner' };
+    if (y < HH) {
+      const c = colAt(x);
+      return c < 0 ? { k: 'none' } : { k: 'col', c };
+    }
+    if (x < geo.hw) {
+      const r = rowAt(y);
+      return r < 0 ? { k: 'none' } : { k: 'row', r };
+    }
+    const h = hit(x, y);
+    return h ? { k: 'cell', r: h.r, c: h.c } : { k: 'none' };
+  }
+
+  /** Left edge (scroller px) of column c, top edge of row r. */
+  function screenX(c) {
+    const L = layoutOf(S.cur);
+    if (c < L.fc) return geo.hw + L.colX[c] * S.z;
+    return geo.hw + geo.fw + (L.colX[c] - L.colX[L.fc] - geo.ox) * S.z;
+  }
+
+  function screenY(r) {
+    const L = layoutOf(S.cur);
+    if (r < L.fr) return HH + L.rowY[r] * S.z;
+    return HH + geo.fh + (L.rowY[r] - L.rowY[L.fr] - geo.oy) * S.z;
+  }
+
+  const normRange = (g) => ({ r1: Math.min(g.r1, g.r2), c1: Math.min(g.c1, g.c2), r2: Math.max(g.r1, g.r2), c2: Math.max(g.c1, g.c2) });
+
+  /** A range grown to take in every merged area it touches. */
+  function withMerges(g) {
+    const L = layoutOf(S.cur);
+    let { r1, c1, r2, c2 } = normRange(g);
+    for (let again = true, n = 0; again && n < 20; n++) {
+      again = false;
+      for (const m of L.merges) {
+        if (m[2] < r1 || m[0] > r2 || m[3] < c1 || m[1] > c2) continue;
+        if (m[0] < r1 || m[1] < c1 || m[2] > r2 || m[3] > c2) {
+          r1 = Math.min(r1, m[0]);
+          c1 = Math.min(c1, m[1]);
+          r2 = Math.max(r2, m[2]);
+          c2 = Math.max(c2, m[3]);
+          again = true;
+        }
+      }
+    }
+    return { r1, c1, r2, c2 };
+  }
+
+  function afterSelect(scroll) {
+    if (scroll) scrollIntoView((S.ext || S.sel).r, (S.ext || S.sel).c);
+    renderBar();
+    requestDraw();
+    if (ui().onSelect) ui().onSelect();
   }
 
   function select(r, c, scroll) {
     const L = layoutOf(S.cur);
     const m = L.merges.find((mm) => r >= mm[0] && r <= mm[2] && c >= mm[1] && c <= mm[3]);
     S.sel = m ? { r: m[0], c: m[1] } : { r, c };
-    if (scroll) scrollIntoView(S.sel.r, S.sel.c);
-    renderBar();
-    requestDraw();
+    S.ext = null;
+    S.rng = m ? { r1: m[0], c1: m[1], r2: m[2], c2: m[3] } : { r1: r, c1: c, r2: r, c2: c };
+    S.kind = 'cell';
+    S.handles = false;
+    afterSelect(scroll);
+  }
+
+  /** Extends the selection from the active cell to (r, c). */
+  function extendTo(r, c, scroll) {
+    S.ext = { r, c };
+    S.rng = withMerges({ r1: S.sel.r, c1: S.sel.c, r2: r, c2: c });
+    S.kind = 'cell';
+    afterSelect(scroll);
+  }
+
+  function selectLines(rows, a, b) {
+    const lo = Math.min(a, b);
+    const hi = Math.max(a, b);
+    S.sel = rows ? { r: lo, c: 0 } : { r: 0, c: lo };
+    S.ext = null;
+    S.rng = rows ? { r1: lo, c1: 0, r2: hi, c2: MAXC - 1 } : { r1: 0, c1: lo, r2: MAXR - 1, c2: hi };
+    S.kind = rows ? 'rows' : 'cols';
+    S.handles = false;
+    afterSelect(false);
+  }
+
+  function selectAll() {
+    S.sel = { r: 0, c: 0 };
+    S.ext = null;
+    S.rng = { r1: 0, c1: 0, r2: MAXR - 1, c2: MAXC - 1 };
+    S.kind = 'all';
+    S.handles = false;
+    afterSelect(false);
+  }
+
+  /** Sets a rectangular range with the given active cell. */
+  function setRange(r1, c1, r2, c2, scroll) {
+    S.sel = { r: r1, c: c1 };
+    S.ext = null;
+    S.rng = withMerges({ r1, c1, r2, c2 });
+    S.kind = 'cell';
+    afterSelect(scroll);
   }
 
   function scrollIntoView(r, c) {
@@ -1088,12 +1312,19 @@
 
   function renderBar() {
     const { r, c } = S.sel;
-    $('addr').textContent = cellName(r, c);
+    const g = normRange(S.rng);
+    let label = cellName(r, c);
+    if (S.kind === 'cell' && (g.r1 !== g.r2 || g.c1 !== g.c2)) label = `${cellName(g.r1, g.c1)}:${cellName(g.r2, g.c2)}`;
+    else if (S.kind === 'rows') label = g.r1 === g.r2 ? `Row ${g.r1 + 1}` : `${g.r1 + 1}:${g.r2 + 1}`;
+    else if (S.kind === 'cols') label = g.c1 === g.c2 ? `Col ${colName(g.c1)}` : `${colName(g.c1)}:${colName(g.c2)}`;
+    else if (S.kind === 'all') label = 'All';
+    $('addr').textContent = label;
     const fx = $('fx');
     const mine = ++barSeq;
     const cached = S.cell(r, c);
     fx.textContent = cached ? markBidi(cached.input) : '';
     if (S.live.ready && S.live.role === 'edit' && !editing) $('fxin').value = cached ? (cached.hidden_formula ? '' : cached.input) : '';
+    showNote(cached);
     sendPresence();
     if (!cached) {
       // The shown text is a good first answer while the exact input arrives.
@@ -1108,12 +1339,75 @@
           if (mine !== barSeq) return;
           fx.textContent = markBidi(info.hidden_formula ? '(formula hidden)' : info.input || info.text);
           if (S.live.ready && S.live.role === 'edit' && !editing) $('fxin').value = info.hidden_formula ? '' : info.input || '';
+          showNote(info);
         })
         .catch(() => {});
     }
   }
 
   S.cell = (r, c) => S.cellInfo.get(`${S.rev}:${S.cur}:${r}:${c}`);
+
+  /** A note on the selected cell (read-only here). */
+  function showNote(info) {
+    const chip = $('notechip');
+    if (info && info.note && S.kind === 'cell') {
+      chip.textContent = `Note: ${stripBidi(info.note)}`;
+      chip.hidden = false;
+    } else {
+      chip.hidden = true;
+    }
+  }
+
+  /** Handles, the size handle and the fill handle follow the selection. */
+  function positionOverlays() {
+    const a = $('hdl-a');
+    const b = $('hdl-b');
+    const rsz = $('rsz');
+    const fh = $('fillh');
+    for (const e of [a, b, rsz, fh]) e.hidden = true;
+    if (!S.meta || $('app').hidden || !geo.vw || editing) return;
+    const L = layoutOf(S.cur);
+    const g = normRange(S.rng);
+    const r2 = Math.min(g.r2, L.nr - 1);
+    const c2 = Math.min(g.c2, L.nc - 1);
+    const inView = (x, y) => x >= geo.hw - 1 && y >= HH - 1 && x <= geo.vw + 1 && y <= geo.vh + 1;
+    const put = (e, x, y) => {
+      e.style.left = `${Math.round(x)}px`;
+      e.style.top = `${Math.round(y)}px`;
+      e.hidden = false;
+    };
+    const edit = S.live.ready && S.live.role === 'edit';
+    if (S.kind === 'cell') {
+      const x1 = screenX(g.c1);
+      const y1 = screenY(g.r1);
+      const x2 = screenX(c2 + 1);
+      const y2 = screenY(r2 + 1);
+      if (S.handles) {
+        if (inView(x1, y1)) put(a, x1, y1);
+        if (inView(x2, y2)) put(b, x2, y2);
+      } else if (edit && !IN.coarse && inView(x2, y2)) {
+        put(fh, x2, y2);
+      }
+    } else if (S.kind === 'cols') {
+      const x = screenX(c2 + 1);
+      if (x >= geo.hw && x <= geo.vw) {
+        if (edit) {
+          rsz.className = 'rsz col';
+          put(rsz, x, HH / 2);
+        }
+        put(b, x, HH + 26);
+      }
+    } else if (S.kind === 'rows') {
+      const y = screenY(r2 + 1);
+      if (y >= HH && y <= geo.vh) {
+        if (edit) {
+          rsz.className = 'rsz row';
+          put(rsz, geo.hw / 2, y);
+        }
+        put(b, geo.hw + 26, y);
+      }
+    }
+  }
 
   // ---------------------------------------------------------------------------
   // Zoom
@@ -1140,6 +1434,310 @@
   // Events
   // ---------------------------------------------------------------------------
 
+  /** Pointer state: the press in progress, long-press timer, drags. */
+  const IN = { down: null, timer: 0, drag: null, suppress: false, lastTap: 0, menuTimer: 0, coarse: window.matchMedia('(pointer: coarse)').matches };
+
+  const localXY = (e) => {
+    const r = $('scroller').getBoundingClientRect();
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  };
+
+  const cancelLong = () => {
+    clearTimeout(IN.timer);
+    IN.timer = 0;
+  };
+
+  /** The cell nearest to a point (clamped into the cell area), for dragging. */
+  function hitNear(p) {
+    const L = layoutOf(S.cur);
+    const x = clamp(p.x, geo.hw + 1, geo.vw - 1);
+    const y = clamp(p.y, HH + 1, geo.vh - 1);
+    const h = hit(x, y);
+    return h || { r: clamp(rowAt(y), 0, L.nr - 1), c: clamp(colAt(x), 0, L.nc - 1) };
+  }
+
+  /** Scrolls while a drag is held near an edge. */
+  let auto = { timer: 0, dx: 0, dy: 0, fn: null };
+  function autoScroll(p, fn) {
+    const m = 36;
+    auto.dx = p.x > geo.vw - m ? 14 : p.x < geo.hw + m ? -14 : 0;
+    auto.dy = p.y > geo.vh - m ? 14 : p.y < HH + m ? -14 : 0;
+    auto.fn = fn;
+    if ((auto.dx || auto.dy) && !auto.timer) {
+      auto.timer = setInterval(() => {
+        const sc = $('scroller');
+        sc.scrollLeft += auto.dx;
+        sc.scrollTop += auto.dy;
+        if (auto.fn) auto.fn();
+      }, 50);
+    } else if (!auto.dx && !auto.dy) {
+      stopAuto();
+    }
+  }
+  function stopAuto() {
+    clearInterval(auto.timer);
+    auto.timer = 0;
+    auto.fn = null;
+  }
+
+  function longPress() {
+    IN.timer = 0;
+    const d = IN.down;
+    if (!d || d.moved || d.area.k !== 'cell') return;
+    IN.suppress = true;
+    select(d.area.r, d.area.c, false);
+    S.handles = true;
+    positionOverlays();
+    requestDraw();
+    if (navigator.vibrate && navigator.userActivation && navigator.userActivation.hasBeenActive) navigator.vibrate(8);
+  }
+
+  function wirePointer(sc) {
+    sc.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0 || !S.meta || !e.isPrimary) return;
+      const p = localXY(e);
+      if (p.x >= sc.clientWidth || p.y >= sc.clientHeight) return; // a scroll bar
+      cancelLong();
+      const area = areaAt(p.x, p.y);
+      IN.down = { x: p.x, y: p.y, type: e.pointerType, area, moved: false };
+      IN.suppress = false;
+      if (area.k !== 'cell') return;
+      if (e.pointerType === 'mouse') {
+        if (e.shiftKey) extendTo(area.r, area.c, false);
+        else select(area.r, area.c, false);
+        IN.drag = { type: 'cells' };
+        try {
+          sc.setPointerCapture(e.pointerId);
+        } catch {
+          /* not capturable */
+        }
+      } else {
+        IN.timer = setTimeout(longPress, 450);
+      }
+    });
+    sc.addEventListener('pointermove', (e) => {
+      const d = IN.down;
+      if (!d) return;
+      const p = localXY(e);
+      if (Math.hypot(p.x - d.x, p.y - d.y) > 8) {
+        d.moved = true;
+        cancelLong();
+      }
+      if (IN.drag && IN.drag.type === 'cells' && e.pointerType === 'mouse' && e.buttons & 1 && d.moved) {
+        const go = () => {
+          const h = hitNear(p);
+          extendTo(h.r, h.c, false);
+        };
+        go();
+        autoScroll(p, go);
+      }
+    });
+    const up = () => {
+      cancelLong();
+      stopAuto();
+      if (IN.drag && IN.down && IN.down.moved) IN.suppress = true;
+      IN.drag = null;
+    };
+    sc.addEventListener('pointerup', up);
+    sc.addEventListener('pointercancel', up);
+    sc.addEventListener('click', (e) => {
+      if (IN.suppress) {
+        IN.suppress = false;
+        return;
+      }
+      const p = localXY(e);
+      if (p.x >= sc.clientWidth || p.y >= sc.clientHeight) return;
+      const area = areaAt(p.x, p.y);
+      const touch = IN.down ? IN.down.type !== 'mouse' : false;
+      sc.focus({ preventScroll: true });
+      if (area.k === 'cell') {
+        if (!touch) return; // the mouse acted on press
+        const inSel = S.kind === 'cell' && area.r >= S.rng.r1 && area.r <= S.rng.r2 && area.c >= S.rng.c1 && area.c <= S.rng.c2 && S.rng.r1 === S.rng.r2 && S.rng.c1 === S.rng.c2;
+        const merged = S.kind === 'cell' && S.rng.r1 <= area.r && area.r <= S.rng.r2 && S.rng.c1 <= area.c && area.c <= S.rng.c2;
+        const now = Date.now();
+        if (inSel || merged) {
+          clearTimeout(IN.menuTimer);
+          if (now - IN.lastTap < 380) {
+            IN.lastTap = 0;
+            if (ui().editCell) ui().editCell();
+          } else {
+            IN.lastTap = now;
+            IN.menuTimer = setTimeout(() => {
+              if (ui().cellMenu) ui().cellMenu();
+            }, 390);
+          }
+        } else {
+          clearTimeout(IN.menuTimer);
+          IN.lastTap = now;
+          select(area.r, area.c, false);
+        }
+      } else if (area.k === 'col' || area.k === 'row') {
+        const rows = area.k === 'row';
+        const idx = rows ? area.r : area.c;
+        if (!touch && e.shiftKey && S.kind === (rows ? 'rows' : 'cols')) selectLines(rows, rows ? S.sel.r : S.sel.c, idx);
+        else selectLines(rows, idx, idx);
+        if (touch && ui().headerMenu) ui().headerMenu();
+      } else if (area.k === 'corner') {
+        selectAll();
+        if (touch && ui().headerMenu) ui().headerMenu();
+      }
+    });
+    sc.addEventListener('dblclick', (e) => {
+      const p = localXY(e);
+      const area = areaAt(p.x, p.y);
+      if (area.k === 'cell' && e.pointerType !== 'touch' && ui().editCell) ui().editCell();
+    });
+    sc.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      if (IN.down && IN.down.type !== 'mouse') return;
+      const p = localXY(e);
+      const area = areaAt(p.x, p.y);
+      if (area.k === 'cell') {
+        const inside = S.kind !== 'cell' || area.r < S.rng.r1 || area.r > S.rng.r2 || area.c < S.rng.c1 || area.c > S.rng.c2;
+        if (inside) select(area.r, area.c, false);
+        if (ui().cellMenu) ui().cellMenu();
+      } else if (area.k === 'col' || area.k === 'row') {
+        const rows = area.k === 'row';
+        const idx = rows ? area.r : area.c;
+        const inRange = S.kind === (rows ? 'rows' : 'cols') && idx >= (rows ? S.rng.r1 : S.rng.c1) && idx <= (rows ? S.rng.r2 : S.rng.c2);
+        if (!inRange) selectLines(rows, idx, idx);
+        if (ui().headerMenu) ui().headerMenu();
+      }
+    });
+  }
+
+  /** Drag handles of a selection (touch), the size handle of a header, the desktop fill handle. */
+  function wireHandles() {
+    const drag = (el, onStart, onMove, onEnd) => {
+      el.addEventListener('pointerdown', (e) => {
+        if (e.button !== 0) return;
+        e.preventDefault();
+        e.stopPropagation();
+        try {
+          el.setPointerCapture(e.pointerId);
+        } catch {
+          /* not capturable */
+        }
+        const st = onStart(e);
+        const move = (ev) => {
+          const p = localXY(ev);
+          onMove(st, p, ev);
+          autoScroll(p, () => onMove(st, p, ev));
+        };
+        const end = (ev) => {
+          el.removeEventListener('pointermove', move);
+          el.removeEventListener('pointerup', end);
+          el.removeEventListener('pointercancel', end);
+          stopAuto();
+          onEnd(st, localXY(ev));
+        };
+        el.addEventListener('pointermove', move);
+        el.addEventListener('pointerup', end);
+        el.addEventListener('pointercancel', end);
+      });
+    };
+    const A = $('hdl-a');
+    const B = $('hdl-b');
+    // The two corners of a cell range, or the end of a run of columns or rows.
+    drag(
+      A,
+      () => ({ fix: { r: S.rng.r2, c: S.rng.c2 } }),
+      (st, p) => {
+        const h = hitNear({ x: p.x + 8, y: p.y + 8 });
+        setRangeKeep(st.fix.r, st.fix.c, h.r, h.c);
+      },
+      () => {},
+    );
+    drag(
+      B,
+      () => ({ fix: { r: S.rng.r1, c: S.rng.c1 }, kind: S.kind }),
+      (st, p) => {
+        const h = hitNear({ x: p.x - 8, y: p.y - 8 });
+        if (st.kind === 'cell') setRangeKeep(st.fix.r, st.fix.c, h.r, h.c);
+        else if (st.kind === 'cols') keepLines(false, st.fix.c, h.c);
+        else if (st.kind === 'rows') keepLines(true, st.fix.r, h.r);
+      },
+      () => {},
+    );
+    // Size handle.
+    const R = $('rsz');
+    drag(
+      R,
+      (e) => {
+        const g = normRange(S.rng);
+        const rows = S.kind === 'rows';
+        const L = layoutOf(S.cur);
+        const size = rows ? L.rh[g.r2] : L.cw[g.c2];
+        $('stage').classList.add('sizing');
+        return { rows, a: rows ? g.r1 : g.c1, b: rows ? g.r2 : g.c2, start: rows ? e.clientY : e.clientX, size, px: size };
+      },
+      (st, p, ev) => {
+        const d = ((st.rows ? ev.clientY : ev.clientX) - st.start) / S.z;
+        st.px = Math.round(clamp(st.size + d, st.rows ? 4 : 8, st.rows ? 600 : 800));
+        previewSize(st.rows, st.a, st.b, st.px);
+      },
+      (st) => {
+        $('stage').classList.remove('sizing');
+        if (st.px !== st.size) commitSize(st.rows, st.a, st.b, st.px);
+      },
+    );
+    // Desktop fill handle: drag down or right to repeat the selection.
+    const F = $('fillh');
+    drag(
+      F,
+      () => ({ src: normRange(S.rng), to: null }),
+      (st, p) => {
+        const h = hitNear(p);
+        const dr = h.r - st.src.r2;
+        const dc = h.c - st.src.c2;
+        st.to = dr <= 0 && dc <= 0 ? null : dr >= dc ? { r2n: h.r, c2n: st.src.c2 } : { r2n: st.src.r2, c2n: h.c };
+        S.fillPrev = st.to ? { r1: st.src.r1, c1: st.src.c1, r2: st.to.r2n, c2: st.to.c2n } : null;
+        requestDraw();
+      },
+      (st) => {
+        S.fillPrev = null;
+        requestDraw();
+        if (!st.to) return;
+        const g = st.src;
+        liveSend(selMsg('autofill', { r1: g.r1, c1: g.c1, r2: g.r2, c2: g.c2, r2n: st.to.r2n, c2n: st.to.c2n, clamp: false }));
+        setRange(g.r1, g.c1, st.to.r2n, st.to.c2n, false);
+      },
+    );
+  }
+
+  /** A range from a fixed corner to a moving one, keeping the active cell where it was set. */
+  function setRangeKeep(fr, fc, mr, mc) {
+    S.rng = withMerges({ r1: fr, c1: fc, r2: mr, c2: mc });
+    S.sel = { r: Math.min(fr, mr), c: Math.min(fc, mc) };
+    S.kind = 'cell';
+    S.handles = true;
+    renderBar();
+    requestDraw();
+  }
+
+  function keepLines(rows, a, b) {
+    const lo = Math.min(a, b);
+    const hi = Math.max(a, b);
+    S.rng = rows ? { r1: lo, c1: 0, r2: hi, c2: MAXC - 1 } : { r1: 0, c1: lo, r2: MAXR - 1, c2: hi };
+    renderBar();
+    requestDraw();
+  }
+
+  /** Shows a new width or height at once (the server's answer replaces it). */
+  function previewSize(rows, a, b, px) {
+    const L = layoutOf(S.cur);
+    const arr = rows ? L.rh : L.cw;
+    for (let k = a; k <= b && k < arr.length && k < a + 500; k++) arr[k] = px;
+    rebuildOffsets(L);
+    measure();
+    readScroll();
+    requestDraw();
+  }
+
+  function commitSize(rows, a, b, px) {
+    liveSend(selMsg('size', { axis: rows ? 'r' : 'c', a, b, px }));
+  }
+
   function wire() {
     const sc = $('scroller');
     sc.addEventListener(
@@ -1151,12 +1749,8 @@
       },
       { passive: true },
     );
-    sc.addEventListener('click', (e) => {
-      const rect = sc.getBoundingClientRect();
-      const h = hit(e.clientX - rect.left, e.clientY - rect.top);
-      if (h) select(h.r, h.c, false);
-      sc.focus({ preventScroll: true });
-    });
+    wirePointer(sc);
+    wireHandles();
     sc.addEventListener('keydown', onKey);
     // Pinch to change the text size.
     let pinch = null;
@@ -1164,6 +1758,7 @@
       'touchstart',
       (e) => {
         if (e.touches.length === 2) {
+          cancelLong();
           pinch = { d: dist(e.touches), z: S.z };
         }
       },
@@ -1205,20 +1800,37 @@
     $('more').addEventListener('click', () => toggleMenu());
     $('m-refresh').addEventListener('click', () => {
       toggleMenu(false);
-      reload();
+      if (S.live.ready) liveSend({ t: 'meta' });
+      else reload();
     });
     document.addEventListener('click', (e) => {
       if (!$('menu').hidden && !$('menu').contains(e.target) && e.target !== $('more')) toggleMenu(false);
     });
     for (const a of ['m-xlsx', 'm-csv', 'm-native']) $(a).addEventListener('click', () => toggleMenu(false));
-    window.addEventListener('resize', () => {
+    const relayout = () => {
       if ($('app').hidden) return;
       measure();
       readScroll();
       requestDraw();
       ensureBlocks();
-    });
-    window.addEventListener('orientationchange', () => setTimeout(() => window.dispatchEvent(new Event('resize')), 250));
+    };
+    window.addEventListener('resize', relayout);
+    if (window.ResizeObserver) new ResizeObserver(relayout).observe($('stage'));
+    window.addEventListener('orientationchange', () => setTimeout(relayout, 250));
+    // The on-screen keyboard (iOS keeps the layout viewport and slides the page up): the app
+    // follows the visual viewport so the formula bar stays in view.
+    const vv = window.visualViewport;
+    if (vv) {
+      const fit = () => {
+        const app = $('app');
+        app.style.height = `${Math.round(vv.height)}px`;
+        app.style.transform = vv.offsetTop > 0 ? `translateY(${Math.round(vv.offsetTop)}px)` : '';
+        if (document.scrollingElement && document.scrollingElement.scrollTop !== 0) window.scrollTo(0, 0);
+        relayout();
+      };
+      vv.addEventListener('resize', fit);
+      vv.addEventListener('scroll', fit);
+    }
     const mq = window.matchMedia('(prefers-color-scheme: dark)');
     S.dark = mq.matches;
     mq.addEventListener('change', (e) => {
@@ -1251,21 +1863,23 @@
   }
 
   function onKey(e) {
+    if (ui().key && ui().key(e)) return;
     const L = layoutOf(S.cur);
-    let { r, c } = S.sel;
+    const from = e.shiftKey && S.kind === 'cell' ? S.ext || S.sel : S.sel;
+    let { r, c } = from;
     const page = Math.max(1, Math.floor(geo.viewH / S.z / 20) - 1);
     switch (e.key) {
       case 'ArrowDown':
-        r = nextVisible(L.rowY, r, 1, L.nr);
+        r = e.ctrlKey || e.metaKey ? edgeOf(L, r, c, 1, 0) : nextVisible(L.rowY, r, 1, L.nr);
         break;
       case 'ArrowUp':
-        r = nextVisible(L.rowY, r, -1, L.nr);
+        r = e.ctrlKey || e.metaKey ? edgeOf(L, r, c, -1, 0) : nextVisible(L.rowY, r, -1, L.nr);
         break;
       case 'ArrowRight':
-        c = nextVisible(L.colX, c, 1, L.nc);
+        c = e.ctrlKey || e.metaKey ? edgeOf(L, r, c, 0, 1) : nextVisible(L.colX, c, 1, L.nc);
         break;
       case 'ArrowLeft':
-        c = nextVisible(L.colX, c, -1, L.nc);
+        c = e.ctrlKey || e.metaKey ? edgeOf(L, r, c, 0, -1) : nextVisible(L.colX, c, -1, L.nc);
         break;
       case 'PageDown':
         r = Math.min(L.nr - 1, r + page);
@@ -1275,13 +1889,52 @@
         break;
       case 'Home':
         c = 0;
-        if (e.ctrlKey) r = 0;
+        if (e.ctrlKey || e.metaKey) r = 0;
         break;
       default:
         return;
     }
     e.preventDefault();
-    select(r, c, true);
+    if (e.shiftKey && S.kind === 'cell') extendTo(r, c, true);
+    else select(r, c, true);
+  }
+
+  /** Ctrl+arrow: the end of the run of filled cells (or the next filled cell) in the loaded part. */
+  function edgeOf(L, r, c, dr, dc) {
+    const filled = (a, b) => {
+      const x = S.cells.get(a * KEYC + b);
+      return !!(x && x.t);
+    };
+    let a = r;
+    let b = c;
+    const lim = (v, n) => clamp(v, 0, n - 1);
+    const step = () => {
+      a = lim(a + dr, L.nr);
+      b = lim(b + dc, L.nc);
+    };
+    const start = filled(a, b);
+    step();
+    const next = filled(a, b);
+    if (start && next) {
+      for (let n = 0; n < 5000; n++) {
+        const pa = a;
+        const pb = b;
+        step();
+        if (!filled(a, b) || (pa === a && pb === b)) {
+          a = pa;
+          b = pb;
+          break;
+        }
+      }
+    } else {
+      for (let n = 0; n < 5000 && !filled(a, b); n++) {
+        const pa = a;
+        const pb = b;
+        step();
+        if (pa === a && pb === b) break;
+      }
+    }
+    return dr ? a : b;
   }
 
   function nextVisible(off, i, d, n) {
@@ -1290,10 +1943,11 @@
     return k < 0 || k >= n ? i : k;
   }
 
-
   // ---------------------------------------------------------------------------
   // Live: the server-side bridge (/api/items/<id>/web-live) and editing
   // ---------------------------------------------------------------------------
+
+  const ui = () => (window.FSheet && window.FSheet.ui) || {};
 
   function liveCall(msg) {
     return new Promise((resolve, reject) => {
@@ -1305,9 +1959,45 @@
     });
   }
 
+  /** Messages that change the workbook: held (in memory only) while the connection is down. */
+  const EDITS = new Set(['edit', 'clear', 'fmt', 'ins', 'del', 'size', 'hide', 'freeze', 'merge', 'paste', 'fill', 'autofill', 'sheet_add', 'sheet_rename', 'sheet_del', 'sheet_move', 'sheet_hide', 'sheet_color']);
+  const MAX_QUEUE = 300;
+  const MAX_QUEUE_BYTES = 2 * 1024 * 1024;
+
   function liveSend(msg) {
     const L = S.live;
+    const up = L.ws && L.state === 'open' && L.ready;
+    if (EDITS.has(msg.t)) {
+      if (!up) return enqueue(msg);
+      if (S.queue.length) flushQueue();
+    }
     if (L.ws && L.state === 'open') L.ws.send(JSON.stringify(msg));
+  }
+
+  function enqueue(msg) {
+    if (S.live.role !== 'edit') return toast("You're offline and can't change anything yet.", 'error');
+    const size = JSON.stringify(msg).length;
+    if (S.queue.length >= MAX_QUEUE || S.queueBytes + size > MAX_QUEUE_BYTES) return toast('Too many changes are waiting for the connection. Wait until you are back online.', 'error');
+    S.queue.push(msg);
+    S.queueBytes += size;
+    // Typed text stays on screen meanwhile.
+    if (msg.t === 'edit') {
+      const idx = S.meta.sheets.findIndex((s) => s.uid === msg.suid);
+      if (idx === S.cur) S.cells.set(msg.r * KEYC + msg.c, { t: stripBidi(msg.text), k: /^-?[\d.,]+%?$/.test(msg.text) ? 'n' : 's', st: null, l: false });
+      requestDraw();
+    }
+    toast(`Offline. ${S.queue.length} change${S.queue.length === 1 ? '' : 's'} will be sent when the connection is back.`);
+    setStatus();
+  }
+
+  function flushQueue() {
+    const L = S.live;
+    if (!S.queue.length || !(L.ws && L.state === 'open')) return 0;
+    const q = S.queue;
+    S.queue = [];
+    S.queueBytes = 0;
+    for (const m of q) L.ws.send(JSON.stringify(m));
+    return q.length;
   }
 
   async function connectLive() {
@@ -1334,7 +2024,7 @@
     L.ws = ws;
     ws.addEventListener('open', () => {
       L.state = 'open';
-      liveSend({ t: 'meta' });
+      ws.send(JSON.stringify({ t: 'meta' }));
     });
     ws.addEventListener('message', (e) => {
       let m;
@@ -1365,10 +2055,13 @@
     requestDraw();
     clearTimeout(L.timer);
     L.retry = Math.min(L.retry + 1, 4);
-    L.timer = setTimeout(() => {
-      L.state = 'off';
-      connectLive();
-    }, 1000 * 2 ** L.retry);
+    L.timer = setTimeout(
+      () => {
+        L.state = 'off';
+        connectLive();
+      },
+      1000 * 2 ** L.retry,
+    );
   }
 
   function onLive(m) {
@@ -1376,26 +2069,61 @@
     switch (m.t) {
       case 'meta': {
         const first = !L.ready;
+        const reconnect = first && L.everReady;
+        if (first) L.session = (L.session || 0) + 1;
         L.ready = true;
+        L.everReady = true;
         L.retry = 0;
         L.role = m.role;
+        const curUid = S.meta && S.meta.sheets[S.cur] ? S.meta.sheets[S.cur].uid : null;
         S.meta = { ...S.meta, sheets: m.sheets, role: m.role, cells: m.cells };
         S.rev = `L${m.rev}`;
         S.layouts.clear();
-        dropData();
-        if (!S.meta.sheets[S.cur]) S.cur = 0;
+        let idx = curUid ? m.sheets.findIndex((s) => s.uid === curUid) : S.cur;
+        let moved = false;
+        if (S.focusUid) {
+          const f = m.sheets.findIndex((s) => s.uid === S.focusUid);
+          S.focusUid = null;
+          if (f >= 0) {
+            idx = f;
+            moved = true;
+          }
+        }
+        if (idx < 0 || !m.sheets[idx] || m.sheets[idx].hidden) {
+          idx = Math.max(0, m.sheets.findIndex((s) => !s.hidden));
+          moved = true;
+        }
+        const changed = idx !== S.cur || moved;
+        const { ox, oy } = geo;
+        S.cur = idx;
         buildTabs();
-        measure();
-        readScroll();
-        if (first) writeScroll(geo.ox, geo.oy);
-        requestDraw();
-        ensureBlocks();
-        renderBar();
+        if (changed) {
+          switchSheet(idx);
+        } else {
+          if (first) dropData();
+          measure();
+          writeScroll(ox, oy);
+          readScroll();
+          requestDraw();
+          if (first) ensureBlocks();
+          else refetchSoon();
+          renderBar();
+        }
         setStatus();
+        loadCharts();
+        if (first) {
+          const n = flushQueue();
+          if (reconnect) toast(n ? `Reconnected. ${n} change${n === 1 ? '' : 's'} re-sent.` : 'Reconnected.');
+          setStatus();
+        }
+        if (ui().onMeta) ui().onMeta();
         break;
       }
       case 'win':
-      case 'cell': {
+      case 'cell':
+      case 'clip':
+      case 'found':
+      case 'charts': {
         const p = L.pending.get(m.id);
         if (p) {
           L.pending.delete(m.id);
@@ -1417,6 +2145,9 @@
         if (m.sheets) liveSend({ t: 'meta' });
         else refetchSoon();
         break;
+      case 'focus':
+        S.focusUid = m.uid;
+        break;
       case 'status':
         L.save = m.state;
         setStatus();
@@ -1424,17 +2155,19 @@
       case 'role':
         L.role = m.role;
         S.meta.role = m.role;
-        showBanner(m.role === 'edit' ? 'You can now edit this workbook.' : 'You now have view-only access to this workbook.');
+        toast(m.role === 'edit' ? 'You can now edit this workbook.' : 'You now have view-only access to this workbook.');
         setStatus();
         break;
       case 'rejected':
-        showBanner(m.message);
+        toast(m.message, 'error');
         break;
       case 'error':
         if (m.id !== undefined && L.pending.has(m.id)) {
           const p = L.pending.get(m.id);
           L.pending.delete(m.id);
           p.reject(new ApiError(400, { error: m.message }));
+        } else if (m.message) {
+          toast(m.message, 'error');
         }
         break;
       case 'revoked':
@@ -1482,22 +2215,80 @@
       pump();
       ensureBlocks();
       renderBar();
+      loadCharts();
     }, 60);
   }
 
-  function showBanner(text) {
-    let b = $('banner');
-    if (!b) {
-      b = el('div', { id: 'banner', class: 'banner', role: 'status' });
-      $('app').insertBefore(b, $('app').children[2]);
+  // ---- charts and pictures
+
+  let chartSeq = 0;
+  function loadCharts() {
+    const sh = S.meta && S.meta.sheets[S.cur];
+    if (!sh) return;
+    if (!sh.charts) {
+      if (S.charts.has(S.cur)) {
+        S.charts.delete(S.cur);
+        requestDraw();
+      }
+      return;
     }
-    b.textContent = text;
-    b.hidden = false;
-    clearTimeout(showBanner.t);
-    showBanner.t = setTimeout(() => {
-      b.hidden = true;
-    }, 6000);
+    const mine = ++chartSeq;
+    const cur = S.cur;
+    const via = S.live.ready ? liveCall({ t: 'charts', sheet: cur, suid: sh.uid }).then((m) => m.charts) : get(`${itemPath('/sheet/charts')}?sheet=${cur}`);
+    via
+      .then((list) => {
+        if (mine !== chartSeq || cur !== S.cur) return;
+        S.charts.set(cur, list);
+        requestDraw();
+      })
+      .catch(() => {});
   }
+
+  /** The picture to draw for a sheet's n-th image, loaded on first use. */
+  function pictureFor(sheet, im) {
+    const key = `${sheet}:${im.n}:${im.w}x${im.h}:${im.name}`;
+    let e = S.imgs.get(key);
+    if (!e) {
+      e = { img: new Image(), ok: false };
+      e.img.onload = () => {
+        e.ok = true;
+        requestDraw();
+      };
+      e.img.onerror = () => {
+        e.bad = true;
+      };
+      e.img.alt = im.descr || im.name || 'Picture';
+      e.img.src = `${itemPath('/sheet/image')}?sheet=${sheet}&n=${im.n}`;
+      S.imgs.set(key, e);
+      if (S.imgs.size > 60) S.imgs.delete(S.imgs.keys().next().value);
+    }
+    return e;
+  }
+
+  // ---- messages, toasts
+
+  function toast(text, kind) {
+    const t = $('toast');
+    t.textContent = text;
+    t.className = kind === 'error' ? 'toast error' : 'toast';
+    t.hidden = false;
+    clearTimeout(toast.t);
+    toast.t = setTimeout(
+      () => {
+        t.hidden = true;
+      },
+      kind === 'error' ? 5000 : 3500,
+    );
+  }
+
+  /** A message addressing the selected range on the current sheet. */
+  function selMsg(t, extra) {
+    const g = normRange(S.rng);
+    return { t, sheet: S.cur, suid: S.meta.sheets[S.cur].uid, r1: g.r1, c1: g.c1, r2: g.r2, c2: g.c2, clamp: S.kind !== 'cell', ...extra };
+  }
+
+  /** A message addressing the current sheet. */
+  const sheetMsg = (t, extra) => ({ t, sheet: S.cur, suid: S.meta.sheets[S.cur].uid, ...extra });
 
   // ---- editing UI
 
@@ -1513,6 +2304,7 @@
       $('fx-ok').hidden = true;
       $('fx-cancel').hidden = true;
     }
+    if (ui().onSelect) ui().onSelect();
   }
 
   function enterText() {
@@ -1527,21 +2319,25 @@
     $('fx-ok').hidden = !on;
     $('fx-cancel').hidden = !on;
     sendPresence();
+    positionOverlays();
   }
 
   let lastPresence = '';
   function sendPresence() {
+    const g = normRange(S.rng);
     const m = { t: 'presence', sheet: S.cur, r: S.sel.r, c: S.sel.c, editing };
+    if (S.kind === 'cell' && (g.r1 !== g.r2 || g.c1 !== g.c2)) m.sel = [g.r1, g.c1, g.r2, g.c2];
     const k = JSON.stringify(m);
     if (k === lastPresence) return;
     lastPresence = k;
-    liveSend(m);
+    const L = S.live;
+    if (L.ws && L.state === 'open') L.ws.send(k);
   }
 
   function commitEdit(move) {
-    if (!canEdit()) return showBanner("You're offline; reconnecting. Try again in a moment.");
+    if (!canEdit() && S.live.role !== 'edit') return toast("You're offline; reconnecting. Try again in a moment.", 'error');
     const text = $('fxin').value;
-    liveSend({ t: 'edit', sheet: S.cur, r: S.sel.r, c: S.sel.c, text });
+    liveSend({ t: 'edit', sheet: S.cur, suid: S.meta.sheets[S.cur].uid, r: S.sel.r, c: S.sel.c, text });
     setEditing(false);
     $('fxin').blur();
     if (move) select(Math.min(S.sel.r + 1, layoutOf(S.cur).nr - 1), S.sel.c, true);
@@ -1553,6 +2349,14 @@
     $('fxin').value = enterText();
     $('fxin').blur();
     $('scroller').focus({ preventScroll: true });
+  }
+
+  function startEdit(initial) {
+    if (!canEdit()) return;
+    const inp = $('fxin');
+    if (initial !== undefined) inp.value = initial;
+    inp.focus();
+    if (initial !== undefined) inp.setSelectionRange(inp.value.length, inp.value.length);
   }
 
   function wireEdit() {
@@ -1577,27 +2381,12 @@
     $('fx-cancel').addEventListener('click', cancelEdit);
     $('undo').addEventListener('click', () => liveSend({ t: 'undo' }));
     $('redo').addEventListener('click', () => liveSend({ t: 'redo' }));
-    const fmt = (set) => liveSend({ t: 'fmt', sheet: S.cur, r1: S.sel.r, c1: S.sel.c, r2: S.sel.r, c2: S.sel.c, set });
-    $('t-bold').addEventListener('click', () => {
-      const st = (S.cells.get(S.sel.r * KEYC + S.sel.c) || {}).st;
-      fmt({ b: !(st && st.b) });
-    });
-    $('t-italic').addEventListener('click', () => {
-      const st = (S.cells.get(S.sel.r * KEYC + S.sel.c) || {}).st;
-      fmt({ i: !(st && st.i) });
-    });
-    $('t-fill').addEventListener('click', () => {
-      const st = (S.cells.get(S.sel.r * KEYC + S.sel.c) || {}).st;
-      fmt({ fill: st && st.f ? null : '#ffee99' });
-    });
-    $('t-num').addEventListener('click', () => fmt({ nf: '#,##0.00' }));
-    $('t-clear').addEventListener('click', () => liveSend({ t: 'clear', sheet: S.cur, r1: S.sel.r, c1: S.sel.c, r2: S.sel.r, c2: S.sel.c }));
     // The grid: a printable key starts typing; Enter edits; Delete clears.
     $('scroller').addEventListener('keydown', (e) => {
       if (!canEdit() || e.ctrlKey || e.metaKey || e.altKey) return;
       if (e.key === 'Delete' || e.key === 'Backspace') {
         e.preventDefault();
-        liveSend({ t: 'clear', sheet: S.cur, r1: S.sel.r, c1: S.sel.c, r2: S.sel.r, c2: S.sel.c });
+        liveSend(selMsg('clear'));
       } else if (e.key === 'Enter' || e.key === 'F2') {
         e.preventDefault();
         inp.focus();
@@ -1620,18 +2409,110 @@
     });
   }
 
+  // Everything the interface file needs from the core.
+  window.FSheet = {
+    S,
+    geo,
+    $,
+    el,
+    clamp,
+    colName,
+    cellName,
+    layoutOf,
+    liveSend,
+    liveCall,
+    toast,
+    selMsg,
+    sheetMsg,
+    canEdit,
+    select,
+    setRange,
+    selectLines,
+    selectAll,
+    extendTo,
+    normRange,
+    scrollIntoView,
+    requestDraw,
+    previewSize,
+    commitSize,
+    revertLayout: () => {
+      S.layouts.delete(S.cur);
+      measure();
+      readScroll();
+      requestDraw();
+    },
+    startEdit,
+    cancelEdit,
+    switchSheet: (i) => switchSheet(i),
+    reload,
+    positionOverlays,
+    screenX,
+    screenY,
+    stripBidi,
+    pictureFor,
+    loadCharts,
+    ApiError,
+    get: (p) => get(p),
+    itemPath,
+    ui: {},
+  };
+
   // Test hook: lets the browser check read the drawn state without touching the canvas.
   window.__fsheet = {
-    state: () => ({ sel: S.sel, z: S.z, cur: S.cur, rev: S.rev, cells: S.cells.size, blocks: S.blocks.size, ox: geo.ox, oy: geo.oy, sheets: S.meta ? S.meta.sheets.map((s) => s.name) : [], live: S.live.ready, role: S.live.role, save: S.live.save, peers: S.live.peers.length, editing }),
+    state: () => ({
+      sel: S.sel,
+      rng: S.rng,
+      kind: S.kind,
+      z: S.z,
+      cur: S.cur,
+      rev: S.rev,
+      cells: S.cells.size,
+      blocks: S.blocks.size,
+      ox: geo.ox,
+      oy: geo.oy,
+      sheets: S.meta ? S.meta.sheets.map((s) => s.name) : [],
+      hidden: S.meta ? S.meta.sheets.map((s) => !!s.hidden) : [],
+      live: S.live.ready,
+      role: S.live.role,
+      save: S.live.save,
+      peers: S.live.peers.length,
+      editing,
+      queued: S.queue.length,
+      toast: $('toast').hidden ? '' : $('toast').textContent,
+      charts: (S.charts.get(S.cur) || []).length,
+    }),
     cellText: (r, c) => (S.cells.get(r * KEYC + c) || {}).t,
+    images: () => [...S.imgs.values()].map((e) => ({ ok: e.ok, bad: !!e.bad })),
+    cellStyle: (r, c) => (S.cells.get(r * KEYC + c) || {}).st,
+    layout: () => {
+      const L = layoutOf(S.cur);
+      return { nr: L.nr, nc: L.nc, w0: L.colX[1], h0: L.rowY[1], fr: L.fr, fc: L.fc, merges: L.merges.length };
+    },
     select: (r, c) => select(r, c, true),
+    range: (r1, c1, r2, c2) => setRange(r1, c1, r2, c2, true),
     zoom: (z) => setZoom(z),
     switchSheet: (i) => switchSheet(i),
+    drop: () => {
+      // Test: the connection breaks.
+      if (S.live.ws) S.live.ws.close();
+    },
     scrollTo: (ox, oy) => {
       writeScroll(ox, oy);
       readScroll();
       requestDraw();
       ensureBlocks();
+    },
+    point: (r, c) => {
+      const rect = $('scroller').getBoundingClientRect();
+      const sx = screenX(c);
+      const sy = screenY(r);
+      const L = layoutOf(S.cur);
+      return { x: rect.left + sx + ((L.colX[c + 1] - L.colX[c]) * S.z) / 2, y: rect.top + sy + ((L.rowY[r + 1] - L.rowY[r]) * S.z) / 2 };
+    },
+    header: (kind, i) => {
+      const rect = $('scroller').getBoundingClientRect();
+      const L = layoutOf(S.cur);
+      return kind === 'col' ? { x: rect.left + screenX(i) + ((L.colX[i + 1] - L.colX[i]) * S.z) / 2, y: rect.top + HH / 2 } : { x: rect.left + geo.hw / 2, y: rect.top + screenY(i) + ((L.rowY[i + 1] - L.rowY[i]) * S.z) / 2 };
     },
   };
 

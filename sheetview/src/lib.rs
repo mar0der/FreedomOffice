@@ -36,6 +36,12 @@ pub const MAX_WINDOW_ROWS: u32 = 1000;
 pub const MAX_DISPLAY_CHARS: usize = 1000;
 /// Entries of the lists in the sheet metadata (row heights, hidden rows...).
 const MAX_LIST: usize = 100_000;
+/// Charts, series and points per chart sent to the viewer.
+const MAX_CHARTS: usize = 50;
+const MAX_SERIES: usize = 20;
+const MAX_POINTS: usize = 500;
+/// Pictures described per sheet.
+const MAX_IMAGES: usize = 200;
 
 /// Why a file can't be shown.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,11 +218,12 @@ impl Book {
         if rg.rows() > MAX_WINDOW_ROWS || u64::from(rg.rows()) * u64::from(rg.cols()) > MAX_WINDOW_CELLS {
             return Err(format!("A window is at most {MAX_WINDOW_ROWS} rows and {MAX_WINDOW_CELLS} cells."));
         }
-        let mut styles: Vec<Json> = Vec::new();
-        let mut style_ix: HashMap<u32, usize> = HashMap::new();
+        let mut styles = Styles::default();
         let mut cells: Vec<Json> = Vec::new();
-        let mut push = |r: u32, c: u32, cells: &mut Vec<Json>, styles: &mut Vec<Json>| {
-            if let Some(cell) = self.shown(sh, r, c, styles, &mut style_ix) {
+        // Conditional formats of the sheet (statistics are gathered once per window).
+        let cf = (!sh.cond_formats.is_empty()).then(|| freedom_sheets::condfmt::CfFrame::uncached(sh));
+        let push = |r: u32, c: u32, cells: &mut Vec<Json>, styles: &mut Styles| {
+            if let Some(cell) = self.shown(sh, sheet, r, c, styles, cf.as_ref()) {
                 cells.push(cell);
             }
         };
@@ -233,6 +240,12 @@ impl Book {
                 }
             }
         }
+        // Cells with a note show a marker even when they are empty.
+        for &(r, c) in sh.notes.keys() {
+            if rg.contains(r, c) && seen.insert((r, c)) {
+                push(r, c, &mut cells, &mut styles);
+            }
+        }
         // Merged areas touching the window: their anchor cell comes along even when it lies outside.
         let mut merges: Vec<Json> = Vec::new();
         for m in sh.merges.iter().filter(|m| m.intersects(&rg)) {
@@ -244,7 +257,7 @@ impl Book {
                 break;
             }
         }
-        Ok(json!({ "sheet": sheet, "r1": rg.r1, "r2": rg.r2, "c1": rg.c1, "c2": rg.c2, "styles": styles, "cells": cells, "merges": merges }))
+        Ok(json!({ "sheet": sheet, "r1": rg.r1, "r2": rg.r2, "c1": rg.c1, "c2": rg.c2, "styles": styles.list, "cells": cells, "merges": merges }))
     }
 
     /// One cell as the formula bar shows it: the entered text (formula, number as typed), the
@@ -289,14 +302,15 @@ impl Book {
         cell.input_text()
     }
 
-    /// The cell at (r, c) as `[r, c, text, kind, style]` (kind: n number, s text, b bool, e
-    /// error, f a number shown as a date or other format... only the first four are sent), or
-    /// None when there is nothing to show.
-    fn shown(&self, sh: &Sheet, r: u32, c: u32, styles: &mut Vec<Json>, ix: &mut HashMap<u32, usize>) -> Option<Json> {
+    /// The cell at (r, c) as `[r, c, text, kind, style, link, extra]` (kind: n number, s text, b
+    /// bool, e error; link 0/1; `extra` only when present: `{bar: [from, to, colour, gradient],
+    /// note: 1}`), or None when there is nothing to show. Conditional formats are part of the style.
+    fn shown(&self, sh: &Sheet, sheet: usize, r: u32, c: u32, styles: &mut Styles, cf: Option<&freedom_sheets::condfmt::CfFrame>) -> Option<Json> {
         let cell = sh.get(r, c);
         let value = sh.display_value(r, c);
         let style_id = cell.map_or(0, |x| x.style);
-        if value.is_empty() && style_id == 0 {
+        let note = sh.notes.contains_key(&(r, c));
+        if value.is_empty() && style_id == 0 && !note {
             return None;
         }
         let st = self.wb.style(style_id);
@@ -308,37 +322,118 @@ impl Book {
             Value::Error(_) => "e",
             Value::Empty => "",
         };
-        // Style index in this window's table; a number format's colour is part of the style.
-        let key = style_id;
+        let ov = cf.and_then(|cf| cf.eval(&self.wb, sheet, r, c));
         let mut si = 0usize;
-        if style_id != 0 || f.color.is_some() {
-            let slot = if f.color.is_none() { ix.get(&key).copied() } else { None };
-            si = match slot {
-                Some(i) => i,
-                None => {
+        if style_id != 0 || f.color.is_some() || ov.is_some() {
+            si = match (&ov, f.color) {
+                (None, None) => styles.plain(style_id, || style_json(st)),
+                _ => {
                     let mut j = style_json(st);
                     if let Some(col) = f.color {
                         j["c"] = json!(hex(col));
                     }
-                    styles.push(j);
-                    let i = styles.len();
-                    if f.color.is_none() {
-                        ix.insert(key, i);
+                    if let Some(o) = &ov {
+                        if let Some(x) = o.fill {
+                            j["f"] = json!(hex(x));
+                        }
+                        if let Some(x) = o.color {
+                            j["c"] = json!(hex(x));
+                        }
+                        for (on, k) in [(o.bold, "b"), (o.italic, "i"), (o.underline, "u"), (o.strike, "x")] {
+                            if on {
+                                j[k] = json!(1);
+                            }
+                        }
                     }
-                    i
+                    styles.by_json(j)
                 }
             };
         }
-        // Rich text is shown plain; links get a flag (the viewer underlines them).
         let mut text = f.text;
         if let Some((cut_at, _)) = text.char_indices().nth(MAX_DISPLAY_CHARS) {
             text.truncate(cut_at);
         }
         let mut out = json!([r, c, text, kind, si]);
-        if sh.links.contains_key(&(r, c)) {
-            out.as_array_mut().expect("array").push(json!(1));
+        let mut extra = serde_json::Map::new();
+        if let Some(b) = ov.as_ref().and_then(|o| o.bar) {
+            extra.insert("bar".into(), json!([b.start, b.end, hex(b.color), u8::from(b.gradient)]));
+        }
+        if note {
+            extra.insert("note".into(), json!(1));
+        }
+        let link = sh.links.contains_key(&(r, c));
+        if link || !extra.is_empty() {
+            out.as_array_mut().expect("array").push(json!(u8::from(link)));
+        }
+        if !extra.is_empty() {
+            out.as_array_mut().expect("array").push(Json::Object(extra));
         }
         Some(out)
+    }
+
+    /// The n-th picture of a sheet: (extension, bytes), only for formats a browser shows.
+    pub fn image(&self, sheet: usize, n: usize) -> Option<(String, std::sync::Arc<Vec<u8>>)> {
+        let p = self.wb.sheets.get(sheet)?.images.get(n)?;
+        let ext = match freedom_sheets::model::Picture::sniff(&p.data)? {
+            "jpeg" => "jpeg",
+            "png" => "png",
+            "gif" => "gif",
+            "bmp" => "bmp",
+            _ => return None,
+        };
+        Some((ext.to_string(), p.data.clone()))
+    }
+
+    /// The charts of a sheet with the data they show (resolved by the app's own engine), for the
+    /// viewer to draw.
+    pub fn charts(&self, sheet: usize) -> Result<Json, String> {
+        use freedom_sheets::chart::{self, ChartKind, Grouping};
+        let sh = self.wb.sheets.get(sheet).ok_or("No such sheet.")?;
+        let mut out = Vec::new();
+        for ch in sh.charts.iter().take(MAX_CHARTS) {
+            let data = chart::resolve(&self.wb, ch);
+            let kind = match ch.kind {
+                ChartKind::Column => "column",
+                ChartKind::Bar => "bar",
+                ChartKind::Line => "line",
+                ChartKind::Pie => "pie",
+                ChartKind::Doughnut => "doughnut",
+                ChartKind::Area => "area",
+                ChartKind::Scatter => "scatter",
+                ChartKind::Radar => "radar",
+            };
+            let grouping = match ch.grouping {
+                Grouping::Standard => "standard",
+                Grouping::Stacked => "stacked",
+                Grouping::Percent => "percent",
+            };
+            let series: Vec<Json> = data
+                .series
+                .iter()
+                .enumerate()
+                .take(MAX_SERIES)
+                .map(|(i, s)| {
+                    let colors: Vec<String> = if ch.kind.is_round() { (0..s.values.len().min(MAX_POINTS)).map(|k| hex(ch.color(k))).collect() } else { Vec::new() };
+                    json!({
+                        "name": cut(&s.name, 60),
+                        "color": hex(ch.series_fill(i)),
+                        "line": hex(ch.series_line(i)),
+                        "values": s.values.iter().take(MAX_POINTS).collect::<Vec<_>>(),
+                        "xs": s.xs.as_ref().map(|x| x.iter().take(MAX_POINTS).collect::<Vec<_>>()),
+                        "colors": colors,
+                    })
+                })
+                .collect();
+            let title = chart::display_title(ch, &data).map(|t| cut(&t, 120));
+            out.push(json!({
+                "kind": kind, "grouping": grouping, "title": title, "legend": ch.legend,
+                "r": ch.anchor.0, "c": ch.anchor.1, "dx": ch.offset.0, "dy": ch.offset.1, "w": ch.size.0, "h": ch.size.1,
+                "cats": data.categories.iter().take(MAX_POINTS).map(|c| cut(c, 40)).collect::<Vec<_>>(),
+                "xs": data.cat_values.iter().take(MAX_POINTS).collect::<Vec<_>>(),
+                "series": series,
+            }));
+        }
+        Ok(json!(out))
     }
 
     /// The whole sheet as CSV text (displayed values), for the download button.
@@ -358,6 +453,35 @@ impl Book {
             out.push('\n');
         }
         Ok(out)
+    }
+}
+
+/// The styles of one window: distinct style objects, referred to by 1-based index.
+#[derive(Default)]
+struct Styles {
+    list: Vec<Json>,
+    ids: HashMap<u32, usize>,
+    jsons: HashMap<String, usize>,
+}
+
+impl Styles {
+    fn plain(&mut self, id: u32, make: impl FnOnce() -> Json) -> usize {
+        if let Some(i) = self.ids.get(&id) {
+            return *i;
+        }
+        self.list.push(make());
+        self.ids.insert(id, self.list.len());
+        self.list.len()
+    }
+
+    fn by_json(&mut self, j: Json) -> usize {
+        let key = j.to_string();
+        if let Some(i) = self.jsons.get(&key) {
+            return *i;
+        }
+        self.list.push(j);
+        self.jsons.insert(key, self.list.len());
+        self.list.len()
     }
 }
 
@@ -519,6 +643,8 @@ fn sheet_meta(wb: &Workbook, i: usize, s: &Sheet) -> Json {
         "merges": merges,
         "gridlines": s.gridlines,
         "protected": s.protection.is_some(),
+        "charts": s.charts.len(),
+        "images": s.images.iter().take(MAX_IMAGES).enumerate().map(|(n, p)| json!({ "n": n, "r": p.anchor.0, "c": p.anchor.1, "dx": p.offset.0, "dy": p.offset.1, "w": p.size.0, "h": p.size.1, "name": cut(&p.name, 80), "descr": cut(&p.descr, 200) })).collect::<Vec<_>>(),
     })
 }
 

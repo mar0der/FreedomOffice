@@ -660,6 +660,8 @@ pub fn router(app: App) -> Router {
         .route("/api/items/{id}/sheet/cell", get(crate::sheetweb::cell))
         .route("/api/items/{id}/sheet/csv", get(crate::sheetweb::csv))
         .route("/api/items/{id}/sheet/comments", get(crate::sheetweb::comments))
+        .route("/api/items/{id}/sheet/image", get(crate::sheetweb::image))
+        .route("/api/items/{id}/sheet/charts", get(crate::sheetweb::charts))
         .route("/api/items/{id}/web-live", get(crate::webbridge::handler))
         .route("/api/items/{id}/live", get(live))
         .route("/api/items/{id}/live-ticket", post(live_ticket))
