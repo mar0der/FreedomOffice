@@ -911,3 +911,114 @@ fn restoring_while_others_are_connected_reloads_them() {
     wb2.send(&ClientMsg::Ops { base: seq, id: 5, made: None, ops: vec![text(0, 0, "after")] });
     assert!(matches!(wb2.recv_data(), ServerMsg::Ack { .. }));
 }
+
+// ---------------------------------------------------------------------------
+// M5: comment threads
+// ---------------------------------------------------------------------------
+
+fn comment(user: &str, id: &str, at: i64, text: &str) -> cosync::Comment {
+    cosync::Comment { id: id.into(), by: user.into(), name: user.into(), at, text: text.into(), edited: 0 }
+}
+
+fn thread(user: &str, id: &str, text: &str) -> Op {
+    Op::ThreadAdd { s: 1, r: 2, c: 3, th: Box::new(cosync::Thread { id: id.into(), r: 2, c: 3, done: false, comments: vec![comment(user, id, 1, text)] }) }
+}
+
+impl Srv {
+    /// Joins speaking protocol 3 (`proto=3` in the URL, like the current apps).
+    fn join3(&self, token: &str, id: &str, cid: &str) -> Ws {
+        let (seq, _, v) = self.live_base(token, id);
+        let mut ws = self.ws(Some(token), &format!("since={seq}&v={v}&cid={cid}&proto=3"), id).unwrap();
+        let ServerMsg::Welcome { .. } = ws.recv() else { panic!("no welcome") };
+        ws.send(&ClientMsg::Hello { sheets: vec![1], proto: cosync::PROTO });
+        ws
+    }
+}
+
+#[test]
+fn comment_threads_are_checked_by_the_server_and_hidden_from_old_clients() {
+    let s = start();
+    let (a, b, c) = (s.login("alice"), s.login("bob"), s.login("carol"));
+    let id = s.new_file(&a, "Comments.xlsx");
+    s.json("POST", &format!("/api/items/{id}/permissions"), Some(&a), json!({ "username": "bob", "role": "edit" }));
+    s.json("POST", &format!("/api/items/{id}/permissions"), Some(&a), json!({ "username": "carol", "role": "view" }));
+    let mut wa = s.join3(&a, &id, "a");
+    let mut wb = s.join3(&b, &id, "b");
+    let mut wc = s.join3(&c, &id, "c");
+    // A client of the previous protocol (no `proto` in its URL).
+    let (mut old, _) = s.join(&b, &id, "old");
+    old.send(&ClientMsg::Hello { sheets: vec![1], proto: 2 });
+
+    // Alice starts a thread; Bob (protocol 3) gets it, the old client gets the batch without it.
+    wa.send(&ClientMsg::Ops { base: 0, id: 1, made: None, ops: vec![thread("alice", "{T1}", "first"), text(0, 0, "plain")] });
+    let ServerMsg::Ops { ops, .. } = wb.recv_data() else { panic!() };
+    assert!(matches!(&ops[0], Op::ThreadAdd { .. }) && ops.len() == 2);
+    let ServerMsg::Ops { ops, .. } = old.recv_data() else { panic!() };
+    assert_eq!(ops, vec![text(0, 0, "plain")], "an old client is sent only what it understands");
+    let ServerMsg::Ops { ops, .. } = wc.recv_data() else { panic!() };
+    assert_eq!(ops.len(), 2, "viewers see threads");
+    assert!(matches!(wa.recv_data(), ServerMsg::Ack { seq: 1, .. }));
+
+    // Bob replies; claiming to be Alice is refused: the batch commits without that operation
+    // and Bob is told to reload.
+    let reply = |by: &str, id: &str| Op::CommentAdd { s: 1, th: "{T1}".into(), cm: Box::new(comment(by, id, 2, "bob's reply")) };
+    wb.send(&ClientMsg::Ops { base: 1, id: 1, made: None, ops: vec![reply("bob", "{R1}"), reply("alice", "{FORGED}")] });
+    let mut told = (false, false);
+    while !(told.0 && told.1) {
+        match wb.recv_data() {
+            ServerMsg::Ack { .. } => told.0 = true,
+            ServerMsg::Error { message } => assert!(message.contains("can't change that comment")),
+            ServerMsg::Reload => told.1 = true,
+            m => panic!("{m:?}"),
+        }
+    }
+    let ServerMsg::Ops { ops, .. } = wa.recv_data() else { panic!() };
+    assert_eq!(ops, vec![reply("bob", "{R1}")], "only the allowed operation reached the others");
+    // Claiming to manage the document is refused for an editor; the resolve in the same batch stays.
+    let del = |by: &str, adm: bool| Op::CommentDel { s: 1, th: "{T1}".into(), id: "{R1}".into(), by: by.into(), adm };
+    wb.send(&ClientMsg::Ops { base: 2, id: 2, made: None, ops: vec![del("bob", true), Op::ThreadDone { s: 1, th: "{T1}".into(), done: true }] });
+    let ServerMsg::Ops { ops, .. } = wa.recv_data() else { panic!() };
+    assert_eq!(ops, vec![Op::ThreadDone { s: 1, th: "{T1}".into(), done: true }], "a non-manager's adm delete is dropped");
+    // The owner may delete anyone's comment.
+    wa.send(&ClientMsg::Ops { base: 3, id: 2, made: None, ops: vec![del("alice", true)] });
+    let ops = loop {
+        // (Bob is still told about his own refused operation first.)
+        if let ServerMsg::Ops { ops, .. } = wb.recv_data() {
+            break ops;
+        }
+    };
+    assert_eq!(ops, vec![del("alice", true)]);
+    // Viewers can't write comments (the connection is closed like for any change).
+    wc.send(&ClientMsg::Ops { base: 4, id: 1, made: None, ops: vec![thread("carol", "{C1}", "no")] });
+    assert_eq!(wc.close_code(), Some(cosync::close::READ_ONLY));
+    // A client of the previous protocol can't send them (dropped, told to reload).
+    old.send(&ClientMsg::Ops { base: 4, id: 1, made: None, ops: vec![thread("bob", "{O1}", "old")] });
+    loop {
+        if matches!(old.recv_data(), ServerMsg::Reload) {
+            break;
+        }
+    }
+
+    // A late joiner gets the history: protocol 3 with the thread, the old client without it.
+    let (_, _, v) = s.live_base(&a, &id);
+    let mut late3 = s.ws(Some(&a), &format!("since=0&v={v}&cid=late3&proto=3"), &id).unwrap();
+    let mut late2 = s.ws(Some(&a), &format!("since=0&v={v}&cid=late2"), &id).unwrap();
+    for (ws, expect) in [(&mut late3, true), (&mut late2, false)] {
+        let ServerMsg::Welcome { seq: head, .. } = ws.recv() else { panic!() };
+        let (mut threads, mut seen) = (0, 0);
+        while seen < head {
+            if let ServerMsg::Ops { seq, ops, .. } = ws.recv_data() {
+                seen = seq;
+                threads += ops.iter().filter(|o| o.is_thread_op()).count();
+            }
+        }
+        assert!(head >= 4);
+        assert_eq!(threads > 0, expect);
+    }
+
+    // Snapshots come from clients that know comments only.
+    let snap = |hdr: &[(&str, &str)]| s.send("POST", &format!("/api/items/{id}/live/snapshot?seq=1"), Some(&a), hdr, Some(b"x".to_vec())).status;
+    assert_eq!(snap(&[]), 426);
+    assert_eq!(snap(&[("X-Live-Proto", "2")]), 426);
+    assert_eq!(snap(&[("X-Live-Proto", "3"), ("X-Live-Sheets", "1:0")]), 200);
+}

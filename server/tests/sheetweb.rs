@@ -480,3 +480,48 @@ fn the_pages_are_served_with_a_strict_policy() {
     assert_eq!(s.send("GET", "/drive/assets/sheet.html", &[], None).status, 404);
     assert_eq!(s.send("GET", "/drive/assets/sheet.css", &[], None).status, 200);
 }
+
+/// Comment threads are part of the description the browser viewer gets (SPEC.md "Comments").
+#[test]
+fn comment_threads_are_listed_for_the_viewer() {
+    let s = start();
+    let a = s.token("alice");
+    let root = s.root(&a);
+    let id = s.upload(&a, &root, "web-comments.xlsx", &book());
+    assert_eq!(s.post(&format!("/api/items/{id}/permissions"), &a, json!({ "username": "bob", "role": "view" })).status, 200);
+    assert_eq!(s.bearer(&url(&id, ""), &a).json()["threads"], json!([]));
+    {
+        let st = s.store();
+        let item = st.item(&id).unwrap().unwrap();
+        let base = st.live_base(&item).unwrap();
+        let first = cosync::Comment { id: "{T1}".into(), by: "alice".into(), name: "Alice Admin".into(), at: 1_700_000_000_000, text: "Is this right? @Bob Builder".into(), edited: 0 };
+        let reply = cosync::Comment { id: "{R1}".into(), by: "bob".into(), name: "Bob Builder".into(), at: 1_700_000_060_000, text: "Yes".into(), edited: 1_700_000_090_000 };
+        let ops = vec![
+            Op::ThreadAdd { s: 1, r: 4, c: 28, th: Box::new(cosync::Thread { id: "{T1}".into(), r: 4, c: 28, done: false, comments: vec![first] }) },
+            Op::CommentAdd { s: 1, th: "{T1}".into(), cm: Box::new(reply) },
+            Op::ThreadDone { s: 1, th: "{T1}".into(), done: true },
+        ];
+        st.add_live_op(&id, &LiveOp { seq: base.seq + 1, cid: "client-1".into(), batch: 1, actor: "alice".into(), ops: serde_json::to_string(&ops).unwrap(), at: 1 }).unwrap();
+    }
+    let bob = s.web("bob");
+    let m = s.cookie_get(&url(&id, ""), &bob).json();
+    let t = &m["threads"][0];
+    assert_eq!((t["sheet"].as_u64(), t["id"].as_str(), t["r"].as_u64(), t["c"].as_u64(), t["ref"].as_str(), t["done"].as_bool()), (Some(0), Some("{T1}"), Some(4), Some(28), Some("AC5"), Some(true)));
+    let cs = t["comments"].as_array().unwrap();
+    assert_eq!(cs.len(), 2);
+    assert_eq!((cs[0]["by"].as_str(), cs[0]["name"].as_str(), cs[0]["at"].as_i64(), cs[0]["text"].as_str()), (Some("alice"), Some("Alice Admin"), Some(1_700_000_000_000), Some("Is this right? @Bob Builder")));
+    assert_eq!((cs[1]["id"].as_str(), cs[1]["edited"].as_i64()), (Some("{R1}"), Some(1_700_000_090_000)));
+    assert!(cs[0].get("edited").is_none());
+    // The same, per sheet.
+    let c0 = s.cookie_get(&url(&id, "/comments?sheet=0"), &bob);
+    assert_eq!(c0.status, 200, "{}", c0.text());
+    let c0 = c0.json();
+    assert_eq!(c0["threads"], m["threads"]);
+    assert_eq!(c0["rev"], m["rev"]);
+    assert_eq!(s.cookie_get(&url(&id, "/comments?sheet=1"), &bob).json()["threads"], json!([]));
+    assert_eq!(s.cookie_get(&url(&id, "/comments?sheet=9"), &bob).status, 400);
+    assert_eq!(s.cookie_get(&url(&id, "/comments"), &bob).status, 400);
+    // Someone without access learns nothing.
+    let carol = s.web("carol");
+    assert_eq!(s.cookie_get(&url(&id, "/comments?sheet=0"), &carol).status, 404);
+}
