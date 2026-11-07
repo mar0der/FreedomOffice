@@ -11,6 +11,8 @@ pub struct Entry {
     pub id: u64,
     /// Who made it (server-defined, e.g. a user id).
     pub by: String,
+    /// The sequence number the sender had seen (None when loaded from storage).
+    pub base: Option<u64>,
     pub ops: Vec<Op>,
 }
 
@@ -106,7 +108,7 @@ impl Log {
             ops = out;
         }
         let seq = self.head() + 1;
-        self.entries.push(Entry { seq, cid: cid.to_string(), id, by: by.to_string(), ops: ops.clone() });
+        self.entries.push(Entry { seq, cid: cid.to_string(), id, by: by.to_string(), base: Some(base), ops: ops.clone() });
         self.last.insert((by.to_string(), cid.to_string()), (id, seq));
         Ok(Commit::New { seq, ops, extra })
     }

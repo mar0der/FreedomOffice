@@ -210,7 +210,7 @@ fn two_editors_converge_and_reconnect_replays() {
 
     let (mut wa, seq) = s.join(&a, &id, "client-a");
     assert_eq!(seq, 0);
-    wa.send(&ClientMsg::Hello { sheets: vec![1] });
+    wa.send(&ClientMsg::Hello { sheets: vec![1], proto: cosync::PROTO });
     let (mut wb, _) = s.join(&b, &id, "client-b");
     // Alice sees Bob join, with his name and a different colour.
     let ServerMsg::Join { peer } = wa.recv() else { panic!() };
@@ -401,7 +401,7 @@ fn deleting_every_sheet_concurrently_leaves_a_rescue_sheet() {
     let a = s.login("alice");
     let id = s.new_file(&a, "R.xlsx");
     let (mut w1, _) = s.join(&a, &id, "one");
-    w1.send(&ClientMsg::Hello { sheets: vec![1, 2] });
+    w1.send(&ClientMsg::Hello { sheets: vec![1, 2], proto: cosync::PROTO });
     let (mut w2, _) = s.join(&a, &id, "two");
     w1.send(&ClientMsg::Ops { base: 0, id: 1, ops: vec![Op::DelSheet { s: 1, name: "Sheet1".into() }] });
     assert!(matches!(w1.recv_data(), ServerMsg::Ack { extra, .. } if extra.is_empty()));
@@ -424,7 +424,7 @@ fn reconnecting_after_a_plain_save_reloads() {
     let a = s.login("alice");
     let id = s.new_file(&a, "Stale.xlsx");
     let (mut wa, _) = s.join(&a, &id, "client-a");
-    wa.send(&ClientMsg::Hello { sheets: vec![1] });
+    wa.send(&ClientMsg::Hello { sheets: vec![1], proto: cosync::PROTO });
     wa.send(&ClientMsg::Ops { base: 0, id: 1, ops: vec![text(0, 0, "x")] });
     assert!(matches!(wa.recv_data(), ServerMsg::Ack { seq: 1, .. }));
     // The client snapshots everything, then its connection drops (laptop sleeps).
@@ -451,7 +451,7 @@ fn share_links_get_the_live_state_of_the_current_version_only() {
     let a = s.login("alice");
     let id = s.new_file(&a, "Linked.xlsx");
     let (mut wa, _) = s.join(&a, &id, "client-a");
-    wa.send(&ClientMsg::Hello { sheets: vec![1] });
+    wa.send(&ClientMsg::Hello { sheets: vec![1], proto: cosync::PROTO });
     for (seq, state) in [(1u64, "old state"), (2, "new state")] {
         wa.send(&ClientMsg::Ops { base: seq - 1, id: seq, ops: vec![text(0, 0, state)] });
         while !matches!(wa.recv_data(), ServerMsg::Ack { .. }) {}
@@ -474,7 +474,7 @@ fn reload_tells_a_client_its_last_batch_was_committed() {
     let a = s.login("alice");
     let id = s.new_file(&a, "Lost.xlsx");
     let (mut wa, _) = s.join(&a, &id, "client-a");
-    wa.send(&ClientMsg::Hello { sheets: vec![1] });
+    wa.send(&ClientMsg::Hello { sheets: vec![1], proto: cosync::PROTO });
     wa.send(&ClientMsg::Ops { base: 0, id: 7, ops: vec![text(0, 0, "a")] });
     // Its ack is lost: the client never reads it.
     let (mut wb, _) = s.join(&a, &id, "client-b");
@@ -509,7 +509,7 @@ fn snapshots_of_the_same_state_make_one_version() {
     let id = s.new_file(&a, "Twice.xlsx");
     assert_eq!(s.json("POST", &format!("/api/items/{id}/permissions"), Some(&a), json!({ "username": "bob", "role": "edit" })).status, 200);
     let (mut wa, _) = s.join(&a, &id, "client-a");
-    wa.send(&ClientMsg::Hello { sheets: vec![1] });
+    wa.send(&ClientMsg::Hello { sheets: vec![1], proto: cosync::PROTO });
     wa.send(&ClientMsg::Ops { base: 0, id: 1, ops: vec![text(0, 0, "x")] });
     assert!(matches!(wa.recv_data(), ServerMsg::Ack { seq: 1, .. }));
     let before = s.send("GET", &format!("/api/items/{id}"), Some(&a), &[], None).json();
@@ -748,4 +748,59 @@ fn concurrent_joins_leaves_commits_and_rechecks_finish() {
     wa.send(&ClientMsg::Ops { base: seq, id: 1, ops: vec![text(0, 0, "ok")] });
     while !matches!(wa.recv_data(), ServerMsg::Ack { .. }) {}
     drop(b);
+}
+
+#[test]
+fn value_and_format_of_one_cell_both_survive_and_old_clients_are_asked_to_update() {
+    let s = start();
+    let a = s.login("alice");
+    let b = s.login("bob");
+    let id = s.new_file(&a, "Split.xlsx");
+    assert_eq!(s.json("POST", &format!("/api/items/{id}/permissions"), Some(&a), json!({ "username": "bob", "role": "edit" })).status, 200);
+    // The server says which protocol it speaks.
+    let mut peek = s.ws(Some(&a), "since=0&cid=client-peek", &id).unwrap();
+    assert!(matches!(peek.recv(), ServerMsg::Welcome { proto, .. } if proto == cosync::PROTO));
+    drop(peek);
+    let (mut wa, _) = s.join(&a, &id, "client-a");
+    wa.send(&ClientMsg::Hello { sheets: vec![1], proto: cosync::PROTO });
+    let (mut wb, _) = s.join(&b, &id, "client-b");
+    wb.send(&ClientMsg::Hello { sheets: vec![1], proto: cosync::PROTO });
+
+    // Alice types a value while Bob makes the same cell bold, both against seq 0.
+    let value = Op::Content { s: 1, r: 0, c: 0, v: Some(Box::new(CellData { v: Val::Text("typed".into()), ..Default::default() })), adj: vec![] };
+    let bold = Op::Format { s: 1, r: 0, c: 0, st: Some(json!({ "bold": true })) };
+    wa.send(&ClientMsg::Ops { base: 0, id: 1, ops: vec![value.clone()] });
+    wb.send(&ClientMsg::Ops { base: 0, id: 1, ops: vec![bold.clone()] });
+    let mut relayed = Vec::new();
+    for ws in [&mut wa, &mut wb] {
+        for _ in 0..2 {
+            match ws.recv_data() {
+                ServerMsg::Ack { .. } => {}
+                ServerMsg::Ops { base, ops, .. } => {
+                    // Neither was changed by the other; the relay says what the sender had seen.
+                    assert_eq!(base, Some(0));
+                    relayed.extend(ops);
+                }
+                m => panic!("{m:?}"),
+            }
+        }
+    }
+    assert!(relayed.contains(&value) && relayed.contains(&bold), "{relayed:?}");
+
+    // A client that predates the protocol versions is told to update and disconnected.
+    let (mut old, _) = s.join(&b, &id, "client-old");
+    old.ws.send(Message::Text(r#"{"t":"hello","sheets":[1]}"#.to_string().into())).unwrap();
+    let mut told = false;
+    loop {
+        match old.next(Duration::from_secs(10)) {
+            Some(Got::Msg(ServerMsg::Error { message })) => told = message.contains("update"),
+            Some(Got::Msg(_)) => {}
+            Some(Got::Closed(code)) => {
+                assert_eq!(code, Some(cosync::close::UPGRADE));
+                break;
+            }
+            None => panic!("not closed"),
+        }
+    }
+    assert!(told);
 }
