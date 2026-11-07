@@ -1259,6 +1259,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "freedomsheets-agents"
+version = "26.45.2"
+dependencies = [
+ "calamine",
+ "cosync",
+ "freedomoffice-server",
+ "getrandom 0.3.4",
+ "rust_xlsxwriter",
+ "serde_json",
+ "tungstenite",
+ "ureq",
+]
+
+[[package]]
 name = "futures"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
