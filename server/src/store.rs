@@ -177,6 +177,10 @@ pub struct Version {
     pub hash: String,
     pub modified: i64,
     pub modified_by: String,
+    /// A name given by an editor; named versions are never pruned.
+    pub label: String,
+    /// User ids whose live changes are in this version (live snapshots only).
+    pub contributors: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -686,6 +690,17 @@ CREATE TRIGGER audit_count_only BEFORE UPDATE ON audit
 END;
 "#;
 
+/// Version 5: names for versions and who contributed to a live snapshot (additive table).
+const MIGRATION_V5: &str = r#"
+CREATE TABLE IF NOT EXISTS version_meta (
+    item_id TEXT NOT NULL REFERENCES items(id),
+    version INTEGER NOT NULL,
+    label TEXT NOT NULL DEFAULT '',
+    contributors TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (item_id, version)
+);
+"#;
+
 /// The guard against early deletion (as created by `MIGRATION_V3`); `Store::audit_erase`
 /// drops and recreates it inside its transaction.
 const AUDIT_DELETE_TRIGGER: &str = r#"
@@ -706,7 +721,7 @@ pub const AUDIT_AGGREGATE_SECS: i64 = 60;
 pub const AUDIT_DETAIL_MAX: usize = 200;
 
 /// The schema version this code writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// Brings a database (new, or written by an older server) to `SCHEMA_VERSION`. One write
 /// transaction, so a crash leaves the old schema intact, and a second process opening the
@@ -730,6 +745,9 @@ fn migrate(conn: &Connection) -> Res<()> {
         }
         if v < 4 {
             conn.execute_batch(MIGRATION_V4)?;
+        }
+        if v < 5 {
+            conn.execute_batch(MIGRATION_V5)?;
         }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
@@ -1705,18 +1723,39 @@ impl Store {
     pub fn version(&self, item_id: &str, v: i64) -> Res<Option<Version>> {
         Ok(self
             .conn
-            .query_row("SELECT version, size, hash, modified, modified_by FROM versions WHERE item_id = ?1 AND version = ?2", params![item_id, v], |r| {
-                Ok(Version { version: r.get(0)?, size: r.get(1)?, hash: r.get(2)?, modified: r.get(3)?, modified_by: r.get(4)? })
-            })
+            .query_row(&format!("{VERSION_SELECT} AND v.version = ?2"), params![item_id, v], version_row)
             .optional()?)
     }
 
     pub fn versions(&self, item_id: &str) -> Res<Vec<Version>> {
-        let mut st = self.conn.prepare("SELECT version, size, hash, modified, modified_by FROM versions WHERE item_id = ?1 ORDER BY version DESC")?;
-        let v = st
-            .query_map([item_id], |r| Ok(Version { version: r.get(0)?, size: r.get(1)?, hash: r.get(2)?, modified: r.get(3)?, modified_by: r.get(4)? }))?
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut st = self.conn.prepare(&format!("{VERSION_SELECT} ORDER BY v.version DESC"))?;
+        let v = st.query_map([item_id], version_row)?.collect::<Result<Vec<_>, _>>()?;
         Ok(v)
+    }
+
+    /// Names a version (empty clears the name). Named versions are kept by `prune_versions`.
+    pub fn set_version_label(&self, item_id: &str, v: i64, label: &str) -> Res<()> {
+        self.version(item_id, v)?.ok_or(StoreError::NotFound)?;
+        self.conn.execute(
+            "INSERT INTO version_meta (item_id, version, label) VALUES (?1, ?2, ?3) ON CONFLICT(item_id, version) DO UPDATE SET label = excluded.label",
+            params![item_id, v, label],
+        )?;
+        Ok(())
+    }
+
+    /// Users whose live batches lie in `(after, upto]`.
+    pub fn live_contributors(&self, item_id: &str, after: u64, upto: u64) -> Res<Vec<String>> {
+        let mut st = self.conn.prepare("SELECT actor FROM live_ops WHERE item_id = ?1 AND seq > ?2 AND seq <= ?3 GROUP BY actor ORDER BY MIN(seq)")?;
+        let v = st.query_map(params![item_id, after as i64, upto as i64], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+        Ok(v)
+    }
+
+    fn set_contributors(&self, item_id: &str, v: i64, who: &[String]) -> Res<()> {
+        self.conn.execute(
+            "INSERT INTO version_meta (item_id, version, contributors) VALUES (?1, ?2, ?3) ON CONFLICT(item_id, version) DO UPDATE SET contributors = excluded.contributors",
+            params![item_id, v, who.join(",")],
+        )?;
+        Ok(())
     }
 
     /// Keeps the newest `versions_to_keep` versions plus the first version of each day.
@@ -1725,6 +1764,7 @@ impl Store {
         let doomed = versions_to_prune(&all, self.versions_to_keep as usize);
         for v in doomed {
             self.conn.execute("DELETE FROM versions WHERE item_id = ?1 AND version = ?2", params![item_id, v])?;
+            self.conn.execute("DELETE FROM version_meta WHERE item_id = ?1 AND version = ?2", params![item_id, v])?;
             let path = self.blob_path(item_id, v)?;
             self.delete_file_later(path.with_extension("live"));
             self.delete_file_later(path);
@@ -2471,6 +2511,9 @@ impl Store {
             "UPDATE live_state SET version = ?1, seq = ?2, sheets = ?3, floor = ?4, snap_at = ?5 WHERE item_id = ?6",
             params![s.version, seq as i64, s.sheets, s.floor as i64, s.snap_at, item.id],
         )?;
+        if let Ok(who) = self.live_contributors(&item.id, base.seq, seq) {
+            let _ = self.set_contributors(&item.id, saved.version, &who);
+        }
         self.conn.execute("DELETE FROM live_ops WHERE item_id = ?1 AND seq <= ?2", params![item.id, s.floor as i64])?;
         Ok((saved, s))
     }
@@ -2636,7 +2679,7 @@ impl Store {
 
 /// Version numbers to delete: everything except the newest `keep` and the first of each day.
 pub fn versions_to_prune(all: &[Version], keep: usize) -> Vec<i64> {
-    let mut sorted: Vec<&Version> = all.iter().collect();
+    let mut sorted: Vec<&Version> = all.iter().filter(|v| v.label.is_empty()).collect();
     sorted.sort_by_key(|v| std::cmp::Reverse(v.version));
     let mut first_of_day: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
     for v in &sorted {
@@ -2647,6 +2690,14 @@ pub fn versions_to_prune(all: &[Version], keep: usize) -> Vec<i64> {
         }
     }
     sorted.iter().skip(keep).filter(|v| first_of_day.get(&util::day_of(v.modified)) != Some(&v.version)).map(|v| v.version).collect()
+}
+
+const VERSION_SELECT: &str = "SELECT v.version, v.size, v.hash, v.modified, v.modified_by, COALESCE(m.label, ''), COALESCE(m.contributors, '')
+    FROM versions v LEFT JOIN version_meta m ON m.item_id = v.item_id AND m.version = v.version WHERE v.item_id = ?1";
+
+fn version_row(r: &rusqlite::Row) -> rusqlite::Result<Version> {
+    let who: String = r.get(6)?;
+    Ok(Version { version: r.get(0)?, size: r.get(1)?, hash: r.get(2)?, modified: r.get(3)?, modified_by: r.get(4)?, label: r.get(5)?, contributors: who.split(',').filter(|x| !x.is_empty()).map(String::from).collect() })
 }
 
 #[cfg(unix)]
@@ -2664,7 +2715,7 @@ mod tests {
     use super::*;
 
     fn v(version: i64, modified: i64) -> Version {
-        Version { version, size: 0, hash: String::new(), modified, modified_by: String::new() }
+        Version { version, size: 0, hash: String::new(), modified, modified_by: String::new(), label: String::new(), contributors: vec![] }
     }
 
     #[test]
@@ -2831,6 +2882,8 @@ mod tests {
             conn.execute_batch(SCHEMA_V0).unwrap();
             conn.execute_batch(MIGRATION_V1).unwrap();
             conn.execute_batch(MIGRATION_V2).unwrap();
+            // (The code under test reads version_meta while writing the fixture; V5 is idempotent.)
+            conn.execute_batch(MIGRATION_V5).unwrap();
             conn.execute_batch("PRAGMA user_version = 2").unwrap();
             std::fs::create_dir_all(&files).unwrap();
             let s = Store { conn, files: files.clone(), versions_to_keep: 25, allow_links: true, request_ip: Default::default(), frames: Default::default() };

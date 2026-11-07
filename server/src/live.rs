@@ -92,6 +92,8 @@ pub struct Doc {
     snap_asked: Option<Instant>,
     /// Round-robin over editors for snapshot requests.
     snap_turn: usize,
+    /// The file was replaced (restore): no more changes are accepted into this session.
+    retired: bool,
 }
 
 impl Doc {
@@ -278,7 +280,25 @@ impl Hub {
             last_snap: None,
             snap_asked: None,
             snap_turn: 0,
+            retired: false,
         })
+    }
+
+    /// The file was replaced by a restored version: the session is dropped and every
+    /// connection is told to reload (clients keep their unsent changes and rebase them).
+    pub fn retire(&self, item: &str) {
+        let doc = {
+            let mut docs = lock(&self.docs);
+            self.dropped.fetch_add(1, Ordering::SeqCst);
+            docs.remove(item)
+        };
+        let Some(doc) = doc else { return };
+        let mut d = lock(&doc);
+        d.retired = true;
+        for c in &d.conns {
+            c.push(Out::Text(json(&ServerMsg::Reload)));
+            c.push(Out::Close(1000, "reload".into()));
+        }
     }
 
     /// A snapshot containing everything up to `seq` was stored; operations up to `floor` are gone.
@@ -670,6 +690,10 @@ pub async fn run(store: Arc<Mutex<Store>>, hub: Arc<Hub>, socket: WebSocket, j: 
 #[allow(clippy::too_many_arguments)]
 fn commit(store: &Mutex<Store>, doc: &Mutex<Doc>, item: &str, conn: u64, (base, made): (u64, u64), cid: &str, id: u64, actor: &str, ops: Vec<cosync::Op>) -> bool {
     let mut d = lock(doc);
+    if d.retired {
+        d.send(conn, &ServerMsg::Reload);
+        return true;
+    }
     if !d.is_editor(conn) {
         d.close(conn, close::READ_ONLY, "You have view-only access to this workbook.");
         return false;
@@ -736,7 +760,7 @@ mod tests {
         let hub = Hub::default();
         let (tx, mut rx) = mpsc::channel(16);
         let peer = Peer { id: 1, name: String::new(), user: String::new(), color: 0, editor: false, agent: false, presence: None };
-        let mut d = Doc { log: Log::new(0), conns: vec![], unsnapped: 0, unsnapped_since: None, last_commit: None, last_snap: None, snap_asked: None, snap_turn: 0 };
+        let mut d = Doc { log: Log::new(0), conns: vec![], unsnapped: 0, unsnapped_since: None, last_commit: None, last_snap: None, snap_asked: None, snap_turn: 0, retired: false };
         d.conns.push(Conn { peer, tx, kick: Arc::new(Notify::new()), who: Principal::Link { link }, role: Role::View, revoked: true, end: Arc::new(Notify::new()) });
         let doc = Arc::new(Mutex::new(d));
         lock(&hub.docs).insert(item.id.clone(), doc.clone());
@@ -756,7 +780,7 @@ mod tests {
         let peer = |id| Peer { id, name: String::new(), user: String::new(), color: 0, editor: true, agent: false, presence: None };
         let (tx, _rx) = mpsc::channel(2);
         let kick = Arc::new(Notify::new());
-        let d = Doc { log: Log::new(0), conns: vec![Conn { peer: peer(1), tx, kick: kick.clone(), who: link(), role: Role::Edit, revoked: false, end: Arc::new(Notify::new()) }], unsnapped: 0, unsnapped_since: None, last_commit: None, last_snap: None, snap_asked: None, snap_turn: 0 };
+        let d = Doc { log: Log::new(0), conns: vec![Conn { peer: peer(1), tx, kick: kick.clone(), who: link(), role: Role::Edit, revoked: false, end: Arc::new(Notify::new()) }], unsnapped: 0, unsnapped_since: None, last_commit: None, last_snap: None, snap_asked: None, snap_turn: 0, retired: false };
         for _ in 0..2 {
             d.broadcast(9, &ServerMsg::Leave { id: 9 });
         }
@@ -772,7 +796,7 @@ mod tests {
         let peer = |id| Peer { id, name: String::new(), user: String::new(), color: 0, editor: true, agent: false, presence: None };
         let (tx, mut rx) = mpsc::channel(16);
         let ago = |s: u64| Instant::now().checked_sub(Duration::from_secs(s));
-        let mut d = Doc { log: Log::new(0), conns: vec![Conn { peer: peer(1), tx, kick: Arc::new(Notify::new()), who: link(), role: Role::Edit, revoked: false, end: Arc::new(Notify::new()) }], unsnapped: 1, unsnapped_since: ago(1), last_commit: ago(1), last_snap: None, snap_asked: None, snap_turn: 0 };
+        let mut d = Doc { log: Log::new(0), conns: vec![Conn { peer: peer(1), tx, kick: Arc::new(Notify::new()), who: link(), role: Role::Edit, revoked: false, end: Arc::new(Notify::new()) }], unsnapped: 1, unsnapped_since: ago(1), last_commit: ago(1), last_snap: None, snap_asked: None, snap_turn: 0, retired: false };
         let asked = |rx: &mut mpsc::Receiver<Out>| {
             let mut n = 0;
             while let Ok(o) = rx.try_recv() {

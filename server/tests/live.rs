@@ -804,3 +804,110 @@ fn value_and_format_of_one_cell_both_survive_and_old_clients_are_asked_to_update
     }
     assert!(told);
 }
+
+// ---------------------------------------------------------------------------
+// M4: version labels, contributors, restore while connected
+// ---------------------------------------------------------------------------
+
+#[test]
+fn live_snapshots_list_their_contributors_and_labels_can_be_set() {
+    let s = start();
+    let (a, b, c) = (s.login("alice"), s.login("bob"), s.login("carol"));
+    let id = s.new_file(&a, "Who.xlsx");
+    s.share(&a, &id, "bob", "edit");
+    s.share(&a, &id, "carol", "view");
+    let (mut wa, _) = s.join(&a, &id, "client-a");
+    let (mut wb, _) = s.join(&b, &id, "client-b");
+    wa.send(&ClientMsg::Hello { sheets: vec![1], proto: cosync::PROTO });
+    wa.send(&ClientMsg::Ops { base: 0, id: 1, made: None, ops: vec![text(0, 0, "a")] });
+    assert!(matches!(wa.recv_data(), ServerMsg::Ack { seq: 1, .. }));
+    assert!(matches!(wb.recv_data(), ServerMsg::Ops { .. }));
+    wb.send(&ClientMsg::Ops { base: 1, id: 1, made: None, ops: vec![text(1, 0, "b")] });
+    assert!(matches!(wb.recv_data(), ServerMsg::Ack { seq: 2, .. }));
+    let snap = |seq: u32, who: &str| s.send("POST", &format!("/api/items/{id}/live/snapshot?seq={seq}"), Some(who), &[("X-Live-Sheets", "1:0")], Some(format!("snapshot {seq}").into_bytes()));
+    assert_eq!(snap(2, &a).status, 200);
+    let list = s.send("GET", &format!("/api/items/{id}/versions"), Some(&c), &[], None).json();
+    let v2 = &list["versions"][0];
+    assert_eq!(v2["version"], 2);
+    assert_eq!(v2["contributors"], json!(["Alice Admin", "Bob Builder"]));
+    assert_eq!(v2["label"], "");
+    assert_eq!(list["versions"][1]["contributors"], json!([]), "an upload has none, only modified_by");
+    // A second snapshot lists only the people with changes since the first.
+    assert!(matches!(wa.recv_data(), ServerMsg::Ops { .. }));
+    wb.send(&ClientMsg::Ops { base: 2, id: 2, made: None, ops: vec![text(2, 0, "b2")] });
+    assert!(matches!(wb.recv_data(), ServerMsg::Ack { seq: 3, .. }));
+    assert_eq!(snap(3, &b).status, 200);
+    let list = s.send("GET", &format!("/api/items/{id}/versions"), Some(&a), &[], None).json();
+    assert_eq!(list["versions"][0]["contributors"], json!(["Bob Builder"]));
+
+    // Naming: editors only; empty clears; long names are cut.
+    let put = |tok: &str, n: i64, label: &str| s.json("PUT", &format!("/api/items/{id}/versions/{n}"), Some(tok), json!({ "label": label }));
+    assert_eq!(put(&c, 2, "mine").status, 403);
+    assert_eq!(put(&b, 99, "x").status, 404);
+    assert_eq!(s.json("PUT", &format!("/api/items/{id}/versions/2"), Some(&b), json!({})).status, 400);
+    let r = put(&b, 2, "  Before the audit  ");
+    assert_eq!((r.status, r.json()["label"].as_str()), (200, Some("Before the audit")));
+    assert_eq!(put(&a, 1, &"x".repeat(200)).json()["label"].as_str().unwrap().len(), 80);
+    assert_eq!(put(&a, 1, "").json()["label"], "");
+    let list = s.send("GET", &format!("/api/items/{id}/versions"), Some(&a), &[], None).json();
+    assert_eq!(list["versions"][1]["label"], "Before the audit");
+}
+
+#[test]
+fn named_versions_are_not_pruned() {
+    let dir = std::env::temp_dir().join(format!("fo-label-test-{}", freedomoffice_server::util::new_id()));
+    let st = Store::open(&dir.join("db"), &dir.join("files"), 2).unwrap();
+    let u = st.create_user("ann", "", "", PW, false).unwrap();
+    let (mut it, _) = st.create_file(&u.root_id, "A.xlsx", b"1", &u.id, freedomoffice_server::store::OnConflict::Fail).unwrap();
+    for i in 2..=3 {
+        it = st.write_content(&it, format!("{i}").as_bytes(), &u.id).unwrap();
+    }
+    st.set_version_label(&it.id, 2, "keep me").unwrap();
+    for i in 4..=9 {
+        it = st.write_content(&it, format!("{i}").as_bytes(), &u.id).unwrap();
+    }
+    let kept: Vec<i64> = st.versions(&it.id).unwrap().iter().map(|v| v.version).collect();
+    assert_eq!(kept, [9, 8, 2, 1], "newest two, the named one and the day's first");
+    assert!(st.open_content(&it, Some(2)).is_ok(), "its file is still there");
+    // Clearing the name makes it prunable again at the next save.
+    st.set_version_label(&it.id, 2, "").unwrap();
+    it = st.write_content(&it, b"10", &u.id).unwrap();
+    let kept: Vec<i64> = st.versions(&it.id).unwrap().iter().map(|v| v.version).collect();
+    assert_eq!(kept, [10, 9, 1]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn restoring_while_others_are_connected_reloads_them() {
+    let s = start();
+    let (a, b) = (s.login("alice"), s.login("bob"));
+    let id = s.new_file(&a, "Restore.xlsx");
+    s.share(&a, &id, "bob", "edit");
+    assert_eq!(s.put(&a, &id, b"version two").status, 200);
+    let (mut wa, _) = s.join(&a, &id, "client-a");
+    let (mut wb, _) = s.join(&b, &id, "client-b");
+    wa.send(&ClientMsg::Hello { sheets: vec![1], proto: cosync::PROTO });
+    wa.send(&ClientMsg::Ops { base: 0, id: 1, made: None, ops: vec![text(0, 0, "x")] });
+    assert!(matches!(wa.recv_data(), ServerMsg::Ack { seq: 1, .. }));
+    assert!(matches!(wb.recv_data(), ServerMsg::Ops { .. }));
+    // Alice restores version 1 with both connected.
+    let r = s.send("POST", &format!("/api/items/{id}/versions/1/restore"), Some(&a), &[], None);
+    assert_eq!((r.status, r.json()["version"].as_i64()), (200, Some(3)), "{}", String::from_utf8_lossy(&r.body));
+    for w in [&mut wa, &mut wb] {
+        assert!(matches!(w.recv_data(), ServerMsg::Reload));
+        assert_eq!(w.close_code(), Some(1000));
+    }
+    let st = Store::open(&s.cfg.db_path(), &s.cfg.files_dir(), 25).unwrap();
+    assert_eq!(st.live_head(&id).unwrap(), 1, "nothing was committed after the restore");
+    // Reconnecting from the old base is told to reload; a fresh join starts from the restored file.
+    let mut again = s.ws(Some(&b), "since=1&cid=client-b", &id).unwrap();
+    assert!(matches!(again.recv_data(), ServerMsg::Reload));
+    let (seq, _, v) = s.live_base(&b, &id);
+    assert_eq!(v, 3);
+    assert!(seq > 1, "past the old log");
+    let (mut wb2, seq2) = s.join(&b, &id, "client-b");
+    assert_eq!(seq2, seq);
+    wb2.send(&ClientMsg::Hello { sheets: vec![1], proto: cosync::PROTO });
+    wb2.send(&ClientMsg::Ops { base: seq, id: 5, made: None, ops: vec![text(0, 0, "after")] });
+    assert!(matches!(wb2.recv_data(), ServerMsg::Ack { .. }));
+}
