@@ -261,6 +261,20 @@ fn becoming_a_viewer_with_unsent_changes_ends_the_session() {
     }
 }
 
+/// A lost connection is retried after 2, 4, then 8 s, never longer.
+#[test]
+fn reconnecting_waits_at_most_8_seconds() {
+    use crate::live::conn::Event;
+    let (_ctx, mut app) = super::data_ui::sample_app();
+    app.live_for_test();
+    let mut waits = Vec::new();
+    for _ in 0..8 {
+        app.live_event_for_test(Event::Closed { code: None, http: None, reason: "Connection lost".into() });
+        waits.push(app.live_retry_in().expect("a reconnect is scheduled").as_secs_f64().round() as u64);
+    }
+    assert_eq!(waits, [2, 4, 8, 8, 8, 8, 8, 8]);
+}
+
 #[test]
 fn view_only_participants_change_nothing() {
     let (_ctx, mut app) = super::data_ui::sample_app();

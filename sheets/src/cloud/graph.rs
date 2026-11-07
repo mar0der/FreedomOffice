@@ -562,8 +562,20 @@ fn filter_and_sort(items: &mut Vec<DriveItem>, target: &Target) -> Vec<DriveItem
     std::mem::take(items)
 }
 
-/// "2024-03-05T14:07:00Z" -> "2024-03-05 14:07"
+/// "2024-03-05T14:07:00Z" -> "2024-03-05 15:07" in this computer's time zone (TZ, else
+/// /etc/localtime on Linux; the Windows time zone on Windows).
 pub fn short_date(iso: &str) -> String {
+    short_date_in(iso, &chrono::Local)
+}
+
+/// `short_date` in a given time zone. Text that isn't an RFC 3339 date is shortened as it is.
+pub fn short_date_in<Tz: chrono::TimeZone>(iso: &str, tz: &Tz) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    if let Ok(t) = chrono::DateTime::parse_from_rfc3339(iso.trim()) {
+        return t.with_timezone(tz).format("%Y-%m-%d %H:%M").to_string();
+    }
     match iso.split_once('T') {
         Some((d, t)) => format!("{d} {}", t.get(..5).unwrap_or(t)),
         None => iso.to_string(),
@@ -630,7 +642,20 @@ mod tests {
         let b = &items[1];
         assert_eq!((b.kind, b.etag.as_str(), b.size, b.drive_id.as_str()), (Kind::File, "\"{ABC},3\"", 1234, "D1"));
         assert_eq!(b.parent_path().as_deref(), Some("/drives/D1/items/F1"));
-        assert_eq!(short_date(&items[0].modified), "2024-03-05 14:07");
+        assert_eq!(short_date_in(&items[0].modified, &chrono::Utc), "2024-03-05 14:07");
+    }
+
+    #[test]
+    fn dates_are_shown_in_local_time() {
+        let cet = chrono::FixedOffset::east_opt(3600).unwrap();
+        let ny = chrono::FixedOffset::west_opt(5 * 3600).unwrap();
+        assert_eq!(short_date_in("2026-11-07T14:07:09Z", &cet), "2026-11-07 15:07");
+        assert_eq!(short_date_in("2026-11-07T02:30:00Z", &ny), "2026-11-06 21:30", "the day changes too");
+        assert_eq!(short_date_in("2026-11-07T14:07:09+01:00", &chrono::Utc), "2026-11-07 13:07");
+        assert_eq!(short_date_in("not a date", &cet), "not a date");
+        assert_eq!(short_date_in("2026-11-07Tgarbage", &cet), "2026-11-07 garba");
+        // The real zone of this machine: a valid date always gives "YYYY-MM-DD HH:MM".
+        assert_eq!(short_date("2026-11-07T14:07:09Z").len(), 16);
     }
 
     #[test]

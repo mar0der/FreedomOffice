@@ -49,6 +49,9 @@ fn wait_for(h: &std::thread::JoinHandle<()>, end: Instant) {
     }
 }
 
+/// Reconnecting waits 2, 4, then 8 s between attempts (8 s at most).
+const RETRY_MAX_SHIFT: u32 = 3;
+
 /// The session ends when access became view-only; unsent changes stay in the window.
 const VIEW_ONLY_NOW: &str = "You now have view-only access to this workbook, so your latest changes weren't saved to the server. They are still in this window: use Save As to keep a copy.";
 
@@ -689,8 +692,8 @@ impl App {
                 if l.reloading {
                     return;
                 }
-                l.backoff = (l.backoff + 1).min(5);
-                l.retry_at = Some(Instant::now() + Duration::from_secs(1 << l.backoff.min(5)));
+                l.backoff = (l.backoff + 1).min(RETRY_MAX_SHIFT);
+                l.retry_at = Some(Instant::now() + Duration::from_secs(1 << l.backoff));
                 if was_online {
                     self.status = Some("Reconnecting... You can keep editing; your changes are sent when the connection is back.".into());
                 }
@@ -1354,6 +1357,11 @@ impl App {
             l.peers.clear();
             l.retry_at = Some(Instant::now() + Duration::from_secs(3600));
         }
+    }
+
+    /// How long until the next reconnect attempt.
+    pub(crate) fn live_retry_in(&self) -> Option<Duration> {
+        self.live.as_ref().and_then(|l| l.retry_at).map(|t| t.saturating_duration_since(Instant::now()))
     }
 
     pub(crate) fn live_reconnect_for_test(&mut self) {
