@@ -177,7 +177,7 @@ pub struct ServerEntry {
     /// Who is signed in, with their organisations (once `/api/me` answered).
     pub me: Option<Me>,
     /// An `/api/me` request is on its way (at most one per account).
-    checking: bool,
+    pub(super) checking: bool,
     /// When `/api/me` last answered (throttles the re-reads of File > Account).
     checked: Option<std::time::Instant>,
 }
@@ -271,7 +271,7 @@ pub struct VersionsState {
 }
 
 pub struct CloudState {
-    started: bool,
+    pub(super) started: bool,
     pub client_id: Option<String>,
     pub client_id_input: String,
     pub session: Option<Arc<Session>>,
@@ -1363,7 +1363,7 @@ impl App {
         self.cloud_spawn(move || Event::Listing(seq, conn.list(&target)));
     }
 
-    fn cloud_open_with(&mut self, conn: Conn, item: DriveItem) {
+    pub(super) fn cloud_open_with(&mut self, conn: Conn, item: DriveItem) {
         let Some(root) = self.cache_root_of(&conn) else {
             self.status = Some(cloud::NO_SETTINGS_DIR.to_string());
             return;

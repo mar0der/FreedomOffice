@@ -42,6 +42,9 @@ pub struct Journal {
     /// The local working copy of the document (the app's cache), when there is one.
     #[serde(default)]
     pub local: String,
+    /// The sheet ids of that version ("id:pos,...", see the server's `X-Live-Sheets`).
+    #[serde(default)]
+    pub sheets: String,
     /// Seconds since the epoch of the last write.
     pub saved_at: u64,
     pub session: SessionState,
@@ -65,6 +68,7 @@ impl Journal {
             version: 0,
             file_seq: 0,
             local: String::new(),
+            sheets: String::new(),
             saved_at: 0,
             session,
             inflight_changes: 0,

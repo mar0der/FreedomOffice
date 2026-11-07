@@ -262,6 +262,17 @@ fn error_text(r: &Response, host: &str) -> String {
     }
 }
 
+/// What asking for a document's details found.
+#[derive(Debug)]
+pub enum Probe {
+    Found(DriveItem),
+    /// Deleted, or no longer shared with this account.
+    Missing,
+    Denied,
+    /// A network or server problem: nothing is known about the document.
+    Failed(String),
+}
+
 /// A signed-in connection to a FreedomOffice server. Shared between worker threads.
 pub struct ServerSession {
     pub account: Account,
@@ -398,6 +409,21 @@ impl ServerSession {
         Ok(item_from_json(&self.get(&format!("/api/items/{}", pct_encode(id)))?))
     }
 
+    /// Whether the document can still be opened by this account (answers "no longer shared" and
+    /// "deleted" differently from a network problem).
+    pub fn probe_item(&self, id: &str) -> Probe {
+        match self.call(Request::new("GET", format!("/api/items/{}", pct_encode(id)))) {
+            Err(e) => Probe::Failed(e),
+            Ok(r) if r.ok() => match r.json() {
+                Ok(v) => Probe::Found(item_from_json(&v)),
+                Err(e) => Probe::Failed(e),
+            },
+            Ok(r) if r.status == 404 => Probe::Missing,
+            Ok(r) if r.status == 403 && error_code(&r) != PASSWORD_CHANGE_REQUIRED => Probe::Denied,
+            Ok(r) => Probe::Failed(error_text(&r, &self.host())),
+        }
+    }
+
     /// Downloads a file into `root\<item-id>\<name>`. Metadata is read first so a save made in
     /// between surfaces as a conflict on the next save, never a silent overwrite.
     pub fn open(&self, item: &DriveItem, root: &Path) -> Result<CloudDoc, String> {
@@ -420,7 +446,7 @@ impl ServerSession {
             if r.header("x-live-state").is_some() {
                 let s = self.call(Request::new("GET", format!("/api/items/{}/live/state?version={version}", pct_encode(&meta.id))))?;
                 if s.ok() {
-                    let path = doc.local.with_file_name(format!("{}.live", meta.name));
+                    let path = doc.local.with_file_name(format!("{}.live", doc.local.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()));
                     std::fs::write(&path, &s.body).map_err(|e| format!("Couldn't write {}: {e}", path.display()))?;
                     state = Some(path);
                 }
