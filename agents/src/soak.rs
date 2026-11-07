@@ -81,6 +81,7 @@ impl Report {
             "  server closes {:?}, snapshot requests {}, snapshots uploaded {}",
             t.closes, t.snapshot_requests, t.snapshots
         );
+        println!("  reloads from the latest version: {}", t.reloads);
         println!(
             "  own edits replaced by someone's concurrent edit (told to the editor): {}",
             t.replaced
@@ -144,6 +145,7 @@ fn add(a: &mut Stats, b: &Stats) {
     a.snapshot_requests += b.snapshot_requests;
     a.snapshots += b.snapshots;
     a.replaced += b.replaced;
+    a.reloads += b.reloads;
 }
 
 /// A random cell format (a few attributes, so concurrent format edits collide often).

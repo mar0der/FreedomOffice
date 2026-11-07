@@ -1132,6 +1132,29 @@ mod e2e {
         sh.get(r, col).is_some_and(|x| c.app.wb.style(x.style).bold)
     }
 
+    /// A window that was offline while someone's snapshot cut the server's log is told to reload
+    /// on reconnecting: it takes the latest version and puts its unsent changes on top.
+    #[test]
+    fn a_reload_request_keeps_the_unsent_changes() {
+        let (server, dir, mut a, mut b, _) = two_people("reload");
+        b.app.live_drop_for_test();
+        type_at(&mut b.app, 6, 2, "typed offline");
+        type_at(&mut a.app, 2, 1, "from a");
+        pump(&mut [&mut a, &mut b], "a is acknowledged", |cs| cs[0].app.live_quiet());
+        a.app.live_snapshot();
+        let seq = a.app.live_seq();
+        pump(&mut [&mut a, &mut b], "snapshot", |cs| cs[0].app.live_snap_seq() == seq);
+        b.app.live_reconnect_for_test();
+        settle(&mut [&mut a, &mut b], "reloaded and caught up");
+        assert_same(&a, &b, "after the reload");
+        for c in [&a, &b] {
+            assert_eq!(text(c, "Sheet1", 2, 1), "from a");
+            assert_eq!(text(c, "Sheet1", 6, 2), "typed offline");
+        }
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A client in protocol 1 mode (as against an old server) and a normal one edit the same
     /// workbook through a real server: both converge; the old-style one sends only whole cells and
     /// is never told "replaced".
