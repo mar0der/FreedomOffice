@@ -670,7 +670,46 @@ impl Store {
         Ok(v)
     }
 
-    /// Enabled users whose username or display name contains `query` (for the share dialog).
+    /// Whether two people are in at least one organisation together.
+    pub fn shares_org(&self, a: &str, b: &str) -> Res<bool> {
+        Ok(self
+            .conn
+            .query_row("SELECT 1 FROM org_members x JOIN org_members y ON x.org_id = y.org_id WHERE x.user_id = ?1 AND y.user_id = ?2 LIMIT 1", params![a, b], |_| Ok(()))
+            .optional()?
+            .is_some())
+    }
+
+    /// People `caller` may find in the share dialog: those whose username or display name
+    /// contains `query` among the people sharing an organisation with them (the server
+    /// administrator: everyone), plus whoever has exactly that username. Enabled accounts only.
+    pub fn search_users_for(&self, caller: &User, query: &str, limit: usize) -> Res<Vec<User>> {
+        if caller.is_admin {
+            return self.search_users(query, limit);
+        }
+        let q = query.trim().to_lowercase();
+        let cols = USER_COLS.split(", ").map(|c| format!("u.{c}")).collect::<Vec<_>>().join(", ");
+        let mut st = self.conn.prepare(&format!(
+            "SELECT DISTINCT {cols} FROM users u JOIN org_members m ON m.user_id = u.id
+             WHERE m.org_id IN (SELECT org_id FROM org_members WHERE user_id = ?1) AND u.disabled = 0 AND u.org_id IS NULL
+             ORDER BY u.username COLLATE NOCASE"
+        ))?;
+        let mut out: Vec<User> = st
+            .query_map([&caller.id], user_row)?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|u| q.is_empty() || u.username.to_lowercase().contains(&q) || u.display_name.to_lowercase().contains(&q))
+            .collect();
+        if let Some(exact) = self.user_by_name(&q)?.filter(|u| !u.disabled) {
+            if !out.iter().any(|u| u.id == exact.id) {
+                out.insert(0, exact);
+            }
+        }
+        out.truncate(limit);
+        Ok(out)
+    }
+
+    /// Enabled users whose username or display name contains `query` (everyone; for the server
+    /// administrator).
     pub fn search_users(&self, query: &str, limit: usize) -> Res<Vec<User>> {
         let q = query.trim().to_lowercase();
         Ok(self.users()?.into_iter().filter(|u| !u.disabled && (q.is_empty() || u.username.to_lowercase().contains(&q) || u.display_name.to_lowercase().contains(&q))).take(limit).collect())

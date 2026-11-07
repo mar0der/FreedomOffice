@@ -606,7 +606,9 @@ fn organisations_members_and_roles() {
     assert_eq!(s.get(&format!("/api/items/{root}"), &b).status, 404);
     assert_eq!(s.add_member(&b, &org, "carol", "member"), 404);
     assert_eq!(s.add_member(&a, &org, "bob", "admin"), 201);
-    assert_eq!(s.add_member(&b, &org, "carol", "member"), 201, "org admins add people");
+    let r = s.json("POST", &format!("/api/orgs/{org}/members"), Some(&b), json!({ "username": "carol" }));
+    assert_eq!((r.status, r.json()["code"].as_str()), (403, Some("invite_required")), "org admins can't pull in strangers");
+    assert_eq!(s.add_member(&a, &org, "carol", "member"), 201, "the server administrator can");
     assert_eq!(s.add_member(&b, &org, "carol", "owner"), 403, "only owners make owners");
     assert_eq!(s.add_member(&c, &org, "alice", "member"), 403, "members don't manage");
     // The org folder shows up for members.
@@ -862,4 +864,46 @@ fn junk_usernames_are_refused_before_the_limiter() {
         assert_eq!(s.login_with(&name, "whatever-password").status, 401);
     }
     assert_eq!(s.login_with("bob", PW).status, 200, "junk doesn't count against real users");
+}
+
+#[test]
+fn org_admins_reach_only_people_they_know() {
+    let s = start();
+    let (a, b, c) = (s.login("alice"), s.login("bob"), s.login("carol"));
+    let (one, _) = s.org(&a, "One");
+    let (two, _) = s.org(&a, "Two");
+    assert_eq!(s.add_member(&a, &one, "bob", "owner"), 201);
+    assert_eq!(s.add_member(&a, &two, "bob", "admin"), 201);
+    // Search: strangers aren't listed, only found by their exact username.
+    let names = |tok: &str, q: &str| -> Vec<String> { s.get(&format!("/api/users?query={q}"), tok).json()["users"].as_array().unwrap().iter().map(|u| u["username"].as_str().unwrap().to_string()).collect() };
+    assert!(names(&b, "").is_empty());
+    assert!(names(&b, "car").is_empty());
+    assert_eq!(names(&b, "carol"), ["carol"]);
+    assert_eq!(names(&a, ""), ["bob", "carol"], "the server administrator finds everyone");
+    // Carol joins One (through the administrator): now Bob knows her and may add her to Two.
+    assert_eq!(s.add_member(&a, &one, "carol", "member"), 201);
+    assert_eq!(names(&b, "car"), ["carol"]);
+    let r = s.json("POST", &format!("/api/orgs/{two}/members"), Some(&b), json!({ "username": "carol" }));
+    assert_eq!(r.status, 201);
+    assert!(r.json()["members"].as_array().unwrap().iter().all(|m| m.get("email").is_none()), "no emails for org admins");
+    assert!(s.get(&format!("/api/orgs/{two}/members"), &a).json()["members"][0].get("email").is_some(), "the server administrator sees them");
+    // The last owner can't leave or step down; with a second owner they can.
+    assert_eq!(s.send("DELETE", &format!("/api/orgs/{one}/members/bob"), Some(&b), &[], None).status, 409);
+    assert_eq!(s.json("PATCH", &format!("/api/orgs/{one}/members/bob"), Some(&b), json!({ "role": "member" })).status, 409);
+    assert_eq!(s.add_member(&b, &one, "carol", "owner"), 200);
+    assert_eq!(s.send("DELETE", &format!("/api/orgs/{one}/members/bob"), Some(&b), &[], None).status, 204);
+    drop(c);
+}
+
+#[test]
+fn revoking_an_unknown_org_and_a_missing_grant_look_the_same() {
+    let s = start();
+    let a = s.login("alice");
+    let root = s.root(&a);
+    let id = id_of(&s.upload(&a, &root, "R.xlsx", b"r"));
+    s.org(&a, "Secret Club");
+    let x = s.send("DELETE", &format!("/api/items/{id}/permissions/org/Secret%20Club"), Some(&a), &[], None);
+    let y = s.send("DELETE", &format!("/api/items/{id}/permissions/org/No%20Such%20Org"), Some(&a), &[], None);
+    assert_eq!((x.status, y.status), (404, 404));
+    assert_eq!(x.body, y.body);
 }

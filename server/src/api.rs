@@ -865,7 +865,7 @@ async fn get_org(State(app): State<App>, headers: HeaderMap, Path(org): Path<Str
         let me = user_of(&who)?;
         let (o, mine) = org_for(s, me, &org)?;
         let mut v = org_json(s, &o, mine)?;
-        v["member_list"] = members_json(s, &o, need_manage(me, mine).is_ok())?;
+        v["member_list"] = members_json(s, &o, me.is_admin)?;
         ok_json(v)
     })
     .await
@@ -920,8 +920,8 @@ async fn org_members(State(app): State<App>, headers: HeaderMap, Path(org): Path
     app.run(move |s| {
         let who = auth(s, &headers)?;
         let me = user_of(&who)?;
-        let (o, mine) = org_for(s, me, &org)?;
-        ok_json(json!({ "members": members_json(s, &o, need_manage(me, mine).is_ok())? }))
+        let (o, _) = org_for(s, me, &org)?;
+        ok_json(json!({ "members": members_json(s, &o, me.is_admin)? }))
     })
     .await
 }
@@ -946,10 +946,26 @@ fn set_member(s: &Store, headers: &HeaderMap, org: &str, username: &str, role: O
     }
     let before = s.member_role(&o.id, &target.id)?;
     need_owner_for(me, mine, &[Some(role), before])?;
+    // Org admins add directly only people they already share an organisation with; anyone
+    // else gets an invite (which they accept themselves). The server administrator adds anyone.
+    if before.is_none() && !me.is_admin && !s.shares_org(&me.id, &target.id)? {
+        return Err(ApiError::coded(StatusCode::FORBIDDEN, "invite_required", format!("{} isn't in any of your organisations; send them an invite instead.", target.username)));
+    }
+    if target.id == me.id && before == Some(OrgRole::Owner) && role != OrgRole::Owner {
+        last_owner_check(s, &o)?;
+    }
     let added = s.set_member(&o, &target, role, &me.id)?;
     tracing::info!("user '{}' {} '{}' as {} of '{}'", me.username, if added { "added" } else { "set" }, target.username, role.as_str(), o.name);
     let status = if added { StatusCode::CREATED } else { StatusCode::OK };
-    Ok((status, axum::Json(json!({ "members": members_json(s, &o, true)? }))).into_response())
+    Ok((status, axum::Json(json!({ "members": members_json(s, &o, me.is_admin)? }))).into_response())
+}
+
+/// An organisation keeps at least one owner: its last owner can't leave or step down.
+fn last_owner_check(s: &Store, o: &Org) -> Result<(), ApiError> {
+    if s.members(&o.id)?.iter().filter(|m| m.role == OrgRole::Owner).count() <= 1 {
+        return Err(ApiError::new(StatusCode::CONFLICT, format!("You are the last owner of {}. Make someone else an owner first.", o.name)));
+    }
+    Ok(())
 }
 
 /// `POST /api/orgs/{org}/members {username, role?}`: adds a person (default role member) or
@@ -990,6 +1006,8 @@ async fn remove_member(State(app): State<App>, headers: HeaderMap, Path((org, us
         if target.id != me.id {
             need_manage(me, mine)?;
             need_owner_for(me, mine, &[theirs])?;
+        } else if theirs == Some(OrgRole::Owner) {
+            last_owner_check(s, &o)?;
         }
         if theirs.is_none() || !s.remove_member(&o.id, &target.id)? {
             return Err(ApiError::new(StatusCode::NOT_FOUND, format!("{} isn't a member of {}.", target.username, o.name)));
@@ -1242,7 +1260,7 @@ async fn users(State(app): State<App>, headers: HeaderMap, Query(q): Query<HashM
     app.run(move |s| {
         let who = auth(s, &headers)?;
         let me = user_of(&who)?;
-        let list: Vec<Value> = s.search_users(q.get("query").map(String::as_str).unwrap_or(""), 21)?.iter().filter(|u| u.id != me.id).take(20).map(person).collect();
+        let list: Vec<Value> = s.search_users_for(me, q.get("query").map(String::as_str).unwrap_or(""), 21)?.iter().filter(|u| u.id != me.id).take(20).map(person).collect();
         ok_json(json!({ "users": list }))
     })
     .await
@@ -1663,10 +1681,12 @@ fn revoke_org(s: &Store, headers: &HeaderMap, id: &str, org: &str) -> ApiResult 
     let who = auth(s, headers)?;
     let (it, role) = visible(s, &who, id, false)?;
     need_edit(role)?;
-    // Grants to any organisation can be removed (no membership needed, unlike granting).
-    let o = s.find_org(org.trim())?.ok_or_else(ApiError::not_found)?;
+    // Grants to any organisation can be removed (no membership needed, unlike granting). An
+    // unknown name answers exactly like a known one without a grant here, so names can't be probed.
+    let none = || ApiError::new(StatusCode::NOT_FOUND, "That organisation has no access granted on this item (it may come from a parent folder).");
+    let o = s.find_org(org.trim())?.ok_or_else(none)?;
     if !s.revoke_org(&it, &o.id)? {
-        return Err(ApiError::new(StatusCode::NOT_FOUND, "That organisation has no access granted on this item (it may come from a parent folder)."));
+        return Err(none());
     }
     Ok(StatusCode::NO_CONTENT.into_response())
 }

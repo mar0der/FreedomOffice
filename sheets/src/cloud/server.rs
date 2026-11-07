@@ -567,8 +567,13 @@ mod e2e {
         let cfg = Config { data_dir: dir.join("data"), versions_to_keep: 10, ..Config::default() };
         {
             let st = Store::open(&cfg.db_path(), &cfg.files_dir(), cfg.versions_to_keep).unwrap();
-            st.create_user("ann", "Ann Lee", "", PW, false).unwrap();
-            st.create_user("ben", "Ben Ode", "", PW, false).unwrap();
+            let ann = st.create_user("ann", "Ann Lee", "", PW, false).unwrap();
+            let ben = st.create_user("ben", "Ben Ode", "", PW, false).unwrap();
+            // People find each other in the share dialog when they share an organisation.
+            let org = st.create_org("Team", "test").unwrap();
+            for u in [&ann, &ben] {
+                st.set_member(&org, u, freedomoffice_server::store::OrgRole::Member, "test").unwrap();
+            }
         }
         let server = freedomoffice_server::spawn(cfg).unwrap();
         let url = server.url();
