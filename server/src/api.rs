@@ -18,7 +18,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::config::Config;
-use crate::store::{Grant, Item, Kind, Link, OnConflict, Org, OrgGrant, OrgRole, Principal, Role, Store, StoreError, User};
+use crate::store::{Audit, Grant, Item, Kind, Link, OnConflict, Org, OrgGrant, OrgRole, Principal, Role, Store, StoreError, User};
 use crate::util::{self, iso, now};
 
 const JSON_LIMIT: usize = 64 * 1024;
@@ -57,11 +57,15 @@ pub struct App {
     hub: Arc<crate::live::Hub>,
     /// Argon2 runs (about 19 MiB and a core each) at most this many at once.
     argon: Arc<tokio::sync::Semaphore>,
+    /// Where uploads are staged while they stream in (`Store::incoming_dir`).
+    incoming: Arc<std::path::PathBuf>,
 }
 
 impl App {
     pub fn new(mut store: Store, cfg: Config) -> App {
         store.allow_links = cfg.allow_links;
+        store.clear_incoming();
+        let incoming = Arc::new(store.incoming_dir());
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).clamp(1, 16);
         App {
             store: Arc::new(Mutex::new(store)),
@@ -69,6 +73,7 @@ impl App {
             limiter: Arc::new(Mutex::new(Limiter::default())),
             hub: Arc::default(),
             argon: Arc::new(tokio::sync::Semaphore::new(cores)),
+            incoming,
         }
     }
 
@@ -113,11 +118,17 @@ impl App {
     }
 
     /// Runs blocking store work (SQLite, disk) on the blocking pool, one request at a time.
+    /// The client address of the request (see `web::web_gate`) is set on the store for the
+    /// audit log while `f` runs.
     pub(crate) async fn run<T: Send + 'static>(&self, f: impl FnOnce(&Store) -> Result<T, ApiError> + Send + 'static) -> Result<T, ApiError> {
         let store = self.store.clone();
+        let ip = crate::web::REQUEST_IP.try_with(Clone::clone).unwrap_or_default();
         tokio::task::spawn_blocking(move || {
-            let s = store.lock().unwrap_or_else(|e| e.into_inner());
-            f(&s)
+            let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
+            s.request_ip = ip;
+            let r = f(&s);
+            s.request_ip.clear();
+            r
         })
         .await
         .map_err(|_| ApiError::internal())?
@@ -237,7 +248,7 @@ pub struct ApiError {
 }
 
 impl ApiError {
-    fn new(status: StatusCode, msg: impl Into<String>) -> Self {
+    pub(crate) fn new(status: StatusCode, msg: impl Into<String>) -> Self {
         ApiError { status, body: json!({ "error": msg.into() }) }
     }
 
@@ -245,12 +256,12 @@ impl ApiError {
         Self::new(StatusCode::NOT_FOUND, "Not found.")
     }
 
-    fn unauthorized() -> Self {
+    pub(crate) fn unauthorized() -> Self {
         Self::new(StatusCode::UNAUTHORIZED, "Sign in to continue.")
     }
 
     /// With a machine-readable `code` next to the message.
-    fn coded(status: StatusCode, code: &str, msg: impl Into<String>) -> Self {
+    pub(crate) fn coded(status: StatusCode, code: &str, msg: impl Into<String>) -> Self {
         ApiError { status, body: json!({ "error": msg.into(), "code": code }) }
     }
 
@@ -305,7 +316,7 @@ impl IntoResponse for ApiError {
     }
 }
 
-type ApiResult = Result<Response, ApiError>;
+pub(crate) type ApiResult = Result<Response, ApiError>;
 
 fn ok_json(v: Value) -> ApiResult {
     Ok(axum::Json(v).into_response())
@@ -339,22 +350,29 @@ fn auth(s: &Store, headers: &HeaderMap) -> Result<Principal, ApiError> {
 
 /// The caller, even one who still has to change a temporary password (for `/api/me`,
 /// `/api/me/password` and `/api/logout`).
+///
+/// An `Authorization` header decides alone (a bearer device token or share-link access
+/// token). Without one, the browser session cookie of the API (`web`), if `web::web_gate`
+/// let it through: 403 `csrf_failed` / `cross_site` when it didn't.
 fn auth_any(s: &Store, headers: &HeaderMap) -> Result<Principal, ApiError> {
-    let token = bearer(headers).ok_or_else(ApiError::unauthorized)?;
-    s.authenticate(&token)?.ok_or_else(ApiError::unauthorized)
+    if headers.contains_key(header::AUTHORIZATION) {
+        let token = bearer(headers).ok_or_else(ApiError::unauthorized)?;
+        return s.authenticate(&token)?.ok_or_else(ApiError::unauthorized);
+    }
+    let secret = crate::web::verdict(headers)?.ok_or_else(ApiError::unauthorized)?;
+    let (user, sess) = s.web_session(&secret)?.ok_or_else(ApiError::unauthorized)?;
+    Ok(Principal::User { user, sign_in: SignIn::Web(sess.id) })
 }
 
-/// What a person signed in with: an API device token or a web admin session (`/admin`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SignIn {
-    Device(i64),
-    Admin(i64),
-}
+/// What a person signed in with: an API device token, a web admin session (`/admin`) or a
+/// browser session of the API (Drive).
+pub(crate) use crate::store::SignIn;
 
-/// How a request authenticates a person: the API's bearer device token, or the web admin
-/// session cookie (its secret). The administration flows below take this (or the `User` it
-/// gives), so the API and the admin page share every rule; flows that hash a password
-/// outside the store lock authenticate again before they store.
+/// How a request authenticates a person: the API's bearer device token or browser session
+/// (`Bearer`: the request headers), or the web admin session cookie (its secret). The
+/// administration flows below take this (or the `User` it gives), so the API and the admin
+/// page share every rule; flows that hash a password outside the store lock authenticate
+/// again before they store.
 #[derive(Clone)]
 pub(crate) enum Caller {
     Bearer(HeaderMap),
@@ -366,7 +384,7 @@ impl Caller {
     pub(crate) fn person_any(&self, s: &Store) -> Result<(User, SignIn), ApiError> {
         match self {
             Caller::Bearer(h) => match auth_any(s, h)? {
-                Principal::User { user, token_id } => Ok((user, SignIn::Device(token_id))),
+                Principal::User { user, sign_in } => Ok((user, sign_in)),
                 Principal::Link { .. } => Err(ApiError::unauthorized()),
             },
             Caller::Admin(secret) => s.admin_session(secret)?.map(|(u, sess)| (u, SignIn::Admin(sess.id))).ok_or_else(ApiError::unauthorized),
@@ -396,6 +414,14 @@ fn actor(p: &Principal) -> String {
     match p {
         Principal::User { user, .. } => user.id.clone(),
         Principal::Link { link } => format!("link:{}", link.id),
+    }
+}
+
+/// An audit event done by the caller (a person, or a share-link holder as `link:<id>`).
+fn audit_by(who: &Principal, action: &'static str) -> Audit {
+    match who {
+        Principal::User { user, .. } => Audit::by(user, action),
+        Principal::Link { link } => Audit::anonymous(action, format!("link:{}", link.id)),
     }
 }
 
@@ -463,7 +489,7 @@ fn items_json(s: &Store, who: &Principal, items: &[Item]) -> Result<Value, ApiEr
     Ok(json!({ "items": out }))
 }
 
-fn user_json(u: &User) -> Value {
+pub(crate) fn user_json(u: &User) -> Value {
     json!({
         "id": u.id,
         "username": u.username,
@@ -516,6 +542,10 @@ pub fn router(app: App) -> Router {
         .route("/api/health", get(health))
         .route("/api/login", post(login))
         .route("/api/logout", post(logout))
+        .route("/api/web/login", post(crate::web::login))
+        .route("/api/web/session", get(crate::web::session))
+        .route("/api/web/logout", post(crate::web::logout))
+        .route("/api/admin/audit", get(audit_log))
         .route("/api/me", get(me))
         .route("/api/me/password", post(change_password))
         .route("/api/root", get(root))
@@ -564,6 +594,7 @@ pub fn router(app: App) -> Router {
         .fallback(|| async { ApiError::not_found() })
         .layer(DefaultBodyLimit::max(JSON_LIMIT))
         .layer(middleware::from_fn(crate::admin::harden_admin))
+        .layer(middleware::from_fn_with_state(app.clone(), crate::web::web_gate))
         .layer(middleware::from_fn(log_requests))
         .with_state(app)
 }
@@ -607,7 +638,7 @@ struct LoginBody {
 async fn login(State(app): State<App>, ConnectInfo(Peer(peer)): ConnectInfo<Peer>, headers: HeaderMap, body: Bytes) -> ApiResult {
     let b: LoginBody = parse_body(&body)?;
     let ip = client_ip(&app.cfg, peer, &headers);
-    let user = check_sign_in(&app, ip, &b.username, b.password).await?;
+    let user = check_sign_in(&app, ip, &b.username, b.password, "app").await?;
     let device = b.device;
     app.run(move |s| {
         let token = s.create_token(&user.id, &device)?;
@@ -616,17 +647,19 @@ async fn login(State(app): State<App>, ConnectInfo(Peer(peer)): ConnectInfo<Peer
     .await
 }
 
-/// Checks a username and password for a sign-in from `ip` (the API's and the admin page's):
-/// the per-address and per-username limits, the delay after repeated failures, Argon2 in its
-/// slots. The enabled person, or 401 (429 when limited).
-pub(crate) async fn check_sign_in(app: &App, ip: IpAddr, username: &str, password: String) -> Result<User, ApiError> {
-    verify_sign_in(app, ip, username, password, false).await
+/// Checks a username and password for a sign-in from `ip` (the API's, the browser session's
+/// and the admin page's): the per-address and per-username limits, the delay after repeated
+/// failures, Argon2 in its slots. The enabled person, or 401 (429 when limited). The result
+/// goes to the audit log (`sign_in` with `via` as detail, or `sign_in.failed` for usernames
+/// that could exist; never the password).
+pub(crate) async fn check_sign_in(app: &App, ip: IpAddr, username: &str, password: String, via: &'static str) -> Result<User, ApiError> {
+    verify_sign_in(app, ip, username, password, false, via).await
 }
 
 /// `check_sign_in`, optionally also for a disabled account (the right password for one is
 /// still counted as a failure). Lets callers that need the password checked say "disabled"
 /// to someone who proved they know it.
-async fn verify_sign_in(app: &App, ip: IpAddr, username: &str, password: String, allow_disabled: bool) -> Result<User, ApiError> {
+async fn verify_sign_in(app: &App, ip: IpAddr, username: &str, password: String, allow_disabled: bool, via: &'static str) -> Result<User, ApiError> {
     let ip_key = format!("ip:{ip}");
     let wrong = || ApiError::new(StatusCode::UNAUTHORIZED, "The username or password is incorrect.");
     let name = username.trim().to_string();
@@ -665,19 +698,27 @@ async fn verify_sign_in(app: &App, ip: IpAddr, username: &str, password: String,
         .await?;
     let Some(user) = user else {
         tracing::warn!("failed sign-in for user '{name}' from {ip}");
+        let (n, ip) = (name.clone(), ip.to_string());
+        let _ = app.run(move |s| Ok(s.audit(Audit::anonymous("sign_in.failed", "").target(&n).ip(ip).detail(via))?)).await;
         return Err(wrong());
     };
     if !user.disabled {
         app.succeeded(&ip_key, &user_key);
     }
+    let (u, ip) = (user.clone(), ip.to_string());
+    let action = if user.disabled { "sign_in.failed" } else { "sign_in" };
+    let detail = if user.disabled { format!("{via}, account disabled") } else { via.to_string() };
+    let _ = app.run(move |s| Ok(s.audit(Audit::by(&u, action).target(&u.username).ip(ip).detail(detail))?)).await;
     Ok(user)
 }
 
 async fn logout(State(app): State<App>, headers: HeaderMap) -> ApiResult {
     app.run_changing(move |s| {
         let who = auth_any(s, &headers)?;
-        if let Principal::User { token_id, .. } = who {
-            s.revoke_token(token_id)?;
+        match who {
+            Principal::User { sign_in: SignIn::Device(id), .. } => s.revoke_token(id)?,
+            Principal::User { sign_in: SignIn::Admin(id) | SignIn::Web(id), .. } => s.end_admin_session(id)?,
+            Principal::Link { .. } => {}
         }
         Ok(StatusCode::NO_CONTENT.into_response())
     })
@@ -716,7 +757,7 @@ async fn change_password(State(app): State<App>, headers: HeaderMap, body: Bytes
 
 /// A person changes their own password (the API's and the admin page's): the current one is
 /// checked (counted for the username's limit), the new one follows the policy. Every other
-/// sign-in ends (devices and web admin sessions; the one in use stays). The updated person and
+/// sign-in ends (devices, web admin and web browser sessions; the one in use stays). The updated person and
 /// how many sign-ins ended.
 pub(crate) async fn change_own_password(app: &App, caller: Caller, old_password: String, new_password: String) -> Result<(User, usize), ApiError> {
     let c = caller.clone();
@@ -749,17 +790,20 @@ pub(crate) async fn change_own_password(app: &App, caller: Caller, old_password:
         // Still the same password (no other change won the race) and the same sign-in.
         let still = match sign_in {
             SignIn::Device(id) => s.token_exists(id)?,
-            SignIn::Admin(id) => s.admin_session_exists(id)?,
+            SignIn::Admin(id) | SignIn::Web(id) => s.admin_session_exists(id)?,
         };
         if s.password_hash(&user.id)? != hash || !still {
             return Err(ApiError::new(StatusCode::CONFLICT, "Your password was changed meanwhile. Sign in again."));
         }
         s.set_password_hash(&user.id, &new_hash)?;
+        // Every other sign-in ends: devices, admin and web browser sessions.
         let n = match sign_in {
             SignIn::Device(id) => s.revoke_other_tokens(&user.id, id)?,
-            SignIn::Admin(id) => s.revoke_all_but_admin_session(&user.id, id)?,
+            SignIn::Admin(id) | SignIn::Web(id) => s.revoke_all_but_admin_session(&user.id, id)?,
         };
         tracing::info!("user '{}' changed their password ({n} other sign-in(s) ended)", user.username);
+        let was_temp = if user.must_change_password { "replaced a temporary password; " } else { "" };
+        s.audit(Audit::by(&user, "password.change").target(&user.username).detail(format!("{was_temp}{n} other sign-in(s) ended")))?;
         let fresh = s.user_by_id(&user.id)?.ok_or_else(ApiError::not_found)?;
         Ok((fresh, n))
     })
@@ -865,6 +909,11 @@ pub(crate) async fn create_account_as(app: &App, caller: Caller, b: AccountBody)
             let (me, org, _) = account_target(s, &caller, &b)?;
             let u = s.create_temp_account(&b.username, &b.display_name, &b.email, &hash, org.as_ref().map(|(o, r)| (o, *r, me.id.as_str())))?;
             tracing::info!("user '{}' created the account '{}'{}", me.username, u.username, org.as_ref().map(|(o, _)| format!(" in {}", o.name)).unwrap_or_default());
+            let mut a = Audit::by(&me, "account.create").target(&u.username).detail("temporary password");
+            if let Some((o, r)) = &org {
+                a = a.org(&o.id).detail(format!("temporary password; joins {} as {}", o.name, r.as_str()));
+            }
+            s.audit(a)?;
             Ok(u)
         })
         .await?;
@@ -902,6 +951,7 @@ pub(crate) async fn reset_password_as(app: &App, caller: Caller, username: Strin
             not_self_reset(&me, &u)?;
             let n = s.set_temp_password_hash(&u.id, &hash)?;
             tracing::warn!("administrator '{}' reset the password of '{}' ({n} sign-in(s) ended)", me.username, u.username);
+            s.audit(Audit::by(&me, "password.reset").target(&u.username).detail(format!("{n} sign-in(s) ended")))?;
             s.user_by_id(&u.id)?.ok_or_else(ApiError::not_found)
         })
         .await?;
@@ -927,6 +977,7 @@ pub(crate) fn set_disabled_as(s: &Store, me: &User, username: &str, disabled: bo
     }
     s.set_disabled(&u.id, disabled)?;
     tracing::info!("user '{}' {} the account '{}'", me.username, if disabled { "disabled" } else { "enabled" }, u.username);
+    s.audit(Audit::by(me, if disabled { "account.disable" } else { "account.enable" }).target(&u.username))?;
     s.user_by_id(&u.id)?.ok_or_else(ApiError::not_found)
 }
 
@@ -959,6 +1010,7 @@ pub(crate) fn set_super_admin_as(s: &Store, me: &User, username: &str, on: bool)
     }
     s.set_admin(&u.id, on)?;
     tracing::warn!("administrator '{}' {} '{}' {} server administrator", me.username, if on { "made" } else { "removed" }, u.username, if on { "a" } else { "as" });
+    s.audit(Audit::by(me, "account.admin").target(&u.username).detail(if on { "made server administrator" } else { "no longer server administrator" }))?;
     s.user_by_id(&u.id)?.ok_or_else(ApiError::not_found)
 }
 
@@ -995,12 +1047,16 @@ pub(crate) fn end_sign_in_as(s: &Store, me: &User, username: &str, which: SignIn
     let u = person_by_name(s, username)?;
     let ended = match which {
         SignIn::Device(id) => s.revoke_token_of(&u.id, id)?,
-        SignIn::Admin(id) => s.end_admin_session_of(&u.id, id)?,
+        SignIn::Admin(id) | SignIn::Web(id) => s.end_admin_session_of(&u.id, id)?,
     };
     if !ended {
         return Err(ApiError::new(StatusCode::NOT_FOUND, "That sign-in has ended already."));
     }
     tracing::info!("administrator '{}' ended a sign-in of '{}'", me.username, u.username);
+    s.audit(Audit::by(me, "account.session_end").target(&u.username).detail(match which {
+        SignIn::Device(_) => "a device",
+        _ => "a browser session",
+    }))?;
     Ok(u)
 }
 
@@ -1010,6 +1066,7 @@ pub(crate) fn sign_out_everywhere_as(s: &Store, me: &User, username: &str) -> Re
     let u = person_by_name(s, username)?;
     let n = s.revoke_user_tokens(&u.id)?;
     tracing::info!("administrator '{}' signed '{}' out everywhere ({n} sign-in(s) ended)", me.username, u.username);
+    s.audit(Audit::by(me, "account.sign_out").target(&u.username).detail(format!("{n} sign-in(s) ended")))?;
     Ok((u, n))
 }
 
@@ -1019,7 +1076,7 @@ async fn user_sessions(State(app): State<App>, headers: HeaderMap, Path(username
         let who = auth(s, &headers)?;
         let (_, devices, web) = sign_ins_as(s, user_of(&who)?, &username)?;
         let devices: Vec<Value> = devices.iter().map(|t| json!({ "id": t.id, "device": t.device, "created": iso(t.created), "last_used": iso(t.last_used) })).collect();
-        let web: Vec<Value> = web.iter().map(|w| json!({ "id": w.id, "agent": w.agent, "created": iso(w.created), "last_used": iso(w.last_used), "expires": iso(w.expires) })).collect();
+        let web: Vec<Value> = web.iter().map(|w| json!({ "id": w.id, "kind": w.kind.as_str(), "agent": w.agent, "created": iso(w.created), "last_used": iso(w.last_used), "expires": iso(w.expires) })).collect();
         ok_json(json!({ "devices": devices, "web": web }))
     })
     .await
@@ -1092,6 +1149,7 @@ pub(crate) fn create_org_as(s: &Store, me: &User, name: &str) -> Result<Org, Api
     need_admin(me)?;
     let o = s.create_org(name, &me.id)?;
     tracing::info!("user '{}' created the organisation '{}'", me.username, o.name);
+    s.audit(Audit::by(me, "org.create").org(&o.id).detail(o.name.clone()))?;
     Ok(o)
 }
 
@@ -1161,10 +1219,12 @@ pub(crate) fn patch_org_as(s: &Store, me: &User, org: &str, name: Option<&str>, 
     // The rename can still be refused (taken, invalid name); it goes first, so then nothing
     // has changed either.
     if let Some(n) = name {
-        s.rename_org(&o, n)?;
+        let renamed = s.rename_org(&o, n)?;
+        s.audit(Audit::by(me, "org.rename").org(&o.id).detail(format!("{} -> {}", o.name, renamed.name)))?;
     }
     if let Some(r) = role {
         s.set_org_member_role(&o, r)?;
+        s.audit(Audit::by(me, "org.settings").org(&o.id).detail(format!("members can {} ({} before)", r.as_str(), o.member_role.as_str())))?;
     }
     Ok((s.org(&o.id)?.ok_or_else(ApiError::not_found)?, mine))
 }
@@ -1188,6 +1248,7 @@ pub(crate) fn delete_org_as(s: &Store, me: &User, org: &str) -> Result<Org, ApiE
     let (o, _) = org_for(s, me, org)?;
     s.delete_org(&o)?;
     tracing::info!("user '{}' deleted the organisation '{}'", me.username, o.name);
+    s.audit(Audit::by(me, "org.delete").org(&o.id).detail(o.name.clone()))?;
     Ok(o)
 }
 
@@ -1243,6 +1304,11 @@ pub(crate) fn set_member_as(s: &Store, me: &User, org: &str, username: &str, rol
     }
     let added = s.set_member(&o, &target, role, &me.id)?;
     tracing::info!("user '{}' {} '{}' as {} of '{}'", me.username, if added { "added" } else { "set" }, target.username, role.as_str(), o.name);
+    let detail = match before {
+        Some(b) => format!("{} -> {}", b.as_str(), role.as_str()),
+        None => role.as_str().to_string(),
+    };
+    s.audit(Audit::by(me, if added { "member.add" } else { "member.role" }).org(&o.id).target(&target.username).detail(detail))?;
     Ok((o, added))
 }
 
@@ -1307,6 +1373,7 @@ pub(crate) fn remove_member_as(s: &Store, me: &User, org: &str, username: &str) 
         return Err(ApiError::new(StatusCode::NOT_FOUND, format!("{} isn't a member of {}.", target.username, o.name)));
     }
     tracing::info!("user '{}' removed '{}' from '{}'", me.username, target.username, o.name);
+    s.audit(Audit::by(me, "member.remove").org(&o.id).target(&target.username).detail(if target.id == me.id { "left" } else { "removed" }))?;
     Ok(o)
 }
 
@@ -1342,6 +1409,8 @@ pub(crate) fn create_invite_as(s: &Store, me: &User, base_url: &str, org: &str, 
     need_owner_for(me, mine, &[Some(role)])?;
     let (inv, token) = s.create_invite(&o, email, role, &me.id)?;
     tracing::info!("user '{}' created an invite to '{}'", me.username, o.name);
+    // The email the invite is for, never the link.
+    s.audit(Audit::by(me, "invite.create").org(&o.id).detail(format!("{} as {}", if inv.email.is_empty() { "no email" } else { &inv.email }, role.as_str())))?;
     Ok((inv, o, format!("{base_url}/i/{token}")))
 }
 
@@ -1385,6 +1454,7 @@ pub(crate) fn delete_invite_as(s: &Store, me: &User, org: &str, id: &str) -> Res
         Some(i) if i.org_id == o.id => {
             s.delete_invite(&i.id)?;
             tracing::info!("user '{}' revoked an invite to '{}'", me.username, o.name);
+            s.audit(Audit::by(me, "invite.revoke").org(&o.id).detail(if i.email.is_empty() { "no email".to_string() } else { i.email.clone() }))?;
             Ok(())
         }
         _ => Err(ApiError::not_found()),
@@ -1448,6 +1518,96 @@ async fn admin_storage(State(app): State<App>, headers: HeaderMap) -> ApiResult 
             .collect();
         let total: i64 = usage.iter().map(|(_, u)| u.bytes).sum();
         ok_json(json!({ "users": users, "orgs": orgs, "bytes": total }))
+    })
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// Audit log
+// ---------------------------------------------------------------------------
+
+/// Audit filters as they come from a URL (`before`, `limit`, `org`, `user`, `action`).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct AuditFilter {
+    pub(crate) before: Option<i64>,
+    pub(crate) limit: usize,
+    pub(crate) org: String,
+    pub(crate) user: String,
+    pub(crate) action: String,
+}
+
+impl AuditFilter {
+    pub(crate) fn from_query(q: &HashMap<String, String>) -> Result<AuditFilter, ApiError> {
+        let get = |k: &str| q.get(k).map(|v| v.trim().to_string()).unwrap_or_default();
+        let before = match get("before").as_str() {
+            "" => None,
+            v => Some(v.parse::<i64>().map_err(|_| ApiError::bad("before must be a number."))?),
+        };
+        let limit = match get("limit").as_str() {
+            "" => 50,
+            v => v.parse::<usize>().map_err(|_| ApiError::bad("limit must be a number."))?.clamp(1, 200),
+        };
+        let action = get("action");
+        if action.len() > 64 || !action.chars().all(|c| c.is_ascii_lowercase() || c == '_' || c == '.') {
+            return Err(ApiError::bad("action may contain only a-z, '_' and '.'."));
+        }
+        Ok(AuditFilter { before, limit, org: get("org"), user: get("user"), action })
+    }
+}
+
+/// The audit events `me` may see with filter `f`, and the organisations they may filter by:
+/// the server administrator sees everything; an org owner/admin the events of the
+/// organisations they manage; anyone else gets 403. An organisation in the filter that `me`
+/// doesn't manage is 404, like elsewhere.
+pub(crate) fn audit_as(s: &Store, me: &User, f: &AuditFilter) -> Result<(Vec<crate::store::AuditEvent>, Vec<Org>), ApiError> {
+    let managed: Vec<Org> = visible_orgs(s, me)?.into_iter().filter(|(_, r)| me.is_admin || r.is_some_and(OrgRole::manages)).map(|(o, _)| o).collect();
+    if !me.is_admin && managed.is_empty() {
+        return Err(ApiError::forbidden("Only the server administrator and organisation owners and admins can see the audit log."));
+    }
+    let org = match f.org.as_str() {
+        "" => None,
+        o => {
+            let (org, mine) = org_for(s, me, o)?;
+            need_manage(me, mine)?;
+            Some(org.id)
+        }
+    };
+    let q = crate::store::AuditQuery {
+        before: f.before,
+        limit: f.limit,
+        within_orgs: if me.is_admin { None } else { Some(managed.iter().map(|o| o.id.clone()).collect()) },
+        org,
+        user: Some(f.user.clone()).filter(|u| !u.is_empty()),
+        action: Some(f.action.clone()).filter(|a| !a.is_empty()),
+    };
+    Ok((s.audit_events(&q)?, managed))
+}
+
+pub(crate) fn audit_json(s: &Store, e: &crate::store::AuditEvent) -> Value {
+    let org = e.org_id.as_deref().and_then(|o| s.org(o).ok().flatten());
+    json!({
+        "id": e.id,
+        "at": iso(e.at),
+        "actor": e.actor_name,
+        "actor_id": e.actor_id,
+        "ip": e.ip,
+        "action": e.action,
+        "org": e.org_id.as_ref().map(|id| json!({ "id": id, "name": org.as_ref().map(|o| o.name.clone()) })),
+        "item": e.item_id,
+        "target_user": e.target_user,
+        "detail": e.detail,
+    })
+}
+
+/// `GET /api/admin/audit?before=&limit=&org=&user=&action=`: newest first; `next_before` pages on.
+async fn audit_log(State(app): State<App>, headers: HeaderMap, Query(q): Query<HashMap<String, String>>) -> ApiResult {
+    let f = AuditFilter::from_query(&q)?;
+    app.run(move |s| {
+        let who = auth(s, &headers)?;
+        let (events, _) = audit_as(s, user_of(&who)?, &f)?;
+        let next = if events.len() == f.limit { events.last().map(|e| e.id) } else { None };
+        let list: Vec<Value> = events.iter().map(|e| audit_json(s, e)).collect();
+        ok_json(json!({ "events": list, "next_before": next }))
     })
     .await
 }
@@ -1538,6 +1698,15 @@ async fn accept_any(app: &App, ip: IpAddr, token: String, b: AcceptBody) -> Resu
         _ if r.already_member() => tracing::info!("'{}' opened an invite to '{}' but is a member already", u.username, o.name),
         _ => tracing::info!("'{}' joined '{}' through an invite (existing account)", u.username, o.name),
     }
+    if !r.already_member() {
+        let detail = match &r {
+            Accepted::Created(..) => "new account".to_string(),
+            Accepted::Existing(crate::store::InviteAccepted::Joined(_, _, role)) => format!("existing account, as {}", role.as_str()),
+            Accepted::Existing(_) => "existing account".to_string(),
+        };
+        let a = Audit::by(u, "invite.accept").org(&o.id).target(&u.username).ip(ip.to_string()).detail(detail);
+        let _ = app.run(move |s| Ok(s.audit(a)?)).await;
+    }
     Ok(r)
 }
 
@@ -1547,7 +1716,7 @@ async fn accept_any(app: &App, ip: IpAddr, token: String, b: AcceptBody) -> Resu
 /// password gets a clear refusal, but only after its password was right.
 async fn accept_existing(app: &App, ip: IpAddr, ip_key: &str, token: String, username: &str, password: String) -> Result<crate::store::InviteAccepted, ApiError> {
     live_invite(app, ip_key, token.clone()).await?;
-    let user = verify_sign_in(app, ip, username, password, true).await?;
+    let user = verify_sign_in(app, ip, username, password, true, "invite").await?;
     if user.disabled {
         return Err(ApiError::new(StatusCode::FORBIDDEN, "This account is disabled, so it can't join an organisation. Ask your administrator."));
     }
@@ -1776,30 +1945,58 @@ async fn create_folder(State(app): State<App>, headers: HeaderMap, body: Bytes) 
     .await
 }
 
-async fn upload_file(State(app): State<App>, headers: HeaderMap, Query(q): Query<HashMap<String, String>>, body: Bytes) -> ApiResult {
+/// Who uploads into which folder, under which name: checked before the body is read (so
+/// nobody without edit access can make the server store anything) and again when it is stored.
+struct UploadTarget {
+    who: Principal,
+    parent: Item,
+    role: Role,
+    on_conflict: OnConflict,
+    name: String,
+}
+
+fn upload_target(s: &Store, hub: &crate::live::Hub, headers: &HeaderMap, q: &HashMap<String, String>) -> Result<UploadTarget, ApiError> {
+    let who = auth(s, headers)?;
+    let on_conflict = OnConflict::parse(q.get("conflict").map(String::as_str).unwrap_or("")).ok_or_else(|| ApiError::bad("conflict must be fail, rename or replace."))?;
+    let name = q.get("name").cloned().unwrap_or_default();
+    let parent = match q.get("parent").filter(|p| !p.is_empty() && p.as_str() != "root") {
+        Some(p) => p.clone(),
+        None => user_of(&who)?.root_id.clone(),
+    };
+    let (p, role) = visible(s, &who, &parent, false)?;
+    need_edit(role)?;
+    if p.kind != Kind::Folder {
+        return Err(ApiError::bad("Files can only be uploaded into folders."));
+    }
+    let clean = util::clean_name(&name).map_err(ApiError::bad)?;
+    match (s.find_child(&p.id, &clean)?, on_conflict) {
+        (Some(_), OnConflict::Fail) => return Err(ApiError::new(StatusCode::CONFLICT, format!("An item named '{clean}' already exists here."))),
+        (Some(existing), OnConflict::Replace) if live_busy(s, hub, &existing)? => return Err(locked()),
+        _ => {}
+    }
+    Ok(UploadTarget { who, parent: p, role, on_conflict, name })
+}
+
+/// `POST /api/files?parent=&name=&conflict=fail|rename|replace` with the bytes as the body
+/// (streamed to disk; 413 past `max_upload_mb`). 201 for a new file, 200 for a new version
+/// of an existing one (`replace`).
+async fn upload_file(State(app): State<App>, headers: HeaderMap, Query(q): Query<HashMap<String, String>>, body: axum::body::Body) -> ApiResult {
+    let (hub, h, qq) = (app.hub.clone(), headers.clone(), q.clone());
+    app.run(move |s| upload_target(s, &hub, &h, &qq).map(|_| ())).await?;
+    let staged = crate::content::stage(&app.incoming, &headers, body, app.cfg.max_upload_bytes()).await?;
     let hub = app.hub.clone();
     app.run(move |s| {
-        let who = auth(s, &headers)?;
-        let on_conflict = OnConflict::parse(q.get("conflict").map(String::as_str).unwrap_or("")).ok_or_else(|| ApiError::bad("conflict must be fail, rename or replace."))?;
-        let name = q.get("name").cloned().unwrap_or_default();
-        let parent = match q.get("parent").filter(|p| !p.is_empty() && p.as_str() != "root") {
-            Some(p) => p.clone(),
-            None => user_of(&who)?.root_id.clone(),
-        };
-        let (p, role) = visible(s, &who, &parent, false)?;
-        need_edit(role)?;
-        if on_conflict == OnConflict::Replace
-            && let Ok(clean) = util::clean_name(&name)
-            && let Some(existing) = s.find_child(&p.id, &clean)?
-            && live_busy(s, &hub, &existing)?
-        {
-            return Err(locked());
+        let t = upload_target(s, &hub, &headers, &q)?;
+        let blob = crate::store::Blob::Staged { path: &staged.path, size: staged.size, hash: &staged.hash };
+        let (it, created) = s.create_file_from(&t.parent.id, &t.name, blob, &actor(&t.who), t.on_conflict)?;
+        drop(staged);
+        if created {
+            s.audit_item(audit_by(&t.who, "file.upload").detail(format!("{} ({} bytes) in {}", it.name, it.size, t.parent.name)), &it)?;
         }
-        let (it, created) = s.create_file(&p.id, &name, &body, &actor(&who), on_conflict)?;
-        if let Principal::User { user, .. } = &who {
+        if let Principal::User { user, .. } = &t.who {
             s.touch_recent(&user.id, &it.id)?;
         }
-        let role = s.role(&who, &it, false)?.unwrap_or(role);
+        let role = s.role(&t.who, &it, false)?.unwrap_or(t.role);
         let status = if created { StatusCode::CREATED } else { StatusCode::OK };
         Ok((status, axum::Json(item_json(s, &it, role))).into_response())
     })
@@ -1825,13 +2022,15 @@ async fn get_content(State(app): State<App>, headers: HeaderMap, Path(id): Path<
         if version.is_some() && matches!(who, Principal::Link { .. }) {
             return Err(ApiError::not_found());
         }
-        let (data, ver) = s.read_content(&it, version)?;
+        let (file, len, ver) = s.open_content(&it, version)?;
         if let (Principal::User { user, .. }, None) = (&who, version) {
             s.touch_recent(&user.id, &it.id)?;
         }
         // Where a live session starts from this version (for joining it).
         let live = if version.is_none() { Some((s.live_base(&it)?, s.live_state_blob(&it.id, ver.version)?.is_some())) } else { None };
-        let mut res = data.into_response();
+        // Streamed from disk; one Range; `?download=1` for "save as".
+        let download = q.get("download").is_some_and(|v| v == "1");
+        let mut res = crate::content::file_response(&headers, file, len, &it.name, &crate::store::etag(ver.version, &ver.hash), download)?;
         let h = res.headers_mut();
         if let Some((l, state)) = live {
             h.insert("x-live-seq", HeaderValue::from(l.seq));
@@ -1842,10 +2041,7 @@ async fn get_content(State(app): State<App>, headers: HeaderMap, Path(id): Path<
                 h.insert("x-live-state", HeaderValue::from_static("1"));
             }
         }
-        h.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
-        h.insert(header::ETAG, quoted(&crate::store::etag(ver.version, &ver.hash)));
         h.insert("x-version", HeaderValue::from(ver.version));
-        h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
         Ok(res)
     })
     .await
@@ -1856,32 +2052,54 @@ fn norm_etag(s: &str) -> String {
     s.trim().trim_start_matches("W/").trim_matches('"').to_string()
 }
 
-async fn put_content(State(app): State<App>, headers: HeaderMap, Path(id): Path<String>, body: Bytes) -> ApiResult {
+/// The caller, the file and their role; or the 412 answer to send.
+type PutTarget = Result<(Principal, Item, Role), Box<Response>>;
+
+/// Whether the caller may save new content into `id` now: `Ok(Err(412 response))` when
+/// `If-Match` names another version. Checked before the body is read and again before it is
+/// stored (someone may have saved meanwhile).
+fn put_target(s: &Store, hub: &crate::live::Hub, headers: &HeaderMap, id: &str) -> Result<PutTarget, ApiError> {
+    let who = auth(s, headers)?;
+    let (it, role) = visible(s, &who, id, false)?;
+    if it.kind != Kind::File {
+        return Err(ApiError::bad("Folders have no content."));
+    }
+    need_edit(role)?;
+    if live_busy(s, hub, &it)? {
+        return Err(locked());
+    }
+    if let Some(want) = headers.get(header::IF_MATCH).and_then(|v| v.to_str().ok()).map(norm_etag)
+        && want != "*"
+        && want != it.etag()
+    {
+        let body = json!({
+            "error": "Someone else saved changes to this file.",
+            "etag": it.etag(),
+            "version": it.version,
+            "modified_by": display_of(s, &it.modified_by),
+            "modified": iso(it.modified),
+        });
+        return Ok(Err(Box::new((StatusCode::PRECONDITION_FAILED, axum::Json(body)).into_response())));
+    }
+    Ok(Ok((who, it, role)))
+}
+
+/// `PUT /api/items/{id}/content` (optional `If-Match: "<etag>"`): the body, streamed to disk
+/// (413 past `max_upload_mb`), becomes the next version.
+async fn put_content(State(app): State<App>, headers: HeaderMap, Path(id): Path<String>, body: axum::body::Body) -> ApiResult {
+    let (hub, h, i) = (app.hub.clone(), headers.clone(), id.clone());
+    if let Err(res) = app.run(move |s| put_target(s, &hub, &h, &i).map(|r| r.map(|_| ()))).await? {
+        return Ok(*res);
+    }
+    let staged = crate::content::stage(&app.incoming, &headers, body, app.cfg.max_upload_bytes()).await?;
     let hub = app.hub.clone();
     app.run(move |s| {
-        let who = auth(s, &headers)?;
-        let (it, role) = visible(s, &who, &id, false)?;
-        if it.kind != Kind::File {
-            return Err(ApiError::bad("Folders have no content."));
-        }
-        need_edit(role)?;
-        if live_busy(s, &hub, &it)? {
-            return Err(locked());
-        }
-        if let Some(want) = headers.get(header::IF_MATCH).and_then(|v| v.to_str().ok()).map(norm_etag)
-            && want != "*"
-            && want != it.etag()
-        {
-            let body = json!({
-                "error": "Someone else saved changes to this file.",
-                "etag": it.etag(),
-                "version": it.version,
-                "modified_by": display_of(s, &it.modified_by),
-                "modified": iso(it.modified),
-            });
-            return Ok((StatusCode::PRECONDITION_FAILED, axum::Json(body)).into_response());
-        }
-        let saved = s.write_content(&it, &body, &actor(&who))?;
+        let (who, it, role) = match put_target(s, &hub, &headers, &id)? {
+            Ok(t) => t,
+            Err(res) => return Ok(*res),
+        };
+        let saved = s.write_content_from(&it, crate::store::Blob::Staged { path: &staged.path, size: staged.size, hash: &staged.hash }, &actor(&who))?;
+        drop(staged);
         if let Principal::User { user, .. } = &who {
             s.touch_recent(&user.id, &saved.id)?;
         }
@@ -1920,6 +2138,13 @@ async fn patch_item(State(app): State<App>, headers: HeaderMap, Path(id): Path<S
             None => None,
         };
         let updated = s.update_item(&it, b.name.as_deref(), parent.as_ref(), &actor(&who))?;
+        if updated.name != it.name {
+            s.audit_item(audit_by(&who, "item.rename").detail(format!("{} -> {}", it.name, updated.name)), &updated)?;
+        }
+        if updated.parent_id != it.parent_id {
+            let name_of = |id: &Option<String>| id.as_deref().and_then(|i| s.item(i).ok().flatten()).map(|p| p.name).unwrap_or_default();
+            s.audit_item(audit_by(&who, "item.move").detail(format!("{}: {} -> {}", updated.name, name_of(&it.parent_id), name_of(&updated.parent_id))), &updated)?;
+        }
         let role = s.role(&who, &updated, false)?.unwrap_or(role);
         ok_json(item_json(s, &updated, role))
     })
@@ -1933,6 +2158,7 @@ async fn delete_item(State(app): State<App>, headers: HeaderMap, Path(id): Path<
         let (it, role) = visible(s, &who, &id, false)?;
         need_edit(role)?;
         s.trash(&it, &actor(&who))?;
+        s.audit_item(audit_by(&who, "item.trash").detail(it.name.clone()), &it)?;
         Ok(StatusCode::NO_CONTENT.into_response())
     })
     .await
@@ -1945,6 +2171,9 @@ async fn restore_item(State(app): State<App>, headers: HeaderMap, Path(id): Path
         let (it, role) = visible(s, &who, &id, true)?;
         need_edit(role)?;
         let restored = s.restore(&it)?;
+        if it.deleted != 0 {
+            s.audit_item(audit_by(&who, "item.restore").detail(restored.name.clone()), &restored)?;
+        }
         let role = s.role(&who, &restored, false)?.unwrap_or(role);
         ok_json(item_json(s, &restored, role))
     })
@@ -1986,6 +2215,7 @@ async fn restore_version(State(app): State<App>, headers: HeaderMap, Path((id, n
             return Err(locked());
         }
         let saved = s.restore_version(&it, n, &actor(&who))?;
+        s.audit_item(audit_by(&who, "item.version_restore").detail(format!("{}: version {n} saved as version {}", saved.name, saved.version)), &saved)?;
         ok_json(item_json(s, &saved, role))
     })
     .await
@@ -2070,10 +2300,12 @@ async fn grant(State(app): State<App>, headers: HeaderMap, Path(id): Path<String
             Some(org) => {
                 let o = org_to_share_with(s, &me, org)?;
                 s.grant_org(&it, &o, r, &me.id)?;
+                s.audit_item(Audit::by(&me, "permission.grant").detail(format!("{}: everyone in {} can {}", it.name, o.name, r.as_str())), &it)?;
             }
             None => {
                 let target = s.user_by_name(&b.username)?.filter(|u| !u.disabled).ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, format!("There's no user named '{}'.", b.username.trim())))?;
                 s.grant(&it, &target, r, &me.id)?;
+                s.audit_item(Audit::by(&me, "permission.grant").target(&target.username).detail(format!("{}: {}", it.name, r.as_str())), &it)?;
             }
         }
         ok_json(permissions_json(s, &it)?)
@@ -2093,6 +2325,7 @@ fn revoke_user(s: &Store, headers: &HeaderMap, id: &str, username: &str) -> ApiR
     if !s.revoke(&it, &target.id)? {
         return Err(ApiError::new(StatusCode::NOT_FOUND, "That person has no access granted on this item (it may come from a parent folder)."));
     }
+    s.audit_item(Audit::by(&me, "permission.revoke").target(&target.username).detail(it.name.clone()), &it)?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -2107,6 +2340,7 @@ fn revoke_org(s: &Store, headers: &HeaderMap, id: &str, org: &str) -> ApiResult 
     if !s.revoke_org(&it, &o.id)? {
         return Err(none());
     }
+    s.audit_item(audit_by(&who, "permission.revoke").detail(format!("{}: everyone in {}", it.name, o.name)), &it)?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -2183,6 +2417,8 @@ async fn create_link(State(app): State<App>, headers: HeaderMap, Path(id): Path<
             Some(_) => return Err(ApiError::bad("expires_days must be 3650 or less.")),
         };
         let (link, token) = s.create_link(&it, r, expires, pw_hash.as_deref(), &me.id)?;
+        let extra = format!("{}{}", if link.pw_hash.is_some() { ", password" } else { "" }, link.expires.map(|e| format!(", expires {}", iso(e))).unwrap_or_default());
+        s.audit_item(Audit::by(&me, "link.create").detail(format!("{}: {} link {}{extra}", it.name, r.as_str(), link.id)), &it)?;
         let mut v = link_json(s, &link);
         v["url"] = json!(format!("{base}/l/{token}"));
         Ok((StatusCode::CREATED, axum::Json(v)).into_response())
@@ -2211,6 +2447,7 @@ async fn delete_link(State(app): State<App>, headers: HeaderMap, Path((id, link)
         match s.link(&link)? {
             Some(l) if l.item_id == it.id => {
                 s.delete_link(&l.id)?;
+                s.audit_item(audit_by(&who, "link.delete").detail(format!("{}: link {}", it.name, l.id)), &it)?;
                 Ok(StatusCode::NO_CONTENT.into_response())
             }
             _ => Err(ApiError::not_found()),
@@ -2350,33 +2587,25 @@ async fn link_page(State(app): State<App>, Path(token): Path<String>) -> Respons
     }
 }
 
-fn file_response(s: &Store, l: &Link) -> ApiResult {
+/// A share link's file as a download (always `attachment`; the same content type, sandbox
+/// and nosniff rules as `/api/items/{id}/content`, streamed, with Range).
+fn file_response(s: &Store, l: &Link, req: &HeaderMap) -> ApiResult {
     let it = s.item(&l.item_id)?.ok_or_else(ApiError::not_found)?;
     if it.kind != Kind::File {
         return Err(ApiError::bad("Folders can't be downloaded."));
     }
-    let (data, ver) = s.read_content(&it, None)?;
-    let mut res = data.into_response();
-    let h = res.headers_mut();
-    h.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"));
-    h.insert(header::ETAG, quoted(&crate::store::etag(ver.version, &ver.hash)));
-    let encoded: String = it.name.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect();
-    if let Ok(v) = HeaderValue::from_str(&format!("attachment; filename*=UTF-8''{encoded}")) {
-        h.insert(header::CONTENT_DISPOSITION, v);
-    }
-    h.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
-    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    Ok(res)
+    let (file, len, ver) = s.open_content(&it, None)?;
+    crate::content::file_response(req, file, len, &it.name, &crate::store::etag(ver.version, &ver.hash), true)
 }
 
 /// Direct download for links without a password (`GET /l/<token>/download`).
-async fn link_download(State(app): State<App>, Path(token): Path<String>) -> ApiResult {
+async fn link_download(State(app): State<App>, headers: HeaderMap, Path(token): Path<String>) -> ApiResult {
     app.run(move |s| {
         let l = live_link(s, &token)?;
         if l.pw_hash.is_some() {
             return Err(ApiError::new(StatusCode::UNAUTHORIZED, "This link needs a password."));
         }
-        file_response(s, &l)
+        file_response(s, &l, &headers)
     })
     .await
 }
@@ -2438,7 +2667,7 @@ async fn link_download_form(State(app): State<App>, ConnectInfo(Peer(peer)): Con
             return Ok(res);
         }
     }
-    app.run(move |s| file_response(s, &link)).await
+    app.run(move |s| file_response(s, &link, &headers)).await
 }
 
 // ---------------------------------------------------------------------------
@@ -2469,6 +2698,11 @@ async fn live(
     Query(q): Query<HashMap<String, String>>,
     ws: Result<axum::extract::ws::WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
 ) -> ApiResult {
+    // A browser opens WebSockets from any page with its cookies (no CORS for them): the web
+    // session cookie never authenticates this route; a browser gets a ticket first (`POST
+    // .../live-ticket`, which needs the CSRF header).
+    let mut headers = headers;
+    headers.remove(crate::web::VERDICT);
     let hub = app.hub.clone();
     let ticket = q.get("ticket").cloned();
     let iid = id.clone();

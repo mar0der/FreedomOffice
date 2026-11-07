@@ -238,11 +238,40 @@ pub struct DeviceToken {
     pub last_used: i64,
 }
 
-/// A sign-in to the web admin page (`/admin`): a cookie, separate from the device tokens.
+/// What a browser session cookie is for: the web admin page (`/admin`, `__Host-fo_admin`) or
+/// the JSON API from the browser (Drive, `__Host-fo_web`). Both live in `admin_sessions`; a
+/// session of one kind never works as the other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionKind {
+    Admin,
+    Web,
+}
+
+impl SessionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SessionKind::Admin => "admin",
+            SessionKind::Web => "web",
+        }
+    }
+}
+
+/// What a person signed in with: an API device token, a web admin session or a browser
+/// (Drive) session of the API. The ids are `tokens.id` and `admin_sessions.id`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignIn {
+    Device(i64),
+    Admin(i64),
+    Web(i64),
+}
+
+/// A browser sign-in (`/admin`, or the API from the browser): a cookie, separate from the
+/// device tokens.
 #[derive(Clone, Debug)]
 pub struct AdminSession {
     pub id: i64,
     pub user_id: String,
+    pub kind: SessionKind,
     /// The browser's User-Agent (shortened), to tell sessions apart.
     pub agent: String,
     pub created: i64,
@@ -257,10 +286,10 @@ pub const ADMIN_SESSION_SECS: i64 = 12 * 3600;
 /// Web admin sessions kept per person; signing in once more ends the oldest.
 pub const ADMIN_SESSIONS_PER_USER: i64 = 10;
 
-/// Who is calling: a signed-in user (with the device token row) or a share-link holder.
+/// Who is calling: a signed-in user (with how they signed in) or a share-link holder.
 #[derive(Clone, Debug)]
 pub enum Principal {
-    User { user: User, token_id: i64 },
+    User { user: User, sign_in: SignIn },
     Link { link: Link },
 }
 
@@ -312,6 +341,110 @@ impl OnConflict {
             _ => None,
         }
     }
+}
+
+/// New content for a file: in memory, or an upload already staged (written and synced) on
+/// disk under `Store::incoming_dir`, with its size and SHA-256 (hex).
+#[derive(Clone, Copy, Debug)]
+pub enum Blob<'a> {
+    Bytes(&'a [u8]),
+    Staged { path: &'a Path, size: i64, hash: &'a str },
+}
+
+impl Blob<'_> {
+    fn size(&self) -> i64 {
+        match self {
+            Blob::Bytes(b) => b.len() as i64,
+            Blob::Staged { size, .. } => *size,
+        }
+    }
+
+    fn hash(&self) -> String {
+        match self {
+            Blob::Bytes(b) => util::sha256_hex(b),
+            Blob::Staged { hash, .. } => hash.to_string(),
+        }
+    }
+}
+
+/// An event for the audit log (see `Store::audit`). Never passwords, tokens or file contents.
+#[derive(Clone, Debug, Default)]
+pub struct Audit {
+    pub action: &'static str,
+    pub actor_id: String,
+    pub actor_name: String,
+    /// The client address; empty: the address of the request being served (`Store::request_ip`).
+    pub ip: String,
+    pub org_id: Option<String>,
+    pub item_id: Option<String>,
+    pub target_user: String,
+    pub detail: String,
+}
+
+impl Audit {
+    /// Something `user` did (their username is kept as written then).
+    pub fn by(user: &User, action: &'static str) -> Audit {
+        Audit { action, actor_id: user.id.clone(), actor_name: user.username.clone(), ..Audit::default() }
+    }
+
+    /// Something done by a share-link holder or someone not signed in.
+    pub fn anonymous(action: &'static str, actor_id: impl Into<String>) -> Audit {
+        Audit { action, actor_id: actor_id.into(), ..Audit::default() }
+    }
+
+    pub fn org(mut self, org_id: &str) -> Audit {
+        self.org_id = Some(org_id.to_string());
+        self
+    }
+
+    pub fn item(mut self, item_id: &str) -> Audit {
+        self.item_id = Some(item_id.to_string());
+        self
+    }
+
+    pub fn target(mut self, username: &str) -> Audit {
+        self.target_user = username.to_string();
+        self
+    }
+
+    pub fn detail(mut self, detail: impl Into<String>) -> Audit {
+        self.detail = detail.into();
+        self
+    }
+
+    pub fn ip(mut self, ip: impl Into<String>) -> Audit {
+        self.ip = ip.into();
+        self
+    }
+}
+
+/// A stored audit event.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AuditEvent {
+    pub id: i64,
+    pub at: i64,
+    pub actor_id: String,
+    pub actor_name: String,
+    pub ip: String,
+    pub action: String,
+    pub org_id: Option<String>,
+    pub item_id: Option<String>,
+    pub target_user: String,
+    pub detail: String,
+}
+
+/// Which audit events to list: newest first, ids below `before`, at most `limit`.
+#[derive(Clone, Debug, Default)]
+pub struct AuditQuery {
+    pub before: Option<i64>,
+    pub limit: usize,
+    /// Only events of these organisations (an org admin's view); `None`: every event.
+    pub within_orgs: Option<Vec<String>>,
+    pub org: Option<String>,
+    /// Events done by or to this username.
+    pub user: Option<String>,
+    /// An action ("org.rename") or a group ("org": every "org.*").
+    pub action: Option<String>,
 }
 
 /// The original schema (`user_version` 0): created on a new database, then migrated like an
@@ -487,8 +620,42 @@ CREATE TABLE admin_sessions (
 CREATE INDEX admin_sessions_user ON admin_sessions(user_id);
 "#;
 
+/// Version 3 (Drive): browser sessions of the JSON API next to the web admin ones
+/// (`admin_sessions.kind`), and the append-only audit log. The triggers refuse every change
+/// to an audit row and every deletion of one younger than `AUDIT_KEEP_DAYS` (pruning).
+const MIGRATION_V3: &str = r#"
+ALTER TABLE admin_sessions ADD COLUMN kind TEXT NOT NULL DEFAULT 'admin';
+CREATE INDEX admin_sessions_kind ON admin_sessions(user_id, kind);
+CREATE TABLE audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at INTEGER NOT NULL,
+    actor_id TEXT NOT NULL DEFAULT '',
+    actor_name TEXT NOT NULL DEFAULT '',
+    ip TEXT NOT NULL DEFAULT '',
+    action TEXT NOT NULL,
+    org_id TEXT,
+    item_id TEXT,
+    target_user TEXT NOT NULL DEFAULT '',
+    detail TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX audit_at ON audit(at);
+CREATE INDEX audit_org ON audit(org_id, id);
+CREATE INDEX audit_actor ON audit(actor_name, id);
+CREATE INDEX audit_target ON audit(target_user, id);
+CREATE TRIGGER audit_no_update BEFORE UPDATE ON audit BEGIN
+    SELECT RAISE(ABORT, 'the audit log is append-only');
+END;
+CREATE TRIGGER audit_no_early_delete BEFORE DELETE ON audit
+    WHEN old.at > CAST(strftime('%s', 'now') AS INTEGER) - 365 * 86400 BEGIN
+    SELECT RAISE(ABORT, 'audit events are kept for 365 days');
+END;
+"#;
+
+/// Audit events are kept this long, then pruned (daily).
+pub const AUDIT_KEEP_DAYS: i64 = 365;
+
 /// The schema version this code writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Brings a database (new, or written by an older server) to `SCHEMA_VERSION`. One write
 /// transaction, so a crash leaves the old schema intact, and a second process opening the
@@ -506,6 +673,9 @@ fn migrate(conn: &Connection) -> Res<()> {
         }
         if v < 2 {
             conn.execute_batch(MIGRATION_V2)?;
+        }
+        if v < 3 {
+            conn.execute_batch(MIGRATION_V3)?;
         }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
@@ -547,10 +717,18 @@ fn invite_row(r: &Row) -> rusqlite::Result<Invite> {
     })
 }
 
-const ADMIN_SESSION_COLS: &str = "id, user_id, agent, created, expires, last_used";
+const ADMIN_SESSION_COLS: &str = "id, user_id, agent, created, expires, last_used, kind";
 
 fn admin_session_row(r: &Row, at: usize) -> rusqlite::Result<AdminSession> {
-    Ok(AdminSession { id: r.get(at)?, user_id: r.get(at + 1)?, agent: r.get(at + 2)?, created: r.get(at + 3)?, expires: r.get(at + 4)?, last_used: r.get(at + 5)? })
+    Ok(AdminSession {
+        id: r.get(at)?,
+        user_id: r.get(at + 1)?,
+        agent: r.get(at + 2)?,
+        created: r.get(at + 3)?,
+        expires: r.get(at + 4)?,
+        last_used: r.get(at + 5)?,
+        kind: if r.get::<_, String>(at + 6)? == "web" { SessionKind::Web } else { SessionKind::Admin },
+    })
 }
 
 const INVITE_COLS: &str ="id, email, org_id, role, expires, created, created_by, used";
@@ -617,6 +795,9 @@ pub struct Store {
     /// `allow_links` from the configuration: when false, share-link access tokens don't
     /// authenticate and links can't be opened.
     pub allow_links: bool,
+    /// The client address of the request being served (set by the HTTP layer for each
+    /// store call; recorded in audit events).
+    pub request_ip: String,
 }
 
 impl Store {
@@ -631,7 +812,7 @@ impl Store {
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         migrate(&conn)?;
-        Ok(Store { conn, files: files.to_path_buf(), versions_to_keep: versions_to_keep.max(1), allow_links: true })
+        Ok(Store { conn, files: files.to_path_buf(), versions_to_keep: versions_to_keep.max(1), allow_links: true, request_ip: String::new() })
     }
 
     pub fn files_dir(&self) -> &Path {
@@ -886,18 +1067,24 @@ impl Store {
     /// A new web admin session (valid `ADMIN_SESSION_SECS`); returns its secret (only the
     /// SHA-256 is stored). Expired sessions are cleared on the way.
     pub fn create_admin_session(&self, user_id: &str, agent: &str) -> Res<String> {
+        self.create_session(user_id, agent, SessionKind::Admin)
+    }
+
+    /// A new browser session of `kind` (valid `ADMIN_SESSION_SECS` from now, whatever the
+    /// activity); returns its secret (only the SHA-256 is stored). A person keeps at most
+    /// `ADMIN_SESSIONS_PER_USER` of each kind (the oldest end). Expired sessions are cleared.
+    pub fn create_session(&self, user_id: &str, agent: &str, kind: SessionKind) -> Res<String> {
         let token = util::new_token();
         let agent: String = agent.trim().chars().filter(|c| !c.is_control()).take(120).collect();
         let t = now();
         self.conn.execute("DELETE FROM admin_sessions WHERE expires <= ?1", [t])?;
         self.conn.execute(
-            "INSERT INTO admin_sessions (user_id, hash, agent, created, expires, last_used) VALUES (?1, ?2, ?3, ?4, ?5, ?4)",
-            params![user_id, util::token_hash(&token), agent, t, t + ADMIN_SESSION_SECS],
+            "INSERT INTO admin_sessions (user_id, hash, agent, created, expires, last_used, kind) VALUES (?1, ?2, ?3, ?4, ?5, ?4, ?6)",
+            params![user_id, util::token_hash(&token), agent, t, t + ADMIN_SESSION_SECS, kind.as_str()],
         )?;
-        // At most ADMIN_SESSIONS_PER_USER: the oldest go.
         self.conn.execute(
-            "DELETE FROM admin_sessions WHERE user_id = ?1 AND id NOT IN (SELECT id FROM admin_sessions WHERE user_id = ?1 ORDER BY id DESC LIMIT ?2)",
-            params![user_id, ADMIN_SESSIONS_PER_USER],
+            "DELETE FROM admin_sessions WHERE user_id = ?1 AND kind = ?3 AND id NOT IN (SELECT id FROM admin_sessions WHERE user_id = ?1 AND kind = ?3 ORDER BY id DESC LIMIT ?2)",
+            params![user_id, ADMIN_SESSIONS_PER_USER, kind.as_str()],
         )?;
         self.conn.execute("UPDATE users SET last_login = ?1 WHERE id = ?2", params![t, user_id])?;
         Ok(token)
@@ -906,6 +1093,17 @@ impl Store {
     /// The person behind a web admin session secret: an unexpired session of an enabled
     /// person (never an organisation's account).
     pub fn admin_session(&self, token: &str) -> Res<Option<(User, AdminSession)>> {
+        self.session(token, SessionKind::Admin)
+    }
+
+    /// The person behind a browser (Drive) session secret of the API.
+    pub fn web_session(&self, token: &str) -> Res<Option<(User, AdminSession)>> {
+        self.session(token, SessionKind::Web)
+    }
+
+    /// The person behind a session secret of `kind`: an unexpired session of an enabled
+    /// person (never an organisation's account).
+    pub fn session(&self, token: &str, kind: SessionKind) -> Res<Option<(User, AdminSession)>> {
         if token.is_empty() || token.len() > 200 {
             return Ok(None);
         }
@@ -916,7 +1114,7 @@ impl Store {
             .optional()?;
         let Some((stored, sess)) = row else { return Ok(None) };
         let t = now();
-        if !util::ct_eq(&stored, &hash) || sess.expires <= t {
+        if !util::ct_eq(&stored, &hash) || sess.expires <= t || sess.kind != kind {
             return Ok(None);
         }
         let Some(user) = self.user_by_id(&sess.user_id)?.filter(|u| !u.disabled && u.org_id.is_none()) else { return Ok(None) };
@@ -946,8 +1144,13 @@ impl Store {
     /// Ends the web admin session with this secret, if there is one (whoever's it is: a browser
     /// that signs in again leaves its old session behind).
     pub fn end_admin_session_by_secret(&self, token: &str) -> Res<()> {
+        self.end_session_by_secret(token, SessionKind::Admin)
+    }
+
+    /// Ends the session of `kind` with this secret, if there is one.
+    pub fn end_session_by_secret(&self, token: &str, kind: SessionKind) -> Res<()> {
         if !token.is_empty() && token.len() <= 200 {
-            self.conn.execute("DELETE FROM admin_sessions WHERE hash = ?1", [util::token_hash(token)])?;
+            self.conn.execute("DELETE FROM admin_sessions WHERE hash = ?1 AND kind = ?2", params![util::token_hash(token), kind.as_str()])?;
         }
         Ok(())
     }
@@ -967,14 +1170,18 @@ impl Store {
     /// off), else the principal with fresh details.
     pub fn recheck_principal(&self, who: &Principal) -> Res<Result<Principal, &'static str>> {
         match who {
-            Principal::User { user, token_id } => {
+            Principal::User { user, sign_in } => {
                 let fresh = self.user_by_id(&user.id)?;
+                let signed_in = match *sign_in {
+                    SignIn::Device(id) => self.token_exists(id)?,
+                    SignIn::Admin(id) | SignIn::Web(id) => self.admin_session_exists(id)?,
+                };
                 Ok(match fresh {
                     Some(u) if u.disabled => Err("Your account was disabled."),
                     None => Err("Your account was removed."),
-                    Some(_) if !self.token_exists(*token_id)? => Err("You were signed out."),
+                    Some(_) if !signed_in => Err("You were signed out."),
                     Some(u) if u.must_change_password => Err("Your password was reset; sign in again."),
-                    Some(u) => Ok(Principal::User { user: u, token_id: *token_id }),
+                    Some(u) => Ok(Principal::User { user: u, sign_in: *sign_in }),
                 })
             }
             Principal::Link { link } => Ok(match self.link(&link.id)? {
@@ -1006,7 +1213,7 @@ impl Store {
             if t - last_used >= 60 {
                 self.conn.execute("UPDATE tokens SET last_used = ?1 WHERE id = ?2", params![t, token_id])?;
             }
-            return Ok(Some(Principal::User { user, token_id }));
+            return Ok(Some(Principal::User { user, sign_in: SignIn::Device(token_id) }));
         }
         if !self.allow_links {
             return Ok(None);
@@ -1158,6 +1365,12 @@ impl Store {
     /// Creates a file in a folder (the folder owner owns it). `Replace` adds a version to an
     /// existing file of that name.
     pub fn create_file(&self, parent_id: &str, name: &str, data: &[u8], by: &str, on_conflict: OnConflict) -> Res<(Item, bool)> {
+        self.create_file_from(parent_id, name, Blob::Bytes(data), by, on_conflict)
+    }
+
+    /// `create_file` with the content in memory or staged on disk (`Blob::Staged`, moved into
+    /// place; left where it is when this fails).
+    pub fn create_file_from(&self, parent_id: &str, name: &str, data: Blob<'_>, by: &str, on_conflict: OnConflict) -> Res<(Item, bool)> {
         let name = util::clean_name(name).map_err(StoreError::Invalid)?;
         let parent = self.folder(parent_id)?;
         let name = match (self.find_child(&parent.id, &name)?, on_conflict) {
@@ -1168,43 +1381,56 @@ impl Store {
                 if existing.kind == Kind::Folder {
                     return Err(StoreError::Conflict(format!("A folder named '{name}' already exists here.")));
                 }
-                return Ok((self.write_content(&existing, data, by)?, false));
+                return Ok((self.write_content_from(&existing, data, by)?, false));
             }
         };
         let id = util::new_id();
         let t = now();
-        let hash = util::sha256_hex(data);
+        let (size, hash) = (data.size(), data.hash());
         self.write_blob(&id, 1, data)?;
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO items (id, parent_id, name, kind, owner_id, size, version, hash, modified, modified_by, created) VALUES (?1, ?2, ?3, 'file', ?4, ?5, 1, ?6, ?7, ?8, ?7)",
-            params![id, parent.id, name, parent.owner_id, data.len() as i64, hash, t, by],
+            params![id, parent.id, name, parent.owner_id, size, hash, t, by],
         )?;
-        tx.execute("INSERT INTO versions (item_id, version, size, hash, modified, modified_by) VALUES (?1, 1, ?2, ?3, ?4, ?5)", params![id, data.len() as i64, hash, t, by])?;
+        tx.execute("INSERT INTO versions (item_id, version, size, hash, modified, modified_by) VALUES (?1, 1, ?2, ?3, ?4, ?5)", params![id, size, hash, t, by])?;
         tx.commit()?;
         Ok((self.item(&id)?.ok_or(StoreError::NotFound)?, true))
     }
 
     /// Saves new content as the next version.
     pub fn write_content(&self, item: &Item, data: &[u8], by: &str) -> Res<Item> {
+        self.write_content_from(item, Blob::Bytes(data), by)
+    }
+
+    /// `write_content` with the content in memory or staged on disk.
+    pub fn write_content_from(&self, item: &Item, data: Blob<'_>, by: &str) -> Res<Item> {
         if item.kind != Kind::File {
             return Err(StoreError::Invalid("Folders have no content.".into()));
         }
         // Re-read inside the caller's lock so the version always increases by one.
         let cur = self.item(&item.id)?.ok_or(StoreError::NotFound)?;
         let v = cur.version + 1;
-        let hash = util::sha256_hex(data);
+        let (size, hash) = (data.size(), data.hash());
         let t = now();
         self.write_blob(&cur.id, v, data)?;
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "UPDATE items SET size = ?1, version = ?2, hash = ?3, modified = ?4, modified_by = ?5 WHERE id = ?6",
-            params![data.len() as i64, v, hash, t, by, cur.id],
-        )?;
-        tx.execute("INSERT INTO versions (item_id, version, size, hash, modified, modified_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![cur.id, v, data.len() as i64, hash, t, by])?;
+        tx.execute("UPDATE items SET size = ?1, version = ?2, hash = ?3, modified = ?4, modified_by = ?5 WHERE id = ?6", params![size, v, hash, t, by, cur.id])?;
+        tx.execute("INSERT INTO versions (item_id, version, size, hash, modified, modified_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![cur.id, v, size, hash, t, by])?;
         tx.commit()?;
         self.prune_versions(&cur.id)?;
         self.item(&cur.id)?.ok_or(StoreError::NotFound)
+    }
+
+    /// Where uploads are staged while they stream in: `incoming/` next to `files/` in the data
+    /// directory (the same file system, so the final rename is atomic; never backed up).
+    pub fn incoming_dir(&self) -> PathBuf {
+        self.files.parent().map(|p| p.join("incoming")).unwrap_or_else(|| self.files.join("..").join("incoming"))
+    }
+
+    /// Removes uploads left half-done by a crash.
+    pub fn clear_incoming(&self) {
+        let _ = std::fs::remove_dir_all(self.incoming_dir());
     }
 
     fn blob_path(&self, id: &str, version: i64) -> Res<PathBuf> {
@@ -1214,9 +1440,20 @@ impl Store {
         Ok(self.files.join(id).join(format!("{version}.xlsx")))
     }
 
-    /// Atomic, durable write: temp file, fsync, rename, fsync the directory.
-    fn write_blob(&self, id: &str, version: i64, data: &[u8]) -> Res<()> {
-        self.write_file(&self.blob_path(id, version)?, version, data)
+    /// Atomic, durable write: temp file, fsync, rename, fsync the directory. A staged upload
+    /// (written and synced by its writer) is renamed into place.
+    fn write_blob(&self, id: &str, version: i64, data: Blob<'_>) -> Res<()> {
+        let path = self.blob_path(id, version)?;
+        match data {
+            Blob::Bytes(b) => self.write_file(&path, version, b),
+            Blob::Staged { path: staged, .. } => {
+                let dir = path.parent().ok_or_else(|| StoreError::Internal("bad path".into()))?;
+                std::fs::create_dir_all(dir)?;
+                std::fs::rename(staged, &path)?;
+                sync_dir(dir);
+                Ok(())
+            }
+        }
     }
 
     fn write_file(&self, path: &Path, version: i64, data: &[u8]) -> Res<()> {
@@ -1244,6 +1481,16 @@ impl Store {
         let ver = self.version(&item.id, v)?.ok_or(StoreError::NotFound)?;
         let data = std::fs::read(self.blob_path(&item.id, v)?)?;
         Ok((data, ver))
+    }
+
+    /// The content of a version as an open file (for streaming; version files never change,
+    /// and an open file stays readable even if the version is pruned meanwhile) and its size.
+    pub fn open_content(&self, item: &Item, version: Option<i64>) -> Res<(std::fs::File, u64, Version)> {
+        let v = version.unwrap_or(item.version);
+        let ver = self.version(&item.id, v)?.ok_or(StoreError::NotFound)?;
+        let f = std::fs::File::open(self.blob_path(&item.id, v)?)?;
+        let len = f.metadata()?.len();
+        Ok((f, len, ver))
     }
 
     pub fn version(&self, item_id: &str, v: i64) -> Res<Option<Version>> {
@@ -1276,9 +1523,20 @@ impl Store {
         Ok(())
     }
 
+    /// Saves an older version's content as the newest version (copied on disk, never read
+    /// into memory).
     pub fn restore_version(&self, item: &Item, v: i64, by: &str) -> Res<Item> {
-        let (data, _) = self.read_content(item, Some(v))?;
-        self.write_content(item, &data, by)
+        let ver = self.version(&item.id, v)?.ok_or(StoreError::NotFound)?;
+        let dir = self.incoming_dir();
+        std::fs::create_dir_all(&dir)?;
+        let staged = dir.join(format!("{}.restore", util::new_id()));
+        let r = (|| -> Res<Item> {
+            std::fs::copy(self.blob_path(&item.id, v)?, &staged)?;
+            std::fs::File::open(&staged)?.sync_all()?;
+            self.write_content_from(item, Blob::Staged { path: &staged, size: ver.size, hash: &ver.hash }, by)
+        })();
+        let _ = std::fs::remove_file(&staged);
+        r
     }
 
     /// Rename and/or move within the same owner's files.
@@ -2004,6 +2262,88 @@ impl Store {
     }
 
     // ------------------------------------------------------------------
+    // Audit log
+    // ------------------------------------------------------------------
+
+    /// Appends an event to the audit log (the address is the request's unless `a.ip` is set).
+    /// Text is kept to one line and 500 characters.
+    pub fn audit(&self, a: Audit) -> Res<()> {
+        let clip = |s: &str, n: usize| -> String { s.chars().map(|c| if c.is_control() { ' ' } else { c }).take(n).collect() };
+        let ip = if a.ip.is_empty() { self.request_ip.clone() } else { a.ip };
+        self.conn.execute(
+            "INSERT INTO audit (at, actor_id, actor_name, ip, action, org_id, item_id, target_user, detail) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![now(), clip(&a.actor_id, 80), clip(&a.actor_name, 80), clip(&ip, 64), a.action, a.org_id, a.item_id, clip(&a.target_user, 80), clip(&a.detail, 500)],
+        )?;
+        Ok(())
+    }
+
+    /// `audit` for something done to an item: the event carries the item's organisation (so
+    /// its admins see it), if the item is in one.
+    pub fn audit_item(&self, a: Audit, item: &Item) -> Res<()> {
+        let org = self.org_of_item(item)?.map(|o| o.id);
+        self.audit(Audit { org_id: org, ..a }.item(&item.id))
+    }
+
+    /// Audit events, newest first (see `AuditQuery`).
+    pub fn audit_events(&self, q: &AuditQuery) -> Res<Vec<AuditEvent>> {
+        let mut sql = String::from("SELECT id, at, actor_id, actor_name, ip, action, org_id, item_id, target_user, detail FROM audit WHERE 1 = 1");
+        use rusqlite::types::Value as V;
+        let mut args: Vec<V> = Vec::new();
+        // Adds a value and gives its placeholder.
+        let mut p = |v: V| {
+            args.push(v);
+            format!("?{}", args.len())
+        };
+        if let Some(b) = q.before {
+            sql.push_str(&format!(" AND id < {}", p(V::Integer(b))));
+        }
+        if let Some(orgs) = &q.within_orgs {
+            if orgs.is_empty() {
+                return Ok(Vec::new());
+            }
+            let list: Vec<String> = orgs.iter().map(|o| p(V::Text(o.clone()))).collect();
+            sql.push_str(&format!(" AND org_id IN ({})", list.join(", ")));
+        }
+        if let Some(o) = &q.org {
+            sql.push_str(&format!(" AND org_id = {}", p(V::Text(o.clone()))));
+        }
+        if let Some(u) = &q.user {
+            let n = p(V::Text(u.clone()));
+            sql.push_str(&format!(" AND (actor_name = {n} COLLATE NOCASE OR target_user = {n} COLLATE NOCASE)"));
+        }
+        if let Some(a) = &q.action {
+            // Only letters, '_' and '.' get here (see the API), so no LIKE wildcards.
+            let n = p(V::Text(a.clone()));
+            sql.push_str(&format!(" AND (action = {n} OR action LIKE {n} || '.%')"));
+        }
+        sql.push_str(&format!(" ORDER BY id DESC LIMIT {}", p(V::Integer(q.limit.clamp(1, 500) as i64))));
+        let mut st = self.conn.prepare(&sql)?;
+        let v = st
+            .query_map(rusqlite::params_from_iter(args.iter()), |r| {
+                Ok(AuditEvent {
+                    id: r.get(0)?,
+                    at: r.get(1)?,
+                    actor_id: r.get(2)?,
+                    actor_name: r.get(3)?,
+                    ip: r.get(4)?,
+                    action: r.get(5)?,
+                    org_id: r.get(6)?,
+                    item_id: r.get(7)?,
+                    target_user: r.get(8)?,
+                    detail: r.get(9)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(v)
+    }
+
+    /// Deletes audit events older than `AUDIT_KEEP_DAYS` (the database's own clock, which the
+    /// trigger that guards younger events uses too). How many went.
+    pub fn prune_audit(&self) -> Res<usize> {
+        Ok(self.conn.execute(&format!("DELETE FROM audit WHERE at < CAST(strftime('%s', 'now') AS INTEGER) - {AUDIT_KEEP_DAYS} * 86400"), [])?)
+    }
+
+    // ------------------------------------------------------------------
     // Backup
     // ------------------------------------------------------------------
 
@@ -2099,7 +2439,7 @@ mod tests {
     }
 
     fn user_of(s: &Store, name: &str) -> Principal {
-        Principal::User { user: s.user_by_name(name).unwrap().unwrap(), token_id: 0 }
+        Principal::User { user: s.user_by_name(name).unwrap().unwrap(), sign_in: SignIn::Device(0) }
     }
 
     /// A database written by the server before organisations existed (schema 0, with data)
@@ -2162,7 +2502,7 @@ mod tests {
             conn.execute_batch(MIGRATION_V1).unwrap();
             conn.execute_batch("PRAGMA user_version = 1").unwrap();
             std::fs::create_dir_all(&files).unwrap();
-            let s = Store { conn, files: files.clone(), versions_to_keep: 25, allow_links: true };
+            let s = Store { conn, files: files.clone(), versions_to_keep: 25, allow_links: true, request_ip: String::new() };
             let alice = s.create_user("alice", "Alice", "", "old-password-123", true).unwrap();
             let bob = s.create_user("bob", "Bob", "", "old-password-123", false).unwrap();
             let carol = s.create_user("carol", "Carol", "", "old-password-123", false).unwrap();
@@ -2243,7 +2583,7 @@ mod tests {
         let folder = s.create_folder(&org.root_id, "Docs", &ann.id).unwrap();
         let (file, _) = s.create_file(&folder.id, "Plan.xlsx", b"x", &ann.id, OnConflict::Fail).unwrap();
         assert_eq!(file.owner_id, org.account_id, "files in the org folder belong to the org");
-        let p = |u: &User| Principal::User { user: u.clone(), token_id: 0 };
+        let p = |u: &User| Principal::User { user: u.clone(), sign_in: SignIn::Device(0) };
         assert_eq!(s.role(&p(&admin), &file, false).unwrap(), None, "no implicit access for the server admin");
         s.set_member(&org, &ann, OrgRole::Admin, &admin.id).unwrap();
         s.set_member(&org, &ben, OrgRole::Member, &admin.id).unwrap();

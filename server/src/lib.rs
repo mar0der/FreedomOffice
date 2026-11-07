@@ -4,10 +4,12 @@
 pub mod admin;
 pub mod api;
 pub mod config;
+pub mod content;
 pub mod live;
 pub mod store;
 pub mod tls;
 pub mod util;
+pub mod web;
 
 use std::net::SocketAddr;
 

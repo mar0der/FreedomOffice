@@ -63,7 +63,7 @@ pub fn routes() -> Router<App> {
 /// Only when the server is reached over plain http (allowed only on loopback or with
 /// `allow_insecure_http`, see `Config::check_plain_http`) is it `fo_admin` without `Secure`,
 /// because browsers wouldn't send a Secure cookie back over http.
-fn secure(cfg: &Config) -> bool {
+pub(crate) fn secure(cfg: &Config) -> bool {
     !cfg.base_url().starts_with("http://") || !matches!(cfg.tls(), Ok(crate::config::Tls::None))
 }
 
@@ -78,7 +78,11 @@ fn set_cookie(cfg: &Config, value: &str, max_age: i64) -> HeaderValue {
 
 /// The session secret from the request's cookies.
 fn session_secret(cfg: &Config, headers: &HeaderMap) -> Option<String> {
-    let name = cookie_name(cfg);
+    cookie_value(headers, cookie_name(cfg))
+}
+
+/// The value of cookie `name` (non-empty, at most 200 characters).
+pub(crate) fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get_all(header::COOKIE)
         .iter()
@@ -92,7 +96,7 @@ fn session_secret(cfg: &Config, headers: &HeaderMap) -> Option<String> {
 
 /// The CSRF token of a session: derived from its secret, so it needs no storage and can't be
 /// worked out without the (HttpOnly) cookie.
-fn csrf_for(secret: &str) -> String {
+pub(crate) fn csrf_for(secret: &str) -> String {
     util::base64url(&util::token_hash(&format!("freedomoffice admin csrf\0{secret}")))
 }
 
@@ -114,7 +118,7 @@ fn origin_of(url: &str) -> String {
 /// no Origin, a Referer must be on it. (Admin pages use `Referrer-Policy: same-origin`, so
 /// browsers send the real Origin with their forms; `null` is refused.) With neither header,
 /// the CSRF token and SameSite=Strict still protect.
-fn same_origin(cfg: &Config, headers: &HeaderMap) -> bool {
+pub(crate) fn same_origin(cfg: &Config, headers: &HeaderMap) -> bool {
     let ours = origin_of(&cfg.base_url());
     if let Some(o) = headers.get(header::ORIGIN) {
         return o.to_str().is_ok_and(|o| origin_of(o) == ours && !o.trim().eq_ignore_ascii_case("null"));
@@ -479,7 +483,7 @@ async fn login(State(app): State<App>, ConnectInfo(Peer(peer)): ConnectInfo<Peer
         return login_html(StatusCode::FORBIDDEN, "This form was sent from another site.");
     }
     let ip = api::client_ip(app.cfg(), peer, &headers);
-    let user = match api::check_sign_in(&app, ip, &field(&body, "username"), field(&body, "password")).await {
+    let user = match api::check_sign_in(&app, ip, &field(&body, "username"), field(&body, "password"), "admin").await {
         Ok(u) => u,
         Err(e) => return login_html(e.status(), e.message()),
     };
@@ -1100,8 +1104,9 @@ async fn person_page(State(app): State<App>, headers: HeaderMap, Path(username):
             for w in &web {
                 let this = if w.id == ctx.session { " <span class=\"tag\">this browser</span>" } else { "" };
                 rows.push_str(&format!(
-                    "<tr><td>{}{this}</td><td>admin page</td><td>{}</td><td>{}</td><td class=\"actions\">{}</td></tr>",
+                    "<tr><td>{}{this}</td><td>{}</td><td>{}</td><td>{}</td><td class=\"actions\">{}</td></tr>",
                     if w.agent.is_empty() { "Browser".to_string() } else { esc(&w.agent) },
+                    if w.kind == crate::store::SessionKind::Web { "browser (Drive)" } else { "admin page" },
                     when(w.created),
                     when(w.last_used),
                     ctx.button(&format!("{base}/sessions/web/{}/revoke", w.id), "Sign out", "danger")
