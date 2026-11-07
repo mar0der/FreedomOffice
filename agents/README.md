@@ -153,6 +153,7 @@ Runs on this branch:
 | in-process test, seed 0x5eed | 3 x 80 actions | 211 ops in 138 batches, 138 acks, 276 remote batches applied, 5 forced disconnects/5 reconnects, converged yes (fresh joiner too), 3.5 s |
 | shared test instance (Tailscale, TLS), Budget.xlsx | 4 x 200 actions | 732 ops in 607 batches, 605 acks, 1821 remote batches applied, 18 forced disconnects/18 reconnects, final seq 607, 173 cells, converged yes (fresh joiner too), 9.9 s |
 | shared test instance, soak-m3.xlsx (M3: clients killed right after an edit and restarted from their journals) | 4 x 200 / 300 / 400 / 300 actions, kill chance 3 / 5 / 8 / 12 % per action | seeds 3001-3004: 734 to 1449 ops, 24 / 64 / 131 / 147 kills with 22 / 62 / 119 / 138 journals put back, 19 to 44 forced disconnects, 3 snapshots and (seed 3004) 3 reloads, up to 52013 remote batches applied; converged yes (fresh joiner too) and no journal left in all four, 11 to 23 s each |
+| shared test instance, soak-m4.xlsx (M4: undo action in the mix, plus kills/restarts) | 4 x 200 / 300 / 400 actions, kill chance 3 / 5 / 3 %, undo chance 8 / 12 / 20 % | seeds 4001-4003: 743 / 1075 / 1444 ops, 34 / 131 / 225 undos applied and 4 / 30 / 56 blocked (someone else had changed the cell), 25 / 64 / 46 kills with 21 / 60 / 44 journals put back, 14 to 35 forced disconnects, 3 to 6 snapshots; converged yes (fresh joiner too), no journal left, 12 to 21 s each |
 
 ## Shared test instance
 

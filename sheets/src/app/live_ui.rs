@@ -1928,10 +1928,11 @@ impl App {
             }
             let hovered = hover.is_some_and(|h| cr.contains(h));
             if hovered || seen.moved.elapsed().as_secs_f32() < FLAG_SECS || pr.editing {
-                let mut label = presence_label(&seen.peer);
-                if pr.editing {
-                    label.push_str(" (editing)");
-                }
+                let label = match (pr.editing, seen.peer.agent) {
+                    (true, true) => format!("{} (bot, editing)", seen.peer.name),
+                    (true, false) => format!("{} (editing)", seen.peer.name),
+                    _ => presence_label(&seen.peer),
+                };
                 let font = super::theme::ui_font(11.0);
                 let white = Color32::WHITE.gamma_multiply(alpha);
                 let g = p.layout_no_wrap(label, font, white);
