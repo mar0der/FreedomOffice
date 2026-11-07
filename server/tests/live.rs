@@ -652,3 +652,18 @@ fn leaving_an_organisation_ends_its_sessions() {
         }
     }
 }
+
+#[test]
+fn removing_a_share_link_ends_its_sessions() {
+    let s = start();
+    let a = s.login("alice");
+    let id = s.new_file(&a, "Linked.xlsx");
+    let link = s.json("POST", &format!("/api/items/{id}/links"), Some(&a), json!({ "role": "edit" })).json();
+    let (link_id, token) = (link["id"].as_str().unwrap().to_string(), link["url"].as_str().unwrap().rsplit('/').next().unwrap().to_string());
+    let access = s.send("GET", &format!("/api/links/{token}"), None, &[], None).json()["access_token"].as_str().unwrap().to_string();
+    let mut wl = s.ws(Some(&access), "since=0&v=1&cid=link", &id).unwrap();
+    let ServerMsg::Welcome { .. } = wl.recv() else { panic!() };
+    assert_eq!(s.send("DELETE", &format!("/api/items/{id}/links/{link_id}"), Some(&a), &[], None).status, 204);
+    assert_eq!(wl.recv_access(), ServerMsg::Revoked { reason: "The share link was removed.".into() });
+    assert_eq!(wl.close_code(), Some(cosync::close::REVOKED));
+}

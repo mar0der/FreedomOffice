@@ -636,7 +636,7 @@ fn organisations_members_and_roles() {
     assert_eq!(s.json("PATCH", &format!("/api/orgs/{org}"), Some(&a), json!({ "name": "Crew" })).json()["name"], "Crew");
     assert_eq!(s.get(&format!("/api/items/{root}"), &c).json()["name"], "Crew");
     // Leaving / removing ends access.
-    assert_eq!(s.send("DELETE", &format!("/api/orgs/Crew/members/carol"), Some(&c), &[], None).status, 204, "anyone may leave");
+    assert_eq!(s.send("DELETE", "/api/orgs/Crew/members/carol", Some(&c), &[], None).status, 204, "anyone may leave");
     assert_eq!(s.get(&format!("/api/items/{plan}"), &c).status, 404);
     assert_eq!(s.get(&format!("/api/orgs/{org}"), &c).status, 404);
     // Storage use.
