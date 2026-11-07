@@ -595,6 +595,47 @@ fn me_tells_the_drive_app_its_storage_and_limits() {
     assert_eq!(me["server"], json!({ "max_upload_mb": 7, "allow_links": false }));
     assert_eq!(me["storage"]["files"], 1);
     assert_eq!(me["storage"]["bytes"], 5);
+    // Only bob's own files count (not carol's).
+    let ct = s.token("carol");
+    assert_eq!(s.upload(&ct, &s.root(&ct), "b.txt", b"0123456789").status, 201);
+    assert_eq!(w.get("/api/me").json()["storage"]["bytes"], 5);
+}
+
+#[test]
+fn hsts_when_browsers_come_over_https() {
+    let s = start();
+    for path in ["/drive", "/api/health", "/api/nothing-here", "/admin/login"] {
+        assert_eq!(s.send("GET", path, &[], None).header("strict-transport-security"), Some("max-age=31536000"), "{path}");
+    }
+    drop(s);
+    // Plain http on loopback (dev): none, or browsers would refuse it for a year.
+    let s = start_with(|c| c.public_url = String::new());
+    assert!(s.send("GET", "/drive", &[], None).header("strict-transport-security").is_none());
+}
+
+#[test]
+fn names_with_invisible_or_direction_characters_are_refused() {
+    let s = start();
+    let t = s.token("bob");
+    let root = s.root(&t);
+    let spoof = "invoice\u{202E}fdp.exe";
+    let r = s.api("POST", "/api/folders", &t, json!({ "name": "a\u{200B}b" }));
+    assert_eq!(r.status, 400);
+    assert!(r.json()["error"].as_str().unwrap().contains("invisible"), "{}", r.text());
+    assert_eq!(s.upload(&t, &root, spoof, b"x").status, 400);
+    let id = s.upload(&t, &root, "Plain.txt", b"x").json()["id"].as_str().unwrap().to_string();
+    assert_eq!(s.api("PATCH", &format!("/api/items/{id}"), &t, json!({ "name": spoof })).status, 400);
+    assert_eq!(s.api("PATCH", &format!("/api/items/{id}"), &t, json!({ "name": "\u{FEFF}Plain.txt" })).status, 400);
+    assert_eq!(s.api("POST", "/api/folders", &t, json!({ "name": "Family 👩\u{200D}👩\u{200D}👧" })).status, 201, "emoji sequences are fine");
+    // A name stored before the rule keeps working: listed, downloaded, moved; renaming it
+    // away is allowed.
+    s.store().conn.execute("UPDATE items SET name = ?1 WHERE id = ?2", [spoof, id.as_str()]).unwrap();
+    let kids = s.api("GET", &format!("/api/items/{root}/children"), &t, json!({})).json();
+    assert!(kids["items"].as_array().unwrap().iter().any(|i| i["name"] == spoof));
+    assert_eq!(s.send("GET", &format!("/api/items/{id}/content"), &[("Authorization", &format!("Bearer {t}"))], None).status, 200);
+    let dest = s.api("POST", "/api/folders", &t, json!({ "name": "Dest" })).json()["id"].as_str().unwrap().to_string();
+    assert_eq!(s.api("PATCH", &format!("/api/items/{id}"), &t, json!({ "parent": dest })).status, 200);
+    assert_eq!(s.api("PATCH", &format!("/api/items/{id}"), &t, json!({ "name": "Clean.txt" })).status, 200);
 }
 
 // ---------------------------------------------------------------------------

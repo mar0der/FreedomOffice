@@ -2284,7 +2284,12 @@ impl Store {
     }
 
     pub fn usage_of(&self, owner_id: &str) -> Res<Usage> {
-        Ok(self.usage()?.into_iter().find(|(o, _)| o == owner_id).map(|(_, u)| u).unwrap_or_default())
+        Ok(self.conn.query_row(
+            "SELECT COUNT(DISTINCT i.id), COUNT(v.version), COALESCE(SUM(v.size), 0)
+             FROM items i JOIN versions v ON v.item_id = i.id WHERE i.kind = 'file' AND i.owner_id = ?1",
+            [owner_id],
+            |r| Ok(Usage { files: r.get(0)?, versions: r.get(1)?, bytes: r.get(2)? }),
+        )?)
     }
 
     // ------------------------------------------------------------------

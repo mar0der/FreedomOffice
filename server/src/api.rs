@@ -663,9 +663,22 @@ pub fn router(app: App) -> Router {
         .fallback(|| async { ApiError::not_found() })
         .layer(DefaultBodyLimit::max(JSON_LIMIT))
         .layer(middleware::from_fn(crate::admin::harden_admin))
+        .layer(middleware::from_fn_with_state(app.clone(), hsts))
         .layer(middleware::from_fn_with_state(app.clone(), crate::web::web_gate))
         .layer(middleware::from_fn(log_requests))
         .with_state(app)
+}
+
+/// `Strict-Transport-Security` on every answer when browsers reach this server over https
+/// (it serves TLS itself, or `public_url` is https behind a proxy): they then refuse a
+/// downgraded plain-http visit for a year.
+async fn hsts(State(app): State<App>, req: Request, next: Next) -> Response {
+    let https = app.cfg.public_url.trim().to_ascii_lowercase().starts_with("https://") || !matches!(app.cfg.tls(), Ok(crate::config::Tls::None));
+    let mut res = next.run(req).await;
+    if https {
+        res.headers_mut().insert(header::STRICT_TRANSPORT_SECURITY, HeaderValue::from_static("max-age=31536000"));
+    }
+    res
 }
 
 /// Logs method, path (secrets in link paths redacted), status and time. Never bodies or headers.

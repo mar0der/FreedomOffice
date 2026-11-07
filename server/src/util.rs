@@ -128,6 +128,25 @@ pub fn ip_bucket(ip: std::net::IpAddr) -> String {
 }
 
 /// Validates and normalizes a file or folder name.
+/// Invisible and direction-changing characters (zero-width spaces and joiners, bidi marks,
+/// embeddings, overrides and isolates, the byte order mark): in a name they can make
+/// "invoice\u{202E}fdp.exe" look like "invoiceexe.pdf". Refused in new names; names that
+/// already exist keep working.
+pub fn sneaky_char(c: char) -> bool {
+    matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{2069}' | '\u{061C}' | '\u{FEFF}')
+}
+
+/// Emoji (and pictographs) a zero-width joiner may glue together ("👩‍👩‍👧").
+fn pictograph(c: char) -> bool {
+    matches!(c, '\u{1F000}'..='\u{1FAFF}' | '\u{2600}'..='\u{27BF}' | '\u{FE0F}')
+}
+
+/// A `sneaky_char`, except a zero-width joiner between two emoji (emoji sequences need it).
+pub fn has_sneaky_char(name: &str) -> bool {
+    let cs: Vec<char> = name.chars().collect();
+    cs.iter().enumerate().any(|(i, &c)| sneaky_char(c) && !(c == '\u{200D}' && i > 0 && i + 1 < cs.len() && pictograph(cs[i - 1]) && pictograph(cs[i + 1])))
+}
+
 pub fn clean_name(name: &str) -> Result<String, String> {
     let n = name.trim();
     if n.is_empty() {
@@ -138,6 +157,9 @@ pub fn clean_name(name: &str) -> Result<String, String> {
     }
     if n.chars().any(|c| c.is_control() || r#"/\:*?"<>|"#.contains(c)) {
         return Err(r#"A name can't contain any of these characters: / \ : * ? " < > |"#.into());
+    }
+    if has_sneaky_char(n) {
+        return Err("A name can't contain invisible or text-direction characters (such as zero-width spaces or right-to-left marks).".into());
     }
     if n == "." || n == ".." {
         return Err("That name isn't allowed.".into());
@@ -281,6 +303,11 @@ mod tests {
         for bad in ["", "  ", "a/b", "a\\b", "a:b", "a*b", "a?b", "a\"b", "a<b", "a>b", "a|b", "a\nb", "..", "."] {
             assert!(clean_name(bad).is_err(), "{bad:?}");
         }
+        for bad in ["invoice\u{202E}fdp.exe", "a\u{200B}b", "\u{FEFF}x", "x\u{2066}y\u{2069}", "a\u{061C}b", "a\u{2060}b", "a\u{200F}", "a\u{200D}b", "\u{200D}👩"] {
+            assert!(clean_name(bad).unwrap_err().contains("invisible"), "{bad:?}");
+        }
+        assert!(clean_name("مرحبا.xlsx").is_ok(), "right-to-left text itself is fine");
+        assert!(clean_name("Café 👩‍👩‍👧.txt").is_ok(), "emoji sequences (U+200D joiner) are fine");
         assert!(clean_name(&"x".repeat(255)).is_ok());
         assert!(clean_name(&"x".repeat(256)).is_err());
         assert_eq!(numbered_name("Book.xlsx", 2), "Book (2).xlsx");
