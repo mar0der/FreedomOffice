@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
@@ -55,12 +55,34 @@ pub struct App {
     cfg: Arc<Config>,
     limiter: Arc<Mutex<Limiter>>,
     hub: Arc<crate::live::Hub>,
+    /// Argon2 runs (about 19 MiB and a core each) at most this many at once.
+    argon: Arc<tokio::sync::Semaphore>,
 }
 
 impl App {
     pub fn new(mut store: Store, cfg: Config) -> App {
         store.allow_links = cfg.allow_links;
-        App { store: Arc::new(Mutex::new(store)), cfg: Arc::new(cfg), limiter: Arc::new(Mutex::new(Limiter::default())), hub: Arc::default() }
+        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).clamp(1, 16);
+        App {
+            store: Arc::new(Mutex::new(store)),
+            cfg: Arc::new(cfg),
+            limiter: Arc::new(Mutex::new(Limiter::default())),
+            hub: Arc::default(),
+            argon: Arc::new(tokio::sync::Semaphore::new(cores)),
+        }
+    }
+
+    /// Password hashing or checking (Argon2): never under the store lock, at most one per core
+    /// at a time (waiting requests hold no thread and no memory).
+    async fn argon<T: Send + 'static>(&self, f: impl FnOnce() -> T + Send + 'static) -> Result<T, ApiError> {
+        let _permit = self.argon.acquire().await.map_err(|_| ApiError::internal())?;
+        tokio::task::spawn_blocking(f).await.map_err(|_| ApiError::internal())
+    }
+
+    /// Checks a new password against the policy, then hashes it (see `argon`).
+    async fn new_password_hash(&self, password: String, username: String) -> Result<String, ApiError> {
+        util::check_new_password(&password, &username).map_err(ApiError::bad)?;
+        self.argon(move || util::hash_password(&password)).await
     }
 
     /// After a change that can affect who may see or edit what: re-checks every live session
@@ -90,24 +112,44 @@ impl App {
         .map_err(|_| ApiError::internal())?
     }
 
+    fn limiter(&self) -> MutexGuard<'_, Limiter> {
+        self.limiter.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn limited(&self, keys: &[String]) -> bool {
-        let mut l = self.limiter.lock().unwrap_or_else(|e| e.into_inner());
+        let mut l = self.limiter();
         keys.iter().any(|k| l.blocked(k))
     }
 
     fn fail(&self, keys: &[String]) {
-        let mut l = self.limiter.lock().unwrap_or_else(|e| e.into_inner());
+        let mut l = self.limiter();
         for k in keys {
             l.fail(k);
         }
     }
 
-    fn clear(&self, key: &str) {
-        self.limiter.lock().unwrap_or_else(|e| e.into_inner()).map.remove(key);
+    /// Checks the limits and, in the same step, counts this attempt as a failure in advance
+    /// (taken back by `succeeded`), so parallel attempts can't all pass the check before any
+    /// of them fails. Returns the failures of `keys[1]` before this attempt, or `None` when
+    /// limited.
+    fn attempt(&self, keys: &[String]) -> Option<usize> {
+        let mut l = self.limiter();
+        if keys.iter().any(|k| l.blocked(k)) {
+            return None;
+        }
+        let before = keys.get(1).map(|k| l.prune(k)).unwrap_or(0);
+        for k in keys {
+            l.fail(k);
+        }
+        Some(before)
     }
 
-    fn failures(&self, key: &str) -> usize {
-        self.limiter.lock().unwrap_or_else(|e| e.into_inner()).prune(key)
+    /// The attempt counted by `attempt` succeeded: forget the user's failures and give the
+    /// address its provisional failure back.
+    fn succeeded(&self, ip_key: &str, user_key: &str) {
+        let mut l = self.limiter();
+        l.map.remove(user_key);
+        l.unfail(ip_key);
     }
 }
 
@@ -121,10 +163,8 @@ fn login_delay(failures: usize, base: Duration) -> Duration {
     base.saturating_mul(factor as u32)
 }
 
-/// A username as typed, safe for one log line.
-fn loggable(name: &str) -> String {
-    name.trim().chars().filter(|c| !c.is_control()).take(64).collect()
-}
+/// Keys kept by the limiter at most (each is short: an address, a valid username or a link id).
+const LIMITER_KEYS: usize = 100_000;
 
 #[derive(Default)]
 struct Limiter {
@@ -149,10 +189,33 @@ impl Limiter {
     }
 
     fn fail(&mut self, key: &str) {
-        if self.map.len() > 100_000 {
+        if !self.map.contains_key(key) && self.map.len() >= LIMITER_KEYS {
             self.map.retain(|_, q| q.back().is_some_and(|t| t.elapsed() < LOGIN_WINDOW));
+            // Still full (an attack from very many addresses or names): drop the keys whose last
+            // failure is oldest, so the map stays bounded.
+            if self.map.len() >= LIMITER_KEYS {
+                let mut last: Vec<Instant> = self.map.values().filter_map(|q| q.back().copied()).collect();
+                last.sort_unstable();
+                let cut = last[last.len() / 10];
+                self.map.retain(|_, q| q.back().is_some_and(|t| *t > cut));
+            }
         }
-        self.map.entry(key.to_string()).or_default().push_back(Instant::now());
+        let q = self.map.entry(key.to_string()).or_default();
+        q.push_back(Instant::now());
+        // Only the count within the window matters; never keep more than the limit needs.
+        while q.len() > LOGIN_FAILURES * 2 {
+            q.pop_front();
+        }
+    }
+
+    /// Takes back the newest failure of `key` (a provisional one that turned out a success).
+    fn unfail(&mut self, key: &str) {
+        if let Some(q) = self.map.get_mut(key) {
+            q.pop_back();
+            if q.is_empty() {
+                self.map.remove(key);
+            }
+        }
     }
 }
 
@@ -470,37 +533,47 @@ struct LoginBody {
 
 async fn login(State(app): State<App>, ConnectInfo(Peer(peer)): ConnectInfo<Peer>, headers: HeaderMap, body: Bytes) -> ApiResult {
     let b: LoginBody = parse_body(&body)?;
-    let ip_key = format!("ip:{}", client_ip(&app.cfg, peer, &headers));
-    let user_key = format!("user:{}", b.username.trim().to_lowercase());
-    let keys = [ip_key, user_key.clone()];
-    if app.limited(&keys) {
-        return Err(too_many());
+    let ip = client_ip(&app.cfg, peer, &headers);
+    let ip_key = format!("ip:{ip}");
+    let wrong = || ApiError::new(StatusCode::UNAUTHORIZED, "The username or password is incorrect.");
+    let name = b.username.trim().to_string();
+    // Something that can't be a username (or an absurd password) never reaches the limiter's
+    // username keys, the database or Argon2, and isn't logged as typed.
+    if !util::valid_username(&name) || b.password.len() > 1024 {
+        if app.attempt(std::slice::from_ref(&ip_key)).is_none() {
+            return Err(too_many());
+        }
+        tracing::warn!("failed sign-in with an invalid username from {ip}");
+        return Err(wrong());
     }
+    let user_key = format!("user:{}", name.to_lowercase());
+    let keys = [ip_key.clone(), user_key.clone()];
+    // Counted as a failure up front, so parallel attempts are limited too.
+    let Some(before) = app.attempt(&keys) else { return Err(too_many()) };
     // Repeated failures for a username slow every further attempt down (right or wrong, so the
     // wait says nothing about the password).
-    let wait = login_delay(app.failures(&user_key), Duration::from_millis(app.cfg.login_delay_ms));
+    let wait = login_delay(before, Duration::from_millis(app.cfg.login_delay_ms));
     if !wait.is_zero() {
         tokio::time::sleep(wait).await;
     }
-    let name = b.username.clone();
-    let found = app.run(move |s| Ok(s.user_by_name(&name)?.map(|u| (s.password_hash(&u.id), u)))).await?;
+    let n = name.clone();
+    let found = app.run(move |s| Ok(s.user_by_name(&n)?.map(|u| (s.password_hash(&u.id), u)))).await?;
     let pw = b.password;
-    let user = tokio::task::spawn_blocking(move || match found {
-        Some((Ok(hash), u)) if util::verify_password(&pw, &hash) && !u.disabled => Some(u),
-        Some(_) => None,
-        None => {
-            util::dummy_verify(&pw);
-            None
-        }
-    })
-    .await
-    .map_err(|_| ApiError::internal())?;
+    let user = app
+        .argon(move || match found {
+            Some((Ok(hash), u)) if util::verify_password(&pw, &hash) && !u.disabled => Some(u),
+            Some(_) => None,
+            None => {
+                util::dummy_verify(&pw);
+                None
+            }
+        })
+        .await?;
     let Some(user) = user else {
-        app.fail(&keys);
-        tracing::warn!("failed sign-in for user '{}' from {}", loggable(&b.username), client_ip(&app.cfg, peer, &headers));
-        return Err(ApiError::new(StatusCode::UNAUTHORIZED, "The username or password is incorrect."));
+        tracing::warn!("failed sign-in for user '{name}' from {ip}");
+        return Err(wrong());
     };
-    app.clear(&user_key);
+    app.succeeded(&ip_key, &user_key);
     let device = b.device;
     app.run(move |s| {
         let token = s.create_token(&user.id, &device)?;
@@ -555,22 +628,26 @@ async fn change_password(State(app): State<App>, headers: HeaderMap, body: Bytes
         })
         .await?;
     let key = format!("user:{}", user.username.to_lowercase());
-    if app.limited(std::slice::from_ref(&key)) {
+    if b.old_password.len() > 1024 || app.attempt(std::slice::from_ref(&key)).is_none() {
         return Err(too_many());
     }
-    let old = b.old_password;
-    let ok = tokio::task::spawn_blocking(move || util::verify_password(&old, &hash)).await.map_err(|_| ApiError::internal())?;
+    let (old, new, current) = (b.old_password, b.new_password.clone(), hash.clone());
+    let (ok, same) = app.argon(move || (util::verify_password(&old, &current), util::verify_password(&new, &current))).await?;
     if !ok {
-        app.fail(std::slice::from_ref(&key));
         tracing::warn!("wrong current password in a password change for user '{}'", user.username);
         return Err(ApiError::coded(StatusCode::FORBIDDEN, "wrong_password", "The current password is incorrect."));
     }
-    let new = b.new_password;
+    app.limiter().map.remove(&key);
+    if same {
+        return Err(ApiError::bad("The new password must be different from the current one."));
+    }
+    let new_hash = app.new_password_hash(b.new_password, user.username.clone()).await?;
     app.run_changing(move |s| {
-        if util::verify_password(&new, &s.password_hash(&user.id)?) {
-            return Err(ApiError::bad("The new password must be different from the current one."));
+        // Still the same password (no other change won the race) and the same device.
+        if s.password_hash(&user.id)? != hash || !s.token_exists(token_id)? {
+            return Err(ApiError::new(StatusCode::CONFLICT, "Your password was changed meanwhile. Sign in again."));
         }
-        s.set_password(&user.id, &new)?;
+        s.set_password_hash(&user.id, &new_hash)?;
         let n = s.revoke_other_tokens(&user.id, token_id)?;
         tracing::info!("user '{}' changed their password ({n} other device(s) signed out)", user.username);
         let fresh = s.user_by_id(&user.id)?.ok_or_else(ApiError::not_found)?;
@@ -631,32 +708,42 @@ struct AccountBody {
     role: Option<String>,
 }
 
+/// Who may create the account in `b` and into which organisation (checked before the password
+/// is hashed and again when the account is stored).
+fn account_target(s: &Store, headers: &HeaderMap, b: &AccountBody) -> Result<(User, Option<(Org, OrgRole)>, String), ApiError> {
+    let who = auth(s, headers)?;
+    let me = user_of(&who)?.clone();
+    let org = match b.org.as_deref().filter(|o| !o.trim().is_empty()) {
+        Some(o) => {
+            let (org, mine) = org_for(s, &me, o)?;
+            need_manage(&me, mine)?;
+            let role = OrgRole::parse(b.role.as_deref().unwrap_or("member")).ok_or_else(|| ApiError::bad("role must be member, admin or owner."))?;
+            need_owner_for(&me, mine, &[Some(role)])?;
+            Some((org, role))
+        }
+        None => {
+            need_admin(&me)?;
+            None
+        }
+    };
+    let username = s.check_new_username(&b.username)?;
+    Ok((me, org, username))
+}
+
 /// `POST /api/users`: a new account with a temporary password generated by the server,
 /// returned once in this response (never logged or stored in clear); the person must choose
 /// a new one when they first sign in. Org owners/admins create accounts into their org.
 async fn create_account(State(app): State<App>, headers: HeaderMap, body: Bytes) -> ApiResult {
+    let b: AccountBody = parse_body(&body)?;
+    let b = Arc::new(b);
+    let (h, bb) = (headers.clone(), b.clone());
+    let (_, _, username) = app.run(move |s| account_target(s, &h, &bb)).await?;
+    let pw = util::temp_password_for(&username);
+    let p = pw.clone();
+    let hash = app.argon(move || util::hash_password(&p)).await?;
     app.run(move |s| {
-        let who = auth(s, &headers)?;
-        let me = user_of(&who)?.clone();
-        let b: AccountBody = parse_body(&body)?;
-        let org = match b.org.as_deref().filter(|o| !o.trim().is_empty()) {
-            Some(o) => {
-                let (org, mine) = org_for(s, &me, o)?;
-                need_manage(&me, mine)?;
-                let role = OrgRole::parse(b.role.as_deref().unwrap_or("member")).ok_or_else(|| ApiError::bad("role must be member, admin or owner."))?;
-                need_owner_for(&me, mine, &[Some(role)])?;
-                Some((org, role))
-            }
-            None => {
-                need_admin(&me)?;
-                None
-            }
-        };
-        let pw = util::temp_password();
-        let u = s.create_account(&b.username, &b.display_name, &b.email, &pw, false, true)?;
-        if let Some((org, role)) = &org {
-            s.set_member(org, &u, *role, &me.id)?;
-        }
+        let (me, org, _) = account_target(s, &headers, &b)?;
+        let u = s.create_temp_account(&b.username, &b.display_name, &b.email, &hash, org.as_ref().map(|(o, r)| (o, *r, me.id.as_str())))?;
         tracing::info!("user '{}' created the account '{}'{}", me.username, u.username, org.as_ref().map(|(o, _)| format!(" in {}", o.name)).unwrap_or_default());
         Ok((StatusCode::CREATED, axum::Json(json!({ "user": user_json(&u), "temporary_password": pw }))).into_response())
     })
@@ -664,15 +751,26 @@ async fn create_account(State(app): State<App>, headers: HeaderMap, body: Bytes)
 }
 
 /// `POST /api/users/{username}/reset-password` (server administrator): a new temporary
-/// password (returned once), all devices signed out.
+/// password (returned once; accepted policy, SPEC §2), all devices signed out.
 async fn reset_password(State(app): State<App>, headers: HeaderMap, Path(username): Path<String>) -> ApiResult {
+    let (h, n) = (headers.clone(), username.clone());
+    let target = app
+        .run(move |s| {
+            let who = auth(s, &h)?;
+            need_admin(user_of(&who)?)?;
+            Ok(person_by_name(s, &n)?)
+        })
+        .await?;
+    let pw = util::temp_password_for(&target.username);
+    let p = pw.clone();
+    let hash = app.argon(move || util::hash_password(&p)).await?;
     app.run_changing(move |s| {
         let who = auth(s, &headers)?;
         let me = user_of(&who)?;
         need_admin(me)?;
         let u = person_by_name(s, &username)?;
-        let pw = s.set_temp_password(&u.id)?;
-        tracing::info!("user '{}' reset the password of '{}'", me.username, u.username);
+        let n = s.set_temp_password_hash(&u.id, &hash)?;
+        tracing::warn!("administrator '{}' reset the password of '{}' ({n} device(s) signed out)", me.username, u.username);
         ok_json(json!({ "user": user_json(&s.user_by_id(&u.id)?.ok_or_else(ApiError::not_found)?), "temporary_password": pw }))
     })
     .await
@@ -1020,9 +1118,10 @@ async fn admin_storage(State(app): State<App>, headers: HeaderMap) -> ApiResult 
 // Invites (no account yet)
 // ---------------------------------------------------------------------------
 
-/// The invite behind a token, or 404 (counted as a failure for the address).
+/// The invite behind a token, or 404 (counted as a failure for the address, up front so
+/// parallel guesses are limited too).
 async fn live_invite(app: &App, ip_key: &str, token: String) -> Result<(crate::store::Invite, Org), ApiError> {
-    if app.limited(&[ip_key.to_string()]) {
+    if app.attempt(&[ip_key.to_string()]).is_none() {
         return Err(too_many());
     }
     let r = app
@@ -1032,8 +1131,8 @@ async fn live_invite(app: &App, ip_key: &str, token: String) -> Result<(crate::s
             Ok((inv, org))
         })
         .await;
-    if r.is_err() {
-        app.fail(&[ip_key.to_string()]);
+    if r.is_ok() {
+        app.limiter().unfail(ip_key);
     }
     r
 }
@@ -1055,10 +1154,14 @@ struct AcceptBody {
     device: String,
 }
 
-/// Creates the account and membership for an invite; the password is hashed off the async runtime.
+/// Creates the account and membership for an invite. The username and password are checked
+/// first; the password is hashed outside the store lock (see `App::argon`).
 async fn accept(app: &App, ip_key: &str, token: String, b: AcceptBody) -> Result<(User, Org), ApiError> {
     live_invite(app, ip_key, token.clone()).await?;
-    app.run_changing(move |s| Ok(s.accept_invite(&token, &b.username, &b.display_name, &b.password)?)).await
+    let name = b.username.clone();
+    let username = app.run(move |s| Ok(s.check_new_username(&name)?)).await?;
+    let hash = app.new_password_hash(b.password, username.clone()).await?;
+    app.run_changing(move |s| Ok(s.accept_invite(&token, &username, &b.display_name, &hash)?)).await
 }
 
 /// `POST /api/invites/{token} {username, password, display_name?, device?}`: creates the
@@ -1616,10 +1719,19 @@ fn link_json(s: &Store, l: &Link) -> Value {
 
 async fn create_link(State(app): State<App>, headers: HeaderMap, Path(id): Path<String>, body: Bytes) -> ApiResult {
     let base = app.cfg.base_url();
+    let b: LinkBody = parse_body(&body)?;
+    // The link's password is hashed before the store is locked (only for signed-in callers,
+    // so nobody else can make the server hash for them).
+    let h = headers.clone();
+    app.run(move |s| user_of(&auth(s, &h)?).map(|_| ())).await?;
+    let pw_hash = match b.password.clone().filter(|p| !p.is_empty()) {
+        Some(p) if p.len() > 1024 => return Err(ApiError::bad("The password is too long.")),
+        Some(p) => Some(app.argon(move || util::hash_password(&p)).await?),
+        None => None,
+    };
     app.run(move |s| {
         let who = auth(s, &headers)?;
         let me = user_of(&who)?.clone();
-        let b: LinkBody = parse_body(&body)?;
         let (it, role) = visible(s, &who, &id, false)?;
         need_edit(role)?;
         if !s.allow_links {
@@ -1631,7 +1743,7 @@ async fn create_link(State(app): State<App>, headers: HeaderMap, Path(id): Path<
             Some(d) if d <= 3650 => Some(now() + d as i64 * 86400),
             Some(_) => return Err(ApiError::bad("expires_days must be 3650 or less.")),
         };
-        let (link, token) = s.create_link(&it, r, expires, b.password.as_deref(), &me.id)?;
+        let (link, token) = s.create_link(&it, r, expires, pw_hash.as_deref(), &me.id)?;
         let mut v = link_json(s, &link);
         v["url"] = json!(format!("{base}/l/{token}"));
         Ok((StatusCode::CREATED, axum::Json(v)).into_response())
@@ -1707,7 +1819,7 @@ async fn resolve_link(app: App, peer: SocketAddr, headers: HeaderMap, token: Str
             let body = json!({ "error": "This link needs a password.", "password_required": true });
             return Ok((StatusCode::UNAUTHORIZED, axum::Json(body)).into_response());
         }
-        let ok = tokio::task::spawn_blocking(move || util::verify_password(&password, &hash)).await.map_err(|_| ApiError::internal())?;
+        let ok = app.argon(move || util::verify_password(&password, &hash)).await?;
         if !ok {
             app.fail(&[ip_key, link_key]);
             let body = json!({ "error": "The password is incorrect.", "password_required": true });
@@ -1879,7 +1991,7 @@ async fn link_download_form(State(app): State<App>, ConnectInfo(Peer(peer)): Con
         return Err(too_many());
     }
     if let Some(hash) = link.pw_hash.clone() {
-        let ok = tokio::task::spawn_blocking(move || util::verify_password(&password, &hash)).await.map_err(|_| ApiError::internal())?;
+        let ok = app.argon(move || util::verify_password(&password, &hash)).await?;
         if !ok {
             app.fail(&[ip_key, link_key]);
             let mut res = page("FreedomOffice", "<p>The password is incorrect. Go back and try again.</p>");
@@ -2047,5 +2159,21 @@ mod tests {
         l.fail("k");
         assert!(l.blocked("k"));
         assert!(!l.blocked("other"));
+        l.unfail("k");
+        assert!(!l.blocked("k"));
+    }
+
+    #[test]
+    fn limiter_stays_bounded() {
+        let mut l = Limiter::default();
+        for i in 0..LIMITER_KEYS + 5000 {
+            l.fail(&format!("ip:{i}"));
+        }
+        assert!(l.map.len() <= LIMITER_KEYS);
+        for _ in 0..100 {
+            l.fail("k");
+        }
+        assert!(l.map["k"].len() <= LOGIN_FAILURES * 2);
+        assert!(l.blocked("k"));
     }
 }

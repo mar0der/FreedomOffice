@@ -594,31 +594,64 @@ impl Store {
     }
 
     /// A person's account; with `must_change_password` the password is a temporary one.
+    /// Checks the password policy and hashes here (for the CLI and tests); the server hashes
+    /// outside the store lock and calls `create_account_hashed`.
     pub fn create_account(&self, username: &str, display_name: &str, email: &str, password: &str, is_admin: bool, must_change_password: bool) -> Res<User> {
+        util::check_new_password(password, username.trim()).map_err(StoreError::Invalid)?;
+        self.create_account_hashed(username, display_name, email, &util::hash_password(password), is_admin, must_change_password)
+    }
+
+    /// The username for a new account, trimmed, when it is valid and free.
+    pub fn check_new_username(&self, username: &str) -> Res<String> {
         let username = username.trim();
         if !util::valid_username(username) {
             return Err(StoreError::Invalid("A username may contain letters, digits, '.', '-' and '_' (64 characters at most).".into()));
         }
-        util::check_new_password(password, username).map_err(StoreError::Invalid)?;
         if self.user_by_name(username)?.is_some() {
             return Err(StoreError::Conflict(format!("The user '{username}' already exists.")));
         }
-        let display = if display_name.trim().is_empty() { username.to_string() } else { display_name.trim().chars().take(100).collect() };
-        let email: String = email.trim().chars().take(254).collect();
+        Ok(username.to_string())
+    }
+
+    /// `create_account` with the password already checked and hashed (`util::hash_password`).
+    pub fn create_account_hashed(&self, username: &str, display_name: &str, email: &str, pw_hash: &str, is_admin: bool, must_change_password: bool) -> Res<User> {
+        let tx = self.conn.unchecked_transaction()?;
+        let id = self.insert_account(username, display_name, email, pw_hash, is_admin, must_change_password)?;
+        tx.commit()?;
+        self.user_by_id(&id)?.ok_or(StoreError::NotFound)
+    }
+
+    /// An account with a temporary password (hash), joined to `org` with a role (added by
+    /// the given user id) in the same transaction.
+    pub fn create_temp_account(&self, username: &str, display_name: &str, email: &str, pw_hash: &str, org: Option<(&Org, OrgRole, &str)>) -> Res<User> {
+        let tx = self.conn.unchecked_transaction()?;
+        let id = self.insert_account(username, display_name, email, pw_hash, false, true)?;
+        if let Some((o, role, by)) = org {
+            self.conn.execute(
+                "INSERT INTO org_members (org_id, user_id, role, added_by, created) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![o.id, id, role.as_str(), by, now()],
+            )?;
+        }
+        tx.commit()?;
+        self.user_by_id(&id)?.ok_or(StoreError::NotFound)
+    }
+
+    /// The account row and its root folder; the caller holds a transaction.
+    fn insert_account(&self, username: &str, display_name: &str, email: &str, pw_hash: &str, is_admin: bool, must_change_password: bool) -> Res<String> {
+        let username = self.check_new_username(username)?;
+        let display = if display_name.trim().is_empty() { username.clone() } else { display_name.trim().chars().filter(|c| !c.is_control()).take(100).collect() };
+        let email: String = email.trim().chars().filter(|c| !c.is_control()).take(254).collect();
         let (id, root) = (util::new_id(), util::new_id());
         let t = now();
-        let hash = util::hash_password(password);
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
+        self.conn.execute(
             "INSERT INTO users (id, username, display_name, email, pw_hash, is_admin, created, root_id, must_change_password) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![id, username, display, email, hash, is_admin as i64, t, root, must_change_password as i64],
+            params![id, username, display, email, pw_hash, is_admin as i64, t, root, must_change_password as i64],
         )?;
-        tx.execute(
+        self.conn.execute(
             "INSERT INTO items (id, parent_id, name, kind, owner_id, modified, modified_by, created) VALUES (?1, NULL, 'My files', 'folder', ?2, ?3, ?2, ?3)",
             params![root, id, t],
         )?;
-        tx.commit()?;
-        self.user_by_id(&id)?.ok_or(StoreError::NotFound)
+        Ok(id)
     }
 
     /// A person (organisation accounts are never found by name).
@@ -648,22 +681,28 @@ impl Store {
         Ok(self.conn.query_row("SELECT pw_hash FROM users WHERE id = ?1", [user_id], |r| r.get(0))?)
     }
 
-    /// A password the person chose (clears `must_change_password`).
+    /// A password the person chose (clears `must_change_password`). Checks and hashes here
+    /// (CLI); the server uses `set_password_hash`.
     pub fn set_password(&self, user_id: &str, password: &str) -> Res<()> {
         let u = self.user_by_id(user_id)?.filter(|u| u.org_id.is_none()).ok_or(StoreError::NotFound)?;
         util::check_new_password(password, &u.username).map_err(StoreError::Invalid)?;
-        self.conn.execute("UPDATE users SET pw_hash = ?1, must_change_password = 0 WHERE id = ?2", params![util::hash_password(password), user_id])?;
+        self.set_password_hash(user_id, &util::hash_password(password))
+    }
+
+    /// Stores the hash of a password the person chose (checked by the caller); clears
+    /// `must_change_password`.
+    pub fn set_password_hash(&self, user_id: &str, pw_hash: &str) -> Res<()> {
+        self.user_by_id(user_id)?.filter(|u| u.org_id.is_none()).ok_or(StoreError::NotFound)?;
+        self.conn.execute("UPDATE users SET pw_hash = ?1, must_change_password = 0 WHERE id = ?2", params![pw_hash, user_id])?;
         Ok(())
     }
 
-    /// Replaces the password with a new random temporary one (returned; shown once, never
-    /// stored in clear), which must be changed at the next sign-in. Signs the user out everywhere.
-    pub fn set_temp_password(&self, user_id: &str) -> Res<String> {
+    /// Stores the hash of a temporary password (`util::temp_password`), which must be changed at
+    /// the next sign-in, and signs the user out everywhere.
+    pub fn set_temp_password_hash(&self, user_id: &str, pw_hash: &str) -> Res<usize> {
         self.user_by_id(user_id)?.filter(|u| u.org_id.is_none()).ok_or(StoreError::NotFound)?;
-        let pw = util::temp_password();
-        self.conn.execute("UPDATE users SET pw_hash = ?1, must_change_password = 1 WHERE id = ?2", params![util::hash_password(&pw), user_id])?;
-        self.revoke_user_tokens(user_id)?;
-        Ok(pw)
+        self.conn.execute("UPDATE users SET pw_hash = ?1, must_change_password = 1 WHERE id = ?2", params![pw_hash, user_id])?;
+        self.revoke_user_tokens(user_id)
     }
 
     pub fn set_disabled(&self, user_id: &str, disabled: bool) -> Res<()> {
@@ -1474,25 +1513,45 @@ impl Store {
         Ok(self.conn.execute("DELETE FROM invites WHERE id = ?1", [id])? > 0)
     }
 
-    /// Uses an invite: creates the account (with the password the person chose) and the
-    /// membership. An invite works once: it is claimed first, and given back when the account
-    /// can't be created (username taken, password too weak), so the person can try again.
-    pub fn accept_invite(&self, token: &str, username: &str, display_name: &str, password: &str) -> Res<(User, Org)> {
+    /// Whether the person who made an invite may still add people with its role: the server
+    /// administrator, or an owner/admin of the organisation (an owner for owner invites).
+    pub fn invite_still_authorised(&self, inv: &Invite) -> Res<bool> {
+        let Some(creator) = self.user_by_id(&inv.created_by)? else { return Ok(false) };
+        if creator.disabled || creator.org_id.is_some() {
+            return Ok(false);
+        }
+        if creator.is_admin {
+            return Ok(true);
+        }
+        Ok(match self.member_role(&inv.org_id, &creator.id)? {
+            Some(OrgRole::Owner) => true,
+            Some(OrgRole::Admin) => inv.role != OrgRole::Owner,
+            _ => false,
+        })
+    }
+
+    /// Uses an invite: creates the account (the password was checked against the policy and
+    /// hashed by the caller) and the membership, in one transaction. An invite works once, and
+    /// only while whoever made it may still add people; a failed attempt (username taken)
+    /// leaves it usable.
+    pub fn accept_invite(&self, token: &str, username: &str, display_name: &str, pw_hash: &str) -> Res<(User, Org)> {
         let inv = self.invite_by_token(token)?.ok_or(StoreError::NotFound)?;
         let org = self.org(&inv.org_id)?.ok_or(StoreError::NotFound)?;
+        if !self.invite_still_authorised(&inv)? {
+            return Err(StoreError::Forbidden("This invite is no longer valid (whoever sent it can't add people any more). Ask for a new one.".into()));
+        }
+        let tx = self.conn.unchecked_transaction()?;
         if self.conn.execute("UPDATE invites SET used = ?1 WHERE id = ?2 AND used = 0", params![now(), inv.id])? != 1 {
             return Err(StoreError::NotFound);
         }
-        let user = match self.create_account(username, display_name, &inv.email, password, false, false) {
-            Ok(u) => u,
-            Err(e) => {
-                self.conn.execute("UPDATE invites SET used = 0 WHERE id = ?1", [&inv.id])?;
-                return Err(e);
-            }
-        };
-        self.conn.execute("UPDATE invites SET used_by = ?1 WHERE id = ?2", params![user.id, inv.id])?;
-        self.set_member(&org, &user, inv.role, &inv.created_by)?;
-        Ok((user, org))
+        let id = self.insert_account(username, display_name, &inv.email, pw_hash, false, false)?;
+        self.conn.execute("UPDATE invites SET used_by = ?1 WHERE id = ?2", params![id, inv.id])?;
+        self.conn.execute(
+            "INSERT INTO org_members (org_id, user_id, role, added_by, created) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![org.id, id, inv.role.as_str(), inv.created_by, now()],
+        )?;
+        tx.commit()?;
+        Ok((self.user_by_id(&id)?.ok_or(StoreError::NotFound)?, org))
     }
 
     // ------------------------------------------------------------------
@@ -1519,18 +1578,11 @@ impl Store {
     // ------------------------------------------------------------------
 
     /// Creates a link; returns it with its secret token (shown once).
-    pub fn create_link(&self, item: &Item, role: Role, expires: Option<i64>, password: Option<&str>, by: &str) -> Res<(Link, String)> {
+    /// `pw_hash`: the hash of the link's password, if it has one (`util::hash_password`).
+    pub fn create_link(&self, item: &Item, role: Role, expires: Option<i64>, pw_hash: Option<&str>, by: &str) -> Res<(Link, String)> {
         let token = util::new_token();
         let id = util::new_id();
-        let pw = match password.filter(|p| !p.is_empty()) {
-            Some(p) => {
-                if p.len() > 1024 {
-                    return Err(StoreError::Invalid("The password is too long.".into()));
-                }
-                Some(util::hash_password(p))
-            }
-            None => None,
-        };
+        let pw = pw_hash;
         self.conn.execute(
             "INSERT INTO links (id, token_hash, item_id, role, expires, pw_hash, created, created_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![id, util::token_hash(&token), item.id, role.as_str(), expires, pw, now(), by],
@@ -1898,15 +1950,28 @@ mod tests {
         let dir = temp();
         let s = Store::open(&dir.join("db"), &dir.join("files"), 25).unwrap();
         let org = s.create_org("Club", "x").unwrap();
-        let (inv, token) = s.create_invite(&org, "new@example.test", OrgRole::Member, "x").unwrap();
+        let boss = s.create_user("boss", "", "", "test-password-1", false).unwrap();
+        s.set_member(&org, &boss, OrgRole::Admin, "x").unwrap();
+        let (inv, token) = s.create_invite(&org, "new@example.test", OrgRole::Member, &boss.id).unwrap();
+        // An admin's owner invite, or any invite after its maker lost the right to add people, is void.
+        let (_, owner_token) = s.create_invite(&org, "", OrgRole::Owner, &boss.id).unwrap();
+        let h0 = util::hash_password("test-password-1");
+        assert!(matches!(s.accept_invite(&owner_token, "sneaky", "", &h0), Err(StoreError::Forbidden(_))));
         assert_eq!(s.invite_by_token(&token).unwrap().unwrap().id, inv.id);
-        assert!(s.accept_invite(&token, "newbie", "", "short").is_err(), "weak password");
+        let h = util::hash_password("test-password-1");
+        s.create_user("taken", "", "", "test-password-1", false).unwrap();
+        assert!(s.accept_invite(&token, "taken", "", &h).is_err(), "username taken");
         assert!(s.invite_by_token(&token).unwrap().is_some(), "still usable after a failed attempt");
-        let (u, o) = s.accept_invite(&token, "newbie", "New Bie", "test-password-1").unwrap();
+        assert!(s.user_by_name("taken").unwrap().is_some());
+        let (u, o) = s.accept_invite(&token, "newbie", "New Bie", &h).unwrap();
         assert_eq!((u.email.as_str(), o.id.as_str()), ("new@example.test", org.id.as_str()));
         assert_eq!(s.member_role(&org.id, &u.id).unwrap(), Some(OrgRole::Member));
         assert!(s.invite_by_token(&token).unwrap().is_none());
-        assert!(s.accept_invite(&token, "other", "", "test-password-1").is_err());
+        assert!(s.accept_invite(&token, "other", "", &h).is_err());
+        assert!(s.user_by_name("other").unwrap().is_none(), "nothing half-created");
+        let (_, t2) = s.create_invite(&org, "", OrgRole::Member, &boss.id).unwrap();
+        s.set_member(&org, &boss, OrgRole::Member, "x").unwrap();
+        assert!(matches!(s.accept_invite(&t2, "late", "", &h), Err(StoreError::Forbidden(_))));
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
     }

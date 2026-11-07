@@ -196,6 +196,17 @@ pub fn temp_password() -> String {
     out
 }
 
+/// A temporary password that passes `check_new_password` for `username` (drawn again in the
+/// unlikely case it doesn't, e.g. it happens to contain a short username).
+pub fn temp_password_for(username: &str) -> String {
+    loop {
+        let pw = temp_password();
+        if check_new_password(&pw, username).is_ok() {
+            return pw;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

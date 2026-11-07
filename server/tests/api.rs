@@ -840,3 +840,26 @@ fn new_passwords_follow_the_policy() {
     let bob = st.user_by_name("bob").unwrap().unwrap();
     assert!(st.set_password(&bob.id, "qwertyuiop123").is_err());
 }
+
+#[test]
+fn parallel_wrong_sign_ins_are_limited() {
+    let s = start();
+    let codes: Vec<u16> = std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..40).map(|_| sc.spawn(|| s.login_with("bob", "wrong-password-x").status)).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let wrong = codes.iter().filter(|c| **c == 401).count();
+    let limited = codes.iter().filter(|c| **c == 429).count();
+    assert!(wrong <= 10, "at most 10 attempts reach the password check: {codes:?}");
+    assert_eq!(wrong + limited, 40);
+    assert_eq!(s.login_with("bob", PW).status, 429, "locked even with the right password");
+}
+
+#[test]
+fn junk_usernames_are_refused_before_the_limiter() {
+    let s = start();
+    for name in ["x".repeat(5000), "bob\nfake log line".to_string(), String::new()] {
+        assert_eq!(s.login_with(&name, "whatever-password").status, 401);
+    }
+    assert_eq!(s.login_with("bob", PW).status, 200, "junk doesn't count against real users");
+}
