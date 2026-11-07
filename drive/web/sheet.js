@@ -875,7 +875,13 @@
       if (!pr || pr.sheet !== S.cur || (S.live.me && q.id === S.live.me.id)) continue;
       if (pr.r >= L.nr || pr.c >= L.nc) continue;
       const m = L.merges.find((mm) => pr.r >= mm[0] && pr.r <= mm[2] && pr.c >= mm[1] && pr.c <= mm[3]);
-      const [r1, c1, r2, c2] = m || [pr.r, pr.c, pr.r, pr.c];
+      let [r1, c1, r2, c2] = m || [pr.r, pr.c, pr.r, pr.c];
+      if (pr.sel && pr.sel.length === 4) {
+        r1 = Math.min(pr.sel[0], L.nr - 1);
+        c1 = Math.min(pr.sel[1], L.nc - 1);
+        r2 = Math.min(pr.sel[2], L.nr - 1);
+        c2 = Math.min(pr.sel[3], L.nc - 1);
+      }
       if (r2 < p.ra || r1 > p.rb || c2 < p.ca || c1 > p.cb) continue;
       const x = px(p, L, c1, z);
       const y = py(p, L, r1, z);
@@ -2318,7 +2324,9 @@
 
   let lastPresence = '';
   function sendPresence() {
+    const g = normRange(S.rng);
     const m = { t: 'presence', sheet: S.cur, r: S.sel.r, c: S.sel.c, editing };
+    if (S.kind === 'cell' && (g.r1 !== g.r2 || g.c1 !== g.c2)) m.sel = [g.r1, g.c1, g.r2, g.c2];
     const k = JSON.stringify(m);
     if (k === lastPresence) return;
     lastPresence = k;
@@ -2474,6 +2482,7 @@
       charts: (S.charts.get(S.cur) || []).length,
     }),
     cellText: (r, c) => (S.cells.get(r * KEYC + c) || {}).t,
+    images: () => [...S.imgs.values()].map((e) => ({ ok: e.ok, bad: !!e.bad })),
     cellStyle: (r, c) => (S.cells.get(r * KEYC + c) || {}).st,
     layout: () => {
       const L = layoutOf(S.cur);

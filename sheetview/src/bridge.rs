@@ -354,7 +354,23 @@ impl Bridge {
                 if let (Some(i), Some(r), Some(c)) = (self.sheet_index(v), v.get("r").and_then(Json::as_u64), v.get("c").and_then(Json::as_u64)) {
                     let (r, c) = (r.min(u64::from(MAX_ROWS - 1)) as u32, c.min(u64::from(MAX_COLS - 1)) as u32);
                     let editing = v.get("editing").and_then(Json::as_bool).unwrap_or(false);
-                    let p = Presence { s: self.uid(i), r, c, sel: Rect { r1: r, c1: c, r2: r, c2: c }, editing };
+                    // The selected range too, when it is a bounded one (whole rows/columns are shown as the cell).
+                    let mut sel = Rect { r1: r, c1: c, r2: r, c2: c };
+                    if let Some(a) = v.get("sel").and_then(Json::as_array).filter(|a| a.len() == 4) {
+                        let g = |k: usize| a[k].as_u64().filter(|x| *x < u64::from(MAX_ROWS)).map(|x| x as u32);
+                        if let (Some(r1), Some(c1), Some(r2), Some(c2)) = (g(0), g(1), g(2), g(3))
+                            && r1 <= r2
+                            && c1 <= c2
+                            && c2 < MAX_COLS
+                            && r1 <= r
+                            && r <= r2
+                            && c1 <= c
+                            && c <= c2
+                        {
+                            sel = Rect { r1, c1, r2, c2 };
+                        }
+                    }
+                    let p = Presence { s: self.uid(i), r, c, sel, editing };
                     if let Some(me) = &mut self.me {
                         me.presence = Some(p.clone());
                     }
