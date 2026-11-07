@@ -210,15 +210,15 @@ fn two_editors_converge_and_reconnect_replays() {
 
     let (mut wa, seq) = s.join(&a, &id, "client-a");
     assert_eq!(seq, 0);
-    wa.send(&ClientMsg::Hello { sheets: vec![1] });
+    wa.send(&ClientMsg::Hello { sheets: vec![1], proto: cosync::PROTO });
     let (mut wb, _) = s.join(&b, &id, "client-b");
     // Alice sees Bob join, with his name and a different colour.
     let ServerMsg::Join { peer } = wa.recv() else { panic!() };
     assert_eq!((peer.name.as_str(), peer.user.as_str(), peer.editor), ("Bob Builder", "bob", true));
 
     // Concurrent: Alice types in B5 while Bob inserts a row above it, both against seq 0.
-    wa.send(&ClientMsg::Ops { base: 0, id: 1, ops: vec![text(4, 1, "alice")] });
-    wb.send(&ClientMsg::Ops { base: 0, id: 1, ops: vec![Op::Rows { s: 1, at: 0, n: 1 }] });
+    wa.send(&ClientMsg::Ops { base: 0, id: 1, made: None, ops: vec![text(4, 1, "alice")] });
+    wb.send(&ClientMsg::Ops { base: 0, id: 1, made: None, ops: vec![Op::Rows { s: 1, at: 0, n: 1 }] });
     let mut committed = Vec::new();
     for ws in [&mut wa, &mut wb] {
         for _ in 0..2 {
@@ -255,7 +255,7 @@ fn two_editors_converge_and_reconnect_replays() {
     assert_eq!(seq, 2);
     assert!(cid == "client-a" || cid == "client-b");
     // Resending an already committed batch is acknowledged, not committed twice.
-    wb.send(&ClientMsg::Ops { base: 0, id: 1, ops: vec![Op::Rows { s: 1, at: 0, n: 1 }] });
+    wb.send(&ClientMsg::Ops { base: 0, id: 1, made: None, ops: vec![Op::Rows { s: 1, at: 0, n: 1 }] });
     match wb.recv_data() {
         ServerMsg::Ack { id: 1, seq, .. } => assert!(seq <= 2),
         m => panic!("{m:?}"),
@@ -318,11 +318,11 @@ fn viewers_receive_but_cannot_edit() {
     let (mut wc, _) = s.join(&c, &id, "c");
     let ServerMsg::Join { peer } = wa.recv() else { panic!() };
     assert!(!peer.editor);
-    wa.send(&ClientMsg::Ops { base: 0, id: 1, ops: vec![text(0, 0, "hello")] });
+    wa.send(&ClientMsg::Ops { base: 0, id: 1, made: None, ops: vec![text(0, 0, "hello")] });
     let ServerMsg::Ops { ops, .. } = wc.recv_data() else { panic!() };
     assert_eq!(ops, vec![text(0, 0, "hello")]);
     // A viewer that sends changes is disconnected.
-    wc.send(&ClientMsg::Ops { base: 1, id: 1, ops: vec![text(0, 0, "nope")] });
+    wc.send(&ClientMsg::Ops { base: 1, id: 1, made: None, ops: vec![text(0, 0, "nope")] });
     assert_eq!(wc.close_code(), Some(cosync::close::READ_ONLY));
     assert!(wa.quiet(300));
     // Viewers can't upload snapshots either.
@@ -359,7 +359,7 @@ fn tickets_garbage_and_limits() {
     assert!(matches!(s.ws(None, &format!("since=0&v=1&cid=t&ticket={t}"), &id), Err(tungstenite::Error::Http(r)) if r.status() == 401));
 
     // Out-of-bounds operations close the connection.
-    w.send(&ClientMsg::Ops { base: 0, id: 1, ops: vec![text(cosync::MAX_ROWS, 0, "x")] });
+    w.send(&ClientMsg::Ops { base: 0, id: 1, made: None, ops: vec![text(cosync::MAX_ROWS, 0, "x")] });
     assert_eq!(w.close_code(), Some(cosync::close::INVALID));
     // So does garbage.
     let mut w = s.ws(Some(&a), "since=0&v=1&cid=g", &id).unwrap();
@@ -369,14 +369,14 @@ fn tickets_garbage_and_limits() {
     // A base from the future too.
     let mut w = s.ws(Some(&a), "since=0&v=1&cid=f", &id).unwrap();
     w.recv();
-    w.send(&ClientMsg::Ops { base: 99, id: 1, ops: vec![text(0, 0, "x")] });
+    w.send(&ClientMsg::Ops { base: 99, id: 1, made: None, ops: vec![text(0, 0, "x")] });
     assert_eq!(w.close_code(), Some(cosync::close::INVALID));
     // Flooding trips the rate limit.
     let mut w = s.ws(Some(&a), "since=0&v=1&cid=r", &id).unwrap();
     w.recv();
     let mut code = None;
     for i in 0..400 {
-        if w.ws.send(Message::Text(serde_json::to_string(&ClientMsg::Ops { base: 0, id: i + 1, ops: vec![] }).unwrap().into())).is_err() {
+        if w.ws.send(Message::Text(serde_json::to_string(&ClientMsg::Ops { base: 0, id: i + 1, made: None, ops: vec![] }).unwrap().into())).is_err() {
             break;
         }
     }
@@ -401,11 +401,11 @@ fn deleting_every_sheet_concurrently_leaves_a_rescue_sheet() {
     let a = s.login("alice");
     let id = s.new_file(&a, "R.xlsx");
     let (mut w1, _) = s.join(&a, &id, "one");
-    w1.send(&ClientMsg::Hello { sheets: vec![1, 2] });
+    w1.send(&ClientMsg::Hello { sheets: vec![1, 2], proto: cosync::PROTO });
     let (mut w2, _) = s.join(&a, &id, "two");
-    w1.send(&ClientMsg::Ops { base: 0, id: 1, ops: vec![Op::DelSheet { s: 1, name: "Sheet1".into() }] });
+    w1.send(&ClientMsg::Ops { base: 0, id: 1, made: None, ops: vec![Op::DelSheet { s: 1, name: "Sheet1".into() }] });
     assert!(matches!(w1.recv_data(), ServerMsg::Ack { extra, .. } if extra.is_empty()));
-    w2.send(&ClientMsg::Ops { base: 0, id: 1, ops: vec![Op::DelSheet { s: 2, name: "Sheet2".into() }] });
+    w2.send(&ClientMsg::Ops { base: 0, id: 1, made: None, ops: vec![Op::DelSheet { s: 2, name: "Sheet2".into() }] });
     loop {
         match w2.recv_data() {
             ServerMsg::Ops { .. } => {}
@@ -424,8 +424,8 @@ fn reconnecting_after_a_plain_save_reloads() {
     let a = s.login("alice");
     let id = s.new_file(&a, "Stale.xlsx");
     let (mut wa, _) = s.join(&a, &id, "client-a");
-    wa.send(&ClientMsg::Hello { sheets: vec![1] });
-    wa.send(&ClientMsg::Ops { base: 0, id: 1, ops: vec![text(0, 0, "x")] });
+    wa.send(&ClientMsg::Hello { sheets: vec![1], proto: cosync::PROTO });
+    wa.send(&ClientMsg::Ops { base: 0, id: 1, made: None, ops: vec![text(0, 0, "x")] });
     assert!(matches!(wa.recv_data(), ServerMsg::Ack { seq: 1, .. }));
     // The client snapshots everything, then its connection drops (laptop sleeps).
     assert_eq!(s.send("POST", &format!("/api/items/{id}/live/snapshot?seq=1"), Some(&a), &[("X-Live-Sheets", "1:0")], Some(b"snap".to_vec())).status, 200);
@@ -451,9 +451,9 @@ fn share_links_get_the_live_state_of_the_current_version_only() {
     let a = s.login("alice");
     let id = s.new_file(&a, "Linked.xlsx");
     let (mut wa, _) = s.join(&a, &id, "client-a");
-    wa.send(&ClientMsg::Hello { sheets: vec![1] });
+    wa.send(&ClientMsg::Hello { sheets: vec![1], proto: cosync::PROTO });
     for (seq, state) in [(1u64, "old state"), (2, "new state")] {
-        wa.send(&ClientMsg::Ops { base: seq - 1, id: seq, ops: vec![text(0, 0, state)] });
+        wa.send(&ClientMsg::Ops { base: seq - 1, id: seq, made: None, ops: vec![text(0, 0, state)] });
         while !matches!(wa.recv_data(), ServerMsg::Ack { .. }) {}
         let mut body = b"snap".to_vec();
         body.extend_from_slice(state.as_bytes());
@@ -474,12 +474,12 @@ fn reload_tells_a_client_its_last_batch_was_committed() {
     let a = s.login("alice");
     let id = s.new_file(&a, "Lost.xlsx");
     let (mut wa, _) = s.join(&a, &id, "client-a");
-    wa.send(&ClientMsg::Hello { sheets: vec![1] });
-    wa.send(&ClientMsg::Ops { base: 0, id: 7, ops: vec![text(0, 0, "a")] });
+    wa.send(&ClientMsg::Hello { sheets: vec![1], proto: cosync::PROTO });
+    wa.send(&ClientMsg::Ops { base: 0, id: 7, made: None, ops: vec![text(0, 0, "a")] });
     // Its ack is lost: the client never reads it.
     let (mut wb, _) = s.join(&a, &id, "client-b");
     for i in 0..3 {
-        wb.send(&ClientMsg::Ops { base: i + 1, id: i + 1, ops: vec![text(5, 0, "b")] });
+        wb.send(&ClientMsg::Ops { base: i + 1, id: i + 1, made: None, ops: vec![text(5, 0, "b")] });
         while !matches!(wb.recv_data(), ServerMsg::Ack { .. }) {}
     }
     // Two snapshots prune past the client's base; then everyone leaves (the session is
@@ -509,8 +509,8 @@ fn snapshots_of_the_same_state_make_one_version() {
     let id = s.new_file(&a, "Twice.xlsx");
     assert_eq!(s.json("POST", &format!("/api/items/{id}/permissions"), Some(&a), json!({ "username": "bob", "role": "edit" })).status, 200);
     let (mut wa, _) = s.join(&a, &id, "client-a");
-    wa.send(&ClientMsg::Hello { sheets: vec![1] });
-    wa.send(&ClientMsg::Ops { base: 0, id: 1, ops: vec![text(0, 0, "x")] });
+    wa.send(&ClientMsg::Hello { sheets: vec![1], proto: cosync::PROTO });
+    wa.send(&ClientMsg::Ops { base: 0, id: 1, made: None, ops: vec![text(0, 0, "x")] });
     assert!(matches!(wa.recv_data(), ServerMsg::Ack { seq: 1, .. }));
     let before = s.send("GET", &format!("/api/items/{id}"), Some(&a), &[], None).json();
     std::thread::sleep(Duration::from_millis(1100));
@@ -557,7 +557,7 @@ fn a_lowered_role_takes_effect_in_open_sessions() {
     s.share(&a, &id, "bob", "edit");
     let (mut wa, _) = s.join(&a, &id, "a");
     let (mut wb, _) = s.join(&b, &id, "b");
-    wb.send(&ClientMsg::Ops { base: 0, id: 1, ops: vec![text(0, 0, "bob was here")] });
+    wb.send(&ClientMsg::Ops { base: 0, id: 1, made: None, ops: vec![text(0, 0, "bob was here")] });
     let ServerMsg::Ack { seq: 1, .. } = wb.recv_data() else { panic!() };
     let ServerMsg::Ops { .. } = wa.recv_data() else { panic!() };
     // Down to view: told at once; the owner isn't.
@@ -567,12 +567,12 @@ fn a_lowered_role_takes_effect_in_open_sessions() {
     // Back to edit: changes are accepted again.
     s.share(&a, &id, "bob", "edit");
     assert_eq!(wb.recv_access(), ServerMsg::Role { role: "edit".into() });
-    wb.send(&ClientMsg::Ops { base: 1, id: 2, ops: vec![text(0, 1, "again")] });
+    wb.send(&ClientMsg::Ops { base: 1, id: 2, made: None, ops: vec![text(0, 1, "again")] });
     let ServerMsg::Ack { seq: 2, .. } = wb.recv_data() else { panic!() };
     // View again; a change sent anyway closes the connection and isn't committed.
     s.share(&a, &id, "bob", "view");
     assert_eq!(wb.recv_access(), ServerMsg::Role { role: "view".into() });
-    wb.send(&ClientMsg::Ops { base: 2, id: 3, ops: vec![text(0, 2, "nope")] });
+    wb.send(&ClientMsg::Ops { base: 2, id: 3, made: None, ops: vec![text(0, 2, "nope")] });
     assert_eq!(wb.close_code(), Some(cosync::close::READ_ONLY));
     let ServerMsg::Ops { seq: 2, .. } = wa.recv_data() else { panic!() };
     assert!(wa.quiet(300), "the refused change never reaches others");
@@ -643,7 +643,7 @@ fn leaving_an_organisation_ends_its_sessions() {
     assert_eq!(reason, "Your access to this workbook was removed.");
     assert_eq!(wc.close_code(), Some(cosync::close::REVOKED));
     // Bob (admin) is unaffected and still edits.
-    wb.send(&ClientMsg::Ops { base: 0, id: 1, ops: vec![text(0, 0, "still here")] });
+    wb.send(&ClientMsg::Ops { base: 0, id: 1, made: None, ops: vec![text(0, 0, "still here")] });
     loop {
         match wb.recv_data() {
             ServerMsg::Ack { seq: 1, .. } => break,
@@ -710,7 +710,7 @@ fn concurrent_joins_leaves_commits_and_rechecks_finish() {
         sc.spawn(|| {
             let (mut w, mut seq) = s.join(&a, &id, "committer");
             for i in 0..30u32 {
-                w.send(&ClientMsg::Ops { base: seq, id: u64::from(i) + 1, ops: vec![text(1, i, "x")] });
+                w.send(&ClientMsg::Ops { base: seq, id: u64::from(i) + 1, made: None, ops: vec![text(1, i, "x")] });
                 loop {
                     match w.recv_data() {
                         ServerMsg::Ack { seq: q, .. } => {
@@ -745,7 +745,62 @@ fn concurrent_joins_leaves_commits_and_rechecks_finish() {
     });
     // Still serving.
     let (mut wa, seq) = s.join(&a, &id, "final");
-    wa.send(&ClientMsg::Ops { base: seq, id: 1, ops: vec![text(0, 0, "ok")] });
+    wa.send(&ClientMsg::Ops { base: seq, id: 1, made: None, ops: vec![text(0, 0, "ok")] });
     while !matches!(wa.recv_data(), ServerMsg::Ack { .. }) {}
     drop(b);
+}
+
+#[test]
+fn value_and_format_of_one_cell_both_survive_and_old_clients_are_asked_to_update() {
+    let s = start();
+    let a = s.login("alice");
+    let b = s.login("bob");
+    let id = s.new_file(&a, "Split.xlsx");
+    assert_eq!(s.json("POST", &format!("/api/items/{id}/permissions"), Some(&a), json!({ "username": "bob", "role": "edit" })).status, 200);
+    // The server says which protocol it speaks.
+    let mut peek = s.ws(Some(&a), "since=0&cid=client-peek", &id).unwrap();
+    assert!(matches!(peek.recv(), ServerMsg::Welcome { proto, .. } if proto == cosync::PROTO));
+    drop(peek);
+    let (mut wa, _) = s.join(&a, &id, "client-a");
+    wa.send(&ClientMsg::Hello { sheets: vec![1], proto: cosync::PROTO });
+    let (mut wb, _) = s.join(&b, &id, "client-b");
+    wb.send(&ClientMsg::Hello { sheets: vec![1], proto: cosync::PROTO });
+
+    // Alice types a value while Bob makes the same cell bold, both against seq 0.
+    let value = Op::Content { s: 1, r: 0, c: 0, v: Some(Box::new(CellData { v: Val::Text("typed".into()), ..Default::default() })), adj: vec![] };
+    let bold = Op::Format { s: 1, r: 0, c: 0, st: Some(json!({ "bold": true })) };
+    wa.send(&ClientMsg::Ops { base: 0, id: 1, made: None, ops: vec![value.clone()] });
+    wb.send(&ClientMsg::Ops { base: 0, id: 1, made: None, ops: vec![bold.clone()] });
+    let mut relayed = Vec::new();
+    for ws in [&mut wa, &mut wb] {
+        for _ in 0..2 {
+            match ws.recv_data() {
+                ServerMsg::Ack { .. } => {}
+                ServerMsg::Ops { base, ops, .. } => {
+                    // Neither was changed by the other; the relay says what the sender had seen.
+                    assert_eq!(base, Some(0));
+                    relayed.extend(ops);
+                }
+                m => panic!("{m:?}"),
+            }
+        }
+    }
+    assert!(relayed.contains(&value) && relayed.contains(&bold), "{relayed:?}");
+
+    // A client that predates the protocol versions is told to update and disconnected.
+    let (mut old, _) = s.join(&b, &id, "client-old");
+    old.ws.send(Message::Text(r#"{"t":"hello","sheets":[1]}"#.to_string().into())).unwrap();
+    let mut told = false;
+    loop {
+        match old.next(Duration::from_secs(10)) {
+            Some(Got::Msg(ServerMsg::Error { message })) => told = message.contains("update"),
+            Some(Got::Msg(_)) => {}
+            Some(Got::Closed(code)) => {
+                assert_eq!(code, Some(cosync::close::UPGRADE));
+                break;
+            }
+            None => panic!("not closed"),
+        }
+    }
+    assert!(told);
 }

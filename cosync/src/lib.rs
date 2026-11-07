@@ -18,7 +18,7 @@ mod transform;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 
-pub use transform::{carry_down, fix_range, map_index, over, touches, transform};
+pub use transform::{carry_down, cell_write, fix_range, map_index, over, touches, transform, CellWrite};
 
 pub const MAX_ROWS: u32 = 1_048_576;
 pub const MAX_COLS: u32 = 16_384;
@@ -28,6 +28,16 @@ pub const MAX_SHEET_NAME: usize = 31;
 /// `AddSheet` of this id to the batch that deleted the last one. A client that runs out of
 /// sheets before that shows a provisional sheet with this id.
 pub const RESCUE_SHEET: SheetId = 0x7E5C_0E5C_0E5C_0E5C;
+
+/// The protocol version this build speaks. 1: a cell is one target (`Op::Cell`). 2: a cell's
+/// content (`Op::Content`) and format (`Op::Format`) are separate targets; `Op::Cell` still
+/// exists and writes both. Clients send theirs in `Hello`, servers in `Welcome`; a missing
+/// field means 1.
+pub const PROTO: u32 = 2;
+
+fn proto_v1() -> u32 {
+    1
+}
 
 /// Stable identity of a worksheet (survives renames and moves).
 pub type SheetId = u64;
@@ -102,7 +112,9 @@ pub enum Op {
     Rename { s: SheetId, from: String, to: String },
     /// Moves a sheet tab: its new order key.
     Place { s: SheetId, pos: f64 },
-    /// Sets a cell (None clears it).
+    /// Sets a whole cell: content and format together (None clears it). What protocol 1
+    /// clients send for every cell change; writes both targets of the cell, so it wins or
+    /// loses against `Content` and `Format` for each part separately.
     Cell {
         s: SheetId,
         r: u32,
@@ -111,6 +123,26 @@ pub enum Op {
         v: Option<Box<CellData>>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         adj: Vec<Op>,
+    },
+    /// Sets a cell's content: value or formula, with its rich text (None clears them).
+    /// The format stays; `st` of the data is ignored. Last writer wins per cell content.
+    Content {
+        s: SheetId,
+        r: u32,
+        c: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        v: Option<Box<CellData>>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        adj: Vec<Op>,
+    },
+    /// Sets a cell's format (style content; None = the default style). The content stays.
+    /// Last writer wins per cell format (the whole style, not per attribute).
+    Format {
+        s: SheetId,
+        r: u32,
+        c: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        st: Option<Json>,
     },
     Note { s: SheetId, r: u32, c: u32, text: Option<String>, author: Option<String> },
     Link { s: SheetId, r: u32, c: u32, url: Option<String> },
@@ -153,6 +185,8 @@ impl Op {
             | DelSheet { s, .. }
             | Rename { s, .. }
             | Cell { s, .. }
+            | Content { s, .. }
+            | Format { s, .. }
             | Note { s, .. }
             | Link { s, .. }
             | RowH { s, .. }
@@ -212,9 +246,23 @@ pub struct Peer {
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum ClientMsg {
     /// First message after connecting: the sheet ids of the workbook as loaded.
-    Hello { sheets: Vec<SheetId> },
+    Hello {
+        sheets: Vec<SheetId>,
+        /// The protocol version (`PROTO`); absent from clients that predate versions (1).
+        #[serde(default = "proto_v1")]
+        proto: u32,
+    },
     /// A batch of changes made against the state at `base`.
-    Ops { base: u64, id: u64, ops: Vec<Op> },
+    /// `made`: the sequence number the person had seen when they made these changes, when
+    /// that is older than `base` (changes made offline, or while an earlier batch was in
+    /// flight, are sent against a newer base after being transformed); absent = `base`.
+    Ops {
+        base: u64,
+        id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        made: Option<u64>,
+        ops: Vec<Op>,
+    },
     Presence { p: Presence },
 }
 
@@ -224,10 +272,29 @@ pub enum ClientMsg {
 pub enum ServerMsg {
     /// First message: the server's current sequence number (ops after the client's `since`
     /// follow until the client reaches it), who you are and who else is here.
-    Welcome { seq: u64, you: Peer, peers: Vec<Peer> },
+    Welcome {
+        seq: u64,
+        you: Peer,
+        peers: Vec<Peer>,
+        /// The server's protocol version (`PROTO`); absent from servers that predate versions (1).
+        #[serde(default = "proto_v1")]
+        proto: u32,
+    },
     /// A committed batch. `cid`/`id` identify the sender's client and batch (so a client
-    /// recognises its own batch when it is replayed after a reconnect).
-    Ops { seq: u64, cid: String, id: u64, by: u64, ops: Vec<Op> },
+    /// recognises its own batch when it is replayed after a reconnect). `base`: the sequence
+    /// number the sender had seen when it made the changes (`made`, else `base`, of its
+    /// batch; absent when not known, e.g. for batches replayed from storage): a batch with
+    /// `base` below the sequence number of one of your own was made without seeing it, which
+    /// is how "your change was replaced" is told apart from a later, deliberate edit.
+    Ops {
+        seq: u64,
+        cid: String,
+        id: u64,
+        by: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base: Option<u64>,
+        ops: Vec<Op>,
+    },
     /// Your batch `id` was committed as `seq` (the committed form is the batch transformed
     /// over what you already received). `extra`: ops the server inserted into it (at these
     /// indices of the committed form), to apply too.
@@ -267,6 +334,9 @@ pub mod close {
     /// Access to the document ended while connected (after `ServerMsg::Revoked`); reconnecting
     /// won't help.
     pub const REVOKED: u16 = 4401;
+    /// The client speaks an older protocol than the server needs (after an `Error` message
+    /// telling the person to update).
+    pub const UPGRADE: u16 = 4426;
 }
 
 /// Limits the server enforces on what clients send.
@@ -330,7 +400,7 @@ fn validate_op(op: &Op, in_adj: bool) -> Result<(), String> {
                 return Err("invalid sheet position".into());
             }
         }
-        Cell { r, c, v, adj, .. } => {
+        Cell { r, c, v, adj, .. } | Content { r, c, v, adj, .. } => {
             row(*r)?;
             col(*c)?;
             if let Some(d) = v {
@@ -344,6 +414,10 @@ fn validate_op(op: &Op, in_adj: bool) -> Result<(), String> {
                 }
             }
             adj_ok(adj)?;
+        }
+        Format { r, c, .. } => {
+            row(*r)?;
+            col(*c)?;
         }
         Note { r, c, text: t, author, .. } => {
             row(*r)?;

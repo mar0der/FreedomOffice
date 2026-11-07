@@ -11,6 +11,8 @@ pub struct Entry {
     pub id: u64,
     /// Who made it (server-defined, e.g. a user id).
     pub by: String,
+    /// The sequence number the sender had seen (None when loaded from storage).
+    pub base: Option<u64>,
     pub ops: Vec<Op>,
 }
 
@@ -70,6 +72,12 @@ impl Log {
 
     /// Transforms a client batch over everything committed after its base and commits it.
     pub fn commit(&mut self, base: u64, cid: &str, id: u64, by: &str, ops: Vec<Op>) -> Result<Commit, CommitError> {
+        self.commit_made(base, base, cid, id, by, ops)
+    }
+
+    /// Like `commit`; `made` (<= `base`) is what the sender had seen when it made the changes,
+    /// which is what other clients are told to tell concurrent edits.
+    pub fn commit_made(&mut self, base: u64, made: u64, cid: &str, id: u64, by: &str, ops: Vec<Op>) -> Result<Commit, CommitError> {
         if let Some(e) = self.entries.iter().find(|e| e.cid == cid && e.id == id && e.by == by) {
             return Ok(Commit::Duplicate { seq: e.seq });
         }
@@ -106,7 +114,7 @@ impl Log {
             ops = out;
         }
         let seq = self.head() + 1;
-        self.entries.push(Entry { seq, cid: cid.to_string(), id, by: by.to_string(), ops: ops.clone() });
+        self.entries.push(Entry { seq, cid: cid.to_string(), id, by: by.to_string(), base: Some(made.min(base)), ops: ops.clone() });
         self.last.insert((by.to_string(), cid.to_string()), (id, seq));
         Ok(Commit::New { seq, ops, extra })
     }

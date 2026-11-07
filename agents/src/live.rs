@@ -13,11 +13,13 @@
 //! to `/live/snapshot` once everything is acknowledged, which becomes a version.
 
 use std::collections::BTreeMap;
+
+use serde_json::{Value as Json, json};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
-use cosync::client::{Batch, Session, Step};
-use cosync::{CellData, ClientMsg, Op, Peer, Presence, Rect, ServerMsg, SheetId, close};
+use cosync::client::{Batch, Replaced, Session, Step};
+use cosync::{CellData, CellWrite, ClientMsg, Op, Peer, Presence, Rect, ServerMsg, SheetId, close};
 use freedom_sheets::live::{self, ApplyState};
 use freedom_sheets::model::{Sheet, Workbook};
 use tungstenite::client::IntoClientRequest;
@@ -47,6 +49,42 @@ pub struct Stats {
     pub snapshot_requests: u64,
     /// Snapshots uploaded (each normally becomes a version).
     pub snapshots: u64,
+    /// Own edits that someone else's concurrent edit replaced.
+    pub replaced: u64,
+}
+
+/// One of this client's own cell edits that a concurrent edit by someone else replaced (the
+/// same event the app shows as "Your change to B3 was replaced by Alice's").
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReplacedEvent {
+    pub sheet: String,
+    /// A1 name of the cell.
+    pub cell: String,
+    /// True when it was the cell's format, not its value or formula.
+    pub format: bool,
+    /// What this client had entered (formula, value, or "formatting").
+    pub yours: String,
+    /// Display name of who replaced it.
+    pub by: String,
+}
+
+impl ReplacedEvent {
+    pub fn message(&self) -> String {
+        let cell = format!("{}!{}", self.sheet, self.cell);
+        let whose = if self.by.is_empty() { "someone else's".to_string() } else { format!("{}'s", self.by) };
+        if self.format {
+            format!("Your formatting of {cell} was replaced by {whose}.")
+        } else {
+            format!("Your change to {cell} ({}) was replaced by {whose}.", self.yours)
+        }
+    }
+
+    pub fn to_json(&self) -> Json {
+        json!({
+            "sheet": self.sheet, "cell": self.cell, "part": if self.format { "format" } else { "value" },
+            "yours": self.yours, "replaced_by": self.by, "message": self.message(),
+        })
+    }
 }
 
 pub struct Live {
@@ -82,6 +120,11 @@ pub struct Live {
     unsaved: bool,
     /// The last version uploaded as a snapshot.
     pub last_snapshot: Option<i64>,
+    /// Own edits that were replaced and not yet reported (see [`Live::take_replaced`]).
+    replaced: Vec<ReplacedEvent>,
+    /// The server speaks protocol 1 (its Welcome has no `proto`): only whole `Cell` operations
+    /// are sent, without `made`, and nothing is reported as replaced.
+    pub legacy: bool,
 }
 
 fn version_of_etag(etag: &str) -> Option<i64> {
@@ -166,6 +209,8 @@ impl Live {
             snapshot_wanted: false,
             unsaved: false,
             last_snapshot: None,
+            replaced: Vec::new(),
+            legacy: false,
         })
     }
 
@@ -228,6 +273,7 @@ impl Live {
         self.stats.connects += 1;
         self.send(ClientMsg::Hello {
             sheets: self.wb.sheets.iter().map(|s| s.uid).collect(),
+            proto: cosync::PROTO,
         });
         Ok(())
     }
@@ -259,6 +305,7 @@ impl Live {
         self.send(ClientMsg::Ops {
             base: b.base,
             id: b.id,
+            made: (b.made < b.base && !self.legacy).then_some(b.made),
             ops: b.ops,
         });
     }
@@ -276,6 +323,7 @@ impl Live {
                 close::READ_ONLY => Some("You have view-only access to this workbook."),
                 close::REVOKED => Some("Your access to this workbook was removed."),
                 close::INVALID => Some("The server refused a change as invalid."),
+                close::UPGRADE => Some("This version of fsheets is too old for the server."),
                 _ => None,
             };
             if let Some(f) = fatal {
@@ -333,7 +381,16 @@ impl Live {
 
     fn handle(&mut self, m: ServerMsg) {
         match m {
-            ServerMsg::Welcome { seq, you, peers } => {
+            ServerMsg::Welcome { seq, you, peers, proto } => {
+                // An older server only knows whole cells: send only those (also what was made
+                // before this Welcome and is still waiting).
+                self.legacy = proto < cosync::PROTO;
+                if self.legacy {
+                    if let Some(b) = &mut self.sess.inflight {
+                        b.ops = live::collapse_cells(&self.wb, &b.ops);
+                    }
+                    self.sess.buffer = live::collapse_cells(&self.wb, &self.sess.buffer);
+                }
                 self.editor = you.editor;
                 self.me = Some(you);
                 self.peers = peers.into_iter().map(|p| (p.id, p)).collect();
@@ -342,9 +399,16 @@ impl Live {
                 self.check_caught_up();
             }
             ServerMsg::Ops {
-                seq, cid, id, ops, ..
+                seq,
+                cid,
+                id,
+                by,
+                base,
+                ops,
             } => {
-                let step = self.sess.remote(seq, &cid, id, ops);
+                let step = self.sess.remote_based(seq, &cid, id, base, ops);
+                let who = self.peers.get(&by).map(|p| p.name.clone()).unwrap_or_default();
+                self.note_replaced(&step.replaced, &who);
                 self.stepped(step);
                 self.check_caught_up();
             }
@@ -381,6 +445,28 @@ impl Live {
         }
     }
 
+    fn note_replaced(&mut self, replaced: &[Replaced], who: &str) {
+        if self.legacy {
+            return;
+        }
+        for r in replaced {
+            let sheet = live::index_of(&self.wb, r.s).map(|i| self.wb.sheets[i].name.clone()).unwrap_or_default();
+            self.stats.replaced += 1;
+            self.replaced.push(ReplacedEvent {
+                sheet,
+                cell: freedom_sheets::model::cell_name(r.r, r.c),
+                format: r.part == CellWrite::Format,
+                yours: live::entered_text(&r.mine),
+                by: who.to_string(),
+            });
+        }
+    }
+
+    /// The own edits that others' concurrent edits replaced since the last call.
+    pub fn take_replaced(&mut self) -> Vec<ReplacedEvent> {
+        std::mem::take(&mut self.replaced)
+    }
+
     fn stepped(&mut self, step: Step) {
         self.apply(&step.apply, true);
         if !step.own {
@@ -413,6 +499,7 @@ impl Live {
         }
         self.apply(&ops, false);
         self.unsaved = true;
+        let ops = if self.legacy { live::collapse_cells(&self.wb, &ops) } else { ops };
         if let Some(b) = self.sess.local(ops) {
             self.send_batch(b, false);
         }
@@ -461,6 +548,22 @@ impl Live {
         live::compare(&self.wb, &other.wb)
     }
 
+    /// Sets a cell's value or formula (and rich text); its format stays.
+    pub fn set_content(&mut self, s: SheetId, r: u32, c: u32, data: Option<CellData>) {
+        let v = data
+            .map(|d| CellData { st: None, ..d })
+            .filter(|d| !d.v.is_empty() || d.f.is_some() || d.rich.is_some())
+            .map(Box::new);
+        self.edit(vec![Op::Content { s, r, c, v, adj: vec![] }]);
+    }
+
+    /// Sets a cell's format (style content, None = default); its content stays.
+    pub fn set_format(&mut self, s: SheetId, r: u32, c: u32, st: Option<Json>) {
+        self.edit(vec![Op::Format { s, r, c, st }]);
+    }
+
+    /// Sets the whole cell, content and format together (what protocol 1 clients did for
+    /// every change).
     pub fn set_cell(&mut self, s: SheetId, r: u32, c: u32, data: Option<CellData>) {
         self.edit(vec![Op::Cell {
             s,

@@ -127,3 +127,29 @@ fn snapshot_metadata_gives_the_same_ids_everywhere() {
     let back: Vec<crate::model::Picture> = serde_json::from_value(j).unwrap();
     assert_eq!(back[0], pic);
 }
+
+#[test]
+fn content_and_format_operations_each_leave_the_other_part_alone() {
+    let mut wb = book();
+    let s = wb.sheets[0].uid;
+    let mut st = ApplyState::default();
+    let bold = serde_json::to_value(crate::model::Style { bold: true, ..Default::default() }).unwrap();
+    // A format on a cell with a value keeps the value; on an empty cell it makes a styled blank.
+    apply_ops(&mut wb, &[Op::Format { s, r: 0, c: 0, st: Some(bold.clone()) }, Op::Format { s, r: 20, c: 3, st: Some(bold.clone()) }], true, &mut st);
+    let a1 = wb.sheets[0].get(0, 0).unwrap();
+    assert!(wb.style(a1.style).bold && a1.value == crate::model::Value::Number(1.0));
+    assert!(wb.sheets[0].get(20, 3).is_some_and(|c| c.value.is_empty() && wb.style(c.style).bold));
+    // New content keeps the format, a formula too; clearing the content leaves the styled cell.
+    let text = |t: &str| Some(Box::new(CellData { v: Val::Text(t.into()), ..Default::default() }));
+    apply_ops(&mut wb, &[Op::Content { s, r: 0, c: 0, v: text("typed"), adj: vec![] }, Op::Content { s, r: 20, c: 3, v: Some(Box::new(CellData { f: Some("A1&\"!\"".into()), ..Default::default() })), adj: vec![] }], true, &mut st);
+    let a1 = wb.sheets[0].get(0, 0).unwrap();
+    assert!(wb.style(a1.style).bold && a1.value == crate::model::Value::Text("typed".into()));
+    assert_eq!(formula_at(&wb, 0, 20, 3), "A1&\"!\"");
+    assert!(wb.style(wb.sheets[0].get(20, 3).unwrap().style).bold);
+    apply_ops(&mut wb, &[Op::Content { s, r: 0, c: 0, v: None, adj: vec![] }], true, &mut st);
+    assert!(wb.sheets[0].get(0, 0).is_some_and(|c| c.value.is_empty() && wb.style(c.style).bold));
+    // Resetting the format of an otherwise empty cell removes it; a cell with content stays.
+    apply_ops(&mut wb, &[Op::Format { s, r: 0, c: 0, st: None }, Op::Format { s, r: 1, c: 0, st: None }], true, &mut st);
+    assert!(wb.sheets[0].get(0, 0).is_none());
+    assert_eq!(wb.sheets[0].get(1, 0).unwrap().value, crate::model::Value::Number(2.0));
+}

@@ -226,6 +226,67 @@ it back from an older check). Live tickets are re-checked when used. Per connect
 Not yet: other participants aren't told that someone's role changed (their peer list keeps the old
 `editor` flag until that person reconnects).
 
+### Live co-editing: operations and merge rules (protocol 2)
+
+`GET /api/items/{id}/live` (WebSocket, JSON text frames; crate `cosync` defines both ends). The server keeps
+one numbered log of committed batches per document; a client sends one batch at a time against the last
+sequence number it has seen (`base`) and the server transforms it over everything committed since
+(client/server operational transformation). **Last committed wins** wherever two changes write the same target.
+
+Messages: `hello {sheets, proto}` → `welcome {seq, you, peers, proto}` (+ replay of committed batches) →
+`ops {base, id, made?, ops}` / `ack {id, seq, extra}` / `ops {seq, cid, id, by, base?, ops}` (relay) /
+`presence` / `snapshot` / `reload` / `role` / `revoked` / `error`.
+
+**Targets** (each is last-writer-wins on its own):
+
+| Operation | Writes target |
+|---|---|
+| `content {s,r,c,v,adj}` | the cell's **content**: value or formula, with its rich text (`v` null = cleared). The format stays. |
+| `format {s,r,c,st}` | the cell's **format**: the whole style (`st` null = default style). The content stays. |
+| `cell {s,r,c,v,adj}` | **both** targets of the cell (what protocol 1 sent for every change; still what a command that changes both, such as paste or clear, sends). |
+| `note`, `link`, `row_h`, `col_w`, `row_hidden`, `col_hidden`, `row_level`, `col_level`, `merge`, `prop`, `feature`, `book`, `place` | one target each (per cell, row, column, range, key) |
+| `rows`, `cols`, `add_sheet`, `del_sheet`, `rename` | structure; moves other operations (below) |
+
+Merge rules:
+
+- A value or formula change and a format change of the same cell, made at the same time, **both survive** on
+  every client. Two concurrent value changes: the later commit wins (the earlier one is replaced). Two
+  concurrent format changes: the later commit's whole style wins (styles are opaque JSON; there is no
+  per-attribute merge, so bold by one person and a fill by another concurrently leaves only the later one;
+  the loser is told, see below).
+- A `cell` operation that loses against a `content` or `format` operation on the same cell is cut down to
+  the part that was not taken (a `format` or a `content`); losing to both drops it. A `cell` that wins
+  replaces both parts. So an older client's `cell` operations always work and converge.
+- `rows`/`cols` insert or delete moves `cell`, `content`, `format` (and notes, links, sizes, merges) exactly
+  alike; content inside deleted rows/columns is dropped; `del_sheet` drops everything on the sheet. A
+  `content` or `cell` with a formula records the structure changes it was transformed over in `adj`; the
+  receiver adjusts the formula by them as if it had been there (`cell` and `content` alike; `format` has
+  no references).
+- Undo is per person and is blocked only when someone else wrote the same target since (a value edit is
+  not blocked by somebody's formatting).
+
+**Protocol version.** `hello.proto` and `welcome.proto` (absent = 1). Protocol 1 had no `content`/`format`.
+A v1 client would apply them as whole cells and diverge, and the server cannot translate them (it keeps no
+workbook state, only the log), so the server answers a `hello` with `proto < 2` with
+`error "This version of FreedomOffice Sheets is too old to edit this workbook live. Please update the app."`
+and closes with `4426` (`close::UPGRADE`); nothing the client sent is committed. A v2 client that gets a
+`welcome` without `proto` (an older server) switches to protocol 1 mode: it sends only whole `cell`
+operations (every `content`/`format` its diff makes is collapsed into one `cell` carrying the cell's full
+current data, also for changes still waiting from before the `welcome`), omits `made`, and shows no
+"replaced" messages (an old server relays no `base`). It converges with other clients like any v1 client. Stored logs and live-state blobs from before still replay: `cell` is unchanged.
+
+**"Your change was replaced".** A relayed `ops` carries `base`: what the sender had seen when it *made* the
+changes (a batch sent after catching up from offline or while an earlier one was in flight is based on
+the newest seq but made against an older one; the client sends that as `made`, the server relays
+`min(made, base)`; absent for batches replayed from storage). A client remembers the cell writes of its
+recently acknowledged batches (last 32 batches / 20 000 writes, moved along with row/column inserts and
+deletes). When a relayed batch has `base` below the seq of one of them and writes the same part of the
+same cell with different data, that edit of ours was replaced: the client reports it (cell, what we had
+entered, who) unless it has written the cell again since. Edits made after seeing ours, and
+value-vs-format, never report. The app shows a non-modal bar "Your change to B3 was replaced by Alice's."
+with Show, Restore mine (writes our value again as a new change) and a close button; `fsheets` logs it to
+stderr, MCP `write_range` and `replaced_changes` return it under `replaced`.
+
 ### Known limits
 
 - Anyone can lock a username out for 15 minutes with 10 wrong passwords (per-username lockout DoS).

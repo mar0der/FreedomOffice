@@ -238,10 +238,8 @@ pub(super) fn sheet_pair(wx: &Workbook, x: &Sheet, wy: &Workbook, y: &Sheet, fwd
         for c in cols {
             let a = x.get(r, c).map(|cell| (x, r, c, cell));
             let b = y.get(r, c).map(|cell| (y, r, c, cell));
-            if !same_across(wx, a, wy, b) {
-                fwd.push(Op::Cell { s, r, c, v: data_of(wy, y, r, c), adj: Vec::new() });
-                inv.push(Op::Cell { s, r, c, v: data_of(wx, x, r, c), adj: Vec::new() });
-            }
+            let (content, format) = (same_content(a, b, true), same_format(wx, a, wy, b));
+            cell_ops(s, r, c, (content, format), (wx, x), (wy, y), true, fwd, inv);
         }
     }
     // Notes (with their authors) and links
@@ -336,7 +334,8 @@ pub(super) fn sheet_pair(wx: &Workbook, x: &Sheet, wy: &Workbook, y: &Sheet, fwd
     }
 }
 
-fn same_across(wx: &Workbook, a: Option<(&Sheet, u32, u32, &Cell)>, wy: &Workbook, b: Option<(&Sheet, u32, u32, &Cell)>) -> bool {
+/// Whether two cells hold the same value or formula (and rich text, when `rich`).
+fn same_content(a: Option<(&Sheet, u32, u32, &Cell)>, b: Option<(&Sheet, u32, u32, &Cell)>, rich: bool) -> bool {
     match (a, b) {
         (None, None) => true,
         (Some((sa, ra, ca, x)), Some((sb, rb, cb, y))) => {
@@ -345,9 +344,51 @@ fn same_across(wx: &Workbook, a: Option<(&Sheet, u32, u32, &Cell)>, wy: &Workboo
                 (None, None) => x.value == y.value,
                 _ => false,
             };
-            content && wx.style(x.style) == wy.style(y.style) && sa.rich_at(ra, ca) == sb.rich_at(rb, cb)
+            content && (!rich || sa.rich_at(ra, ca) == sb.rich_at(rb, cb))
         }
-        (Some((_, _, _, x)), None) | (None, Some((_, _, _, x))) => x.is_blank(),
+        // (A cell that is only formatted has no content.)
+        (Some((_, _, _, x)), None) | (None, Some((_, _, _, x))) => x.value.is_empty() && x.formula.is_none(),
+    }
+}
+
+/// Whether two cells have the same format (styles compared by content).
+fn same_format(wx: &Workbook, a: Option<(&Sheet, u32, u32, &Cell)>, wy: &Workbook, b: Option<(&Sheet, u32, u32, &Cell)>) -> bool {
+    let style = |c: Option<(&Sheet, u32, u32, &Cell)>| c.map_or(0, |c| c.3.style);
+    wx.style(style(a)) == wy.style(style(b))
+}
+
+/// The value, formula and rich text of a cell (None when it has none).
+fn content_of(w: &Workbook, sh: &Sheet, r: u32, c: u32, rich: bool) -> Option<Box<cosync::CellData>> {
+    let d = cell_data(w, sh, r, c, sh.get(r, c)?);
+    let d = cosync::CellData { st: None, rich: if rich { d.rich } else { None }, ..d };
+    (!d.v.is_empty() || d.f.is_some() || d.rich.is_some()).then(|| Box::new(d))
+}
+
+/// The style content of a cell (None for the default style or no cell).
+fn format_of(w: &Workbook, sh: &Sheet, r: u32, c: u32) -> Option<serde_json::Value> {
+    sh.get(r, c).and_then(|x| super::style_json(w.style(x.style)))
+}
+
+/// The operation(s) for one cell that differs: `Content` when only its value/formula/rich text
+/// changed, `Format` when only its style did, a whole `Cell` when both did (like paste or
+/// clear), each with its inverse.
+#[allow(clippy::too_many_arguments)]
+fn cell_ops(s: SheetId, r: u32, c: u32, same: (bool, bool), x: (&Workbook, &Sheet), y: (&Workbook, &Sheet), rich: bool, fwd: &mut Vec<Op>, inv: &mut Vec<Op>) {
+    let adj = Vec::new;
+    match same {
+        (true, true) => {}
+        (false, false) => {
+            fwd.push(Op::Cell { s, r, c, v: data_of(y.0, y.1, r, c), adj: adj() });
+            inv.push(Op::Cell { s, r, c, v: data_of(x.0, x.1, r, c), adj: adj() });
+        }
+        (false, true) => {
+            fwd.push(Op::Content { s, r, c, v: content_of(y.0, y.1, r, c, rich), adj: adj() });
+            inv.push(Op::Content { s, r, c, v: content_of(x.0, x.1, r, c, rich), adj: adj() });
+        }
+        (true, false) => {
+            fwd.push(Op::Format { s, r, c, st: format_of(y.0, y.1, r, c) });
+            inv.push(Op::Format { s, r, c, st: format_of(x.0, x.1, r, c) });
+        }
     }
 }
 
@@ -360,28 +401,43 @@ fn range_pair(wb: &Workbook, rg: Range, before: &[(u32, u32, Cell)], sh: &Sheet,
     for (r, c) in keys {
         let a = old.get(&(r, c)).copied();
         let b = sh.get(r, c);
-        let same = match (a, b) {
+        let content = match (a, b) {
             (None, None) => true,
-            (Some(x), Some(y)) => {
-                let content = match (&x.formula, &y.formula) {
-                    (Some(f), Some(g)) => f.text == g.text,
-                    (None, None) => x.value == y.value,
-                    _ => false,
-                };
-                content && wb.style(x.style) == wb.style(y.style)
-            }
-            (Some(x), None) | (None, Some(x)) => x.is_blank(),
+            (Some(x), Some(y)) => match (&x.formula, &y.formula) {
+                (Some(f), Some(g)) => f.text == g.text,
+                (None, None) => x.value == y.value,
+                _ => false,
+            },
+            (Some(x), None) | (None, Some(x)) => x.value.is_empty() && x.formula.is_none(),
         };
-        if !same {
-            fwd.push(Op::Cell { s, r, c, v: data_of(wb, sh, r, c), adj: Vec::new() });
-            let v = a.filter(|x| !x.is_blank()).map(|x| {
+        let format = wb.style(a.map_or(0, |x| x.style)) == wb.style(b.map_or(0, |x| x.style));
+        if content && format {
+            continue;
+        }
+        // What the cell held before (without rich text, which the snapshot doesn't keep).
+        let old = |with_style: bool| {
+            a.filter(|x| !x.is_blank()).map(|x| {
                 let (v, f) = match &x.formula {
                     Some(f) => (cosync::Val::Empty, Some(f.text.clone())),
                     None => (super::val_of(&x.value), None),
                 };
-                Box::new(cosync::CellData { v, f, st: super::style_json(wb.style(x.style)), rich: None })
-            });
-            inv.push(Op::Cell { s, r, c, v, adj: Vec::new() });
+                Box::new(cosync::CellData { v, f, st: if with_style { super::style_json(wb.style(x.style)) } else { None }, rich: None })
+            })
+        };
+        let adj = Vec::new;
+        match (content, format) {
+            (false, false) => {
+                fwd.push(Op::Cell { s, r, c, v: data_of(wb, sh, r, c), adj: adj() });
+                inv.push(Op::Cell { s, r, c, v: old(true), adj: adj() });
+            }
+            (false, true) => {
+                fwd.push(Op::Content { s, r, c, v: content_of(wb, sh, r, c, true), adj: adj() });
+                inv.push(Op::Content { s, r, c, v: old(false).filter(|d| !d.v.is_empty() || d.f.is_some()), adj: adj() });
+            }
+            _ => {
+                fwd.push(Op::Format { s, r, c, st: format_of(wb, sh, r, c) });
+                inv.push(Op::Format { s, r, c, st: a.and_then(|x| super::style_json(wb.style(x.style))) });
+            }
         }
     }
 }

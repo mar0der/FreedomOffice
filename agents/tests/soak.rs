@@ -129,8 +129,14 @@ fn concurrent_edits_of_one_cell() {
     let (apis, item) = shared_workbook(&s, "tasks");
     let p = soak::probe_conflicts(&apis[0], &apis[1], &item).unwrap();
     println!("{p:#?}");
-    // Last writer wins per cell: the value and the format are one target, so one is lost.
-    assert!(p.value_survived != p.format_survived);
+    // A cell's content and format are separate targets: both survive.
+    assert!(p.value_survived && p.format_survived, "{}", p.value_vs_format);
+    assert!(!p.value_vs_format.contains("told something was replaced: true"));
+    // Two values: the later commit wins and the loser, and only the loser, is told.
+    assert!(p.told_loser, "{}", p.value_vs_value);
+    // An edit made after seeing the other's reports nothing.
+    assert!(p.sequential_quiet);
+    assert!(p.format_vs_format.contains("A was told: Your formatting of"), "{}", p.format_vs_format);
     assert!(p.insert_vs_edit_ok, "{}", p.insert_vs_edit);
 }
 
@@ -162,4 +168,39 @@ fn agents_are_marked_and_see_each_other() {
     assert!(a.wait_synced(std::time::Duration::from_secs(5)));
     b.pump(std::time::Duration::from_millis(300));
     assert_eq!(b.cell_data(sheet, 20, 0), a.cell_data(sheet, 20, 0));
+}
+
+/// Against a protocol 1 server (Welcome without `proto`) fsheets keeps working: only whole `Cell`
+/// operations are sent. Simulated by switching the mode on a client of the current server (a reconnect would reset it).
+#[test]
+fn protocol_1_mode_sends_only_whole_cells_and_converges() {
+    use cosync::{CellData, Op, Val};
+    let s = start();
+    let (apis, item) = shared_workbook(&s, "tasks");
+    let mut a = Live::open(&apis[0], &item, true).unwrap();
+    let mut b = Live::open(&apis[1], &item, true).unwrap();
+    assert!(a.wait_synced(std::time::Duration::from_secs(5)));
+    a.legacy = true;
+    let sheet = a.first_sheet().unwrap();
+    // Value, format and both: whole cells in the batch in flight and in the buffer behind it.
+    a.set_content(sheet, 30, 0, Some(CellData { v: Val::Text("v".into()), ..Default::default() }));
+    a.set_format(sheet, 31, 0, freedom_sheets::live::style_json(&freedom_sheets::model::Style { bold: true, ..Default::default() }));
+    a.set_content(sheet, 31, 0, Some(CellData { v: Val::Num(5.0), ..Default::default() }));
+    let pending = a.sess.pending();
+    assert_eq!(pending.len(), 3);
+    assert!(pending.iter().all(|o| matches!(o, Op::Cell { .. })), "{pending:?}");
+    // (The second content edit carries the cell's whole state, format included.)
+    assert!(matches!(&pending[2], Op::Cell { v: Some(d), .. } if d.st.is_some() && d.v == Val::Num(5.0)));
+    // B formats the cell A typed in, at the same time.
+    b.set_format(sheet, 30, 0, freedom_sheets::live::style_json(&freedom_sheets::model::Style { italic: true, ..Default::default() }));
+    for _ in 0..100 {
+        a.pump(std::time::Duration::from_millis(20));
+        b.pump(std::time::Duration::from_millis(20));
+        if a.synced() && b.synced() && a.seq() == b.seq() {
+            break;
+        }
+    }
+    assert!(a.synced() && b.synced());
+    assert!(a.differences(&b).is_empty(), "{:?}", a.differences(&b));
+    assert!(a.take_replaced().is_empty());
 }

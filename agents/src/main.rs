@@ -125,6 +125,9 @@ fn change<T>(
     let mut live = join(api, item)?;
     let out = f(&mut live)?;
     let version = work::settle(&mut live)?;
+    for e in live.take_replaced() {
+        eprintln!("fsheets: {}", e.message());
+    }
     live.disconnect();
     Ok((out, version))
 }
@@ -412,11 +415,14 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
             let b = apis.get(1).unwrap_or(&apis[0]);
             let p = soak::probe_conflicts(&apis[0], b, &item)?;
             println!(
-                "{}\n  value kept: {}, format kept: {}\n{}\n{}",
+                "{}\n  value kept: {}, format kept: {}\n{}\n  the loser was told: {}; a sequential edit told nobody: {}\n{}\n{}",
                 p.value_vs_format,
                 p.value_survived,
                 p.format_survived,
                 p.value_vs_value,
+                p.told_loser,
+                p.sequential_quiet,
+                p.format_vs_format,
                 p.insert_vs_edit
             );
         }

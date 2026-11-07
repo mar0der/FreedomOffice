@@ -8,7 +8,9 @@
 
 use std::collections::HashSet;
 
-use crate::{Op, Rect, SheetId, MAX_COLS, MAX_ROWS, MAX_SHEET_NAME};
+use serde_json::Value as Json;
+
+use crate::{CellData, Op, Rect, SheetId, MAX_COLS, MAX_ROWS, MAX_SHEET_NAME};
 
 /// Where index `i` lands after inserting (n > 0) or deleting (n < 0) at `at`; None when it
 /// is deleted or pushed off the end (`max`).
@@ -111,7 +113,10 @@ fn alt_name(name: &str) -> String {
 /// What a content operation writes, for last-writer-wins.
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum Target {
-    Cell(SheetId, u32, u32),
+    /// A cell's value or formula, with its rich text.
+    CellContent(SheetId, u32, u32),
+    /// A cell's style.
+    CellFormat(SheetId, u32, u32),
     Note(SheetId, u32, u32),
     Link(SheetId, u32, u32),
     RowH(SheetId, u32),
@@ -127,10 +132,22 @@ enum Target {
     Place(SheetId),
 }
 
+/// The targets an operation writes: a whole `Cell` writes two, everything else one or none.
+fn targets(op: &Op) -> impl Iterator<Item = Target> {
+    let two = match op {
+        Op::Cell { s, r, c, .. } => (Some(Target::CellContent(*s, *r, *c)), Some(Target::CellFormat(*s, *r, *c))),
+        _ => (target(op), None),
+    };
+    [two.0, two.1].into_iter().flatten()
+}
+
 fn target(op: &Op) -> Option<Target> {
     use Op::*;
     Some(match op {
-        Cell { s, r, c, .. } => Target::Cell(*s, *r, *c),
+        Content { s, r, c, .. } => Target::CellContent(*s, *r, *c),
+        Format { s, r, c, .. } => Target::CellFormat(*s, *r, *c),
+        // (a whole cell has two targets: see `targets`)
+        Cell { s, r, c, .. } => Target::CellContent(*s, *r, *c),
         Note { s, r, c, .. } => Target::Note(*s, *r, *c),
         Link { s, r, c, .. } => Target::Link(*s, *r, *c),
         RowH { s, r, .. } => Target::RowH(*s, *r),
@@ -221,19 +238,80 @@ fn content_over(x: &Op, y: &Op, xw: bool) -> Vec<Op> {
         }
         AddSheet { .. } => vec![x.clone()],
         _ => {
-            if !xw && target(x).is_some() && target(x) == target(y) {
-                vec![]
-            } else {
-                vec![x.clone()]
+            if xw {
+                return vec![x.clone()];
             }
+            let taken: HashSet<Target> = targets(y).collect();
+            reduce(x, &taken).into_iter().collect()
         }
+    }
+}
+
+/// Strips the style from cell data; None when nothing else is left (a cleared content).
+fn content_part(d: Option<&CellData>) -> Option<Box<CellData>> {
+    d.filter(|d| !d.v.is_empty() || d.f.is_some() || d.rich.is_some()).map(|d| Box::new(CellData { st: None, ..d.clone() }))
+}
+
+/// `op` without the writes to the `taken` targets (which a later-committed operation wins):
+/// a whole `Cell` keeps the part that is not taken, as a `Content` or `Format`.
+fn reduce(op: &Op, taken: &HashSet<Target>) -> Option<Op> {
+    if let Op::Cell { s, r, c, v, adj } = op {
+        let content = taken.contains(&Target::CellContent(*s, *r, *c));
+        let format = taken.contains(&Target::CellFormat(*s, *r, *c));
+        return match (content, format) {
+            (false, false) => Some(op.clone()),
+            (true, true) => None,
+            (true, false) => Some(Op::Format { s: *s, r: *r, c: *c, st: v.as_ref().and_then(|d| d.st.clone()) }),
+            (false, true) => Some(Op::Content { s: *s, r: *r, c: *c, v: content_part(v.as_deref()), adj: adj.clone() }),
+        };
+    }
+    match target(op) {
+        Some(t) if taken.contains(&t) => None,
+        _ => Some(op.clone()),
+    }
+}
+
+/// Which part of a cell a write is to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CellWrite {
+    Content,
+    Format,
+}
+
+/// The single-part writes a cell operation makes (a whole `Cell` makes both), each as a
+/// `Content` or `Format` operation; empty for everything else.
+pub fn cell_write(op: &Op) -> Vec<(CellWrite, Op)> {
+    match op {
+        Op::Cell { s, r, c, v, adj } => vec![
+            (CellWrite::Content, Op::Content { s: *s, r: *r, c: *c, v: content_part(v.as_deref()), adj: adj.clone() }),
+            (CellWrite::Format, Op::Format { s: *s, r: *r, c: *c, st: v.as_ref().and_then(|d| d.st.clone()) }),
+        ],
+        Op::Content { v, .. } => {
+            let mut o = op.clone();
+            if let Op::Content { v: nv, .. } = &mut o {
+                *nv = content_part(v.as_deref());
+            }
+            vec![(CellWrite::Content, o)]
+        }
+        Op::Format { .. } => vec![(CellWrite::Format, op.clone())],
+        _ => Vec::new(),
+    }
+}
+
+/// Where a single-part cell write lands and what it writes (for comparing two writes to the
+/// same place: equal writes don't conflict).
+pub(crate) fn write_key(op: &Op) -> Option<(CellWrite, SheetId, u32, u32, Option<Json>)> {
+    match op {
+        Op::Content { s, r, c, v, .. } => Some((CellWrite::Content, *s, *r, *c, v.as_ref().and_then(|d| serde_json::to_value(d).ok()))),
+        Op::Format { s, r, c, st } => Some((CellWrite::Format, *s, *r, *c, st.clone())),
+        _ => None,
     }
 }
 
 /// Records a structural op the content of `x` must be adjusted by.
 fn push_adj(x: &mut Op, y: &Op) {
     match x {
-        Op::Cell { v, adj, .. } if v.as_ref().is_some_and(|d| d.f.is_some()) => adj.push(y.clone()),
+        Op::Cell { v, adj, .. } | Op::Content { v, adj, .. } if v.as_ref().is_some_and(|d| d.f.is_some()) => adj.push(y.clone()),
         Op::Feature { adj, .. } | Op::Book { adj, .. } => adj.push(y.clone()),
         _ => {}
     }
@@ -254,7 +332,7 @@ fn shift_content(x: &Op, s: SheetId, rows: bool, at: u32, n: i32, y: &Op) -> Vec
         }
     };
     let keep = match &mut x {
-        Cell { r, c, .. } | Note { r, c, .. } | Link { r, c, .. } => !same || mv(if rows { r } else { c }),
+        Cell { r, c, .. } | Content { r, c, .. } | Format { r, c, .. } | Note { r, c, .. } | Link { r, c, .. } => !same || mv(if rows { r } else { c }),
         RowH { r, .. } | RowHidden { r, .. } | RowLevel { r, .. } => !(same && rows) || mv(r),
         ColW { c, .. } | ColHidden { c, .. } | ColLevel { c, .. } => !(same && !rows) || mv(c),
         Merge { rg, .. } => {
@@ -282,8 +360,8 @@ fn shift_content(x: &Op, s: SheetId, rows: bool, at: u32, n: i32, y: &Op) -> Vec
 /// True when some content operation of `a` writes a target that `b` also writes (undo uses
 /// this to refuse undoing a change someone else has changed since, like Excel).
 pub fn touches(a: &[Op], b: &[Op]) -> bool {
-    let tb: HashSet<Target> = b.iter().filter_map(target).collect();
-    !tb.is_empty() && a.iter().filter_map(target).any(|t| tb.contains(&t))
+    let tb: HashSet<Target> = b.iter().flat_map(targets).collect();
+    !tb.is_empty() && a.iter().flat_map(targets).any(|t| tb.contains(&t))
 }
 
 /// Brings an undo stack (newest step first: each step's ops reverse it, in the state left by
@@ -357,8 +435,8 @@ fn seg_pair(x: &Seg, y: &Seg, xw: bool) -> (Vec<Seg>, Vec<Seg>) {
         (Seg::Light(xs), Seg::Heavy(b)) => (light(xs.iter().flat_map(|x| over(x, b, xw)).collect()), vec![Seg::Heavy(b.clone())]),
         (Seg::Light(xs), Seg::Light(ys)) => {
             let loser = |v: &[Op], winners: &[Op]| -> Vec<Op> {
-                let taken: HashSet<_> = winners.iter().filter_map(target).collect();
-                v.iter().filter(|o| target(o).is_none_or(|t| !taken.contains(&t))).cloned().collect()
+                let taken: HashSet<_> = winners.iter().flat_map(targets).collect();
+                v.iter().filter_map(|o| reduce(o, &taken)).collect()
             };
             if xw { (light(xs.clone()), light(loser(ys, xs))) } else { (light(loser(xs, ys)), light(ys.clone())) }
         }

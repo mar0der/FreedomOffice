@@ -41,6 +41,48 @@ pub fn value_of(v: &Val) -> Value {
     }
 }
 
+/// What a single-part cell write (`Content` or `Format`) entered, as a person would say it: the
+/// formula (`=...`) or value typed, "(empty)" for a cleared cell, "formatting" for a format.
+pub fn entered_text(op: &Op) -> String {
+    match op {
+        Op::Content { v: Some(d), .. } => match (&d.f, &d.v) {
+            (Some(f), _) => format!("={f}"),
+            (None, Val::Text(t)) | (None, Val::Err(t)) => t.clone(),
+            (None, Val::Num(n)) => crate::numfmt::value_to_text(&Value::Number(*n)),
+            (None, Val::Bool(b)) => if *b { "TRUE" } else { "FALSE" }.to_string(),
+            (None, Val::Empty) => "(empty)".to_string(),
+        },
+        Op::Content { v: None, .. } => "(empty)".to_string(),
+        _ => "formatting".to_string(),
+    }
+}
+
+/// Protocol 1 mode (the server's `Welcome` has no `proto`): that server only knows whole `Cell`
+/// operations. Replaces every `Content`/`Format` by one `Cell` carrying the cell's full current
+/// data in `wb` (the workbook the operations were just applied to, whose formulas already
+/// include any structure changes), at the place of the first operation on that cell. Other
+/// operations are kept as they are.
+pub fn collapse_cells(wb: &Workbook, ops: &[Op]) -> Vec<Op> {
+    let mut out: Vec<Op> = Vec::with_capacity(ops.len());
+    let mut done = std::collections::HashSet::new();
+    for op in ops {
+        match op {
+            Op::Content { s, r, c, .. } | Op::Format { s, r, c, .. } => {
+                if !done.insert((*s, *r, *c)) {
+                    continue;
+                }
+                let v = index_of(wb, *s).and_then(|i| {
+                    let sh = &wb.sheets[i];
+                    sh.get(*r, *c).filter(|x| !x.is_blank()).map(|x| Box::new(cell_data(wb, sh, *r, *c, x)))
+                });
+                out.push(Op::Cell { s: *s, r: *r, c: *c, v, adj: Vec::new() });
+            }
+            _ => out.push(op.clone()),
+        }
+    }
+    out
+}
+
 /// Style content (None for the default style).
 pub fn style_json(st: &Style) -> Option<Json> {
     if *st == Style::default() { None } else { serde_json::to_value(st).ok() }
@@ -251,6 +293,47 @@ fn apply_op(wb: &mut Workbook, op: &Op, remote: bool, st: &mut ApplyState, out: 
                     sh.set(*r, *c, Some(cell));
                 }
             }
+            out.cells.push((i, Range::cell(*r, *c)));
+        }
+        Op::Content { s, r, c, v, adj } => {
+            // The value, formula and rich text; the format the cell has stays.
+            let style = wb.sheets[i].get(*r, *c).map_or(0, |x| x.style);
+            match v {
+                None => {
+                    let sh = &mut wb.sheets[i];
+                    sh.rich.remove(&(*r, *c));
+                    sh.set(*r, *c, Some(Cell { style, ..Cell::default() }));
+                }
+                Some(d) => {
+                    let mut cell = cell_from_data(wb, *s, &CellData { st: None, ..(**d).clone() }, adj);
+                    cell.style = style;
+                    let sh = &mut wb.sheets[i];
+                    match d.rich.as_ref().and_then(|j| serde_json::from_value(j.clone()).ok()) {
+                        Some(rt) => {
+                            sh.rich.insert((*r, *c), rt);
+                        }
+                        None => {
+                            sh.rich.remove(&(*r, *c));
+                        }
+                    }
+                    sh.set(*r, *c, Some(cell));
+                }
+            }
+            out.cells.push((i, Range::cell(*r, *c)));
+        }
+        Op::Format { r, c, st, .. } => {
+            // The style; the cell's content stays.
+            let style = match st {
+                Some(j) => match serde_json::from_value::<Style>(j.clone()) {
+                    Ok(x) => wb.intern_style(x),
+                    Err(_) => 0,
+                },
+                None => 0,
+            };
+            let sh = &mut wb.sheets[i];
+            let mut cell = sh.get(*r, *c).cloned().unwrap_or_default();
+            cell.style = style;
+            sh.set(*r, *c, Some(cell));
             out.cells.push((i, Range::cell(*r, *c)));
         }
         Op::Note { r, c, text, author, .. } => {

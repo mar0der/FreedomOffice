@@ -259,7 +259,7 @@ impl Hub {
             if o.seq > base.seq {
                 unsnapped += 1;
             }
-            log.entries.push(cosync::server::Entry { seq: o.seq, cid: o.cid, id: o.batch, by: o.actor, ops: parsed });
+            log.entries.push(cosync::server::Entry { seq: o.seq, cid: o.cid, id: o.batch, by: o.actor, base: None, ops: parsed });
         }
         for (actor, cid, batch, seq) in s.live_clients(&item.id).map_err(|e| e.to_string())? {
             log.last.insert((actor, cid), (batch, seq));
@@ -500,9 +500,9 @@ pub async fn run(store: Arc<Mutex<Store>>, hub: Arc<Hub>, socket: WebSocket, j: 
             let used: Vec<u8> = d.conns.iter().map(|c| c.peer.color).collect();
             peer.color = (0..u8::MAX).find(|c| !used.contains(c)).unwrap_or(0);
             let peers: Vec<Peer> = d.conns.iter().map(|c| c.peer.clone()).collect();
-            let _ = tx.try_send(Out::Text(json(&ServerMsg::Welcome { seq: d.log.head(), you: peer.clone(), peers })));
+            let _ = tx.try_send(Out::Text(json(&ServerMsg::Welcome { seq: d.log.head(), you: peer.clone(), peers, proto: cosync::PROTO })));
             for e in replay {
-                let msg = ServerMsg::Ops { seq: e.seq, cid: e.cid, id: e.id, by: 0, ops: e.ops };
+                let msg = ServerMsg::Ops { seq: e.seq, cid: e.cid, id: e.id, by: 0, base: e.base, ops: e.ops };
                 let _ = tx.try_send(Out::Text(json(&msg)));
             }
             d.broadcast(conn_id, &ServerMsg::Join { peer: peer.clone() });
@@ -574,7 +574,14 @@ pub async fn run(store: Arc<Mutex<Store>>, hub: Arc<Hub>, socket: WebSocket, j: 
                     break;
                 };
                 match msg {
-                    ClientMsg::Hello { sheets } => {
+                    ClientMsg::Hello { sheets, proto } => {
+                        if proto < cosync::PROTO {
+                            // A protocol 1 client would apply the split cell operations as whole
+                            // cells and diverge: ask for an update instead (nothing it sent is lost).
+                            let _ = tx.try_send(Out::Text(json(&ServerMsg::Error { message: "This version of FreedomOffice Sheets is too old to edit this workbook live. Please update the app.".into() })));
+                            fail(close::UPGRADE, "Update FreedomOffice Sheets.");
+                            break;
+                        }
                         let mut d = lock(&doc);
                         if d.log.sheets.is_none() && !sheets.is_empty() && sheets.len() <= 10_000 {
                             d.log.set_sheets(sheets);
@@ -591,7 +598,7 @@ pub async fn run(store: Arc<Mutex<Store>>, hub: Arc<Hub>, socket: WebSocket, j: 
                         }
                         d.broadcast(conn_id, &ServerMsg::Presence { id: conn_id, p });
                     }
-                    ClientMsg::Ops { base, id, ops } => {
+                    ClientMsg::Ops { base, id, made, ops } => {
                         // The role may have changed since the connection opened (`Hub::recheck`);
                         // `commit` checks again under the document lock.
                         if !lock(&doc).is_editor(conn_id) {
@@ -608,7 +615,7 @@ pub async fn run(store: Arc<Mutex<Store>>, hub: Arc<Hub>, socket: WebSocket, j: 
                             break;
                         }
                         let (store, doc, cid, actor, item) = (store.clone(), doc.clone(), j.cid.clone(), j.actor.clone(), item_id.clone());
-                        let ok = tokio::task::spawn_blocking(move || commit(&store, &doc, &item, conn_id, base, &cid, id, &actor, ops)).await.unwrap_or(false);
+                        let ok = tokio::task::spawn_blocking(move || commit(&store, &doc, &item, conn_id, (base, made.unwrap_or(base)), &cid, id, &actor, ops)).await.unwrap_or(false);
                         if !ok {
                             break;
                         }
@@ -661,14 +668,14 @@ pub async fn run(store: Arc<Mutex<Store>>, hub: Arc<Hub>, socket: WebSocket, j: 
 
 /// Transforms, stores and distributes one batch. False when the connection must close.
 #[allow(clippy::too_many_arguments)]
-fn commit(store: &Mutex<Store>, doc: &Mutex<Doc>, item: &str, conn: u64, base: u64, cid: &str, id: u64, actor: &str, ops: Vec<cosync::Op>) -> bool {
+fn commit(store: &Mutex<Store>, doc: &Mutex<Doc>, item: &str, conn: u64, (base, made): (u64, u64), cid: &str, id: u64, actor: &str, ops: Vec<cosync::Op>) -> bool {
     let mut d = lock(doc);
     if !d.is_editor(conn) {
         d.close(conn, close::READ_ONLY, "You have view-only access to this workbook.");
         return false;
     }
     let (sheets_before, last_before) = (d.log.sheets.clone(), d.log.last_commit(cid, actor));
-    match d.log.commit(base, cid, id, actor, ops) {
+    match d.log.commit_made(base, made, cid, id, actor, ops) {
         Ok(Commit::New { seq, ops, extra }) => {
             let rec = LiveOp { seq, cid: cid.to_string(), batch: id, actor: actor.to_string(), ops: serde_json::to_string(&ops).unwrap_or_default(), at: now() };
             if let Err(e) = lock(store).add_live_op(item, &rec) {
@@ -683,7 +690,7 @@ fn commit(store: &Mutex<Store>, doc: &Mutex<Doc>, item: &str, conn: u64, base: u
                 return false;
             }
             d.send(conn, &ServerMsg::Ack { id, seq, extra });
-            d.broadcast(conn, &ServerMsg::Ops { seq, cid: cid.to_string(), id, by: conn, ops });
+            d.broadcast(conn, &ServerMsg::Ops { seq, cid: cid.to_string(), id, by: conn, base: Some(made.min(base)), ops });
             d.unsnapped += 1;
             if d.unsnapped_since.is_none() {
                 d.unsnapped_since = Some(Instant::now());
