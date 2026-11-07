@@ -667,3 +667,85 @@ fn removing_a_share_link_ends_its_sessions() {
     assert_eq!(wl.recv_access(), ServerMsg::Revoked { reason: "The share link was removed.".into() });
     assert_eq!(wl.close_code(), Some(cosync::close::REVOKED));
 }
+
+#[test]
+fn a_ticket_does_not_outlive_the_account() {
+    let s = start();
+    let (a, b) = (s.login("alice"), s.login("bob"));
+    let id = s.new_file(&a, "Ticket.xlsx");
+    s.share(&a, &id, "bob", "edit");
+    let ticket = |tok: &str| s.send("POST", &format!("/api/items/{id}/live-ticket"), Some(tok), &[], None).json()["ticket"].as_str().unwrap().to_string();
+    // Disabled after the ticket was issued.
+    let t = ticket(&b);
+    assert_eq!(s.send("POST", "/api/users/bob/disable", Some(&a), &[], None).status, 204);
+    assert!(matches!(s.ws(None, &format!("since=0&v=1&cid=t&ticket={t}"), &id), Err(tungstenite::Error::Http(r)) if r.status() == 401));
+    // Signed out after the ticket was issued.
+    assert_eq!(s.send("POST", "/api/users/bob/enable", Some(&a), &[], None).status, 204);
+    let b = s.login("bob");
+    let t = ticket(&b);
+    assert_eq!(s.send("POST", "/api/logout", Some(&b), &[], None).status, 204);
+    assert!(matches!(s.ws(None, &format!("since=0&v=1&cid=t&ticket={t}"), &id), Err(tungstenite::Error::Http(r)) if r.status() == 401));
+}
+
+/// Joins, leaves, commits and re-checks all at once: nothing deadlocks and every editor ends
+/// with every batch.
+#[test]
+fn concurrent_joins_leaves_commits_and_rechecks_finish() {
+    let s = start();
+    let (a, b) = (s.login("alice"), s.login("bob"));
+    let id = s.new_file(&a, "Busy.xlsx");
+    s.share(&a, &id, "bob", "edit");
+    let done = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|sc| {
+        // Someone keeps changing Bob's access (each change re-checks every session).
+        sc.spawn(|| {
+            let mut i = 0;
+            while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                s.share(&a, &id, "bob", if i % 2 == 0 { "edit" } else { "view" });
+                i += 1;
+            }
+            s.share(&a, &id, "bob", "edit");
+        });
+        // Alice commits all along.
+        sc.spawn(|| {
+            let (mut w, mut seq) = s.join(&a, &id, "committer");
+            for i in 0..30u32 {
+                w.send(&ClientMsg::Ops { base: seq, id: u64::from(i) + 1, ops: vec![text(1, i, "x")] });
+                loop {
+                    match w.recv_data() {
+                        ServerMsg::Ack { seq: q, .. } => {
+                            seq = q;
+                            break;
+                        }
+                        ServerMsg::Ops { seq: q, .. } => seq = q,
+                        _ => {}
+                    }
+                }
+            }
+        });
+        let workers: Vec<_> = (0..4)
+            .map(|n| {
+                let (s, a, id) = (&s, &a, &id);
+                sc.spawn(move || {
+                    for round in 0..5 {
+                        let (seq, _, v) = s.live_base(a, id);
+                        let Ok(mut w) = s.ws(Some(a), &format!("since={seq}&v={v}&cid=w{n}r{round}"), id) else { continue };
+                        if !matches!(w.next(Duration::from_secs(10)), Some(Got::Msg(ServerMsg::Welcome { .. })) | Some(Got::Msg(ServerMsg::Reload))) {
+                            panic!("no welcome");
+                        }
+                        drop(w);
+                    }
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().unwrap();
+        }
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    // Still serving.
+    let (mut wa, seq) = s.join(&a, &id, "final");
+    wa.send(&ClientMsg::Ops { base: seq, id: 1, ops: vec![text(0, 0, "ok")] });
+    while !matches!(wa.recv_data(), ServerMsg::Ack { .. }) {}
+    drop(b);
+}

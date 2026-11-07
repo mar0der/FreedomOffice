@@ -2036,7 +2036,12 @@ async fn live(
     let (item, who, role) = app
         .run(move |s| {
             let who = match ticket {
-                Some(t) if bearer(&headers).is_none() => hub.redeem(&t, &iid).ok_or_else(ApiError::unauthorized)?,
+                // A ticket carries who asked for it then: check the account, device token or
+                // link again now (disabled, signed out, temporary password since).
+                Some(t) if bearer(&headers).is_none() => {
+                    let issued = hub.redeem(&t, &iid).ok_or_else(ApiError::unauthorized)?;
+                    s.recheck_principal(&issued)?.map_err(|_| ApiError::unauthorized())?
+                }
                 _ => auth(s, &headers)?,
             };
             let (it, role) = visible(s, &who, &iid, false)?;
