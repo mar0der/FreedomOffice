@@ -45,7 +45,10 @@ fn opt(args: &mut Vec<String>, name: &str) -> Option<String> {
 }
 
 fn flag(args: &mut Vec<String>, name: &str) -> bool {
-    args.iter().position(|a| a == name).map(|i| args.remove(i)).is_some()
+    args.iter()
+        .position(|a| a == name)
+        .map(|i| args.remove(i))
+        .is_some()
 }
 
 fn need(v: Option<String>, name: &str) -> Result<String, String> {
@@ -55,9 +58,13 @@ fn need(v: Option<String>, name: &str) -> Result<String, String> {
 fn read_password(file: Option<String>) -> Result<String, String> {
     let mut s = String::new();
     match file {
-        Some(f) => s = std::fs::read_to_string(&f).map_err(|e| format!("Couldn't read {f}: {e}"))?,
+        Some(f) => {
+            s = std::fs::read_to_string(&f).map_err(|e| format!("Couldn't read {f}: {e}"))?
+        }
         None => {
-            std::io::stdin().read_to_string(&mut s).map_err(|e| e.to_string())?;
+            std::io::stdin()
+                .read_to_string(&mut s)
+                .map_err(|e| e.to_string())?;
         }
     }
     Ok(s.trim_end_matches(['\r', '\n']).to_string())
@@ -68,7 +75,12 @@ fn logins(server: &str, users: &str, dir: &str) -> Result<Vec<Api>, String> {
         .split(',')
         .filter(|u| !u.is_empty())
         .map(|u| {
-            let pw = read_password(Some(Path::new(dir).join(format!("{u}.pw")).to_string_lossy().into_owned()))?;
+            let pw = read_password(Some(
+                Path::new(dir)
+                    .join(format!("{u}.pw"))
+                    .to_string_lossy()
+                    .into_owned(),
+            ))?;
             Api::login(server, u, &pw, "fsheets")
         })
         .collect()
@@ -80,7 +92,12 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
         return Ok(());
     }
     let cmd = args.remove(0);
-    let token = |a: &mut Vec<String>| -> Result<Api, String> { Api::from_token_file(&PathBuf::from(need(opt(a, "--token-file"), "--token-file")?)) };
+    let token = |a: &mut Vec<String>| -> Result<Api, String> {
+        Api::from_token_file(&PathBuf::from(need(
+            opt(a, "--token-file"),
+            "--token-file",
+        )?))
+    };
     match cmd.as_str() {
         "login" => {
             let server = need(opt(&mut args, "--server"), "--server")?;
@@ -89,7 +106,12 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
             let pw = read_password(opt(&mut args, "--password-file"))?;
             let api = Api::login(&server, &user, &pw, "fsheets")?;
             api.save_token(&file)?;
-            println!("Signed in as {} on {}; token saved to {}.", api.username, api.url, file.display());
+            println!(
+                "Signed in as {} on {}; token saved to {}.",
+                api.username,
+                api.url,
+                file.display()
+            );
         }
         "ls" => {
             let api = token(&mut args)?;
@@ -104,7 +126,14 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
                 }
             };
             for i in items {
-                println!("{}\t{}\t{}\tv{}\t{}", i.id, if i.folder { "folder" } else { "file" }, i.name, i.version, i.role);
+                println!(
+                    "{}\t{}\t{}\tv{}\t{}",
+                    i.id,
+                    if i.folder { "folder" } else { "file" },
+                    i.name,
+                    i.version,
+                    i.role
+                );
             }
         }
         "cat" => {
@@ -117,11 +146,17 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
                 eprintln!("note: {n}");
             }
             for (id, sh) in live.book.ordered() {
-                if sheet.as_ref().is_some_and(|s| live.book.find(s) != Some(id)) {
+                if sheet
+                    .as_ref()
+                    .is_some_and(|s| live.book.find(s) != Some(id))
+                {
                     continue;
                 }
                 println!("# {} (sheet {id})", sh.name);
-                let (rows, cols) = sh.cells.keys().fold((0, 0), |(r, c), k| (r.max(k.0 + 1), c.max(k.1 + 1)));
+                let (rows, cols) = sh
+                    .cells
+                    .keys()
+                    .fold((0, 0), |(r, c), k| (r.max(k.0 + 1), c.max(k.1 + 1)));
                 for r in 0..rows {
                     let line: Vec<String> = (0..cols)
                         .map(|c| match sh.cells.get(&(r, c)) {
@@ -148,15 +183,26 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
             live.wait_synced(Duration::from_secs(15));
             let s = match sheet {
                 Some(n) => live.book.find(&n).ok_or("No such sheet.")?,
-                None => live.book.ordered().first().map(|x| x.0).ok_or("No sheet.")?,
+                None => live
+                    .book
+                    .ordered()
+                    .first()
+                    .map(|x| x.0)
+                    .ok_or("No sheet.")?,
             };
             let data = if clear {
                 None
             } else {
                 let v = need(value, "--value or --clear")?;
                 Some(match v.strip_prefix('=') {
-                    Some(f) => CellData { f: Some(f.to_string()), ..Default::default() },
-                    None => CellData { v: v.parse::<f64>().map(Val::Num).unwrap_or(Val::Text(v)), ..Default::default() },
+                    Some(f) => CellData {
+                        f: Some(f.to_string()),
+                        ..Default::default()
+                    },
+                    None => CellData {
+                        v: v.parse::<f64>().map(Val::Num).unwrap_or(Val::Text(v)),
+                        ..Default::default()
+                    },
                 })
             };
             live.set_cell(s, r, c, data);
@@ -168,7 +214,11 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
         "soak" => {
             let server = need(opt(&mut args, "--server"), "--server")?;
             let item = need(opt(&mut args, "--item"), "--item")?;
-            let apis = logins(&server, &need(opt(&mut args, "--users"), "--users")?, &need(opt(&mut args, "--secrets-dir"), "--secrets-dir")?)?;
+            let apis = logins(
+                &server,
+                &need(opt(&mut args, "--users"), "--users")?,
+                &need(opt(&mut args, "--secrets-dir"), "--secrets-dir")?,
+            )?;
             let mut cfg = soak::Config::default();
             if let Some(v) = opt(&mut args, "--clients") {
                 cfg.clients = v.parse().map_err(|_| "--clients must be a number")?;
@@ -192,15 +242,27 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
         "probe" => {
             let server = need(opt(&mut args, "--server"), "--server")?;
             let item = need(opt(&mut args, "--item"), "--item")?;
-            let apis = logins(&server, &need(opt(&mut args, "--users"), "--users")?, &need(opt(&mut args, "--secrets-dir"), "--secrets-dir")?)?;
+            let apis = logins(
+                &server,
+                &need(opt(&mut args, "--users"), "--users")?,
+                &need(opt(&mut args, "--secrets-dir"), "--secrets-dir")?,
+            )?;
             let b = apis.get(1).unwrap_or(&apis[0]);
             let p = soak::probe_conflicts(&apis[0], b, &item)?;
-            println!("{}\n  value kept: {}, format kept: {}\n{}\n{}", p.value_vs_format, p.value_survived, p.format_survived, p.value_vs_value, p.insert_vs_edit);
+            println!(
+                "{}\n  value kept: {}, format kept: {}\n{}\n{}",
+                p.value_vs_format,
+                p.value_survived,
+                p.format_survived,
+                p.value_vs_value,
+                p.insert_vs_edit
+            );
         }
         "seed" => {
             let api = token(&mut args)?;
             let folder = need(opt(&mut args, "--folder"), "--folder")?;
-            let existing: Vec<String> = api.children(&folder)?.into_iter().map(|i| i.name).collect();
+            let existing: Vec<String> =
+                api.children(&folder)?.into_iter().map(|i| i.name).collect();
             for kind in sample::SAMPLES {
                 let name = format!("{}.xlsx", kind[..1].to_uppercase() + &kind[1..]);
                 if existing.contains(&name) {
@@ -212,7 +274,9 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
             }
         }
         "make-sample" => {
-            let [kind, file] = args.as_slice() else { return Err("Expected `make-sample KIND FILE`.".into()) };
+            let [kind, file] = args.as_slice() else {
+                return Err("Expected `make-sample KIND FILE`.".into());
+            };
             std::fs::write(file, sample::make(kind)?).map_err(|e| e.to_string())?;
         }
         other => return Err(format!("Unknown command '{other}'. See --help.")),

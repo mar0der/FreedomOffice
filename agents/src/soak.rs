@@ -29,7 +29,16 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Config { clients: 4, edits: 150, seed: 0, interval_ms: 40, disconnect_pct: 3.0, structure_pct: 8.0, hot_rows: 12, hot_cols: 6 }
+        Config {
+            clients: 4,
+            edits: 150,
+            seed: 0,
+            interval_ms: 40,
+            disconnect_pct: 3.0,
+            structure_pct: 8.0,
+            hot_rows: 12,
+            hot_cols: 6,
+        }
     }
 }
 
@@ -57,16 +66,38 @@ impl Report {
     pub fn print(&self) {
         let t = &self.totals;
         println!("soak: {} clients, seed {:#x}", self.clients, self.seed);
-        println!("  ops sent {} in {} batches, acks {}, remote batches applied {}", t.ops_sent, t.batches_sent, t.acks, t.remote_batches);
-        println!("  disconnects forced {}, reconnects {}, own batches replayed {}, presence sent {}", self.forced_disconnects, t.reconnects, t.replayed_own, t.presence_sent);
-        println!("  server closes {:?}, snapshot requests ignored {}", t.closes, t.snapshot_requests);
-        println!("  final seq {}, {} cells, digest {}", self.head_seq, self.cells, self.digest);
-        println!("  all clients identical: {}", if self.clients_identical { "yes" } else { "NO" });
-        println!("  fresh joiner identical: {}", if self.joiner_identical { "yes" } else { "NO" });
+        println!(
+            "  ops sent {} in {} batches, acks {}, remote batches applied {}",
+            t.ops_sent, t.batches_sent, t.acks, t.remote_batches
+        );
+        println!(
+            "  disconnects forced {}, reconnects {}, own batches replayed {}, presence sent {}",
+            self.forced_disconnects, t.reconnects, t.replayed_own, t.presence_sent
+        );
+        println!(
+            "  server closes {:?}, snapshot requests ignored {}",
+            t.closes, t.snapshot_requests
+        );
+        println!(
+            "  final seq {}, {} cells, digest {}",
+            self.head_seq, self.cells, self.digest
+        );
+        println!(
+            "  all clients identical: {}",
+            if self.clients_identical { "yes" } else { "NO" }
+        );
+        println!(
+            "  fresh joiner identical: {}",
+            if self.joiner_identical { "yes" } else { "NO" }
+        );
         if let Some(d) = &self.difference {
             println!("  first difference: {d}");
         }
-        println!("  converged: {}   time {:.1}s", if self.converged() { "yes" } else { "NO" }, self.seconds);
+        println!(
+            "  converged: {}   time {:.1}s",
+            if self.converged() { "yes" } else { "NO" },
+            self.seconds
+        );
     }
 }
 
@@ -84,7 +115,11 @@ fn add(a: &mut Stats, b: &Stats) {
 }
 
 fn first_sheet(l: &Live) -> Result<SheetId, String> {
-    l.book.ordered().first().map(|(i, _)| *i).ok_or_else(|| "The workbook has no sheet.".to_string())
+    l.book
+        .ordered()
+        .first()
+        .map(|(i, _)| *i)
+        .ok_or_else(|| "The workbook has no sheet.".to_string())
 }
 
 /// One client's script. Returns the session (so the caller can compare it) and the number of
@@ -113,9 +148,16 @@ fn client(api: Api, item: String, cfg: Config, idx: usize) -> Result<(Live, u64)
             back_at = Some(Instant::now() + Duration::from_millis(100 + rng.below(500)));
         }
         let roll = rng.below(1000) as f64 / 10.0;
-        let (r, c) = (rng.below(cfg.hot_rows as u64) as u32, rng.below(cfg.hot_cols as u64) as u32);
+        let (r, c) = (
+            rng.below(cfg.hot_rows as u64) as u32,
+            rng.below(cfg.hot_cols as u64) as u32,
+        );
         if roll < cfg.structure_pct {
-            let n = if rng.chance(70.0) { 1 + rng.below(2) as i32 } else { -1 };
+            let n = if rng.chance(70.0) {
+                1 + rng.below(2) as i32
+            } else {
+                -1
+            };
             if rng.chance(70.0) {
                 live.edit(vec![Op::Rows { s: sheet, at: r, n }]);
             } else {
@@ -126,8 +168,20 @@ fn client(api: Api, item: String, cfg: Config, idx: usize) -> Result<(Live, u64)
         } else if roll < cfg.structure_pct + 16.0 {
             live.set_cell(sheet, r, c, None);
         } else {
-            let v = if rng.chance(50.0) { Val::Num(rng.below(1000) as f64) } else { Val::Text(format!("c{idx}-{i}")) };
-            live.set_cell(sheet, r, c, Some(CellData { v, ..Default::default() }));
+            let v = if rng.chance(50.0) {
+                Val::Num(rng.below(1000) as f64)
+            } else {
+                Val::Text(format!("c{idx}-{i}"))
+            };
+            live.set_cell(
+                sheet,
+                r,
+                c,
+                Some(CellData {
+                    v,
+                    ..Default::default()
+                }),
+            );
         }
         if live.connected() {
             live.pump(pause);
@@ -139,7 +193,10 @@ fn client(api: Api, item: String, cfg: Config, idx: usize) -> Result<(Live, u64)
     let end = Instant::now() + Duration::from_secs(30);
     while !live.synced() && Instant::now() < end {
         if live.stopped.is_some() {
-            return Err(format!("client {idx} stopped: {}", live.stopped.clone().unwrap_or_default()));
+            return Err(format!(
+                "client {idx} stopped: {}",
+                live.stopped.clone().unwrap_or_default()
+            ));
         }
         if !live.connected() {
             let _ = live.connect();
@@ -179,7 +236,11 @@ pub fn run(apis: &[Api], item: &str, cfg: &Config) -> Result<Report, String> {
             l.pump(Duration::from_millis(15));
         }
         let top = lives.iter().map(|l| l.seq()).max().unwrap_or(0);
-        if lives.iter().all(|l| l.synced() && l.seq() == top) { stable += 1 } else { stable = 0 }
+        if lives.iter().all(|l| l.synced() && l.seq() == top) {
+            stable += 1
+        } else {
+            stable = 0
+        }
     }
     // A client that joins now replays the whole log from the file's version.
     let mut joiner = Live::open(&apis[0], item, true)?;
@@ -191,12 +252,33 @@ pub fn run(apis: &[Api], item: &str, cfg: &Config) -> Result<Report, String> {
     for (i, l) in lives.iter().enumerate().skip(1) {
         if l.book != lives[0].book {
             clients_identical = false;
-            difference = difference.or_else(|| lives[0].book.first_difference(&l.book).map(|d| format!("client 0 vs client {i}: {d}")));
+            difference = difference.or_else(|| {
+                lives[0]
+                    .book
+                    .first_difference(&l.book)
+                    .map(|d| format!("client 0 vs client {i}: {d}"))
+            });
         }
     }
     let joiner_identical = joiner.book == lives[0].book && joiner.seq() == head_seq;
     if !joiner_identical {
-        difference = difference.or_else(|| lives[0].book.first_difference(&joiner.book).map(|d| format!("client 0 vs fresh joiner (seq {} vs {head_seq}): {d}", joiner.seq())).or_else(|| Some(format!("fresh joiner at seq {} vs {head_seq}", joiner.seq()))));
+        difference = difference.or_else(|| {
+            lives[0]
+                .book
+                .first_difference(&joiner.book)
+                .map(|d| {
+                    format!(
+                        "client 0 vs fresh joiner (seq {} vs {head_seq}): {d}",
+                        joiner.seq()
+                    )
+                })
+                .or_else(|| {
+                    Some(format!(
+                        "fresh joiner at seq {} vs {head_seq}",
+                        joiner.seq()
+                    ))
+                })
+        });
     }
     let mut totals = Stats::default();
     for l in &lives {
@@ -253,39 +335,102 @@ pub fn probe_conflicts(api_a: &Api, api_b: &Api, item: &str) -> Result<ProbeRepo
     let (r, c) = (40, 3);
     a.disconnect();
     b.disconnect();
-    a.set_cell(s, r, c, Some(CellData { v: Val::Text("typed by A".into()), ..Default::default() }));
-    b.set_cell(s, r, c, Some(CellData { st: Some(serde_json::json!({"bold": true})), ..Default::default() }));
+    a.set_cell(
+        s,
+        r,
+        c,
+        Some(CellData {
+            v: Val::Text("typed by A".into()),
+            ..Default::default()
+        }),
+    );
+    b.set_cell(
+        s,
+        r,
+        c,
+        Some(CellData {
+            st: Some(serde_json::json!({"bold": true})),
+            ..Default::default()
+        }),
+    );
     a.connect()?;
     a.wait_synced(Duration::from_secs(10));
     b.connect()?;
     wait(&mut a, &mut b);
     let end = a.book.cell(s, r, c).cloned().unwrap_or_default();
-    let (value_survived, format_survived) = (end.v == Val::Text("typed by A".into()), end.st.is_some());
+    let (value_survived, format_survived) =
+        (end.v == Val::Text("typed by A".into()), end.st.is_some());
     let same = a.book.cell(s, r, c) == b.book.cell(s, r, c);
-    let value_vs_format = format!("A typed a value, B made it bold, both offline; A reconnected first: final cell {} (clients agree: {same})", serde_json::to_string(&end).unwrap_or_default());
+    let value_vs_format = format!(
+        "A typed a value, B made it bold, both offline; A reconnected first: final cell {} (clients agree: {same})",
+        serde_json::to_string(&end).unwrap_or_default()
+    );
     // Value vs value.
     let (r2, c2) = (41, 3);
     a.disconnect();
     b.disconnect();
-    a.set_cell(s, r2, c2, Some(CellData { v: Val::Text("from A".into()), ..Default::default() }));
-    b.set_cell(s, r2, c2, Some(CellData { v: Val::Text("from B".into()), ..Default::default() }));
+    a.set_cell(
+        s,
+        r2,
+        c2,
+        Some(CellData {
+            v: Val::Text("from A".into()),
+            ..Default::default()
+        }),
+    );
+    b.set_cell(
+        s,
+        r2,
+        c2,
+        Some(CellData {
+            v: Val::Text("from B".into()),
+            ..Default::default()
+        }),
+    );
     a.connect()?;
     a.wait_synced(Duration::from_secs(10));
     b.connect()?;
     wait(&mut a, &mut b);
-    let end2 = a.book.cell(s, r2, c2).map(|d| crate::book::val_text(&d.v)).unwrap_or_default();
-    let value_vs_value = format!("A and B both typed in one cell, A reconnected first: final value '{end2}' (the later commit wins; B is not told that A's edit was replaced, A is not told that its edit was overwritten)");
+    let end2 = a
+        .book
+        .cell(s, r2, c2)
+        .map(|d| crate::book::val_text(&d.v))
+        .unwrap_or_default();
+    let value_vs_value = format!(
+        "A and B both typed in one cell, A reconnected first: final value '{end2}' (the later commit wins; B is not told that A's edit was replaced, A is not told that its edit was overwritten)"
+    );
     // Row insert above an edit.
     let (r3, c3) = (50, 1);
     a.disconnect();
     b.disconnect();
     a.edit(vec![Op::Rows { s, at: 45, n: 1 }]);
-    b.set_cell(s, r3, c3, Some(CellData { v: Val::Text("below the insert".into()), ..Default::default() }));
+    b.set_cell(
+        s,
+        r3,
+        c3,
+        Some(CellData {
+            v: Val::Text("below the insert".into()),
+            ..Default::default()
+        }),
+    );
     a.connect()?;
     a.wait_synced(Duration::from_secs(10));
     b.connect()?;
     wait(&mut a, &mut b);
-    let moved = a.book.cell(s, r3 + 1, c3).is_some_and(|d| d.v == Val::Text("below the insert".into())) && a.book.cell(s, r3, c3).is_none();
-    let insert_vs_edit = format!("A inserted a row at 46, B typed in row 51 concurrently: B's text ends up in row 52: {moved}");
-    Ok(ProbeReport { value_vs_format, value_survived, format_survived, value_vs_value, insert_vs_edit, insert_vs_edit_ok: moved && a.book == b.book })
+    let moved = a
+        .book
+        .cell(s, r3 + 1, c3)
+        .is_some_and(|d| d.v == Val::Text("below the insert".into()))
+        && a.book.cell(s, r3, c3).is_none();
+    let insert_vs_edit = format!(
+        "A inserted a row at 46, B typed in row 51 concurrently: B's text ends up in row 52: {moved}"
+    );
+    Ok(ProbeReport {
+        value_vs_format,
+        value_survived,
+        format_survived,
+        value_vs_value,
+        insert_vs_edit,
+        insert_vs_edit_ok: moved && a.book == b.book,
+    })
 }

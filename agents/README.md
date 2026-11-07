@@ -1,0 +1,103 @@
+# fsheets: headless FreedomOffice client (agents and scripted tests)
+
+Package `freedomsheets-agents`, library `fsheets`, binary `fsheets`. One client for tests and for
+agents (DECISIONS #9): sign in, list, open an item's live session over the WebSocket protocol of
+`cosync`, keep the cells in memory, send edits and presence.
+
+| Module | What |
+|---|---|
+| `api` | HTTP: login (password only in that one request), `/api/me`, root/children, content, upload, token file (0600) |
+| `live` | one live session: `Live::open`, `pump`, `edit`/`set_cell`, `send_presence`, `disconnect`/`connect` (resumes from the last seq, resends the unacknowledged batch), `synced()`. OT bookkeeping is `cosync::client::Session`, the code the app runs |
+| `book` | in-memory workbook: sheets, cells (values and formula text), row/column inserts and deletes; starting state read from the .xlsx with calamine |
+| `soak` | the multi-client harness and `probe_conflicts` |
+| `sample` | three sample workbooks (rust_xlsxwriter) |
+
+Agents are marked in presence: `agent=1` on the live URL makes the server set `Peer.agent`
+(`#[serde(default, skip_serializing_if = "Not::not")]`, so the wire format is unchanged for
+people and older apps). Tested in `server/tests/live.rs` and `cosync/src/tests.rs`.
+
+## Commands
+
+```
+fsheets login --server URL --user NAME --token-file F [--password-file F]   # password from file or stdin
+fsheets ls    --token-file F [--folder ID]
+fsheets cat   --token-file F --item ID [--sheet NAME]
+fsheets set   --token-file F --item ID --cell B7 (--value TEXT | --clear)
+fsheets soak  --server URL --item ID --users a,b,c --secrets-dir DIR [--clients 4] [--edits 150] [--seed N]
+fsheets probe --server URL --item ID --users a,b --secrets-dir DIR
+fsheets seed  --token-file F --folder ID
+```
+
+`soak`/`probe` read `DIR/<user>.pw`. Nothing takes a password as an argument.
+
+## Soak harness
+
+N clients (threads, one account each, cycled) edit the top-left 12x6 cells (so they collide),
+insert and delete rows and columns, send presence, and drop their connection at random
+(3% per action) and come back 0.1-0.6 s later while still editing offline. At the end every
+client must be synced to the same seq, and a freshly joined client (which replays the whole log
+from the file's version) must hold the same cell map. Pace is 40 ms per action because the
+server allows about 30 batches/s per connection (closes with 4429 beyond that).
+
+Test: `cargo test -p freedomsheets-agents` (server in-process on 127.0.0.1:0, temp data dir).
+
+Runs on this branch:
+
+| Where | Clients | Result |
+|---|---|---|
+| in-process test, seed 0x5eed | 3 x 80 actions | 211 ops in 138 batches, 138 acks, 276 remote batches applied, 5 forced disconnects/5 reconnects, converged yes (fresh joiner too), 3.5 s |
+| shared test instance (Tailscale, TLS), Budget.xlsx | 4 x 200 actions | 732 ops in 607 batches, 605 acks, 1821 remote batches applied, 18 forced disconnects/18 reconnects, final seq 607, 173 cells, converged yes (fresh joiner too), 9.9 s |
+
+## Shared test instance
+
+`agents/scripts/shared-test-setup.sh` reproduces the instance (idempotent): data in
+`~/freedomoffice-shared-test`, binds only the Tailscale address `100.x:8090` with the tailnet
+certificate (`tailscale cert`), user unit `freedomoffice-sharedtest.service`, org TestOrg,
+accounts testadmin (org admin), test-a..test-d and agent-claude (members), passwords from
+`openssl rand` in `secrets/<user>.pw` (0600, read through stdin/files only), the three samples
+(`Budget.xlsx`, `Tasks.xlsx`, `Grades.xlsx`) in TestOrg's folder. It backs the data up before
+replacing the binary and revokes the seeding token.
+
+## Formulas and .xlsx/.csv export with FreedomSheets' own engine (investigation)
+
+Finding: **`sheets` can get a `[lib]` target without egui.** Only `app/` (35 files),
+`live/conn.rs` and `main.rs` use egui/eframe. I tried it: a `sheets/src/lib.rs` declaring
+`chart, condfmt, filter, formula, hash, iconset, io, live, model, numfmt, page, pivot,
+sparkline, structure, table, validation, whatif` compiles (`cargo check --lib`) with exactly one
+change: `live/conn.rs` (egui `Context`, `crate::cloud::pct_encode`) gated behind a feature (or
+moved out). I reverted the experiment; nothing of it is committed.
+
+What the agent gets from it:
+- `io::xlsx_read::read` / `io::xlsx_write::write`, `io::delimited` (csv/tsv read and write): export and import identical to the app.
+- `formula::recalc`, `eval_formula`, `eval_expr`: the app's results for every function it supports.
+- `live::{assign_ids, join_workbook(file, state), decode_state, apply_ops, state_ops, encode_state, compare, contents}`: a real `Workbook` joined with the file *and the lossless live state*, remote ops applied exactly as the app does (with the `adj` formula adjustments, styles, merges, notes that `fsheets::book` skips), then recalculated.
+- Consequence: an agent can also answer the server's `Snapshot` request (upload workbook + state through `/live/snapshot`), which `fsheets` cannot do today.
+
+Recommended approach (M1b):
+1. Add `sheets/src/lib.rs` (package `freedom-sheets`, lib name `freedom_sheets`) re-exporting the headless modules; in `main.rs` replace `mod x;` by `use freedom_sheets::{x, ...};` so every `crate::x` path in `app/` keeps working. Gate `live::conn` behind `feature = "ui"` (default on for the app; `fsheets` depends with `default-features = false`). Platform bits already `cfg`: `page.rs` uses `windows-sys` only on Windows.
+2. Move `pct_encode` out of `cloud` (live/conn and crash use it).
+3. Keep `eframe`, `rfd`, `image` and winit out of the lib's dependencies (optional deps behind `ui`) so `fsheets` doesn't pull in the GUI stack.
+4. Replace `fsheets::book::Book` by `freedom_sheets::model::Workbook` plus `live::apply_ops`; keep `Book` only as the cheap read model if wanted. Add `fsheets eval "=SUM(A1:A5)"`, `export --format xlsx|csv`, `snapshot`.
+5. Fallbacks if the lib proves too invasive later: ask a live app peer (no protocol for it), or read cached values (formula cells carry no values on the wire; the file's cached values go stale).
+
+Today `fsheets cat` prints formula text for formula cells and does not calculate them.
+
+## Gap audit vs Excel Online
+
+Evidence is the harness (`probe`, `soak`) and the code on this branch.
+
+| Area | State | Evidence |
+|---|---|---|
+| Presence / cursors | **Done**, minus a few things. Selection, active cell, "editing" flag, colour slot and names are relayed (rate limit 15/s) and painted by the app (coloured borders, name flag for a few seconds). Agents appear with `agent: true` but the app does not yet show that (no robot badge). No cursor for a cell being edited inside the formula bar, no following ("jump to user"), presence is per sheet only. | `cosync::Presence`, `app/live_ui.rs::paint_presence`, test `agents_are_marked_and_see_each_other` |
+| Cell conflicts | **Gap (planned, DECISIONS #7).** A cell is one target: `Op::Cell` carries value, formula, style and rich text together, last committed wins. A value edit concurrent with a format edit of the same cell loses one of them. Probe result (A types a value, B makes the cell bold, both offline, A reconnects first): final cell `{"st":{"bold":true}}`, A's value is gone, no one is told. Same for two values: the later commit wins silently. Structural vs content works: a row inserted above a concurrent edit moves it (probe: true), and 80-action random soaks with row/column inserts and deletes converge. | `soak::probe_conflicts`, test `concurrent_edits_of_one_cell`, `cosync::Op::Cell`, `transform.rs` |
+| Offline / reconnect | **Partly.** Reconnect resumes from the last seq, resends the unacknowledged batch, duplicates are recognised by (cid, batch id): 18 forced reconnects in the 4-client run converged. Edits made offline are buffered in memory only: closing/killing the app loses unsent live ops; the app's AutoRecover writes a whole recovery .xlsx every 2 minutes when dirty, which is a copy to reopen, not a replay of ops into the session. There is a limit of what the server keeps (`Reload` when the base is too old): then pending changes are re-based as one batch, but conflicts are not shown. An agent that restarts loses its pending batch the same way. | `cosync::client::Session`, `app/mod.rs::autosave` (INTERVAL 120 s), `Live` in `agents/src/live.rs` |
+| Per-user undo under concurrency | **Done.** Undo is per person: a stack of inverse ops carried over other people's changes (`cosync::carry_down`), and a step is blocked when someone else changed what it would restore (like Excel). Redo likewise, 100 steps. Not covered by the headless harness (no undo in `fsheets`). | `app/live_ui.rs` (`Undo`, `live_undo`, `carry_down` at line ~1084) |
+| Autosave | **Partly.** Committed batches are stored in SQLite at once (nothing is lost on a server restart); the server asks one editor for a snapshot every 200 batches / 120 s of changes / after a pause, and that becomes a version. Without a GUI editor nobody answers: in the soak the server asked once and `fsheets` ignored it, so the saved *file* stays at the old version while the log grows (a new joiner replays the log, so nothing is lost, but downloads and the web preview show the old file). Fixed by the lib target above. | `server/src/live.rs` (`SNAPSHOT_*`, `maybe_ask_snapshot`), soak report "snapshot requests ignored" |
+| Version history | **Done server side**: every snapshot/save is a version (newest 25 plus the first of each day), restore and download exist; live restore is refused while a session runs (423). Gap: no per-user attribution inside a snapshot (a version is "modified by" the snapshotting client), and no "what changed" view, which Excel Online has. | `server/src/api.rs` versions endpoints, `live_busy` |
+| Comments | **Gap.** Only plain notes (`Op::Note` with text and author) exist; no threads, replies, resolve, @mentions or notifications. Planned as a new op kind (DECISIONS #8). | `cosync::Op::Note` |
+| Not tracked by `fsheets` | formats, merges, notes, column widths, features: counted as `ignored`; formula `adj`; the lossless live state when the file was last saved by an app session (starting state is then the .xlsx only). Convergence of those is covered by the app's own tests, not by this harness. | `book.rs`, `Live::prepare` notes |
+
+Other findings: the live WebSocket authenticates with the bearer token header (the ticket
+endpoint is for browsers); the server's rate limit (30 batches/s, burst 120) closes a client
+that exceeds it with 4429, so an agent must pace itself; the first reconnect needs no `v`
+(`Live` sends it only on the first join, otherwise a changed version would force a reload).

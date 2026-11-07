@@ -24,8 +24,15 @@ impl Drop for Srv {
 }
 
 fn start() -> Srv {
-    let dir = std::env::temp_dir().join(format!("fo-agents-test-{}", freedomoffice_server::util::new_id()));
-    let cfg = Config { data_dir: dir.join("data"), login_delay_ms: 10, ..Config::default() };
+    let dir = std::env::temp_dir().join(format!(
+        "fo-agents-test-{}",
+        freedomoffice_server::util::new_id()
+    ));
+    let cfg = Config {
+        data_dir: dir.join("data"),
+        login_delay_ms: 10,
+        ..Config::default()
+    };
     {
         let s = Store::open(&cfg.db_path(), &cfg.files_dir(), cfg.versions_to_keep).unwrap();
         for (u, admin) in [("alice", true), ("bob", false), ("carol", false)] {
@@ -34,16 +41,32 @@ fn start() -> Srv {
     }
     let run = spawn(cfg).unwrap();
     let url = run.url();
-    Srv { run: Some(run), dir, url }
+    Srv {
+        run: Some(run),
+        dir,
+        url,
+    }
 }
 
 /// A shared workbook (alice's, shared with bob and carol); returns each person's API and the item.
 fn shared_workbook(s: &Srv, sample_name: &str) -> (Vec<Api>, String) {
-    let apis: Vec<Api> = ["alice", "bob", "carol"].iter().map(|u| Api::login(&s.url, u, PW, "test").unwrap()).collect();
+    let apis: Vec<Api> = ["alice", "bob", "carol"]
+        .iter()
+        .map(|u| Api::login(&s.url, u, PW, "test").unwrap())
+        .collect();
     let root = apis[0].root().unwrap();
-    let item = apis[0].upload_new(&root, "Soak.xlsx", sample::make(sample_name).unwrap()).unwrap();
+    let item = apis[0]
+        .upload_new(&root, "Soak.xlsx", sample::make(sample_name).unwrap())
+        .unwrap();
     for u in ["bob", "carol"] {
-        let r = apis[0].send("POST", &format!("/api/items/{}/permissions", item.id), &[("Content-Type", "application/json")], Some(format!(r#"{{"username":"{u}","role":"edit"}}"#).into_bytes())).unwrap();
+        let r = apis[0]
+            .send(
+                "POST",
+                &format!("/api/items/{}/permissions", item.id),
+                &[("Content-Type", "application/json")],
+                Some(format!(r#"{{"username":"{u}","role":"edit"}}"#).into_bytes()),
+            )
+            .unwrap();
         assert!(r.ok(), "{}", r.status);
     }
     (apis, item.id)
@@ -53,12 +76,22 @@ fn shared_workbook(s: &Srv, sample_name: &str) -> (Vec<Api>, String) {
 fn three_clients_converge_with_disconnects() {
     let s = start();
     let (apis, item) = shared_workbook(&s, "budget");
-    let cfg = soak::Config { clients: 3, edits: 80, seed: 0x5eed, interval_ms: 25, disconnect_pct: 4.0, ..Default::default() };
+    let cfg = soak::Config {
+        clients: 3,
+        edits: 80,
+        seed: 0x5eed,
+        interval_ms: 25,
+        disconnect_pct: 4.0,
+        ..Default::default()
+    };
     let report = soak::run(&apis, &item, &cfg).unwrap();
     report.print();
     assert!(report.converged(), "{:?}", report.difference);
     assert!(report.totals.ops_sent > 100, "{report:?}");
-    assert!(report.forced_disconnects > 0 && report.totals.reconnects > 0, "no reconnects happened: {report:?}");
+    assert!(
+        report.forced_disconnects > 0 && report.totals.reconnects > 0,
+        "no reconnects happened: {report:?}"
+    );
     assert!(report.head_seq > 0);
 }
 
@@ -85,8 +118,19 @@ fn agents_are_marked_and_see_each_other() {
     assert!(b.peers.values().any(|p| p.user == "alice" && p.agent));
     // The starting state comes from the xlsx and an edit reaches the other client.
     let sheet = a.book.ordered()[0].0;
-    assert_eq!(a.book.cell(sheet, 0, 0).map(|c| c.v.clone()), Some(cosync::Val::Text("Student".into())));
-    a.set_cell(sheet, 20, 0, Some(cosync::CellData { v: cosync::Val::Text("hi".into()), ..Default::default() }));
+    assert_eq!(
+        a.book.cell(sheet, 0, 0).map(|c| c.v.clone()),
+        Some(cosync::Val::Text("Student".into()))
+    );
+    a.set_cell(
+        sheet,
+        20,
+        0,
+        Some(cosync::CellData {
+            v: cosync::Val::Text("hi".into()),
+            ..Default::default()
+        }),
+    );
     assert!(a.wait_synced(std::time::Duration::from_secs(5)));
     b.pump(std::time::Duration::from_millis(300));
     assert_eq!(b.book.cell(sheet, 20, 0), a.book.cell(sheet, 20, 0));

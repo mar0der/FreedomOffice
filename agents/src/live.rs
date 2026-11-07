@@ -68,7 +68,14 @@ pub struct Live {
 }
 
 fn version_of_etag(etag: &str) -> Option<i64> {
-    etag.trim().trim_start_matches("W/").trim_matches('"').strip_prefix('v')?.split('-').next()?.parse().ok()
+    etag.trim()
+        .trim_start_matches("W/")
+        .trim_matches('"')
+        .strip_prefix('v')?
+        .split('-')
+        .next()?
+        .parse()
+        .ok()
 }
 
 fn would_block(e: &tungstenite::Error) -> bool {
@@ -86,7 +93,10 @@ impl Live {
     /// Like `open`, without connecting.
     pub fn prepare(api: &Api, item: &str, agent: bool) -> Result<Live, String> {
         let r = api.content(item)?;
-        let seq: u64 = r.header("x-live-seq").and_then(|v| v.parse().ok()).ok_or("This server doesn't support live co-editing.")?;
+        let seq: u64 = r
+            .header("x-live-seq")
+            .and_then(|v| v.parse().ok())
+            .ok_or("This server doesn't support live co-editing.")?;
         let version = match r.header("etag").and_then(version_of_etag) {
             Some(v) => v,
             None => api.item(item)?.version,
@@ -98,7 +108,11 @@ impl Live {
         }
         let mut cid = [0u8; 6];
         getrandom::fill(&mut cid).map_err(|e| e.to_string())?;
-        let cid = format!("{}-{}", if agent { "agent" } else { "client" }, cid.iter().map(|b| format!("{b:02x}")).collect::<String>());
+        let cid = format!(
+            "{}-{}",
+            if agent { "agent" } else { "client" },
+            cid.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        );
         let mut sess = Session::new(cid.clone(), seq);
         sess.offline();
         Ok(Live {
@@ -144,16 +158,32 @@ impl Live {
         if let Some(why) = &self.stopped {
             return Err(why.clone());
         }
-        let url = self.api.live_url(&self.item, self.sess.seq, if self.welcomed { None } else { self.version }, &self.cid, self.agent);
+        let url = self.api.live_url(
+            &self.item,
+            self.sess.seq,
+            if self.welcomed { None } else { self.version },
+            &self.cid,
+            self.agent,
+        );
         let mut req = url.into_client_request().map_err(|e| e.to_string())?;
-        req.headers_mut().insert("Authorization", format!("Bearer {}", self.api.token).parse().map_err(|_| "Invalid sign-in token.".to_string())?);
+        req.headers_mut().insert(
+            "Authorization",
+            format!("Bearer {}", self.api.token)
+                .parse()
+                .map_err(|_| "Invalid sign-in token.".to_string())?,
+        );
         let (ws, _) = tungstenite::connect(req).map_err(|e| match e {
-            tungstenite::Error::Http(r) => format!("The server refused the live connection (HTTP {})", r.status().as_u16()),
+            tungstenite::Error::Http(r) => format!(
+                "The server refused the live connection (HTTP {})",
+                r.status().as_u16()
+            ),
             e => format!("Couldn't open the live connection ({e})"),
         })?;
         match ws.get_ref() {
             MaybeTlsStream::Plain(s) => s.set_read_timeout(Some(Duration::from_millis(20))),
-            MaybeTlsStream::NativeTls(s) => s.get_ref().set_read_timeout(Some(Duration::from_millis(20))),
+            MaybeTlsStream::NativeTls(s) => s
+                .get_ref()
+                .set_read_timeout(Some(Duration::from_millis(20))),
             _ => Ok(()),
         }
         .map_err(|e| e.to_string())?;
@@ -164,7 +194,9 @@ impl Live {
             self.stats.reconnects += 1;
         }
         self.stats.connects += 1;
-        self.send(ClientMsg::Hello { sheets: self.book.sheet_ids() });
+        self.send(ClientMsg::Hello {
+            sheets: self.book.sheet_ids(),
+        });
         Ok(())
     }
 
@@ -192,7 +224,11 @@ impl Live {
         if !resend {
             self.stats.ops_sent += b.ops.len() as u64;
         }
-        self.send(ClientMsg::Ops { base: b.base, id: b.id, ops: b.ops });
+        self.send(ClientMsg::Ops {
+            base: b.base,
+            id: b.id,
+            ops: b.ops,
+        });
     }
 
     /// The connection ended.
@@ -228,7 +264,10 @@ impl Live {
                 },
                 Ok(Message::Close(f)) => {
                     let _ = ws.flush();
-                    self.lost(f.as_ref().map(|f| f.code.into()), f.map(|f| f.reason.to_string()).unwrap_or_default());
+                    self.lost(
+                        f.as_ref().map(|f| f.code.into()),
+                        f.map(|f| f.reason.to_string()).unwrap_or_default(),
+                    );
                 }
                 Ok(_) => {}
                 Err(e) if would_block(&e) => {}
@@ -265,7 +304,9 @@ impl Live {
                 self.catch_target = seq;
                 self.check_caught_up();
             }
-            ServerMsg::Ops { seq, cid, id, ops, .. } => {
+            ServerMsg::Ops {
+                seq, cid, id, ops, ..
+            } => {
                 let step = self.sess.remote(seq, &cid, id, ops);
                 self.stepped(step);
                 self.check_caught_up();
@@ -314,7 +355,11 @@ impl Live {
     }
 
     fn check_caught_up(&mut self) {
-        if self.welcomed && !self.caught_up && self.ws.is_some() && self.sess.seq >= self.catch_target {
+        if self.welcomed
+            && !self.caught_up
+            && self.ws.is_some()
+            && self.sess.seq >= self.catch_target
+        {
             self.caught_up = true;
             let had = self.sess.inflight.is_some();
             if let Some(b) = self.sess.resume() {
@@ -336,12 +381,29 @@ impl Live {
     }
 
     pub fn set_cell(&mut self, s: SheetId, r: u32, c: u32, data: Option<CellData>) {
-        self.edit(vec![Op::Cell { s, r, c, v: data.map(Box::new), adj: vec![] }]);
+        self.edit(vec![Op::Cell {
+            s,
+            r,
+            c,
+            v: data.map(Box::new),
+            adj: vec![],
+        }]);
     }
 
     pub fn send_presence(&mut self, s: SheetId, r: u32, c: u32, editing: bool) {
         self.stats.presence_sent += 1;
-        let p = Presence { s, r, c, sel: Rect { r1: r, c1: c, r2: r, c2: c }, editing };
+        let p = Presence {
+            s,
+            r,
+            c,
+            sel: Rect {
+                r1: r,
+                c1: c,
+                r2: r,
+                c2: c,
+            },
+            editing,
+        };
         self.send(ClientMsg::Presence { p });
     }
 }
