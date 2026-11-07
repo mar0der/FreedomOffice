@@ -335,31 +335,44 @@ fn command_candidates(cmd: &str) -> Vec<String> {
     out
 }
 
-/// `C:\...`, `C:/...` or `\\server\...` (relative names are looked up on PATH).
+/// What the takeover check may ask about this computer (the real disk on Windows; stand-ins in
+/// tests).
 #[cfg_attr(not(windows), allow(dead_code))]
-fn absolute_windows_path(p: &str) -> bool {
-    let b = p.as_bytes();
-    (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')) || p.starts_with("\\\\")
+pub struct Disk<'a> {
+    /// A file is there.
+    pub exists: &'a dyn Fn(&str) -> bool,
+    /// The drive letter is a network drive (`GetDriveTypeW` = `DRIVE_REMOTE`).
+    pub remote_drive: &'a dyn Fn(char) -> bool,
 }
 
-/// The registered program is gone: every program the command may run is an absolute path
-/// (no environment variables) that `exists` says isn't there.
+/// A path on a local drive whose absence is meaningful: `C:\...` or `C:/...` on a drive that
+/// isn't a network drive. Never UNC or device paths (`\\server\...`, `//server/...`,
+/// `\\?\UNC\...`, `\\?\...`): a share that can't be reached right now isn't an uninstall.
+/// Relative names (looked up on PATH) don't count either.
 #[cfg_attr(not(windows), allow(dead_code))]
-fn handler_missing(cmd: &str, exists: &dyn Fn(&str) -> bool) -> bool {
+fn local_drive_path(p: &str, disk: &Disk) -> bool {
+    let b = p.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/') && !(disk.remote_drive)(b[0].to_ascii_uppercase() as char)
+}
+
+/// The registered program is gone: every program the command may run is on a local drive
+/// (no environment variables) and isn't there.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn handler_missing(cmd: &str, disk: &Disk) -> bool {
     let c = command_candidates(cmd);
-    !c.is_empty() && c.iter().all(|p| !p.is_empty() && !p.contains('%') && absolute_windows_path(p) && !exists(p))
+    !c.is_empty() && c.iter().all(|p| !p.is_empty() && !p.contains('%') && local_drive_path(p, disk) && !(disk.exists)(p))
 }
 
 /// Whether to (re)write the scheme registration: only when no handler is registered, the
 /// registered one is this same program (moved files re-register), or the registered program no
 /// longer exists (uninstalled). Another installed handler is never taken over. `existing`:
 /// `None` when the key is missing, else its command (`None` when it has none or it can't be
-/// read). `exists`: whether a file is there (the disk on Windows; a stand-in in tests).
+/// read). Only a program on a local drive counts as gone (see `local_drive_path`).
 #[cfg_attr(not(windows), allow(dead_code))]
-pub fn should_register(existing: Option<Option<&str>>, exe: &str, exists: &dyn Fn(&str) -> bool) -> bool {
+pub fn should_register(existing: Option<Option<&str>>, exe: &str, disk: &Disk) -> bool {
     match existing {
         None => true,
-        Some(Some(cmd)) => same_path(command_program(cmd), exe) || handler_missing(cmd, exists),
+        Some(Some(cmd)) => same_path(command_program(cmd), exe) || handler_missing(cmd, disk),
         Some(None) => false,
     }
 }
@@ -387,7 +400,7 @@ pub fn register_windows_handler() {
             let sub = wide(&format!("{SCHEME}\\shell\\open\\command"));
             let mut size = 0u32;
             let rc = RegGetValueW(HKEY_CLASSES_ROOT, sub.as_ptr(), std::ptr::null(), RRF_RT_REG_SZ, std::ptr::null_mut(), std::ptr::null_mut(), &mut size);
-            if rc != 0 || size < 2 || size > 64 * 1024 {
+            if rc != 0 || !(2..=64 * 1024).contains(&size) {
                 Some(None)
             } else {
                 let mut buf = vec![0u16; (size as usize).div_ceil(2)];
@@ -401,7 +414,15 @@ pub fn register_windows_handler() {
             }
         }
     };
-    if !should_register(existing.as_ref().map(|o| o.as_deref()), &exe, &|p| std::path::Path::new(p).is_file()) {
+    // Missing means "not found"; any other answer (access denied, drive not ready) keeps it.
+    let exists = |p: &str| std::fs::metadata(p).map_or_else(|e| e.kind() != std::io::ErrorKind::NotFound, |_| true);
+    let remote_drive = |letter: char| {
+        const DRIVE_REMOTE: u32 = 4;
+        let root = wide(&format!("{letter}:\\"));
+        unsafe { windows_sys::Win32::Storage::FileSystem::GetDriveTypeW(root.as_ptr()) == DRIVE_REMOTE }
+    };
+    let disk = Disk { exists: &exists, remote_drive: &remote_drive };
+    if !should_register(existing.as_ref().map(|o| o.as_deref()), &exe, &disk) {
         return;
     }
     let base = format!("Software\\Classes\\{SCHEME}");
@@ -551,7 +572,8 @@ mod tests {
     #[test]
     fn windows_registration_never_takes_over_another_handler() {
         let exe = r"C:\Program Files\FreedomOffice\FreedomSheets.exe";
-        let all = |_: &str| true;
+        let local = |_: char| false;
+        let all = Disk { exists: &|_: &str| true, remote_drive: &local };
         assert!(should_register(None, exe, &all), "nothing registered");
         assert!(should_register(Some(Some(&handler_command(exe))), exe, &all), "ours");
         assert!(should_register(Some(Some(r#""c:/program files/freedomoffice/freedomsheets.exe" "%1""#)), exe, &all), "ours, other spelling");
@@ -586,22 +608,56 @@ mod tests {
     #[test]
     fn windows_registration_replaces_a_handler_that_is_gone() {
         let exe = r"C:\Users\ann\FreedomSheets.exe";
-        let none = |_: &str| false;
-        let only = |there: &'static str| move |p: &str| p.eq_ignore_ascii_case(there);
-        // The registered program was uninstalled (quoted, unquoted, UNC).
-        assert!(should_register(Some(Some(r#""C:\Old\FreedomSheets.exe" "%1""#)), exe, &none));
-        assert!(should_register(Some(Some(r"C:\Old\Sheets.exe %1")), exe, &none));
-        assert!(should_register(Some(Some(r#""\\nas\apps\handler.exe" "%1""#)), exe, &none));
+        let gone = |_: &str| false;
+        let local = |_: char| false;
+        let none = Disk { exists: &gone, remote_drive: &local };
+        let reg = |cmd: &str, disk: &Disk| should_register(Some(Some(cmd)), exe, disk);
+        // The registered program was uninstalled from a local drive (quoted, unquoted, C:/).
+        assert!(reg(r#""C:\Old\FreedomSheets.exe" "%1""#, &none));
+        assert!(reg(r"C:\Old\Sheets.exe %1", &none));
+        assert!(reg(r#""d:/apps/handler.exe" "%1""#, &none));
         // Still installed: kept.
-        assert!(!should_register(Some(Some(r#""C:\Old\FreedomSheets.exe" "%1""#)), exe, &only(r"C:\Old\FreedomSheets.exe")));
+        let old = |p: &str| p.eq_ignore_ascii_case(r"C:\Old\FreedomSheets.exe");
+        assert!(!reg(r#""C:\Old\FreedomSheets.exe" "%1""#, &Disk { exists: &old, remote_drive: &local }));
         // Unquoted with spaces: Windows also tries "C:\Program Files\Other\h.exe"; it's there.
-        assert!(!should_register(Some(Some(r"C:\Program Files\Other\h.exe %1")), exe, &only(r"C:\Program Files\Other\h.exe")));
-        assert!(!should_register(Some(Some(r"C:\Program Files\Other\h %1")), exe, &only(r"C:\Program Files\Other\h.exe")));
+        let other = |p: &str| p.eq_ignore_ascii_case(r"C:\Program Files\Other\h.exe");
+        let other = Disk { exists: &other, remote_drive: &local };
+        assert!(!reg(r"C:\Program Files\Other\h.exe %1", &other));
+        assert!(!reg(r"C:\Program Files\Other\h %1", &other));
         // Can't tell: names looked up on PATH, environment variables, empty or unreadable.
-        assert!(!should_register(Some(Some("rundll32 url.dll,FileProtocolHandler %1")), exe, &none));
-        assert!(!should_register(Some(Some(r#""%ProgramFiles%\Other\h.exe" "%1""#)), exe, &none));
-        assert!(!should_register(Some(Some(r#""" "%1""#)), exe, &none));
-        assert!(!should_register(Some(Some("")), exe, &none));
+        assert!(!reg("rundll32 url.dll,FileProtocolHandler %1", &none));
+        assert!(!reg(r#""%ProgramFiles%\Other\h.exe" "%1""#, &none));
+        assert!(!reg(r#""" "%1""#, &none));
+        assert!(!reg("", &none));
         assert!(!should_register(Some(None), exe, &none));
+    }
+
+    #[test]
+    fn windows_registration_keeps_handlers_on_network_paths() {
+        let exe = r"C:\Users\ann\FreedomSheets.exe";
+        let gone = |_: &str| false;
+        let local = |_: char| false;
+        let none = Disk { exists: &gone, remote_drive: &local };
+        let reg = |cmd: &str, disk: &Disk| should_register(Some(Some(cmd)), exe, disk);
+        // UNC and device paths: a share that can't be reached now isn't an uninstall.
+        for cmd in [
+            r#""\\nas\apps\handler.exe" "%1""#,
+            r"\\nas\apps\handler.exe %1",
+            r#""//nas/apps/handler.exe" "%1""#,
+            r#""\\?\UNC\nas\apps\handler.exe" "%1""#,
+            r#""\\?\C:\Old\handler.exe" "%1""#,
+            r#""\\.\C:\Old\handler.exe" "%1""#,
+        ] {
+            assert!(!reg(cmd, &none), "{cmd}");
+        }
+        // A mapped network drive (Z:): kept; the same path on a local drive is replaced.
+        let z_remote = |d: char| d == 'Z';
+        let mapped = Disk { exists: &gone, remote_drive: &z_remote };
+        assert!(!reg(r#""Z:\apps\handler.exe" "%1""#, &mapped));
+        assert!(!reg(r#""z:/apps/handler.exe" "%1""#, &mapped), "drive letters in either case");
+        assert!(reg(r#""Y:\apps\handler.exe" "%1""#, &mapped));
+        assert!(reg(r#""Z:\apps\handler.exe" "%1""#, &none));
+        // Our own exe is still re-registered from anywhere.
+        assert!(should_register(Some(Some(r#""\\nas\apps\FreedomSheets.exe" "%1""#)), r"\\nas\apps\FreedomSheets.exe", &none));
     }
 }
