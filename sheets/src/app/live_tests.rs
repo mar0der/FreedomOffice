@@ -347,6 +347,34 @@ fn against_a_protocol_1_server_only_whole_cells_are_sent() {
     let last32 = cells.iter().rev().find(|o| matches!(o, Op::Cell { r: 32, .. })).unwrap();
     assert!(matches!(last32, Op::Cell { v: Some(d), .. } if d.v.is_empty() && d.st.is_some()));
     assert!(app.live_errors().is_empty());
+    // Such a server has no comments either.
+    assert!(app.comment_add(1, 1, "hello").is_none());
+    assert!(app.status.as_deref().is_some_and(|s| s.contains("can't share comments")), "{:?}", app.status);
+}
+
+/// Against the previous server (protocol 2: split cells, no comments) cells are sent as usual, and a
+/// comment is refused with a message instead of sending operations that server would reject.
+#[test]
+fn against_a_protocol_2_server_comments_are_off() {
+    use cosync::Op;
+    let (_ctx, mut app) = super::data_ui::sample_app();
+    app.live_for_test();
+    let you = cosync::Peer { id: 1, name: "Me".into(), user: "me".into(), editor: true, ..Default::default() };
+    let welcome: cosync::ServerMsg = serde_json::from_value(serde_json::json!({ "t": "welcome", "seq": 0, "you": you, "peers": [], "proto": 2 })).unwrap();
+    app.live_event_for_test(crate::live::conn::Event::Msg(welcome));
+    type_at(&mut app, 30, 0, "typed");
+    app.live_flush();
+    assert!(app.live_pending_ops().iter().all(|o| matches!(o, Op::Content { .. })), "{:?}", app.live_pending_ops());
+    assert!(app.comment_add(1, 1, "hello").is_none());
+    assert!(app.status.as_deref().is_some_and(|s| s.contains("can't share comments")), "{:?}", app.status);
+    assert!(app.live_pending_ops().iter().all(|o| !o.is_thread_op()));
+    // The same app against a current server can.
+    let welcome: cosync::ServerMsg = serde_json::from_value(serde_json::json!({ "t": "welcome", "seq": 0, "you": you, "peers": [], "proto": 3 })).unwrap();
+    app.live_event_for_test(crate::live::conn::Event::Msg(welcome));
+    assert!(app.comment_add(1, 1, "hello").is_some());
+    app.live_flush();
+    assert!(app.live_pending_ops().iter().any(|o| matches!(o, Op::ThreadAdd { .. })));
+    assert!(app.live_errors().is_empty());
 }
 
 /// An editor made a viewer while changes are unsent: the session ends (instead of resending

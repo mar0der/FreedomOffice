@@ -390,3 +390,26 @@ fn undo_only_reverts_your_own_text() {
     assert_eq!(a.cell_data(sheet, r2, c2).and_then(|d| d.st), bold, "B's format survives A's undo");
     assert!(a.differences(&b).is_empty(), "{:?}", a.differences(&b));
 }
+
+/// Comment actions (threads, replies, edits, resolves, deletes, including the owner deleting
+/// others' comments) mixed into the usual edits, structure changes and disconnects: every
+/// client and a fresh joiner end with the same threads.
+#[test]
+fn comment_actions_converge_under_the_soak() {
+    let s = start();
+    let (apis, item) = shared_workbook(&s, "budget");
+    let cfg = soak::Config {
+        clients: 3,
+        edits: 90,
+        seed: 0xc033e27,
+        interval_ms: 25,
+        disconnect_pct: 4.0,
+        comment_pct: 35.0,
+        ..Default::default()
+    };
+    let report = soak::run(&apis, &item, &cfg).unwrap();
+    report.print();
+    assert!(report.converged(), "{:?}", report.difference);
+    assert!(report.comment_actions > 40, "{report:?}");
+    assert!(report.threads > 0, "{report:?}");
+}
