@@ -53,6 +53,7 @@ pub fn routes() -> Router<App> {
         .route("/admin/people/{username}/sign-out", post(sign_out_everywhere))
         .route("/admin/people/{username}/admin", post(set_super_admin))
         .route("/admin/people/{username}/sessions/{kind}/{id}/revoke", post(revoke_sign_in))
+        .route("/admin/audit", get(audit_page))
 }
 
 // ---------------------------------------------------------------------------
@@ -227,6 +228,9 @@ fn nav_for(me: &User, manages: bool) -> Vec<(&'static str, &'static str)> {
     }
     if me.is_admin {
         v.push(("/admin/people", "People"));
+    }
+    if manages {
+        v.push(("/admin/audit", "Audit log"));
     }
     v.push(("/admin/password", "Password"));
     v
@@ -1179,6 +1183,105 @@ async fn revoke_sign_in(State(app): State<App>, headers: HeaderMap, Path((userna
 }
 
 // ---------------------------------------------------------------------------
+// Audit log
+// ---------------------------------------------------------------------------
+
+/// The groups of audit actions offered in the filter (`action=org` lists every `org.*`).
+const AUDIT_GROUPS: &[(&str, &str)] = &[
+    ("sign_in", "Sign-ins"),
+    ("sign_out", "Sign-outs"),
+    ("password", "Passwords"),
+    ("account", "Accounts"),
+    ("org", "Organisations"),
+    ("member", "Members"),
+    ("invite", "Invites"),
+    ("permission", "Sharing"),
+    ("link", "Share links"),
+    ("item", "Files and folders"),
+    ("file", "Uploads"),
+];
+
+/// `GET /admin/audit?org=&user=&action=&before=`: newest first, 50 per page. The server
+/// administrator sees every event; an org owner/admin those of the organisations they manage
+/// (`api::audit_as`).
+async fn audit_page(State(app): State<App>, headers: HeaderMap, Query(q): Query<HashMap<String, String>>) -> Response {
+    show(&app, &headers, false, move |s, ctx| {
+        let mut f = api::AuditFilter::from_query(&q)?;
+        f.limit = 50;
+        let (events, managed) = api::audit_as(s, &ctx.me, &f)?;
+        let mut body = String::new();
+        if !ctx.me.is_admin {
+            body.push_str("<p class=\"muted\">Events of the organisations you manage.</p>");
+        }
+        // Filters (a GET form: nothing changes, so no CSRF token).
+        let mut orgs = String::from("<option value=\"\">All</option>");
+        for o in &managed {
+            let sel = if f.org == o.id || f.org.eq_ignore_ascii_case(&o.name) { " selected" } else { "" };
+            orgs.push_str(&format!("<option value=\"{}\"{sel}>{}</option>", esc(&o.id), esc(&o.name)));
+        }
+        let mut actions = String::from("<option value=\"\">All</option>");
+        let mut known = false;
+        for (a, label) in AUDIT_GROUPS {
+            let sel = if f.action == *a { " selected" } else { "" };
+            known |= f.action == *a;
+            actions.push_str(&format!("<option value=\"{a}\"{sel}>{label}</option>"));
+        }
+        if !known && !f.action.is_empty() {
+            actions.push_str(&format!("<option value=\"{0}\" selected>{0}</option>", esc(&f.action)));
+        }
+        body.push_str(&format!(
+            "<form method=\"get\" action=\"/admin/audit\" class=\"row\">\
+             <label>Person<input name=\"user\" value=\"{}\" maxlength=\"64\" autocapitalize=\"none\" spellcheck=\"false\"></label>\
+             <label>Organisation<select name=\"org\">{orgs}</select></label>\
+             <label>What<select name=\"action\">{actions}</select></label>\
+             <button type=\"submit\">Show</button></form>",
+            esc(&f.user)
+        ));
+        if events.is_empty() {
+            body.push_str("<p class=\"muted\">No events.</p>");
+        } else {
+            let mut rows = String::new();
+            for e in &events {
+                let org = e.org_id.as_deref().and_then(|o| s.org(o).ok().flatten()).map(|o| esc(&o.name)).unwrap_or_default();
+                let actor = if e.actor_name.is_empty() {
+                    if e.actor_id.starts_with("link:") { "<span class=\"muted\">share link</span>".to_string() } else { "<span class=\"muted\">-</span>".to_string() }
+                } else {
+                    esc(&e.actor_name)
+                };
+                rows.push_str(&format!(
+                    "<tr><td class=\"nowrap\">{}</td><td>{actor}</td><td><code>{}</code></td><td>{}</td><td>{org}</td><td>{}</td><td class=\"muted\">{}</td></tr>",
+                    when(e.at),
+                    esc(&e.action),
+                    esc(&e.target_user),
+                    esc(&e.detail),
+                    esc(&e.ip)
+                ));
+            }
+            body.push_str(&format!(
+                "<div class=\"table\"><table><thead><tr><th>When</th><th>Who</th><th>What</th><th>Person</th><th>Organisation</th><th>Details</th><th>Address</th></tr></thead><tbody>{rows}</tbody></table></div>"
+            ));
+        }
+        // Paging: the filters stay, `before` moves on.
+        let keep = format!("user={}&org={}&action={}", pct(&f.user), pct(&f.org), pct(&f.action));
+        let mut pages = String::new();
+        if f.before.is_some() {
+            pages.push_str(&format!("<a href=\"/admin/audit?{}\">Newest</a> ", esc(&keep)));
+        }
+        if events.len() == f.limit
+            && let Some(last) = events.last()
+        {
+            pages.push_str(&format!("<a href=\"/admin/audit?{}&amp;before={}\">Older</a>", esc(&keep), last.id));
+        }
+        if !pages.is_empty() {
+            body.push_str(&format!("<p>{pages}</p>"));
+        }
+        body.push_str(&format!("<p class=\"muted\">Events are kept for {} days. Passwords, tokens and file contents are never recorded.</p>", crate::store::AUDIT_KEEP_DAYS));
+        Ok(Page::ok("Audit log", body))
+    })
+    .await
+}
+
+// ---------------------------------------------------------------------------
 // Style (served from /admin/style.css: the CSP allows no inline styles)
 // ---------------------------------------------------------------------------
 
@@ -1199,7 +1302,7 @@ h1{font-size:1.6rem;margin:.5rem 0 1rem}h2{font-size:1.2rem;margin:2rem 0 .75rem
 .stat{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:.75rem 1rem}.stat .label{display:block;color:var(--muted);font-size:.85rem}.stat .value{font-size:1.5rem;font-weight:600}
 .table{overflow-x:auto;background:var(--card);border:1px solid var(--line);border-radius:8px}
 table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:.55rem .75rem;border-bottom:1px solid var(--line);vertical-align:top}tbody tr:last-child td{border-bottom:0}th{font-size:.85rem;color:var(--muted);font-weight:600}
-.num{text-align:right;white-space:nowrap}.actions{white-space:nowrap;text-align:right}
+.num{text-align:right;white-space:nowrap}.actions{white-space:nowrap;text-align:right}.nowrap{white-space:nowrap}code{font:.85rem ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:.75rem}.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:1rem}
 form.stack{display:flex;flex-direction:column;gap:.6rem}form.narrow{max-width:420px}
 form.row{display:flex;flex-wrap:wrap;align-items:flex-end;gap:.6rem;margin:.5rem 0}

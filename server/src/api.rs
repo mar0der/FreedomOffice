@@ -81,6 +81,25 @@ impl App {
         &self.cfg
     }
 
+    /// Background upkeep while the server runs: audit events older than
+    /// `store::AUDIT_KEEP_DAYS` are deleted at start and then once a day.
+    pub fn start_maintenance(&self) {
+        let store = Arc::downgrade(&self.store);
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(Duration::from_secs(24 * 3600));
+            loop {
+                every.tick().await;
+                let Some(store) = store.upgrade() else { break };
+                let r = tokio::task::spawn_blocking(move || store.lock().unwrap_or_else(|e| e.into_inner()).prune_audit()).await;
+                match r {
+                    Ok(Ok(n)) if n > 0 => tracing::info!("pruned {n} audit event(s) older than {} days", crate::store::AUDIT_KEEP_DAYS),
+                    Ok(Err(e)) => tracing::error!("couldn't prune the audit log: {e}"),
+                    _ => {}
+                }
+            }
+        });
+    }
+
     /// Password hashing or checking (Argon2): never under the store lock, at most one per core
     /// at a time (waiting requests hold no thread and no memory).
     pub(crate) async fn argon<T: Send + 'static>(&self, f: impl FnOnce() -> T + Send + 'static) -> Result<T, ApiError> {

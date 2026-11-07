@@ -32,7 +32,9 @@ pub async fn serve_on(cfg: Config, tcp: tokio::net::TcpListener, shutdown: impl 
     let store = open_store(&cfg)?;
     let tls = cfg.tls()?;
     let local = tcp.local_addr().map_err(|e| e.to_string())?;
-    let app = api::router(api::App::new(store, cfg.clone()));
+    let state = api::App::new(store, cfg.clone());
+    state.start_maintenance();
+    let app = api::router(state);
     let svc = app.into_make_service_with_connect_info::<api::Peer>();
     match tls {
         Tls::None => {

@@ -2549,6 +2549,82 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Schema 2 -> 3: existing admin sessions stay admin sessions, web sessions and the audit
+    /// log work, and it is one way (a version 2 server refuses the database).
+    #[test]
+    fn migrates_a_schema_2_database() {
+        let dir = temp();
+        let (db, files) = (dir.join("freedomoffice.db"), dir.join("files"));
+        let (admin_secret, uid);
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+            conn.execute_batch(SCHEMA_V0).unwrap();
+            conn.execute_batch(MIGRATION_V1).unwrap();
+            conn.execute_batch(MIGRATION_V2).unwrap();
+            conn.execute_batch("PRAGMA user_version = 2").unwrap();
+            std::fs::create_dir_all(&files).unwrap();
+            let s = Store { conn, files: files.clone(), versions_to_keep: 25, allow_links: true, request_ip: String::new() };
+            let u = s.create_user("ann", "Ann", "", "old-password-123", true).unwrap();
+            // What the version 2 code wrote: no kind column.
+            let t = util::new_token();
+            s.conn
+                .execute("INSERT INTO admin_sessions (user_id, hash, agent, created, expires, last_used) VALUES (?1, ?2, '', ?3, ?4, ?3)", params![u.id, util::token_hash(&t), now(), now() + 3600])
+                .unwrap();
+            assert!(s.conn.prepare("SELECT 1 FROM audit").is_err(), "a real schema 2 database");
+            (admin_secret, uid) = (t, u.id);
+        }
+        let s = Store::open(&db, &files, 25).unwrap();
+        assert_eq!(s.conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 3);
+        assert_eq!(s.admin_session(&admin_secret).unwrap().unwrap().1.kind, SessionKind::Admin);
+        assert!(s.web_session(&admin_secret).unwrap().is_none(), "an admin session is no web session");
+        let web = s.create_session(&uid, "browser", SessionKind::Web).unwrap();
+        assert!(s.web_session(&web).unwrap().is_some());
+        assert!(s.admin_session(&web).unwrap().is_none(), "and the other way round");
+        s.audit(Audit::anonymous("sign_in.failed", "").target("ann")).unwrap();
+        assert_eq!(s.audit_events(&AuditQuery { limit: 10, ..Default::default() }).unwrap().len(), 1);
+        drop(s);
+        // A version 2 server refuses it: its `migrate` stops at any user_version above 2.
+        let conn = Connection::open(&db).unwrap();
+        let v = conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap();
+        assert!(v > 2, "user_version {v}");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The audit log can't be changed, nor emptied early; pruning removes only old events.
+    #[test]
+    fn the_audit_log_is_append_only() {
+        let dir = temp();
+        let mut s = Store::open(&dir.join("db"), &dir.join("files"), 25).unwrap();
+        let u = s.create_user("ann", "Ann", "", "old-password-123", true).unwrap();
+        s.request_ip = "192.0.2.7".into();
+        s.audit(Audit::by(&u, "org.create").org("o1").detail("Team\nwith a newline")).unwrap();
+        s.audit(Audit::by(&u, "org.rename").org("o1").ip("198.51.100.1")).unwrap();
+        s.audit(Audit::by(&u, "member.add").org("o2").target("bob")).unwrap();
+        let all = s.audit_events(&AuditQuery { limit: 10, ..Default::default() }).unwrap();
+        assert_eq!(all.iter().map(|e| e.action.as_str()).collect::<Vec<_>>(), ["member.add", "org.rename", "org.create"]);
+        assert_eq!(all[2].ip, "192.0.2.7");
+        assert_eq!(all[1].ip, "198.51.100.1");
+        assert_eq!(all[2].detail, "Team with a newline");
+        let q = |f: AuditQuery| s.audit_events(&AuditQuery { limit: 10, ..f }).unwrap().len();
+        assert_eq!(q(AuditQuery { action: Some("org".into()), ..Default::default() }), 2);
+        assert_eq!(q(AuditQuery { action: Some("org.rename".into()), ..Default::default() }), 1);
+        assert_eq!(q(AuditQuery { action: Some("or".into()), ..Default::default() }), 0, "a group is a whole word");
+        assert_eq!(q(AuditQuery { within_orgs: Some(vec!["o2".into()]), ..Default::default() }), 1);
+        assert_eq!(q(AuditQuery { within_orgs: Some(vec![]), ..Default::default() }), 0);
+        assert_eq!(q(AuditQuery { user: Some("BOB".into()), ..Default::default() }), 1);
+        assert_eq!(q(AuditQuery { before: Some(all[1].id), ..Default::default() }), 1);
+        assert!(s.conn.execute("UPDATE audit SET detail = 'x'", []).is_err(), "no changes");
+        assert!(s.conn.execute("DELETE FROM audit", []).is_err(), "no early deletion");
+        s.conn.execute("INSERT INTO audit (at, action) VALUES (?1, 'old.event')", [now() - 366 * 86400]).unwrap();
+        assert_eq!(s.prune_audit().unwrap(), 1);
+        assert_eq!(s.prune_audit().unwrap(), 0);
+        assert_eq!(s.audit_events(&AuditQuery { limit: 10, ..Default::default() }).unwrap().len(), 3);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Web admin sessions: absolute expiry, at most ADMIN_SESSIONS_PER_USER, ended by secret.
     #[test]
     fn admin_sessions_expire_and_are_capped() {
