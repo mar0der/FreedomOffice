@@ -298,3 +298,95 @@ fn an_agent_that_dies_with_unconfirmed_changes_loses_nothing() {
     assert!(d.differences(&other).is_empty(), "{:?}", d.differences(&other));
     let _ = std::fs::remove_dir_all(&jdir);
 }
+
+/// Soak with undo in the mix: each client undoes its own latest text edit only while the cell
+/// still holds exactly that text (found wherever others' row/column changes moved it); when
+/// someone else changed the cell, the undo is blocked. Everyone, and a fresh joiner, converge.
+#[test]
+fn undo_in_the_soak_keeps_convergence() {
+    let s = start();
+    let (apis, item) = shared_workbook(&s, "budget");
+    let seeds: u64 = std::env::var("FSHEETS_SOAK_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    for k in 0..seeds {
+        let cfg = soak::Config {
+            clients: 3,
+            edits: 100,
+            seed: 0x0d0 + k,
+            interval_ms: 25,
+            restart_pct: 0.0,
+            undo_pct: 15.0,
+            hot_rows: 5,
+            hot_cols: 3,
+            ..Default::default()
+        };
+        let report = soak::run(&apis, &item, &cfg).unwrap();
+        report.print();
+        assert!(report.converged(), "seed {:#x}: {:?}", cfg.seed, report.difference);
+        assert!(report.undos > 3, "too few undos to mean anything: {report:?}");
+    }
+}
+
+/// Undo is per person and never takes another person's value back: A types, B overwrites the
+/// same cell after seeing it, A's undo finds the cell no longer holds A's text (blocked); and a
+/// value undone while B only formatted the cell keeps B's format.
+#[test]
+fn undo_only_reverts_your_own_text() {
+    use cosync::{CellData, Val};
+    let s = start();
+    let (apis, item) = shared_workbook(&s, "tasks");
+    let wait = std::time::Duration::from_secs(10);
+    let text = |t: &str| Some(CellData { v: Val::Text(t.into()), ..Default::default() });
+    let mut a = Live::open(&apis[0], &item, true).unwrap();
+    let mut b = Live::open(&apis[1], &item, true).unwrap();
+    assert!(a.wait_synced(wait) && b.wait_synced(wait));
+    let sheet = a.first_sheet().unwrap();
+    let (r, c) = (40, 5);
+    let before = a.cell_data(sheet, r, c);
+    a.set_content(sheet, r, c, text("a-first"));
+    assert!(a.wait_synced(wait));
+    for _ in 0..50 {
+        b.pump(std::time::Duration::from_millis(20));
+        if b.cell_data(sheet, r, c).is_some() {
+            break;
+        }
+    }
+    // B saw A's value and replaced it.
+    b.set_content(sheet, r, c, text("b-second"));
+    assert!(b.wait_synced(wait));
+    for _ in 0..50 {
+        a.pump(std::time::Duration::from_millis(20));
+        if a.cell_data(sheet, r, c).map(|d| d.v) == Some(Val::Text("b-second".into())) {
+            break;
+        }
+    }
+    // A's undo rule: the cell must still hold A's text. It doesn't.
+    let still_mine = a.cell_data(sheet, r, c).is_some_and(|d| d.v == Val::Text("a-first".into()));
+    assert!(!still_mine, "the harness's rule blocks A's undo");
+    assert_eq!(a.cell_data(sheet, r, c).map(|d| d.v), Some(Val::Text("b-second".into())));
+    // B formats the cell while A's text is current; A undoes the value: the format stays.
+    let (r2, c2) = (41, 5);
+    a.set_content(sheet, r2, c2, text("a-third"));
+    assert!(a.wait_synced(wait));
+    for _ in 0..50 {
+        b.pump(std::time::Duration::from_millis(20));
+        if b.cell_data(sheet, r2, c2).is_some() {
+            break;
+        }
+    }
+    let bold = freedom_sheets::live::style_json(&freedom_sheets::model::Style { bold: true, ..Default::default() });
+    b.set_format(sheet, r2, c2, bold.clone());
+    assert!(b.wait_synced(wait));
+    for _ in 0..50 {
+        a.pump(std::time::Duration::from_millis(20));
+        if a.cell_data(sheet, r2, c2).and_then(|d| d.st).is_some() {
+            break;
+        }
+    }
+    a.set_content(sheet, r2, c2, before.clone().map(|d| CellData { st: None, ..d }));
+    assert!(a.wait_synced(wait) && b.wait_synced(wait));
+    for _ in 0..30 {
+        b.pump(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(a.cell_data(sheet, r2, c2).and_then(|d| d.st), bold, "B's format survives A's undo");
+    assert!(a.differences(&b).is_empty(), "{:?}", a.differences(&b));
+}

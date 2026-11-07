@@ -258,6 +258,27 @@ fn undo_never_overwrites_someone_elses_later_value() {
     assert_eq!(crate::numfmt::value_to_text(app.wb.sheets[0].display_value(0, 0)), "theirs");
 }
 
+/// Undo is per person: another person's concurrent format of the same cell and edit of another
+/// cell survive our undo, and our undo only takes back our own value.
+#[test]
+fn undo_reverts_only_my_value_and_keeps_others_concurrent_changes() {
+    let (_ctx, mut app) = super::data_ui::sample_app();
+    app.live_for_test();
+    app.switch_sheet(0);
+    let at = |app: &App, r: u32, c: u32| crate::numfmt::value_to_text(app.wb.sheets[0].display_value(r, c));
+    let old = at(&app, 0, 0);
+    type_at(&mut app, 0, 0, "mine");
+    let s = app.wb.sheets[0].uid;
+    let bold = crate::live::style_json(&crate::model::Style { bold: true, ..Default::default() });
+    let other = cosync::Op::Content { s, r: 3, c: 3, v: Some(Box::new(cosync::CellData { v: cosync::Val::Text("theirs".into()), ..Default::default() })), adj: vec![] };
+    app.live_remote_for_test(&[cosync::Op::Format { s, r: 0, c: 0, st: bold }, other]);
+    app.undo();
+    check(&mut app, "undo");
+    assert_eq!(at(&app, 0, 0), old, "my value is taken back");
+    assert!(app.wb.sheets[0].get(0, 0).is_some_and(|x| app.wb.style(x.style).bold), "their format stays");
+    assert_eq!(at(&app, 3, 3), "theirs", "their other edit stays");
+}
+
 /// A value and a format change are different operations (so they can't overwrite each other);
 /// a command changing both (paste, clear) is one whole cell.
 #[test]
