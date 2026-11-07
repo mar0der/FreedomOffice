@@ -27,6 +27,7 @@ struct Sh {
     col_w: BTreeMap<u32, u32>,
     hidden_rows: BTreeSet<u32>,
     notes: BTreeMap<(u32, u32), String>,
+    threads: Vec<Thread>,
     feats: BTreeMap<String, serde_json::Value>,
     props: BTreeMap<String, serde_json::Value>,
 }
@@ -45,6 +46,7 @@ impl Sh {
             col_w: BTreeMap::new(),
             hidden_rows: BTreeSet::new(),
             notes: BTreeMap::new(),
+            threads: Vec::new(),
             feats: BTreeMap::new(),
             props: BTreeMap::new(),
         }
@@ -88,6 +90,7 @@ impl Doc {
         sh.formulas = std::mem::take(&mut sh.formulas).into_iter().filter_map(|(k, v)| mp(k).map(|k| (k, v))).collect();
         sh.fmts = std::mem::take(&mut sh.fmts).into_iter().filter_map(|(k, v)| mp(k).map(|k| (k, v))).collect();
         sh.notes = std::mem::take(&mut sh.notes).into_iter().filter_map(|(k, v)| mp(k).map(|k| (k, v))).collect();
+        shift_threads(&mut sh.threads, rows, at, n);
         sh.merges = std::mem::take(&mut sh.merges).into_iter().filter_map(|m| fix_range(t_rect(m), rows, at, n)).filter(|m| !m.is_single()).map(rect_t).collect();
         if rows {
             sh.row_h = std::mem::take(&mut sh.row_h).into_iter().filter_map(|(r, h)| map_index(r, at, n, max).map(|r| (r, h))).collect();
@@ -219,6 +222,11 @@ impl Doc {
             }
             Book { key, val, .. } => {
                 self.book.insert(key.clone(), val.clone());
+            }
+            ThreadAdd { s, .. } | ThreadDel { s, .. } | CommentAdd { s, .. } | CommentEdit { s, .. } | CommentDel { s, .. } | ThreadDone { s, .. } => {
+                if let Some(sh) = self.sh(*s) {
+                    apply_thread_op(&mut sh.threads, op);
+                }
             }
             Link { .. } | ColHidden { .. } | RowLevel { .. } | ColLevel { .. } => {}
         }
@@ -592,7 +600,7 @@ fn random_batch(rng: &mut Rng, doc: &Doc, me: usize, counter: &mut u64) -> Vec<O
     let tag = format!("c{me}-{counter}");
     let r = rng.below(12) as u32;
     let c = rng.below(6) as u32;
-    match rng.below(24) {
+    match rng.below(34) {
         0..=4 => vec![text(s, r, c, &tag)],
         5 => vec![formula(s, r, c, &format!("A{}", r + 1))],
         6 => {
@@ -636,7 +644,46 @@ fn random_batch(rng: &mut Rng, doc: &Doc, me: usize, counter: &mut u64) -> Vec<O
         19 | 20 => vec![fmt(s, r, c, &tag)],
         21 => vec![whole(s, r, c, &tag, if rng.chance(50) { Some(&tag) } else { None })],
         22 => vec![Op::Format { s, r, c, st: None }, Op::Content { s, r: r + 1, c, v: None, adj: vec![] }],
-        _ => vec![fmt(s, r, c, &tag), content(s, r, c, &tag), rows(s, r + 1, 1)],
+        23 => vec![fmt(s, r, c, &tag), content(s, r, c, &tag), rows(s, r + 1, 1)],
+        _ => random_thread_batch(rng, sh, me, &tag),
+    }
+}
+
+/// The comment actors of the simulation: client 0 manages the document.
+fn user(me: usize) -> String {
+    format!("user{}", me % 3)
+}
+
+fn comment(me: usize, tag: &str, at: i64, text: &str) -> Comment {
+    Comment { id: format!("{{{tag}}}"), by: user(me), name: format!("User {}", me % 3), at, text: text.into(), edited: 0 }
+}
+
+pub(crate) fn thread_add(s: SheetId, r: u32, c: u32, id: &str, first: Comment) -> Op {
+    Op::ThreadAdd { s, r, c, th: Box::new(Thread { id: id.into(), r, c, done: false, comments: vec![first] }) }
+}
+
+fn random_thread_batch(rng: &mut Rng, sh: &Sh, me: usize, tag: &str) -> Vec<Op> {
+    let s = sh.id;
+    let at = rng.below(40) as i64;
+    let (r, c) = (rng.below(12) as u32, rng.below(6) as u32);
+    let pick = rng.below(sh.threads.len().max(1) as u64) as usize;
+    let Some(t) = sh.threads.get(pick) else {
+        return vec![thread_add(s, r, c, &format!("{{T{tag}}}"), comment(me, &format!("T{tag}"), at, tag))];
+    };
+    let cm = &t.comments[rng.below(t.comments.len() as u64) as usize];
+    // Edits are only ever sent for one's own comments (the app offers nothing else, and the
+    // server refuses the rest); deletes are also tried on others' comments, which only the
+    // manager (client 0) may do.
+    let by = if rng.chance(70) { cm.by.clone() } else { user(me) };
+    let adm = me == 0 && rng.chance(50);
+    let own = cm.by.clone();
+    match rng.below(9) {
+        0 => vec![thread_add(s, r, c, &format!("{{T{tag}}}"), comment(me, &format!("T{tag}"), at, tag))],
+        1..=3 => vec![Op::CommentAdd { s, th: t.id.clone(), cm: Box::new(comment(me, &format!("R{tag}"), at, tag)) }],
+        4 | 5 => vec![Op::CommentEdit { s, th: t.id.clone(), id: cm.id.clone(), text: tag.into(), at, by: own }],
+        6 => vec![Op::CommentDel { s, th: t.id.clone(), id: cm.id.clone(), by, adm }],
+        7 => vec![Op::ThreadDel { s, th: t.id.clone(), by, adm }],
+        _ => vec![Op::ThreadDone { s, th: t.id.clone(), done: rng.chance(50) }, rows(s, r, if rng.chance(50) { 1 } else { -1 })],
     }
 }
 
@@ -992,7 +1039,7 @@ fn old_json_without_new_fields_still_parses() {
     let hello: ClientMsg = serde_json::from_str(r#"{"t":"hello","sheets":[1,2]}"#).unwrap();
     assert_eq!(hello, ClientMsg::Hello { sheets: vec![1, 2], proto: 1 });
     let new = serde_json::to_string(&ClientMsg::Hello { sheets: vec![1], proto: PROTO }).unwrap();
-    assert!(new.contains("\"proto\":2"));
+    assert!(new.contains("\"proto\":3"));
     let ops: ServerMsg = serde_json::from_str(r#"{"t":"ops","seq":4,"cid":"x","id":1,"by":2,"ops":[{"op":"cell","s":1,"r":0,"c":0,"v":{"v":{"k":"Text","x":"hi"},"st":{"bold":true}}}]}"#).unwrap();
     let ServerMsg::Ops { base, ops, .. } = ops else { panic!() };
     assert_eq!(base, None);
@@ -1221,4 +1268,118 @@ fn changes_buffered_while_a_batch_was_in_flight_keep_the_older_made() {
     s.remote(6, "y", 1, vec![content(1, 9, 9, "z")]);
     let b2 = s.ack(b1.id, 7, vec![]).send.unwrap();
     assert_eq!((b2.base, b2.made), (7, 5));
+}
+
+// ---------------------------------------------------------------------------
+// Threaded comments
+// ---------------------------------------------------------------------------
+
+fn tc(me: usize, tag: &str, at: i64) -> Comment {
+    comment(me, tag, at, tag)
+}
+
+fn threads_of(d: &Doc, s: SheetId) -> Vec<Thread> {
+    d.sheets.iter().find(|x| x.id == s).map(|x| x.threads.clone()).unwrap_or_default()
+}
+
+#[test]
+fn threads_follow_rows_columns_and_sheets() {
+    let mut b = base();
+    b.apply(&thread_add(1, 5, 2, "{T}", tc(1, "T", 1)));
+    // Rows inserted above move the anchor; deleted rows take the thread; columns the same.
+    let reply = Op::CommentAdd { s: 1, th: "{T}".into(), cm: Box::new(tc(2, "R", 2)) };
+    let d = tp1(&b, &[rows(1, 0, 2)], &[reply.clone()]);
+    let t = &threads_of(&d, 1)[0];
+    assert_eq!((t.r, t.c, t.comments.len()), (7, 2, 2));
+    let d = tp1(&b, &[rows(1, 4, -3)], &[reply]);
+    assert!(threads_of(&d, 1).is_empty());
+    let d = tp1(&b, &[cols(1, 0, -1)], &[Op::ThreadDone { s: 1, th: "{T}".into(), done: true }]);
+    assert_eq!((threads_of(&d, 1)[0].c, threads_of(&d, 1)[0].done), (1, true));
+    // A thread being added while rows are inserted above it, or its row is deleted.
+    let add = thread_add(1, 3, 0, "{U}", tc(2, "U", 3));
+    assert_eq!(threads_of(&tp1(&b, &[rows(1, 0, 1)], &[add.clone()]), 1).iter().find(|t| t.id == "{U}").map(|t| t.r), Some(4));
+    assert!(threads_of(&tp1(&b, &[rows(1, 3, -1)], &[add.clone()]), 1).iter().all(|t| t.id != "{U}"));
+    // Deleting the sheet takes the comment operations with it.
+    assert!(transform(&[add], &[Op::DelSheet { s: 1, name: "Sheet1".into() }], true).0.is_empty());
+}
+
+#[test]
+fn comment_permissions_are_part_of_applying() {
+    let mut list = Vec::new();
+    apply_thread_op(&mut list, &thread_add(1, 0, 0, "{T}", Comment { by: "ann".into(), ..tc(0, "T", 1) }));
+    apply_thread_op(&mut list, &Op::CommentAdd { s: 1, th: "{T}".into(), cm: Box::new(Comment { by: "ben".into(), ..tc(0, "R", 2) }) });
+    // Only the author edits.
+    let edit = |by: &str, id: &str| Op::CommentEdit { s: 1, th: "{T}".into(), id: id.into(), text: "new".into(), at: 9, by: by.to_string() };
+    assert!(!apply_thread_op(&mut list, &edit("ann", "{R}")));
+    assert!(!apply_thread_op(&mut list, &edit("", "{R}")), "someone with a link has no identity");
+    assert!(apply_thread_op(&mut list, &edit("ben", "{R}")));
+    assert_eq!((list[0].comments[1].text.as_str(), list[0].comments[1].edited), ("new", 9));
+    // Only the author deletes, unless the sender manages the document.
+    let del = |by: &str, adm: bool, id: &str| Op::CommentDel { s: 1, th: "{T}".into(), id: id.into(), by: by.to_string(), adm };
+    assert!(!apply_thread_op(&mut list, &del("ann", false, "{R}")));
+    assert!(apply_thread_op(&mut list, &del("ann", true, "{R}")));
+    assert_eq!(list[0].comments.len(), 1);
+    // Deleting the first comment deletes the thread.
+    assert!(!apply_thread_op(&mut list, &Op::ThreadDel { s: 1, th: "{T}".into(), by: "ben".into(), adm: false }));
+    assert!(apply_thread_op(&mut list, &del("ann", false, "{T}")));
+    assert!(list.is_empty());
+    // Operations on what is gone do nothing.
+    assert!(!apply_thread_op(&mut list, &Op::ThreadDone { s: 1, th: "{T}".into(), done: true }));
+}
+
+#[test]
+fn replies_and_threads_are_ordered_by_time_not_arrival() {
+    let (a, b) = (thread_add(1, 0, 0, "{A}", tc(1, "A", 5)), thread_add(1, 0, 0, "{B}", tc(2, "B", 3)));
+    let (ra, rb) = (Op::CommentAdd { s: 1, th: "{A}".into(), cm: Box::new(tc(1, "RA", 7)) }, Op::CommentAdd { s: 1, th: "{A}".into(), cm: Box::new(tc(2, "RB", 6)) });
+    let (mut x, mut y) = (Vec::new(), Vec::new());
+    for op in [&a, &b, &ra, &rb] {
+        apply_thread_op(&mut x, op);
+    }
+    for op in [&b, &a, &rb, &ra] {
+        apply_thread_op(&mut y, op);
+    }
+    assert_eq!(x, y);
+    assert_eq!(x[0].id, "{B}");
+    assert_eq!(x[1].comments.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["{A}", "{RB}", "{RA}"]);
+}
+
+#[test]
+fn concurrent_edits_and_resolves_are_last_writer_wins() {
+    let mut b = base();
+    b.apply(&thread_add(1, 0, 0, "{T}", Comment { by: user(1), ..tc(1, "T", 1) }));
+    let edit = |t: &str| Op::CommentEdit { s: 1, th: "{T}".into(), id: "{T}".into(), text: t.into(), at: 5, by: user(1) };
+    let d = tp1(&b, &[edit("one")], &[edit("two")]);
+    assert_eq!(threads_of(&d, 1)[0].comments[0].text, "one", "a, the later commit, wins");
+    let done = |v: bool| Op::ThreadDone { s: 1, th: "{T}".into(), done: v };
+    let d = tp1(&b, &[done(true)], &[done(false)]);
+    assert!(threads_of(&d, 1)[0].done);
+    // A reply and a delete of the thread at once: the reply goes with it.
+    let d = tp1(&b, &[Op::CommentAdd { s: 1, th: "{T}".into(), cm: Box::new(tc(2, "R", 2)) }], &[Op::ThreadDel { s: 1, th: "{T}".into(), by: user(1), adm: false }]);
+    assert!(threads_of(&d, 1).is_empty());
+}
+
+#[test]
+fn comment_operations_round_trip_and_validate() {
+    let ops = [
+        thread_add(1, 2, 3, "{T}", tc(1, "T", 1)),
+        Op::CommentAdd { s: 1, th: "{T}".into(), cm: Box::new(tc(2, "R", 2)) },
+        Op::CommentEdit { s: 1, th: "{T}".into(), id: "{R}".into(), text: "x".into(), at: 3, by: "u".into() },
+        Op::CommentDel { s: 1, th: "{T}".into(), id: "{R}".into(), by: "u".into(), adm: true },
+        Op::ThreadDone { s: 1, th: "{T}".into(), done: true },
+        Op::ThreadDel { s: 1, th: "{T}".into(), by: "u".into(), adm: false },
+    ];
+    for op in &ops {
+        assert_eq!(&serde_json::from_str::<Op>(&serde_json::to_string(op).unwrap()).unwrap(), op);
+        assert!(op.is_thread_op());
+    }
+    assert!(validate(&ops).is_ok());
+    assert!(validate(&[thread_add(1, MAX_ROWS, 0, "{T}", tc(1, "T", 1))]).is_err());
+    assert!(validate(&[thread_add(1, 0, 0, "", tc(1, "T", 1))]).is_err());
+    assert!(validate(&[thread_add(1, 0, 0, "{T}", Comment { text: "x".repeat(40_000), ..tc(1, "T", 1) })]).is_err());
+    assert!(validate(&[Op::ThreadAdd { s: 1, r: 0, c: 0, th: Box::new(Thread { id: "{T}".into(), ..Default::default() }) }]).is_err(), "a thread has a first comment");
+    // An old client's JSON (no comment fields on a peer or a role message) still parses.
+    let p: Peer = serde_json::from_str(r#"{"id":1,"name":"a","user":"a","color":0,"editor":true}"#).unwrap();
+    assert!(!p.manager);
+    let r: ServerMsg = serde_json::from_str(r#"{"t":"role","role":"edit"}"#).unwrap();
+    assert_eq!(r, ServerMsg::Role { role: "edit".into(), manager: false });
 }

@@ -14,11 +14,13 @@
 pub mod client;
 pub mod journal;
 pub mod server;
+pub mod threads;
 mod transform;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 
+pub use threads::{apply_thread_op, shift_threads, Comment, Thread};
 pub use transform::{carry_down, cell_write, fix_range, map_index, over, touches, transform, CellWrite};
 
 pub const MAX_ROWS: u32 = 1_048_576;
@@ -32,9 +34,16 @@ pub const RESCUE_SHEET: SheetId = 0x7E5C_0E5C_0E5C_0E5C;
 
 /// The protocol version this build speaks. 1: a cell is one target (`Op::Cell`). 2: a cell's
 /// content (`Op::Content`) and format (`Op::Format`) are separate targets; `Op::Cell` still
-/// exists and writes both. Clients send theirs in `Hello`, servers in `Welcome`; a missing
-/// field means 1.
-pub const PROTO: u32 = 2;
+/// exists and writes both. 3: threaded comments (`Op::Thread*`, `Op::Comment*`; see
+/// `threads`). Clients send theirs in `Hello`, servers in `Welcome`; a missing field means 1.
+/// A server of protocol 3 still serves protocol 2 clients (it leaves the comment operations
+/// out of what it sends them); a protocol 1 client is refused (`MIN_PROTO`).
+pub const PROTO: u32 = 3;
+/// The oldest protocol a server accepts.
+pub const MIN_PROTO: u32 = 2;
+/// The first protocol that understands threaded comments: only its clients are sent (and may
+/// send) the comment operations.
+pub const COMMENTS_PROTO: u32 = 3;
 
 fn proto_v1() -> u32 {
     1
@@ -147,6 +156,45 @@ pub enum Op {
     },
     Note { s: SheetId, r: u32, c: u32, text: Option<String>, author: Option<String> },
     Link { s: SheetId, r: u32, c: u32, url: Option<String> },
+    /// A new comment thread anchored to cell (`r`, `c`); `th` holds the whole thread (its
+    /// first comment, and any replies when a thread is put back). Ignored when a thread with
+    /// that id exists. Several threads can share a cell. Protocol 3.
+    ThreadAdd { s: SheetId, r: u32, c: u32, th: Box<Thread> },
+    /// Deletes a thread with its replies: allowed to the author of its first comment
+    /// (`by` = the sender, set by the server) or, with `adm` (the sender manages the
+    /// document: the server checks), anyone.
+    ThreadDel {
+        s: SheetId,
+        th: String,
+        #[serde(default)]
+        by: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        adm: bool,
+    },
+    /// A reply to thread `th`.
+    CommentAdd { s: SheetId, th: String, cm: Box<Comment> },
+    /// Edits the text of comment `id`: only its author (`by`).
+    CommentEdit {
+        s: SheetId,
+        th: String,
+        id: String,
+        text: String,
+        at: i64,
+        #[serde(default)]
+        by: String,
+    },
+    /// Deletes a comment (the whole thread when it is the first one): its author, or `adm`.
+    CommentDel {
+        s: SheetId,
+        th: String,
+        id: String,
+        #[serde(default)]
+        by: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        adm: bool,
+    },
+    /// Resolves (`done`) or reopens a thread; anyone who can edit.
+    ThreadDone { s: SheetId, th: String, done: bool },
     /// Row height in pixels; None = default.
     RowH { s: SheetId, r: u32, h: Option<f32> },
     ColW { s: SheetId, c: u32, w: Option<f32> },
@@ -190,6 +238,12 @@ impl Op {
             | Format { s, .. }
             | Note { s, .. }
             | Link { s, .. }
+            | ThreadAdd { s, .. }
+            | ThreadDel { s, .. }
+            | CommentAdd { s, .. }
+            | CommentEdit { s, .. }
+            | CommentDel { s, .. }
+            | ThreadDone { s, .. }
             | RowH { s, .. }
             | ColW { s, .. }
             | RowHidden { s, .. }
@@ -202,6 +256,11 @@ impl Op {
             | Place { s, .. } => Some(*s),
             Book { .. } => None,
         }
+    }
+
+    /// A comment-thread operation (protocol 3).
+    pub fn is_thread_op(&self) -> bool {
+        matches!(self, Op::ThreadAdd { .. } | Op::ThreadDel { .. } | Op::CommentAdd { .. } | Op::CommentEdit { .. } | Op::CommentDel { .. } | Op::ThreadDone { .. })
     }
 
     /// Row/column insert or delete, or a sheet add/delete/rename.
@@ -234,6 +293,10 @@ pub struct Peer {
     /// Colour slot (the app maps it to a colour).
     pub color: u8,
     pub editor: bool,
+    /// May delete anyone's comments (owner of the document, or manager of its organisation).
+    /// Optional on the wire.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub manager: bool,
     /// A headless agent (script, MCP tool) rather than a person at the app. Optional on the
     /// wire (absent = false), so older apps and servers ignore it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -316,7 +379,12 @@ pub enum ServerMsg {
     /// Your access changed while connected (a share, organisation membership or role changed):
     /// `role` is "view" (changes you send from now on are refused: the connection is closed
     /// with `close::READ_ONLY`) or "edit" (you may send changes again).
-    Role { role: String },
+    Role {
+        role: String,
+        /// The connection may delete anyone's comments (see `Peer::manager`).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        manager: bool,
+    },
     /// Your access to this document ended (`reason` is for people, e.g. "Your access to this
     /// workbook was removed."); the server closes the connection with `close::REVOKED` next.
     Revoked { reason: String },
@@ -430,6 +498,31 @@ fn validate_op(op: &Op, in_adj: bool) -> Result<(), String> {
             row(*r)?;
             col(*c)?;
             text(url)?;
+        }
+        ThreadAdd { r, c, th, .. } => {
+            row(*r)?;
+            col(*c)?;
+            threads::validate_thread(th)?;
+        }
+        CommentAdd { th, cm, .. } => {
+            threads::validate_id(th)?;
+            threads::validate_comment(cm)?;
+        }
+        ThreadDel { th, by, .. } => {
+            threads::validate_id(th)?;
+            threads::validate_short(by)?;
+        }
+        ThreadDone { th, .. } => threads::validate_id(th)?,
+        CommentEdit { th, id, text: t, by, .. } => {
+            threads::validate_id(th)?;
+            threads::validate_id(id)?;
+            threads::validate_short(by)?;
+            threads::validate_text(t)?;
+        }
+        CommentDel { th, id, by, .. } => {
+            threads::validate_id(th)?;
+            threads::validate_id(id)?;
+            threads::validate_short(by)?;
         }
         RowH { r, h, .. } => {
             row(*r)?;
