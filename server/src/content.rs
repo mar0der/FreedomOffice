@@ -212,17 +212,30 @@ pub fn too_large(limit: usize) -> ApiError {
 /// Streams a request body into a new file in `dir` (hashing as it goes), refusing it with 413
 /// as soon as it is longer than `limit` (or says so in Content-Length). The file is synced
 /// before this returns.
-pub async fn stage(dir: &Path, headers: &HeaderMap, body: Body, limit: usize) -> Result<Staged, ApiError> {
+pub async fn stage(dir: &Path, headers: &HeaderMap, body: Body, limits: &UploadLimits) -> Result<Staged, ApiError> {
+    let limit = limits.max;
     if headers.get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse::<u64>().ok()).is_some_and(|n| n > limit as u64) {
         return Err(too_large(limit));
     }
     tokio::fs::create_dir_all(dir).await.map_err(|e| io_error("create the upload folder", e))?;
+    // The upload may take up to `limit`; afterwards at least `reserve` must still be free.
+    if let Some(free) = free_bytes(dir)
+        && !enough_space(free, limit as u64, limits.reserve)
+    {
+        tracing::error!("refused an upload: only {} MB free on the data disk", free / (1024 * 1024));
+        return Err(ApiError::new(StatusCode::INSUFFICIENT_STORAGE, "The server is running out of disk space. Ask your administrator."));
+    }
     let mut staged = Staged { path: dir.join(format!("{}.upload", util::new_id())), size: 0, hash: String::new() };
     let mut f = tokio::fs::File::create(&staged.path).await.map_err(|e| io_error("create an upload file", e))?;
     let mut hasher = Sha256::new();
     let mut size: u64 = 0;
     let mut stream = body.into_data_stream();
-    while let Some(chunk) = stream.next().await {
+    loop {
+        // A client that stops sending: dropped (the staged file goes with `staged`).
+        let Ok(next) = tokio::time::timeout(limits.idle, stream.next()).await else {
+            return Err(ApiError::new(StatusCode::REQUEST_TIMEOUT, "The upload stalled and was stopped."));
+        };
+        let Some(chunk) = next else { break };
         // A client that stops or breaks the connection mid-way: nothing is stored.
         let chunk = chunk.map_err(|_| ApiError::bad("The upload was interrupted."))?;
         size += chunk.len() as u64;
@@ -238,6 +251,39 @@ pub async fn stage(dir: &Path, headers: &HeaderMap, body: Body, limit: usize) ->
     staged.size = size as i64;
     staged.hash = util::hex(&hasher.finalize());
     Ok(staged)
+}
+
+/// The limits of one upload (from the configuration).
+pub struct UploadLimits {
+    /// Bytes at most (`max_upload_mb`).
+    pub max: usize,
+    /// No data for this long: stop.
+    pub idle: std::time::Duration,
+    /// Bytes that must stay free on the data disk after the largest possible upload.
+    pub reserve: u64,
+}
+
+/// Whether an upload of up to `max` bytes leaves `reserve` free.
+pub fn enough_space(free: u64, max: u64, reserve: u64) -> bool {
+    free >= max.saturating_add(reserve)
+}
+
+/// Free bytes for unprivileged writers on the file system of `dir` (`None` when unknown).
+#[cfg(unix)]
+fn free_bytes(dir: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c` is a valid NUL-terminated path and `st` a properly sized out-parameter.
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    Some((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+}
+
+#[cfg(not(unix))]
+fn free_bytes(_: &Path) -> Option<u64> {
+    None
 }
 
 fn io_error(what: &str, e: std::io::Error) -> ApiError {
@@ -265,6 +311,16 @@ mod tests {
         assert_eq!(parse_range(Some("items=0-1"), 10), Range::Full);
         assert_eq!(parse_range(Some("bytes=a-b"), 10), Range::Full);
         assert_eq!(parse_range(Some("bytes=99999999999999999999-"), 10), Range::Full);
+    }
+
+    #[test]
+    fn disk_space() {
+        let gb = 1024 * 1024 * 1024;
+        assert!(enough_space(2 * gb, 100 << 20, gb));
+        assert!(!enough_space(gb, 100 << 20, gb), "the upload would eat into the reserve");
+        assert!(!enough_space(0, 0, 1));
+        assert!(enough_space(u64::MAX, u64::MAX, u64::MAX), "no overflow");
+        assert!(free_bytes(&std::env::temp_dir()).is_some_and(|f| f > 0));
     }
 
     #[test]

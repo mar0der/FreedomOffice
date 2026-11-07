@@ -51,6 +51,11 @@ fn set_cookie(cfg: &Config, value: &str, max_age: i64) -> HeaderValue {
     HeaderValue::from_str(&format!("{}={value}; Path=/; Max-Age={max_age}; HttpOnly; SameSite=Strict{flags}", cookie_name(cfg))).expect("cookie header")
 }
 
+/// A Set-Cookie that removes the web session cookie.
+pub(crate) fn clear_cookie(cfg: &Config) -> HeaderValue {
+    set_cookie(cfg, "", 0)
+}
+
 fn session_secret(cfg: &Config, headers: &HeaderMap) -> Option<String> {
     crate::admin::cookie_value(headers, cookie_name(cfg))
 }
@@ -193,7 +198,7 @@ pub(crate) async fn logout(State(app): State<App>, headers: HeaderMap) -> ApiRes
         .await?;
     }
     let mut res = StatusCode::NO_CONTENT.into_response();
-    res.headers_mut().insert(header::SET_COOKIE, set_cookie(app.cfg(), "", 0));
+    res.headers_mut().insert(header::SET_COOKIE, clear_cookie(app.cfg()));
     Ok(res)
 }
 

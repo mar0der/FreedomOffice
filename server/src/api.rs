@@ -59,6 +59,29 @@ pub struct App {
     argon: Arc<tokio::sync::Semaphore>,
     /// Where uploads are staged while they stream in (`Store::incoming_dir`).
     incoming: Arc<std::path::PathBuf>,
+    /// Uploads streaming in per uploader (user id or `link:<id>`), at most `UPLOADS_PER_USER`.
+    uploads: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+/// Uploads one person may stream in at the same time.
+pub const UPLOADS_PER_USER: usize = 4;
+
+/// One of an uploader's upload slots, given back when dropped.
+pub(crate) struct UploadSlot {
+    map: Arc<Mutex<HashMap<String, usize>>>,
+    key: String,
+}
+
+impl Drop for UploadSlot {
+    fn drop(&mut self) {
+        let mut m = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = m.get_mut(&self.key) {
+            *n -= 1;
+            if *n == 0 {
+                m.remove(&self.key);
+            }
+        }
+    }
 }
 
 impl App {
@@ -74,11 +97,31 @@ impl App {
             hub: Arc::default(),
             argon: Arc::new(tokio::sync::Semaphore::new(cores)),
             incoming,
+            uploads: Arc::default(),
         }
     }
 
     pub(crate) fn cfg(&self) -> &Config {
         &self.cfg
+    }
+
+    /// A slot for one more upload by `who`, or 429 while they have `UPLOADS_PER_USER` running.
+    pub(crate) fn upload_slot(&self, who: &str) -> Result<UploadSlot, ApiError> {
+        let mut m = self.uploads.lock().unwrap_or_else(|e| e.into_inner());
+        let n = m.entry(who.to_string()).or_insert(0);
+        if *n >= UPLOADS_PER_USER {
+            return Err(ApiError::new(StatusCode::TOO_MANY_REQUESTS, format!("At most {UPLOADS_PER_USER} uploads at a time. Wait for one to finish.")));
+        }
+        *n += 1;
+        Ok(UploadSlot { map: self.uploads.clone(), key: who.to_string() })
+    }
+
+    pub(crate) fn upload_limits(&self) -> crate::content::UploadLimits {
+        crate::content::UploadLimits {
+            max: self.cfg.max_upload_bytes(),
+            idle: Duration::from_millis(self.cfg.upload_idle_ms),
+            reserve: self.cfg.upload_reserve_mb.saturating_mul(1024 * 1024),
+        }
     }
 
     /// Background upkeep while the server runs: audit events older than
@@ -143,11 +186,10 @@ impl App {
         let store = self.store.clone();
         let ip = crate::web::REQUEST_IP.try_with(Clone::clone).unwrap_or_default();
         tokio::task::spawn_blocking(move || {
-            let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
-            s.request_ip = ip;
-            let r = f(&s);
-            s.request_ip.clear();
-            r
+            let s = store.lock().unwrap_or_else(|e| e.into_inner());
+            let _ip = s.with_ip(ip);
+            // One transaction: a change and its audit event are kept together or not at all.
+            s.atomic(f)
         })
         .await
         .map_err(|_| ApiError::internal())?
@@ -444,6 +486,13 @@ fn audit_by(who: &Principal, action: &'static str) -> Audit {
     }
 }
 
+/// A new version of a file was saved (`how`: upload, save, live): one `file.version` row a
+/// minute per person and file, with the count of saves.
+fn audit_version(s: &Store, who: &Principal, it: &Item, how: &str) -> Result<(), ApiError> {
+    let a = audit_by(who, "file.version").detail(format!("{}: version {} ({how})", it.name, it.version)).aggregate(format!("file.version|{}|{}", actor(who), it.id));
+    Ok(s.audit_item(a, it)?)
+}
+
 /// The item and the caller's role, or 404 when the caller can't see it.
 fn visible(s: &Store, who: &Principal, id: &str, include_deleted: bool) -> Result<(Item, Role), ApiError> {
     let item = s.item(id)?.ok_or_else(ApiError::not_found)?;
@@ -679,7 +728,7 @@ pub(crate) async fn check_sign_in(app: &App, ip: IpAddr, username: &str, passwor
 /// still counted as a failure). Lets callers that need the password checked say "disabled"
 /// to someone who proved they know it.
 async fn verify_sign_in(app: &App, ip: IpAddr, username: &str, password: String, allow_disabled: bool, via: &'static str) -> Result<User, ApiError> {
-    let ip_key = format!("ip:{ip}");
+    let ip_key = format!("ip:{}", util::ip_bucket(ip));
     let wrong = || ApiError::new(StatusCode::UNAUTHORIZED, "The username or password is incorrect.");
     let name = username.trim().to_string();
     // Something that can't be a username (or an absurd password) never reaches the limiter's
@@ -703,6 +752,7 @@ async fn verify_sign_in(app: &App, ip: IpAddr, username: &str, password: String,
     }
     let n = name.clone();
     let found = app.run(move |s| Ok(s.user_by_name(&n)?.map(|u| (s.password_hash(&u.id), u)))).await?;
+    let known = found.is_some();
     let pw = password;
     let user = app
         .argon(move || match found {
@@ -716,9 +766,18 @@ async fn verify_sign_in(app: &App, ip: IpAddr, username: &str, password: String,
         })
         .await?;
     let Some(user) = user else {
-        tracing::warn!("failed sign-in for user '{name}' from {ip}");
-        let (n, ip) = (name.clone(), ip.to_string());
-        let _ = app.run(move |s| Ok(s.audit(Audit::anonymous("sign_in.failed", "").target(&n).ip(ip).detail(via))?)).await;
+        // What was typed as the username is kept only when such an account exists: people
+        // sometimes type their password there.
+        let (target, detail) = if known { (name.to_lowercase(), format!("{via}, wrong password")) } else { (String::new(), format!("{via}, unknown username")) };
+        if known {
+            tracing::warn!("failed sign-in for user '{name}' from {ip}");
+        } else {
+            tracing::warn!("failed sign-in with an unknown username from {ip}");
+        }
+        // One row a minute per network (/64 for IPv6) and account (or "unknown").
+        let key = format!("sign_in.failed|{}|{target}", util::ip_bucket(ip));
+        let a = Audit::anonymous("sign_in.failed", "").target(&target).ip(ip.to_string()).detail(detail).aggregate(key);
+        let _ = app.run(move |s| Ok(s.audit(a)?)).await;
         return Err(wrong());
     };
     if !user.disabled {
@@ -731,17 +790,33 @@ async fn verify_sign_in(app: &App, ip: IpAddr, username: &str, password: String,
     Ok(user)
 }
 
+/// `POST /api/logout`: ends the sign-in the request used (a device token, or the browser
+/// session, whose cookie is then cleared too).
 async fn logout(State(app): State<App>, headers: HeaderMap) -> ApiResult {
-    app.run_changing(move |s| {
-        let who = auth_any(s, &headers)?;
-        match who {
-            Principal::User { sign_in: SignIn::Device(id), .. } => s.revoke_token(id)?,
-            Principal::User { sign_in: SignIn::Admin(id) | SignIn::Web(id), .. } => s.end_admin_session(id)?,
-            Principal::Link { .. } => {}
-        }
-        Ok(StatusCode::NO_CONTENT.into_response())
-    })
-    .await
+    let web = app
+        .run_changing(move |s| {
+            let who = auth_any(s, &headers)?;
+            if let Principal::User { user, sign_in } = &who {
+                let how = match *sign_in {
+                    SignIn::Device(id) => {
+                        s.revoke_token(id)?;
+                        "app"
+                    }
+                    SignIn::Admin(id) | SignIn::Web(id) => {
+                        s.end_admin_session(id)?;
+                        "web"
+                    }
+                };
+                s.audit(Audit::by(user, "sign_out").target(&user.username).detail(how))?;
+            }
+            Ok(matches!(who, Principal::User { sign_in: SignIn::Web(_), .. }))
+        })
+        .await?;
+    let mut res = StatusCode::NO_CONTENT.into_response();
+    if web {
+        res.headers_mut().insert(header::SET_COOKIE, crate::web::clear_cookie(&app.cfg));
+    }
+    Ok(res)
 }
 
 /// The signed-in user, with the organisations they belong to (each with its folder).
@@ -1615,6 +1690,8 @@ pub(crate) fn audit_json(s: &Store, e: &crate::store::AuditEvent) -> Value {
         "item": e.item_id,
         "target_user": e.target_user,
         "detail": e.detail,
+        "count": e.count,
+        "last_at": iso(e.last_at.max(e.at)),
     })
 }
 
@@ -1656,7 +1733,7 @@ async fn live_invite(app: &App, ip_key: &str, token: String) -> Result<(crate::s
 
 /// `GET /api/invites/{token}`: what the invite is for.
 async fn invite_info(State(app): State<App>, ConnectInfo(Peer(peer)): ConnectInfo<Peer>, headers: HeaderMap, Path(token): Path<String>) -> ApiResult {
-    let ip_key = format!("ip:{}", client_ip(&app.cfg, peer, &headers));
+    let ip_key = format!("ip:{}", util::ip_bucket(client_ip(&app.cfg, peer, &headers)));
     let (inv, org) = live_invite(&app, &ip_key, token).await?;
     ok_json(json!({
         "org": { "id": org.id, "name": org.name },
@@ -1704,7 +1781,7 @@ impl Accepted {
 
 /// Accepts an invite either way (see `accept` and `accept_existing`) and logs what happened.
 async fn accept_any(app: &App, ip: IpAddr, token: String, b: AcceptBody) -> Result<Accepted, ApiError> {
-    let ip_key = format!("ip:{ip}");
+    let ip_key = format!("ip:{}", util::ip_bucket(ip));
     let r = if b.existing {
         Accepted::Existing(accept_existing(app, ip, &ip_key, token, &b.username, b.password).await?)
     } else {
@@ -1819,7 +1896,7 @@ fn invite_form_html(token: &str, org: &str, email: &str, error: &str) -> String 
 /// `GET /i/{token}`: the invite page a browser shows (sign in with an existing account, or
 /// choose a username and password for a new one).
 async fn invite_page(State(app): State<App>, ConnectInfo(Peer(peer)): ConnectInfo<Peer>, headers: HeaderMap, Path(token): Path<String>) -> Response {
-    let ip_key = format!("ip:{}", client_ip(&app.cfg, peer, &headers));
+    let ip_key = format!("ip:{}", util::ip_bucket(client_ip(&app.cfg, peer, &headers)));
     match live_invite(&app, &ip_key, token.clone()).await {
         Ok((inv, org)) => page("Join FreedomOffice", &invite_form_html(&token, &org.name, &inv.email, "")),
         Err(e) => {
@@ -1958,6 +2035,7 @@ async fn create_folder(State(app): State<App>, headers: HeaderMap, body: Bytes) 
         let (p, role) = visible(s, &who, &parent, false)?;
         need_edit(role)?;
         let it = s.create_folder(&p.id, &b.name, &actor(&who))?;
+        s.audit_item(audit_by(&who, "folder.create").detail(format!("{} in {}", it.name, p.name)), &it)?;
         let role = s.role(&who, &it, false)?.unwrap_or(role);
         Ok((StatusCode::CREATED, axum::Json(item_json(s, &it, role))).into_response())
     })
@@ -2001,8 +2079,9 @@ fn upload_target(s: &Store, hub: &crate::live::Hub, headers: &HeaderMap, q: &Has
 /// of an existing one (`replace`).
 async fn upload_file(State(app): State<App>, headers: HeaderMap, Query(q): Query<HashMap<String, String>>, body: axum::body::Body) -> ApiResult {
     let (hub, h, qq) = (app.hub.clone(), headers.clone(), q.clone());
-    app.run(move |s| upload_target(s, &hub, &h, &qq).map(|_| ())).await?;
-    let staged = crate::content::stage(&app.incoming, &headers, body, app.cfg.max_upload_bytes()).await?;
+    let uploader = app.run(move |s| upload_target(s, &hub, &h, &qq).map(|t| actor(&t.who))).await?;
+    let _slot = app.upload_slot(&uploader)?;
+    let staged = crate::content::stage(&app.incoming, &headers, body, &app.upload_limits()).await?;
     let hub = app.hub.clone();
     app.run(move |s| {
         let t = upload_target(s, &hub, &headers, &q)?;
@@ -2011,6 +2090,8 @@ async fn upload_file(State(app): State<App>, headers: HeaderMap, Query(q): Query
         drop(staged);
         if created {
             s.audit_item(audit_by(&t.who, "file.upload").detail(format!("{} ({} bytes) in {}", it.name, it.size, t.parent.name)), &it)?;
+        } else {
+            audit_version(s, &t.who, &it, "upload")?;
         }
         if let Principal::User { user, .. } = &t.who {
             s.touch_recent(&user.id, &it.id)?;
@@ -2107,10 +2188,12 @@ fn put_target(s: &Store, hub: &crate::live::Hub, headers: &HeaderMap, id: &str) 
 /// (413 past `max_upload_mb`), becomes the next version.
 async fn put_content(State(app): State<App>, headers: HeaderMap, Path(id): Path<String>, body: axum::body::Body) -> ApiResult {
     let (hub, h, i) = (app.hub.clone(), headers.clone(), id.clone());
-    if let Err(res) = app.run(move |s| put_target(s, &hub, &h, &i).map(|r| r.map(|_| ()))).await? {
-        return Ok(*res);
-    }
-    let staged = crate::content::stage(&app.incoming, &headers, body, app.cfg.max_upload_bytes()).await?;
+    let uploader = match app.run(move |s| put_target(s, &hub, &h, &i).map(|r| r.map(|(who, _, _)| actor(&who)))).await? {
+        Ok(u) => u,
+        Err(res) => return Ok(*res),
+    };
+    let _slot = app.upload_slot(&uploader)?;
+    let staged = crate::content::stage(&app.incoming, &headers, body, &app.upload_limits()).await?;
     let hub = app.hub.clone();
     app.run(move |s| {
         let (who, it, role) = match put_target(s, &hub, &headers, &id)? {
@@ -2119,6 +2202,7 @@ async fn put_content(State(app): State<App>, headers: HeaderMap, Path(id): Path<
         };
         let saved = s.write_content_from(&it, crate::store::Blob::Staged { path: &staged.path, size: staged.size, hash: &staged.hash }, &actor(&who))?;
         drop(staged);
+        audit_version(s, &who, &saved, "save")?;
         if let Principal::User { user, .. } = &who {
             s.touch_recent(&user.id, &saved.id)?;
         }
@@ -2158,11 +2242,11 @@ async fn patch_item(State(app): State<App>, headers: HeaderMap, Path(id): Path<S
         };
         let updated = s.update_item(&it, b.name.as_deref(), parent.as_ref(), &actor(&who))?;
         if updated.name != it.name {
-            s.audit_item(audit_by(&who, "item.rename").detail(format!("{} -> {}", it.name, updated.name)), &updated)?;
+            s.audit_item(audit_by(&who, "item.rename").detail(format!("{} -> {}", it.name, updated.name)).aggregate(format!("item.rename|{}|{}", actor(&who), it.id)), &updated)?;
         }
         if updated.parent_id != it.parent_id {
             let name_of = |id: &Option<String>| id.as_deref().and_then(|i| s.item(i).ok().flatten()).map(|p| p.name).unwrap_or_default();
-            s.audit_item(audit_by(&who, "item.move").detail(format!("{}: {} -> {}", updated.name, name_of(&it.parent_id), name_of(&updated.parent_id))), &updated)?;
+            s.audit_item(audit_by(&who, "item.move").detail(format!("{}: {} -> {}", updated.name, name_of(&it.parent_id), name_of(&updated.parent_id))).aggregate(format!("item.move|{}|{}", actor(&who), it.id)), &updated)?;
         }
         let role = s.role(&who, &updated, false)?.unwrap_or(role);
         ok_json(item_json(s, &updated, role))
@@ -2492,7 +2576,7 @@ async fn open_link_password(State(app): State<App>, ConnectInfo(Peer(peer)): Con
 
 /// Checks a link (and its password) and hands out a short-lived access token for its item.
 async fn resolve_link(app: App, peer: SocketAddr, headers: HeaderMap, token: String, password: String) -> ApiResult {
-    let ip_key = format!("ip:{}", client_ip(&app.cfg, peer, &headers));
+    let ip_key = format!("ip:{}", util::ip_bucket(client_ip(&app.cfg, peer, &headers)));
     if app.limited(std::slice::from_ref(&ip_key)) {
         return Err(too_many());
     }
@@ -2661,7 +2745,7 @@ pub(crate) fn form_value(body: &[u8], key: &str) -> String {
 /// Download through the password form (`POST /l/<token>/download`).
 async fn link_download_form(State(app): State<App>, ConnectInfo(Peer(peer)): ConnectInfo<Peer>, headers: HeaderMap, Path(token): Path<String>, body: Bytes) -> ApiResult {
     let password = form_value(&body, "password");
-    let ip_key = format!("ip:{}", client_ip(&app.cfg, peer, &headers));
+    let ip_key = format!("ip:{}", util::ip_bucket(client_ip(&app.cfg, peer, &headers)));
     if app.limited(std::slice::from_ref(&ip_key)) {
         return Err(too_many());
     }
@@ -2812,6 +2896,9 @@ async fn live_snapshot(State(app): State<App>, headers: HeaderMap, Path(id): Pat
             let (it, role) = visible(s, &who, &iid, false)?;
             need_edit(role)?;
             let (saved, st) = s.live_snapshot(&it, &body[..split], &body[split..], &actor(&who), seq, &sheets)?;
+            if saved.version != it.version {
+                audit_version(s, &who, &saved, "live")?;
+            }
             Ok((saved, st, role))
         })
         .await?;

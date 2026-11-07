@@ -379,6 +379,8 @@ pub struct Audit {
     pub item_id: Option<String>,
     pub target_user: String,
     pub detail: String,
+    /// Repeats with this key within `AUDIT_AGGREGATE_SECS` add to one row's count.
+    pub aggregate: Option<String>,
 }
 
 impl Audit {
@@ -416,6 +418,13 @@ impl Audit {
         self.ip = ip.into();
         self
     }
+
+    /// Counts repeats (same key, within a minute of the first) in one row; the row keeps the
+    /// first event's details.
+    pub fn aggregate(mut self, key: impl Into<String>) -> Audit {
+        self.aggregate = Some(key.into());
+        self
+    }
 }
 
 /// A stored audit event.
@@ -431,6 +440,9 @@ pub struct AuditEvent {
     pub item_id: Option<String>,
     pub target_user: String,
     pub detail: String,
+    /// How many events this row stands for (repeats within a minute), and when the last was.
+    pub count: i64,
+    pub last_at: i64,
 }
 
 /// Which audit events to list: newest first, ids below `before`, at most `limit`.
@@ -651,11 +663,45 @@ CREATE TRIGGER audit_no_early_delete BEFORE DELETE ON audit
 END;
 "#;
 
+/// Version 4: repeated audit events are counted in one row (`count`, `last_at`, by `agg_key`
+/// within a minute). The only change a row may ever see is its count going up.
+const MIGRATION_V4: &str = r#"
+ALTER TABLE audit ADD COLUMN count INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE audit ADD COLUMN last_at INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE audit ADD COLUMN agg_key TEXT;
+UPDATE audit SET last_at = at;
+CREATE INDEX audit_agg ON audit(agg_key, id);
+DROP TRIGGER audit_no_update;
+CREATE TRIGGER audit_count_only BEFORE UPDATE ON audit
+    WHEN NOT (new.count > old.count AND new.last_at >= old.last_at AND new.id = old.id AND new.at = old.at
+        AND new.actor_id = old.actor_id AND new.actor_name = old.actor_name AND new.ip = old.ip
+        AND new.action = old.action AND new.org_id IS old.org_id AND new.item_id IS old.item_id
+        AND new.target_user = old.target_user AND new.detail = old.detail AND new.agg_key IS old.agg_key) BEGIN
+    SELECT RAISE(ABORT, 'the audit log is append-only');
+END;
+"#;
+
+/// The guard against early deletion (as created by `MIGRATION_V3`); `Store::audit_erase`
+/// drops and recreates it inside its transaction.
+const AUDIT_DELETE_TRIGGER: &str = r#"
+CREATE TRIGGER audit_no_early_delete BEFORE DELETE ON audit
+    WHEN old.at > CAST(strftime('%s', 'now') AS INTEGER) - 365 * 86400 BEGIN
+    SELECT RAISE(ABORT, 'audit events are kept for 365 days');
+END;
+"#;
+
 /// Audit events are kept this long, then pruned (daily).
 pub const AUDIT_KEEP_DAYS: i64 = 365;
 
+/// Repeated events with the same `Audit::aggregate` key within this many seconds of the
+/// first are one row with a count.
+pub const AUDIT_AGGREGATE_SECS: i64 = 60;
+
+/// `detail` is cut to this many characters.
+pub const AUDIT_DETAIL_MAX: usize = 200;
+
 /// The schema version this code writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// Brings a database (new, or written by an older server) to `SCHEMA_VERSION`. One write
 /// transaction, so a crash leaves the old schema intact, and a second process opening the
@@ -676,6 +722,9 @@ fn migrate(conn: &Connection) -> Res<()> {
         }
         if v < 3 {
             conn.execute_batch(MIGRATION_V3)?;
+        }
+        if v < 4 {
+            conn.execute_batch(MIGRATION_V4)?;
         }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
@@ -796,8 +845,53 @@ pub struct Store {
     /// authenticate and links can't be opened.
     pub allow_links: bool,
     /// The client address of the request being served (set by the HTTP layer for each
-    /// store call; recorded in audit events).
-    pub request_ip: String,
+    /// store call and cleared by a guard afterwards, see `Store::with_ip`; recorded in audit
+    /// events).
+    pub request_ip: std::cell::RefCell<String>,
+    /// Inside `atomic`: version files to delete once it commits (a rollback keeps them, as
+    /// the rows that refer to them come back).
+    deferred_deletes: std::cell::RefCell<Option<Vec<PathBuf>>>,
+}
+
+/// A transaction that nests: a SQLite savepoint. Rolled back when dropped without `commit`.
+/// Every multi-statement change in the store uses one, so that a whole request (`Store::atomic`)
+/// can be one transaction around them, its audit event included.
+pub struct Tx<'a> {
+    conn: &'a Connection,
+    name: String,
+    done: bool,
+}
+
+impl std::ops::Deref for Tx<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        self.conn
+    }
+}
+
+impl Tx<'_> {
+    pub fn commit(mut self) -> Res<()> {
+        self.conn.execute_batch(&format!("RELEASE {}", self.name))?;
+        self.done = true;
+        Ok(())
+    }
+}
+
+impl Drop for Tx<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            let _ = self.conn.execute_batch(&format!("ROLLBACK TO {0}; RELEASE {0}", self.name));
+        }
+    }
+}
+
+/// Clears `Store::request_ip` when dropped (also when the work panics).
+pub struct IpGuard<'a>(&'a Store);
+
+impl Drop for IpGuard<'_> {
+    fn drop(&mut self) {
+        self.0.request_ip.borrow_mut().clear();
+    }
 }
 
 impl Store {
@@ -812,7 +906,56 @@ impl Store {
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         migrate(&conn)?;
-        Ok(Store { conn, files: files.to_path_buf(), versions_to_keep: versions_to_keep.max(1), allow_links: true, request_ip: String::new() })
+        Ok(Store { conn, files: files.to_path_buf(), versions_to_keep: versions_to_keep.max(1), allow_links: true, request_ip: Default::default(), deferred_deletes: Default::default() })
+    }
+
+    /// A nested transaction (savepoint); see `Tx`.
+    pub fn tx(&self) -> Res<Tx<'_>> {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let name = format!("sp{}", SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        self.conn.execute_batch(&format!("SAVEPOINT {name}"))?;
+        Ok(Tx { conn: &self.conn, name, done: false })
+    }
+
+    /// Runs `f` as one transaction: everything it wrote (an action and its audit event) is
+    /// kept only if it succeeds, so a failure (such as the audit write) never leaves a change
+    /// behind that the caller reports as failed.
+    pub fn atomic<T, E: From<StoreError>>(&self, f: impl FnOnce(&Store) -> Result<T, E>) -> Result<T, E> {
+        let outermost = self.deferred_deletes.borrow().is_none();
+        if outermost {
+            *self.deferred_deletes.borrow_mut() = Some(Vec::new());
+        }
+        let r = (|| {
+            let tx = self.tx()?;
+            let r = f(self)?;
+            tx.commit()?;
+            Ok(r)
+        })();
+        if outermost {
+            let doomed = self.deferred_deletes.borrow_mut().take().unwrap_or_default();
+            if r.is_ok() {
+                for p in doomed {
+                    let _ = std::fs::remove_file(p);
+                }
+            }
+        }
+        r
+    }
+
+    /// Deletes a version file now, or when the surrounding `atomic` commits.
+    fn delete_file_later(&self, path: PathBuf) {
+        match self.deferred_deletes.borrow_mut().as_mut() {
+            Some(list) => list.push(path),
+            None => {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
+    /// Sets the client address for audit events until the guard is dropped.
+    pub fn with_ip(&self, ip: String) -> IpGuard<'_> {
+        *self.request_ip.borrow_mut() = ip;
+        IpGuard(self)
     }
 
     pub fn files_dir(&self) -> &Path {
@@ -849,7 +992,7 @@ impl Store {
 
     /// `create_account` with the password already checked and hashed (`util::hash_password`).
     pub fn create_account_hashed(&self, username: &str, display_name: &str, email: &str, pw_hash: &str, is_admin: bool, must_change_password: bool) -> Res<User> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.tx()?;
         let id = self.insert_account(username, display_name, email, pw_hash, is_admin, must_change_password)?;
         tx.commit()?;
         self.user_by_id(&id)?.ok_or(StoreError::NotFound)
@@ -858,7 +1001,7 @@ impl Store {
     /// An account with a temporary password (hash), joined to `org` with a role (added by
     /// the given user id) in the same transaction.
     pub fn create_temp_account(&self, username: &str, display_name: &str, email: &str, pw_hash: &str, org: Option<(&Org, OrgRole, &str)>) -> Res<User> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.tx()?;
         let id = self.insert_account(username, display_name, email, pw_hash, false, true)?;
         if let Some((o, role, by)) = org {
             self.conn.execute(
@@ -1388,7 +1531,7 @@ impl Store {
         let t = now();
         let (size, hash) = (data.size(), data.hash());
         self.write_blob(&id, 1, data)?;
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.tx()?;
         tx.execute(
             "INSERT INTO items (id, parent_id, name, kind, owner_id, size, version, hash, modified, modified_by, created) VALUES (?1, ?2, ?3, 'file', ?4, ?5, 1, ?6, ?7, ?8, ?7)",
             params![id, parent.id, name, parent.owner_id, size, hash, t, by],
@@ -1414,7 +1557,7 @@ impl Store {
         let (size, hash) = (data.size(), data.hash());
         let t = now();
         self.write_blob(&cur.id, v, data)?;
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.tx()?;
         tx.execute("UPDATE items SET size = ?1, version = ?2, hash = ?3, modified = ?4, modified_by = ?5 WHERE id = ?6", params![size, v, hash, t, by, cur.id])?;
         tx.execute("INSERT INTO versions (item_id, version, size, hash, modified, modified_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![cur.id, v, size, hash, t, by])?;
         tx.commit()?;
@@ -1517,8 +1660,8 @@ impl Store {
         for v in doomed {
             self.conn.execute("DELETE FROM versions WHERE item_id = ?1 AND version = ?2", params![item_id, v])?;
             let path = self.blob_path(item_id, v)?;
-            let _ = std::fs::remove_file(path.with_extension("live"));
-            let _ = std::fs::remove_file(path);
+            self.delete_file_later(path.with_extension("live"));
+            self.delete_file_later(path);
         }
         Ok(())
     }
@@ -1789,7 +1932,7 @@ impl Store {
         }
         let (id, account, root) = (util::new_id(), util::new_id(), util::new_id());
         let t = now();
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.tx()?;
         // The account can't sign in: no valid password hash, disabled, and never found by name
         // (':' isn't allowed in usernames).
         tx.execute(
@@ -1857,7 +2000,7 @@ impl Store {
         if self.org_by_name(&name)?.is_some_and(|o| o.id != org.id) {
             return Err(StoreError::Conflict(format!("The organisation '{name}' already exists.")));
         }
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.tx()?;
         tx.execute("UPDATE orgs SET name = ?1 WHERE id = ?2", params![name, org.id])?;
         tx.execute("UPDATE users SET display_name = ?1 WHERE id = ?2", params![name, org.account_id])?;
         tx.execute("UPDATE items SET name = ?1 WHERE id = ?2", params![name, org.root_id])?;
@@ -1881,7 +2024,7 @@ impl Store {
         if !self.children(&org.root_id)?.is_empty() {
             return Err(StoreError::Conflict(format!("The folder of {} isn't empty. Move or delete its files first.", org.name)));
         }
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.tx()?;
         tx.execute("DELETE FROM permissions WHERE grantee_kind = 'org' AND grantee_id = ?1", [&org.id])?;
         tx.execute("DELETE FROM org_members WHERE org_id = ?1", [&org.id])?;
         tx.execute("DELETE FROM invites WHERE org_id = ?1", [&org.id])?;
@@ -2006,7 +2149,7 @@ impl Store {
         if !self.invite_still_authorised(&inv)? {
             return Err(StoreError::Forbidden("This invite is no longer valid (whoever sent it can't add people any more). Ask for a new one.".into()));
         }
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.tx()?;
         if self.conn.execute("UPDATE invites SET used = ?1 WHERE id = ?2 AND used = 0", params![now(), inv.id])? != 1 {
             return Err(StoreError::NotFound);
         }
@@ -2026,7 +2169,7 @@ impl Store {
     /// already gets `AlreadyMember` and the invite stays unused (it may have been meant for
     /// someone else who clicked the wrong button, and nothing changed).
     pub fn accept_invite_existing(&self, token: &str, user_id: &str) -> Res<InviteAccepted> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.tx()?;
         let inv = self.invite_by_token(token)?.ok_or(StoreError::NotFound)?;
         let org = self.org(&inv.org_id)?.ok_or(StoreError::NotFound)?;
         if !self.invite_still_authorised(&inv)? {
@@ -2208,7 +2351,7 @@ impl Store {
     }
 
     pub fn add_live_op(&self, item_id: &str, op: &LiveOp) -> Res<()> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.tx()?;
         tx.execute(
             "INSERT INTO live_ops (item_id, seq, cid, batch, actor, ops, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![item_id, op.seq as i64, op.cid, op.batch as i64, op.actor, op.ops, op.at],
@@ -2266,15 +2409,45 @@ impl Store {
     // ------------------------------------------------------------------
 
     /// Appends an event to the audit log (the address is the request's unless `a.ip` is set).
-    /// Text is kept to one line and 500 characters.
+    /// Text is kept to one line, `detail` to `AUDIT_DETAIL_MAX` characters. With an
+    /// `aggregate` key, a repeat within `AUDIT_AGGREGATE_SECS` of the first only counts up
+    /// that row, so a loop of renames or a flood of failed sign-ins adds one row a minute.
     pub fn audit(&self, a: Audit) -> Res<()> {
         let clip = |s: &str, n: usize| -> String { s.chars().map(|c| if c.is_control() { ' ' } else { c }).take(n).collect() };
-        let ip = if a.ip.is_empty() { self.request_ip.clone() } else { a.ip };
+        let t = now();
+        if let Some(key) = &a.aggregate
+            && self.conn.execute(
+                "UPDATE audit SET count = count + 1, last_at = ?1 WHERE id = (SELECT id FROM audit WHERE agg_key = ?2 AND at > ?1 - ?3 ORDER BY id DESC LIMIT 1)",
+                params![t, key, AUDIT_AGGREGATE_SECS],
+            )? > 0
+        {
+            return Ok(());
+        }
+        let ip = if a.ip.is_empty() { self.request_ip.borrow().clone() } else { a.ip };
         self.conn.execute(
-            "INSERT INTO audit (at, actor_id, actor_name, ip, action, org_id, item_id, target_user, detail) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![now(), clip(&a.actor_id, 80), clip(&a.actor_name, 80), clip(&ip, 64), a.action, a.org_id, a.item_id, clip(&a.target_user, 80), clip(&a.detail, 500)],
+            "INSERT INTO audit (at, actor_id, actor_name, ip, action, org_id, item_id, target_user, detail, count, last_at, agg_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?1, ?10)",
+            params![t, clip(&a.actor_id, 80), clip(&a.actor_name, 80), clip(&ip, 64), a.action, a.org_id, a.item_id, clip(&a.target_user, 80), clip(&a.detail, AUDIT_DETAIL_MAX), a.aggregate],
         )?;
         Ok(())
+    }
+
+    /// Erases audit events older than `before` (Unix seconds), optionally only those done by
+    /// or to `user` (the way to honour a request to delete someone's personal data): the guard
+    /// against early deletion is dropped and recreated in the same transaction, and the erasure
+    /// itself is recorded (without the person's name). How many went. For the offline CLI.
+    pub fn audit_erase(&self, before: i64, user: Option<&str>, by: &str) -> Res<usize> {
+        let tx = self.tx()?;
+        tx.execute_batch("DROP TRIGGER audit_no_early_delete")?;
+        let n = match user {
+            Some(u) => tx.execute("DELETE FROM audit WHERE at < ?1 AND (actor_name = ?2 COLLATE NOCASE OR target_user = ?2 COLLATE NOCASE)", params![before, u])?,
+            None => tx.execute("DELETE FROM audit WHERE at < ?1", [before])?,
+        };
+        tx.execute_batch(AUDIT_DELETE_TRIGGER)?;
+        let date = &util::iso(before)[..10];
+        let detail = format!("{n} event(s) before {date} erased{}", if user.is_some() { " (one person's)" } else { "" });
+        self.audit(Audit::anonymous("audit.erase", by).detail(detail))?;
+        tx.commit()?;
+        Ok(n)
     }
 
     /// `audit` for something done to an item: the event carries the item's organisation (so
@@ -2286,7 +2459,7 @@ impl Store {
 
     /// Audit events, newest first (see `AuditQuery`).
     pub fn audit_events(&self, q: &AuditQuery) -> Res<Vec<AuditEvent>> {
-        let mut sql = String::from("SELECT id, at, actor_id, actor_name, ip, action, org_id, item_id, target_user, detail FROM audit WHERE 1 = 1");
+        let mut sql = String::from("SELECT id, at, actor_id, actor_name, ip, action, org_id, item_id, target_user, detail, count, last_at FROM audit WHERE 1 = 1");
         use rusqlite::types::Value as V;
         let mut args: Vec<V> = Vec::new();
         // Adds a value and gives its placeholder.
@@ -2331,6 +2504,8 @@ impl Store {
                     item_id: r.get(7)?,
                     target_user: r.get(8)?,
                     detail: r.get(9)?,
+                    count: r.get(10)?,
+                    last_at: r.get(11)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -2502,7 +2677,7 @@ mod tests {
             conn.execute_batch(MIGRATION_V1).unwrap();
             conn.execute_batch("PRAGMA user_version = 1").unwrap();
             std::fs::create_dir_all(&files).unwrap();
-            let s = Store { conn, files: files.clone(), versions_to_keep: 25, allow_links: true, request_ip: String::new() };
+            let s = Store { conn, files: files.clone(), versions_to_keep: 25, allow_links: true, request_ip: Default::default(), deferred_deletes: Default::default() };
             let alice = s.create_user("alice", "Alice", "", "old-password-123", true).unwrap();
             let bob = s.create_user("bob", "Bob", "", "old-password-123", false).unwrap();
             let carol = s.create_user("carol", "Carol", "", "old-password-123", false).unwrap();
@@ -2564,7 +2739,7 @@ mod tests {
             conn.execute_batch(MIGRATION_V2).unwrap();
             conn.execute_batch("PRAGMA user_version = 2").unwrap();
             std::fs::create_dir_all(&files).unwrap();
-            let s = Store { conn, files: files.clone(), versions_to_keep: 25, allow_links: true, request_ip: String::new() };
+            let s = Store { conn, files: files.clone(), versions_to_keep: 25, allow_links: true, request_ip: Default::default(), deferred_deletes: Default::default() };
             let u = s.create_user("ann", "Ann", "", "old-password-123", true).unwrap();
             // What the version 2 code wrote: no kind column.
             let t = util::new_token();
@@ -2575,7 +2750,7 @@ mod tests {
             (admin_secret, uid) = (t, u.id);
         }
         let s = Store::open(&db, &files, 25).unwrap();
-        assert_eq!(s.conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 3);
+        assert_eq!(s.conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), SCHEMA_VERSION);
         assert_eq!(s.admin_session(&admin_secret).unwrap().unwrap().1.kind, SessionKind::Admin);
         assert!(s.web_session(&admin_secret).unwrap().is_none(), "an admin session is no web session");
         let web = s.create_session(&uid, "browser", SessionKind::Web).unwrap();
@@ -2596,9 +2771,9 @@ mod tests {
     #[test]
     fn the_audit_log_is_append_only() {
         let dir = temp();
-        let mut s = Store::open(&dir.join("db"), &dir.join("files"), 25).unwrap();
+        let s = Store::open(&dir.join("db"), &dir.join("files"), 25).unwrap();
         let u = s.create_user("ann", "Ann", "", "old-password-123", true).unwrap();
-        s.request_ip = "192.0.2.7".into();
+        let ip = s.with_ip("192.0.2.7".into());
         s.audit(Audit::by(&u, "org.create").org("o1").detail("Team\nwith a newline")).unwrap();
         s.audit(Audit::by(&u, "org.rename").org("o1").ip("198.51.100.1")).unwrap();
         s.audit(Audit::by(&u, "member.add").org("o2").target("bob")).unwrap();
@@ -2621,6 +2796,88 @@ mod tests {
         assert_eq!(s.prune_audit().unwrap(), 1);
         assert_eq!(s.prune_audit().unwrap(), 0);
         assert_eq!(s.audit_events(&AuditQuery { limit: 10, ..Default::default() }).unwrap().len(), 3);
+        drop(ip);
+        assert!(s.request_ip.borrow().is_empty(), "the guard cleared the address");
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Repeats are one row with a count; `detail` is capped; only the count may change;
+    /// `audit_erase` removes old (or one person's) events and records itself.
+    #[test]
+    fn audit_aggregates_and_can_be_erased() {
+        let dir = temp();
+        let s = Store::open(&dir.join("db"), &dir.join("files"), 25).unwrap();
+        let u = s.create_user("ann", "Ann", "", "old-password-123", true).unwrap();
+        for i in 0..500 {
+            s.audit(Audit::by(&u, "item.rename").item("i1").detail(format!("{} {i}", "x".repeat(300))).aggregate("item.rename|ann|i1")).unwrap();
+        }
+        s.audit(Audit::by(&u, "item.rename").item("i2").aggregate("item.rename|ann|i2")).unwrap();
+        let all = s.audit_events(&AuditQuery { limit: 10, ..Default::default() }).unwrap();
+        assert_eq!(all.len(), 2, "one row per key and minute");
+        assert_eq!(all[1].count, 500);
+        assert!(all[1].last_at >= all[1].at);
+        assert_eq!(all[1].detail.chars().count(), AUDIT_DETAIL_MAX, "detail is capped");
+        // A minute later the next repeat starts a new row.
+        s.conn.execute("CREATE TEMP TABLE t AS SELECT 1", []).unwrap();
+        s.conn.execute_batch("DROP TRIGGER audit_count_only").unwrap();
+        s.conn.execute("UPDATE audit SET at = at - 61 WHERE item_id = 'i1'", []).unwrap();
+        s.conn.execute_batch(&MIGRATION_V4[MIGRATION_V4.find("CREATE TRIGGER").unwrap()..]).unwrap();
+        s.audit(Audit::by(&u, "item.rename").item("i1").aggregate("item.rename|ann|i1")).unwrap();
+        assert_eq!(s.audit_events(&AuditQuery { limit: 10, ..Default::default() }).unwrap().len(), 3);
+        // Only the count may go up.
+        assert!(s.conn.execute("UPDATE audit SET count = count + 1, last_at = last_at + 1", []).is_ok());
+        assert!(s.conn.execute("UPDATE audit SET count = count - 1", []).is_err());
+        assert!(s.conn.execute("UPDATE audit SET count = count + 1, detail = 'x'", []).is_err());
+        assert!(s.conn.execute("UPDATE audit SET count = count + 1, actor_name = 'bob'", []).is_err());
+        // Erasing: one person's, then everything before a date; each erasure is recorded.
+        s.audit(Audit::by(&u, "member.add").target("bob")).unwrap();
+        let tomorrow = now() + 86400;
+        assert_eq!(s.audit_erase(tomorrow, Some("BOB"), "cli").unwrap(), 1);
+        let left = s.audit_events(&AuditQuery { limit: 10, ..Default::default() }).unwrap();
+        assert_eq!(left[0].action, "audit.erase");
+        assert!(!left[0].detail.contains("bob"), "{}", left[0].detail);
+        assert!(left.iter().all(|e| e.target_user != "bob"));
+        assert!(s.conn.execute("DELETE FROM audit", []).is_err(), "the guard is back");
+        assert_eq!(s.audit_erase(tomorrow, None, "cli").unwrap(), left.len());
+        let left = s.audit_events(&AuditQuery { limit: 10, ..Default::default() }).unwrap();
+        assert_eq!((left.len(), left[0].action.as_str(), left[0].actor_id.as_str()), (1, "audit.erase", "cli"));
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `atomic` keeps all of its work or none, and version files pruned inside it are deleted
+    /// only when it commits.
+    #[test]
+    fn atomic_work_rolls_back_whole() {
+        let dir = temp();
+        let mut s = Store::open(&dir.join("db"), &dir.join("files"), 1).unwrap();
+        s.versions_to_keep = 1;
+        let u = s.create_user("ann", "Ann", "", "old-password-123", true).unwrap();
+        let (f, _) = s.create_file(&u.root_id, "A.txt", b"one", &u.id, OnConflict::Fail).unwrap();
+        // Versions 1 (the first of today) and 2 exist; keeping 1, the next save prunes 2.
+        let f = s.write_content(&f, b"two", &u.id).unwrap();
+        let v2 = s.blob_path(&f.id, 2).unwrap();
+        assert!(v2.is_file());
+        let r: Res<()> = s.atomic(|s| {
+            s.write_content(&f, b"three", &u.id)?;
+            s.audit(Audit::by(&u, "file.version"))?;
+            Err(StoreError::Internal("the audit write failed".into()))
+        });
+        assert!(r.is_err());
+        let it = s.item(&f.id).unwrap().unwrap();
+        assert_eq!(it.version, 2, "nothing of it stayed");
+        assert!(v2.is_file(), "the pruned version's file is still there, as its row came back");
+        assert_eq!(s.read_content(&it, None).unwrap().0, b"two");
+        assert!(s.audit_events(&AuditQuery { limit: 10, ..Default::default() }).unwrap().is_empty());
+        s.atomic(|s| -> Res<()> {
+            s.write_content(&f, b"three", &u.id)?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(s.item(&f.id).unwrap().unwrap().version, 3);
+        assert!(!v2.is_file(), "pruned once it committed");
+        assert!(s.version(&f.id, 2).unwrap().is_none());
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
     }

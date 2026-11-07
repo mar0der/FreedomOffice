@@ -70,6 +70,29 @@ pub fn iso(ts: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", secs / 3600, secs % 3600 / 60, secs % 60)
 }
 
+/// "2026-11-07" -> Unix seconds of its start (UTC); `None` for anything else.
+pub fn parse_date(s: &str) -> Option<i64> {
+    let b = s.trim().as_bytes();
+    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| std::str::from_utf8(&b[r]).ok().filter(|t| t.bytes().all(|c| c.is_ascii_digit()))?.parse::<i64>().ok();
+    let (y, m, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    // days_from_civil (Howard Hinnant), the inverse of `civil_from_days`.
+    let y2 = if m <= 2 { y - 1 } else { y };
+    let era = y2.div_euclid(400);
+    let yoe = y2 - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    // Refuse dates that don't exist (2026-02-30).
+    (iso(days * 86400).get(..10) == Some(s.trim())).then_some(days * 86400)
+}
+
 /// Day number (days since 1970-01-01, UTC).
 pub fn day_of(ts: i64) -> i64 {
     ts.div_euclid(86400)
@@ -86,6 +109,22 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
     let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// The network an address counts as for limits and aggregation: an IPv4 address itself (also
+/// when written as IPv4-mapped IPv6), an IPv6 address's /64 (one household or host usually
+/// has a whole /64, so per-address limits on single IPv6 addresses mean little).
+pub fn ip_bucket(ip: std::net::IpAddr) -> String {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.to_string(),
+        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => {
+                let s = v6.segments();
+                format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
+            }
+        },
+    }
 }
 
 /// Validates and normalizes a file or folder name.
@@ -218,6 +257,22 @@ mod tests {
         assert_eq!(iso(1794060429), "2026-11-07T14:07:09Z");
         assert_eq!(day_of(86399), 0);
         assert_eq!(day_of(86400), 1);
+        assert_eq!(parse_date("1970-01-01"), Some(0));
+        assert_eq!(parse_date("2000-02-29"), Some(951782400));
+        assert_eq!(parse_date("2026-11-07"), Some(1794009600));
+        for bad in ["2026-02-30", "2026-13-01", "26-11-07", "2026/11/07", "2026-11-7", "x"] {
+            assert_eq!(parse_date(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn ip_buckets() {
+        let b = |s: &str| ip_bucket(s.parse().unwrap());
+        assert_eq!(b("192.0.2.7"), "192.0.2.7");
+        assert_eq!(b("::ffff:192.0.2.7"), "192.0.2.7");
+        assert_eq!(b("2001:db8:1:2:aaaa::1"), "2001:db8:1:2::/64");
+        assert_eq!(b("2001:db8:1:2:ffff:1:2:3"), b("2001:db8:1:2::9"), "one /64");
+        assert_ne!(b("2001:db8:1:2::1"), b("2001:db8:1:3::1"));
     }
 
     #[test]

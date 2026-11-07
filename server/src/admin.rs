@@ -344,7 +344,8 @@ async fn act(app: &App, headers: &HeaderMap, body: Bytes, back: String, f: impl 
     let r = app
         .run(move |s| {
             let ctx = ctx_for(s, &secret, false)?;
-            let done = f(s, &ctx, &body);
+            // Its own transaction: on an error (the audit write included) nothing of it stays.
+            let done = s.atomic(|s| f(s, &ctx, &body));
             let ok = done.is_ok();
             let res = match done {
                 Ok(Done::Go(to)) => redirect(&to),
@@ -529,8 +530,9 @@ async fn logout(State(app): State<App>, headers: HeaderMap, body: Bytes) -> Resp
     }
     let _ = app
         .run(move |s| {
-            if let Some((_, sess)) = s.admin_session(&secret)? {
+            if let Some((u, sess)) = s.admin_session(&secret)? {
                 s.end_admin_session(sess.id)?;
+                s.audit(crate::store::Audit::by(&u, "sign_out").target(&u.username).detail("admin"))?;
             }
             Ok(())
         })
@@ -1251,7 +1253,7 @@ async fn audit_page(State(app): State<App>, headers: HeaderMap, Query(q): Query<
                 rows.push_str(&format!(
                     "<tr><td class=\"nowrap\">{}</td><td>{actor}</td><td><code>{}</code></td><td>{}</td><td>{org}</td><td>{}</td><td class=\"muted\">{}</td></tr>",
                     when(e.at),
-                    esc(&e.action),
+                    if e.count > 1 { format!("{} <span class=\"tag\">x{} until {}</span>", esc(&e.action), e.count, when(e.last_at)) } else { esc(&e.action) },
                     esc(&e.target_user),
                     esc(&e.detail),
                     esc(&e.ip)
