@@ -422,7 +422,7 @@ impl Bridge {
     pub(super) fn copy(&mut self, v: &Json, out: &mut Out) {
         let (i, rg) = match self.rect(v) {
             Ok(x) => x,
-            Err(e) => return out.browser.push(json!({ "t": "rejected", "message": e })),
+            Err(e) => return out.browser.push(json!({ "t": "error", "message": e, "id": v.get("id").cloned().unwrap_or(Json::Null) })),
         };
         self.ready();
         let cut = v.get("cut").and_then(Json::as_bool).unwrap_or(false) && self.editor;
@@ -452,7 +452,7 @@ impl Bridge {
         self.clip_seq += 1;
         let id = self.clip_seq;
         self.clip = Some(Clip { id, sheet: self.uid(i), r1: rg.r1, c1: rg.c1, h: rg.rows(), w: rg.cols(), cut, cells });
-        out.browser.push(json!({ "t": "clip", "id": id, "cut": cut, "text": text, "rows": rg.rows(), "cols": rg.cols(), "rid": v.get("id").cloned().unwrap_or(Json::Null) }));
+        out.browser.push(json!({ "t": "clip", "clip": id, "id": v.get("id").cloned().unwrap_or(Json::Null), "cut": cut, "text": text, "rows": rg.rows(), "cols": rg.cols() }));
     }
 
     /// A formula moved by (dr, dc) as a copy would be (references that would leave the sheet become #REF!).

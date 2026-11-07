@@ -223,7 +223,7 @@ fn copy_cut_paste_fill() {
     // Copy a cell with a formula and paste it one row down: the relative reference moves, the format comes along.
     let c = clip_of(&mut e, json!({ "t": "copy", "sheet": 0, "r1": 0, "c1": 1, "r2": 0, "c2": 1 }));
     assert_eq!(c["text"], "20\n");
-    let id = c["id"].as_u64().unwrap();
+    let id = c["clip"].as_u64().unwrap();
     e.send(json!({ "t": "paste", "sheet": 0, "r": 1, "c": 1, "clip": id }));
     assert_eq!(e.bob_text(0, 1, 1), "50");
     {
@@ -236,7 +236,7 @@ fn copy_cut_paste_fill() {
     // Values only.
     let c = clip_of(&mut e, json!({ "t": "copy", "sheet": 0, "r1": 0, "c1": 0, "r2": 1, "c2": 1 }));
     assert_eq!(c["text"], "2\t20\n5\t50\n");
-    e.send(json!({ "t": "paste", "sheet": 0, "r": 8, "c": 0, "clip": c["id"], "what": "values" }));
+    e.send(json!({ "t": "paste", "sheet": 0, "r": 8, "c": 0, "clip": c["clip"], "what": "values" }));
     assert_eq!(e.bob_text(0, 9, 1), "50");
     assert!(e.bob.workbook().sheets[0].get(9, 1).unwrap().formula.is_none());
     // Undo of a paste puts back what was there.
@@ -244,9 +244,9 @@ fn copy_cut_paste_fill() {
     assert_eq!(e.bob_text(0, 9, 1), "");
     // Cut and paste moves the cells; the source is empty.
     let c = clip_of(&mut e, json!({ "t": "copy", "sheet": 0, "r1": 0, "c1": 0, "r2": 1, "c2": 0, "cut": true }));
-    e.send(json!({ "t": "paste", "sheet": 0, "r": 0, "c": 3, "clip": c["id"] }));
+    e.send(json!({ "t": "paste", "sheet": 0, "r": 0, "c": 3, "clip": c["clip"] }));
     assert_eq!((e.bob_text(0, 0, 3), e.bob_text(0, 1, 3), e.bob_text(0, 0, 0)), ("2".into(), "5".into(), "".into()));
-    assert!(e.rejected(json!({ "t": "paste", "sheet": 0, "r": 0, "c": 6, "clip": c["id"] })).contains("no longer available"), "a cut can be pasted once");
+    assert!(e.rejected(json!({ "t": "paste", "sheet": 0, "r": 0, "c": 6, "clip": c["clip"] })).contains("no longer available"), "a cut can be pasted once");
     // Text from the system clipboard: typed like the keyboard does; formula-looking junk stays text.
     e.send(json!({ "t": "paste", "sheet": 0, "r": 12, "c": 0, "grid": [["x", "1,5", "=1+2"], ["12%", "=SUM(", "a\u{202e}b"]] }));
     assert_eq!((e.bob_text(0, 12, 0), e.bob_text(0, 12, 2), e.bob_text(0, 13, 0)), ("x".into(), "3".into(), "12%".into()));
