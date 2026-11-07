@@ -25,3 +25,10 @@ Started 2026-11-07 16:15 Dubai, from `orgs` at c0d9c74. Brief: inbox/20261107-14
 - Q1: ANSWERED (Guardian 14:14): yes, Tailscale IP only. Done 16:17.
 - Q3: ANSWERED: MCP stays local stdio only. Done in M1b: `fsheets mcp`, hand written JSON-RPC loop (`rmcp` is not in the offline cargo cache), no network listener.
 - Q2: ANSWERED: do not push; waiting on Petar.
+
+## 2026-11-07 18:05 — Drive deploy (Petar approved 15:57 Cairo: "deploy Drive on the21th Tailscale-only")
+- D-1: Drive is deployed on the **shared test instance** (https://the21th.taild48c09.ts.net:8090, binds 100.116.143.66:8090 only), not on the production :8080 server.
+  Why: Petar's note asks which *test accounts* can log in, and production :8080 / tailscale :443 must not be touched unless needed. The test instance already has TestOrg + accounts.
+  Default: moving Drive to production (:8080 behind tailscale serve, schema v2 -> v4 one-way after a DB backup) waits for a separate go from Petar.
+- D-2: drive-web (D1b + all review fixes, b20d195) merged into collab-365 (e84e12f). The fix range was not re-reviewed by the independent reviewer; acceptable for a tailnet-only test instance; re-review before production.
+- D-3: Pushed collab-365 + collab-365-m1 after a secret scan (file names, key patterns, and the 6 real generated passwords/tokens checked against the full history: 0 hits). `server/src/common_passwords.txt` is the weak-password blocklist, not a secret.
