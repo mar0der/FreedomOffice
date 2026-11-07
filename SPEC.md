@@ -227,8 +227,9 @@ Not yet: other participants aren't told that someone's role changed (their peer 
   - Live: `role: view` → read-only at once with a yellow bar "<file>: you can now only view this
     workbook" (still live); with unsent changes, the session ends and the bar offers Save a copy (the
     same for 4403 and a viewer Welcome). `role: edit` → editable again. `revoked` / 4401 (or 404 on
-    reconnect) → no reconnect, "Your access to this file was removed (<reason>)", read-only, Save a copy.
-  - Save As to a server joins the new file's live session at once.
+    reconnect) → no reconnect, "Your access to this file was removed (<reason>)", read-only, Save a copy; a 401 on reconnect does the same with "Sign in again". A cell being typed in counts as an unsent change in all of these.
+  - Save As to a server joins the new file's live session at once (if the window changed during the
+    upload, those changes are saved to the new file instead and it joins live when reopened).
 
 ### Web admin (`/admin`, `server/src/admin.rs`)
 
