@@ -183,6 +183,16 @@ have been meant for someone else). The account keeps its own email; `invites.use
 membership and the invite's use are one transaction (`Store::accept_invite_existing`), single use; the
 live sessions are re-checked afterwards.
 
+Names (`util::clean_name`: files, folders, organisations; created, renamed or uploaded): trimmed, 1-255
+characters, none of `/ \ : * ? " < > |` or control characters, not `.`/`..`, and no invisible or
+text-direction characters: U+200B-U+200F, U+202A-U+202E, U+2060-U+2064, U+2066-U+2069, U+061C, U+FEFF
+(400 "A name can't contain invisible or text-direction characters ..."), except a zero-width joiner
+(U+200D) between two emoji, which emoji sequences need. Names stored before this rule stay valid: they
+are listed, served, moved and can be renamed to a clean name.
+
+`Strict-Transport-Security: max-age=31536000` on every answer when the server serves TLS itself or
+`public_url` is https (not on a plain-http loopback setup).
+
 Passwords (`util::check_new_password`, all new and changed passwords including the CLI): at least 12
 characters, not the username and not containing it (usernames of 3+ characters), not one repeated
 character, not in the embedded list `server/src/common_passwords.txt` — also after stripping leading and
@@ -247,6 +257,11 @@ Not yet: other participants aren't told that someone's role changed (their peer 
   still add a row per network and minute (rows go after 365 days, or with `audit-prune`). Browsers that send
   neither `Sec-Fetch-Site` nor `Origin` (very old ones) rely on SameSite=Strict and the CSRF header alone.
   Web sessions, like admin sessions, aren't bound to an address or browser.
+- Drive app (§6): the upload conflict pre-check compares names with JavaScript's `toLowerCase()`, the
+  server with Rust's `to_lowercase()`; for the rare characters where they differ the server's answer (409,
+  then the same question) decides. Cancelling an upload after its last byte was sent can't undo it: the
+  server may already have stored it (it then shows up in the folder, and in its version history if it
+  replaced a file).
 
 ## 4. Admin UI
 
@@ -588,23 +603,32 @@ Behaviour:
   first; sort by any column; breadcrumbs (walking `parent` up with `GET /api/items/{id}` until the drive's
   root or the first folder the person can't see, then "Shared with me"); loading, empty and error states.
   Select with checkboxes, click, Ctrl/Cmd-click, Shift-click, Shift+arrows, Ctrl/Cmd+A, Escape. Keyboard:
-  rows are one tab stop (arrows, Home/End move), Enter opens, Space selects, Delete deletes (restores in the
-  Recycle bin), F2 renames.
+  rows are one tab stop (arrows, Home/End move), Enter opens, Space selects, Delete deletes (nothing in the
+  Recycle bin), F2 renames. The actions above the list are plain buttons (no `role="toolbar"`). Names are
+  rendered with `unicode-bidi: isolate` (inside sentences: `<bdi>`), so direction characters in an older
+  name can't reorder the text around it.
 - Opening: folders browse; images (png/jpg/gif/webp up to 30 MB) preview in a dialog through a `blob:` URL
   of `fetch(content)` (SVG never previews); PDF opens in a new tab at `content` without `download=1`
   (the server's PDF CSP); `.xlsx/.xlsm/.csv/.fsheet` open `freedomoffice://open?server=<encodeURIComponent(
   location.origin)>&item=<id>` with a "Don't have FreedomSheets?" hint; anything else downloads
-  (`?download=1`). Nothing else renders inline.
-- New folder, rename (`PATCH {name}`), move (`PATCH {parent}`, a folder picker that stays inside the
-  item's drive: My files or the organisation), delete (`DELETE`, then a toast with Undo = restore), version
-  history (download `?version=n&download=1`, restore `POST .../versions/{n}/restore`).
+  (`?download=1`, also each version in the history): a `HEAD` first, so a missing item shows an error
+  toast, then a hidden `<a download>`. An image that fails to decode says it can't be previewed. Nothing
+  else renders inline.
+- New folder, rename (`PATCH {name}`), move (`PATCH {parent}`, a folder picker that stays inside the top
+  of the item's breadcrumbs: My files, the organisation's folder, or the highest folder shared with the
+  person above it; from Recent / Shared with me the item's own folder decides, and an item shared on its
+  own can't be moved), delete (`DELETE`, then a toast with Undo = restore; toasts pause while hovered or
+  focused, and Ctrl/Cmd+Z runs the newest Undo), version history (download `?version=n&download=1`,
+  restore `POST .../versions/{n}/restore`). The breadcrumb cache is emptied on every navigation.
 - Recycle bin: `GET /api/trash`, Restore. There is no permanent delete in the API, so the app has none.
 - Uploads: button (multiple) or drag and drop onto the list (folders are refused with a message), one
   `XMLHttpRequest` per file (`POST /api/files?parent=&name=&conflict=`, `X-FO-CSRF`, the raw file) with a
   progress bar and Cancel each, at most 3 at once (the server allows 4 per person; a 429 is retried up to 3
   times after 3/6/9 s). Files over `max_upload_mb` are refused before sending; 413 shows the server's
   message. A name that exists in the open folder asks first: Replace (`replace`; not for folders),
-  Keep both (`rename`), Skip, optionally for all; a 409 that still happens asks the same. Leaving the page
+  Keep both (`rename`), Skip, optionally for all; a 409 that still happens asks the same. Conflict
+  questions come one at a time. A 403 `csrf_failed` keeps the upload waiting until the session is re-read,
+  then sends it once more. Leaving the page
   while uploading asks first.
 - Share (edit access): people (`GET /api/users?query=`, which suggests people sharing an organisation and
   finds anyone else by exact username) with view/edit, each of the person's organisations with view/edit,

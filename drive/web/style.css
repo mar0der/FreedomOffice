@@ -58,6 +58,9 @@ label.check { display: flex; align-items: center; gap: .5rem; }
 .tag { display: inline-block; font-size: .72rem; padding: 0 .45rem; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); margin-left: .4rem; white-space: nowrap; font-weight: 500; }
 .tag.on { color: var(--accent); border-color: var(--sel-line); }
 .secret { font: .9rem ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+/* Names are isolated: direction characters in one can't reorder the text around it. */
+bdi, .name, .up-name, .crumbs li, .view-title, .navlist a, .picker-item, .access .who, .suggest-item span, .dlg-head h2, .who-name { unicode-bidi: isolate; }
+.kbd { font-weight: 400; opacity: .8; font-size: .85em; }
 
 /* Sign in */
 .auth { min-height: 100%; display: flex; align-items: center; justify-content: center; padding: 1.5rem 1rem; }

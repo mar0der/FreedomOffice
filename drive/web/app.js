@@ -178,6 +178,9 @@
     }
   }
 
+  /** A name inside a sentence, isolated from the text around it. */
+  const nm = (name) => h('bdi', null, name);
+
   function clear(el) {
     el.replaceChildren();
     return el;
@@ -482,6 +485,7 @@
     if (!S.me) return;
     closeNavOnPhone();
     const v = parseHash();
+    S.itemCache.clear();
     const sameView = S.view && S.view.kind === v.kind && S.view.id === v.id;
     S.view = v;
     if (!(keepSelection && sameView)) {
@@ -865,7 +869,7 @@
         return;
       case 'Delete':
         e.preventDefault();
-        if (S.view.kind === 'trash') return restoreItems(targets());
+        if (S.view.kind === 'trash') return; // nothing to delete there (and no permanent delete)
         return deleteItems(targets().filter(canEdit));
       case 'F2': {
         e.preventDefault();
@@ -893,15 +897,25 @@
   // Opening, downloading, previews
   // ---------------------------------------------------------------------------
 
-  function navigateTo(url) {
-    const a = h('a', { href: url, rel: 'noopener' });
+  /** Follows a link in this tab (a download, or the freedomoffice: scheme). */
+  function navigateTo(url, { save = false } = {}) {
+    const a = h('a', { href: url, download: save ? '' : null, hidden: true });
     document.body.append(a);
     a.click();
     a.remove();
   }
 
-  function download(it, version) {
-    navigateTo(contentUrl(it.id, { version, download: true }));
+  /** Checks with HEAD first, so a missing item shows a message instead of the raw error. */
+  async function download(it, version) {
+    const url = contentUrl(it.id, { version, download: true });
+    try {
+      const res = await fetch(url, { method: 'HEAD', credentials: 'same-origin', cache: 'no-store' });
+      if (res.status === 401) return signedOut('Your session has ended. Sign in again.');
+      if (!res.ok) throw new ApiError(res.status, {});
+    } catch (e) {
+      return toast(["Couldn't download ", nm(it.name), `: ${e instanceof ApiError ? e.message : friendly(0)}`], { error: true });
+    }
+    navigateTo(url, { save: true });
   }
 
   function openInSheets(it) {
@@ -930,11 +944,16 @@
     let url = null;
     const img = h('img', { class: 'preview-img', alt: it.name });
     const status = h('p', { class: 'muted', role: 'status' }, 'Loading…');
-    const d = openDialog(it.name, (ctl) => {
+    const d = openDialog(nm(it.name), (ctl) => {
       ctl.content.append(h('div', { class: 'preview' }, status, img));
       ctl.actions(h('button', { type: 'button', class: 'secondary', on: { click: () => download(it) } }, 'Download'), h('button', { type: 'button', on: { click: () => ctl.close() } }, 'Close'));
     }, { wide: true, onClose: () => url && URL.revokeObjectURL(url) });
     img.hidden = true;
+    img.addEventListener('error', () => {
+      img.hidden = true;
+      status.hidden = false;
+      status.textContent = "This image can't be previewed. Download it instead.";
+    });
     try {
       const res = await fetch(contentUrl(it.id), { credentials: 'same-origin', cache: 'no-store' });
       if (res.status === 401) return signedOut('Your session has ended. Sign in again.');
@@ -1059,6 +1078,8 @@
     return d.closed;
   }
 
+  let lastUndo = null; // Ctrl/Cmd+Z runs the newest toast's action while it is shown
+
   function toast(message, { action, onAction, error = false, timeout } = {}) {
     const box = $('toasts');
     const t = h('div', { class: error ? 'toast error' : 'toast', role: error ? 'alert' : null });
@@ -1083,12 +1104,31 @@
             },
           },
           action,
+          h('span', { class: 'kbd' }, ' (Ctrl+Z)'),
         ),
       );
     }
     t.append(h('button', { type: 'button', class: 'icon-btn', 'aria-label': 'Dismiss', on: { click: close } }, '×'));
     box.append(t);
-    timer = setTimeout(close, timeout || (action ? 10000 : error ? 8000 : 4000));
+    const wait = timeout || (action ? 10000 : error ? 8000 : 4000);
+    const start = () => {
+      clearTimeout(timer);
+      timer = setTimeout(close, wait);
+    };
+    // Paused while the pointer or the keyboard focus is on it.
+    t.addEventListener('mouseenter', () => clearTimeout(timer));
+    t.addEventListener('focusin', () => clearTimeout(timer));
+    t.addEventListener('mouseleave', () => !t.contains(document.activeElement) && start());
+    t.addEventListener('focusout', (e) => !t.contains(e.relatedTarget) && !t.matches(':hover') && start());
+    start();
+    if (action) {
+      lastUndo = () => {
+        if (!t.isConnected) return false;
+        close();
+        onAction();
+        return true;
+      };
+    }
     return close;
   }
 
@@ -1117,14 +1157,14 @@
         S.focusId = it.id;
         selectOnly(it.id);
         await refresh();
-        toast(`Created ${it.name}.`);
+        toast(['Created ', nm(it.name), '.']);
       },
     });
   }
 
   function renameDialog(it) {
     nameDialog({
-      title: `Rename ${it.kind === 'folder' ? 'folder' : 'file'}`,
+      title: ['Rename ', nm(it.name)],
       label: 'New name',
       value: it.name,
       submit: 'Rename',
@@ -1133,7 +1173,7 @@
         if (name === it.name) return;
         const u = await api('PATCH', itemPath(it.id), { name });
         await refresh();
-        toast(`Renamed to ${u.name}.`);
+        toast(['Renamed to ', nm(u.name), '.']);
       },
     });
   }
@@ -1153,8 +1193,8 @@
     selectOnly(null);
     await refresh();
     if (done.length) {
-      const what = done.length === 1 ? done[0].name : `${done.length} items`;
-      toast(`Moved ${what} to the Recycle bin.`, { action: 'Undo', onAction: () => restoreItems(done, true) });
+      const what = done.length === 1 ? nm(done[0].name) : `${done.length} items`;
+      toast(['Moved ', what, ' to the Recycle bin.'], { action: 'Undo', onAction: () => restoreItems(done, true) });
     }
   }
 
@@ -1172,26 +1212,47 @@
     }
     selectOnly(null);
     await refresh();
-    if (n) toast(undo ? 'Restored.' : `Restored ${n === 1 ? items[0].name : `${n} items`}.`);
+    if (n) toast(undo ? 'Restored.' : ['Restored ', n === 1 ? nm(items[0].name) : `${n} items`, '.']);
   }
 
   /** The root folder an item lives under (its drive): My files or an organisation's folder. */
-  function driveRootOf(it) {
-    if (S.view.kind === 'folder' && S.crumbs.length && S.crumbs[0].id && S.section !== 'shared') return { id: S.crumbs[0].id, name: S.crumbs[0].name };
-    if (it.org) {
-      const o = (S.me.orgs || []).find((x) => x.id === it.org.id);
-      if (o) return { id: o.root, name: o.name };
+  /**
+   * Where an item may move to: the top of its breadcrumb chain (My files, an organisation's
+   * folder, or the highest folder shared with me above it; moves across owners are refused by
+   * the server) and the folder to start in. `null` when the item's folder isn't visible to me
+   * (something shared on its own), so there is nowhere to move it.
+   */
+  async function moveScope(it) {
+    if (S.view.kind === 'folder' && S.folder) {
+      const top = S.crumbs.find((c) => c.id);
+      if (top) return { root: { id: top.id, name: top.name }, start: S.folder.id };
     }
-    return { id: S.me.root, name: 'My files' };
+    if (!it.parent) return null;
+    let parent;
+    try {
+      parent = await api('GET', itemPath(it.parent));
+    } catch (e) {
+      if (e.status === 404 || e.status === 403) return null;
+      throw e;
+    }
+    const top = (await crumbsFor(parent)).list.find((c) => c.id);
+    return { root: { id: top.id, name: top.name }, start: parent.id };
   }
 
   async function moveDialog(items) {
     if (!items.length) return;
-    const root = driveRootOf(items[0]);
+    let scope;
+    try {
+      scope = await moveScope(items[0]);
+    } catch (e) {
+      return toastError(e);
+    }
+    if (!scope) return toast("This item was shared with you on its own, so it can't be moved to another folder.", { error: true });
+    const root = scope.root;
     const moving = new Set(items.map((i) => i.id));
     const fromParent = items[0].parent;
-    let cur = S.view.kind === 'folder' && S.folder && S.section !== 'shared' ? S.folder.id : root.id;
-    const title = items.length === 1 ? `Move ${items[0].name}` : `Move ${items.length} items`;
+    let cur = scope.start;
+    const title = items.length === 1 ? ['Move ', nm(items[0].name)] : `Move ${items.length} items`;
     openDialog(title, (ctl) => {
       const crumbs = h('ol', { class: 'crumbs inline' });
       const list = h('ul', { class: 'picker', 'aria-label': 'Folders' });
@@ -1209,10 +1270,11 @@
           const chain = await crumbsFor(folder);
           cur = id;
           path = chain.list.filter((c) => c.id);
-          // Stay inside the drive the items are in.
+          // Stay inside the drive (or shared folder) the items are in.
           const at = path.findIndex((c) => c.id === root.id);
+          const outside = at < 0;
           if (at > 0) path = path.slice(at);
-          path[0] = { ...path[0], name: root.name };
+          if (!outside) path[0] = { ...path[0], name: root.name };
           clear(crumbs);
           path.forEach((c, i) => {
             crumbs.append(h('li', null, i === path.length - 1 ? h('span', { 'aria-current': 'location' }, c.name) : h('button', { type: 'button', class: 'link', on: { click: () => load(c.id) } }, c.name)));
@@ -1223,8 +1285,8 @@
           }
           status.textContent = folders.length ? '' : 'No folders in here.';
           const inside = path.some((c) => moving.has(c.id));
-          here.disabled = inside || id === fromParent || !canEdit(folder);
-          here.title = id === fromParent ? 'The items are already here' : inside ? "A folder can't go inside itself" : !canEdit(folder) ? 'You can only view this folder' : '';
+          here.disabled = outside || inside || id === fromParent || !canEdit(folder);
+          here.title = outside ? `Only folders in ${root.name}` : id === fromParent ? 'The items are already here' : inside ? "A folder can't go inside itself" : !canEdit(folder) ? 'You can only view this folder' : '';
           ctl.error('');
         } catch (e) {
           status.textContent = '';
@@ -1249,14 +1311,14 @@
         ctl.close();
         selectOnly(null);
         await refresh();
-        toast(`Moved ${n === 1 ? items[0].name : `${n} items`} to ${path.length ? path[path.length - 1].name : 'the folder'}.`);
+        toast(['Moved ', n === 1 ? nm(items[0].name) : `${n} items`, ' to ', nm(path.length ? path[path.length - 1].name : 'the folder'), '.']);
       });
       load(cur);
     });
   }
 
   async function versionsDialog(it) {
-    openDialog(`Version history: ${it.name}`, (ctl) => {
+    openDialog(['Version history: ', nm(it.name)], (ctl) => {
       const status = h('p', { class: 'muted', role: 'status' }, 'Loading…');
       const body = h('tbody');
       const table = h(
@@ -1307,7 +1369,7 @@
                 h('td', null, h('time', { datetime: v.modified, title: fmtFull(v.modified) }, fmtDate(v.modified))),
                 h('td', { class: 'col-by' }, v.modified_by || ''),
                 h('td', { class: 'num' }, fmtSize(v.size)),
-                h('td', { class: 'actions' }, h('a', { class: 'button secondary small', href: contentUrl(it.id, { version: v.version, download: true }), 'aria-label': `Download version ${v.version}` }, 'Download'), ' ', restore),
+                h('td', { class: 'actions' }, h('button', { type: 'button', class: 'secondary small', 'aria-label': `Download version ${v.version}`, dataset: { version: String(v.version) }, on: { click: () => download(it, v.version) } }, 'Download'), ' ', restore),
               ),
             );
           }
@@ -1328,7 +1390,7 @@
   // ---------------------------------------------------------------------------
 
   function shareDialog(it) {
-    openDialog(`Share ${it.name}`, (ctl) => {
+    openDialog(['Share ', nm(it.name)], (ctl) => {
       const access = h('ul', { class: 'access', 'aria-label': 'People and organisations with access' });
       const accessStatus = h('p', { class: 'muted', role: 'status' }, 'Loading…');
       // People.
@@ -1408,7 +1470,7 @@
           who.value = '';
           clear(suggestions);
           ctl.error('');
-          toast(`Shared with ${username}.`);
+          toast(['Shared with ', nm(username), '.']);
           await loadAccess();
         } catch (e) {
           if (e.status !== 401) ctl.error(e.message);
@@ -1420,7 +1482,7 @@
         try {
           await api('POST', itemPath(it.id, '/permissions'), { org: orgSel.value, role: orole.value });
           ctl.error('');
-          toast(`Shared with everyone in ${orgSel.selectedOptions[0].textContent}.`);
+          toast(['Shared with everyone in ', nm(orgSel.selectedOptions[0].textContent), '.']);
           await loadAccess();
         } catch (e) {
           if (e.status !== 401) ctl.error(e.message);
@@ -1493,7 +1555,7 @@
     const lid = `${ctl.dlg.getAttribute('aria-labelledby')}-l`;
     const role = h('select', { id: `${lid}-r` }, h('option', { value: 'view' }, 'Can view'), h('option', { value: 'edit' }, 'Can edit'));
     const days = h('select', { id: `${lid}-d` }, h('option', { value: '0' }, 'Never'), h('option', { value: '1' }, '1 day'), h('option', { value: '7', selected: true }, '7 days'), h('option', { value: '30' }, '30 days'));
-    const pw = h('input', { id: `${lid}-p`, type: 'password', autocomplete: 'new-password', placeholder: 'Optional' });
+    const pw = h('input', { id: `${lid}-p`, type: 'password', autocomplete: 'off', placeholder: 'Optional' });
     const create = h('button', { type: 'submit', class: 'secondary' }, 'Create link');
     const form = h(
       'form',
@@ -1629,7 +1691,16 @@
     pump();
   }
 
-  async function askConflict(name, isFolder, remaining) {
+  let conflictChain = Promise.resolve();
+
+  /** One conflict question at a time, however many uploads ask. */
+  function askConflict(name, isFolder, remaining) {
+    const next = conflictChain.then(() => askConflictNow(name, isFolder, remaining));
+    conflictChain = next.catch(() => {});
+    return next;
+  }
+
+  async function askConflictNow(name, isFolder, remaining) {
     const all = h('input', { type: 'checkbox', id: `all-${dlgSeq + 1}` });
     const extra = remaining > 0 ? h('label', { class: 'check', for: all.id }, all, `Do the same for other files that already exist`) : null;
     const buttons = [
@@ -1637,7 +1708,7 @@
       { label: 'Keep both', value: 'rename', kind: isFolder ? '' : 'secondary' },
       { label: 'Skip', value: 'skip', kind: 'secondary' },
     ].filter(Boolean);
-    const msg = isFolder ? `There's already a folder named “${name}” here. Upload the file under another name?` : `“${name}” already exists here. Replace it (the old file stays in its version history), keep both, or skip this file?`;
+    const msg = isFolder ? ["There's already a folder named “", nm(name), '” here. Upload the file under another name?'] : ['“', nm(name), '” already exists here. Replace it (the old file stays in its version history), keep both, or skip this file?'];
     const choice = await choose('File already exists', msg, buttons, extra);
     return { choice, all: !!(extra && all.checked && choice) };
   }
@@ -1667,7 +1738,8 @@
 
   function finish(u, state, text) {
     u.state = state;
-    u.status.textContent = text;
+    clear(u.status);
+    append(u.status, [text]);
     u.li.classList.add(state);
     u.cancel.hidden = true;
     if (state === 'done') u.bar.value = u.bar.max;
@@ -1717,16 +1789,21 @@
       }
       const st = xhr.status;
       if (st === 200 || st === 201) {
-        finish(u, 'done', st === 200 ? `Uploaded as a new version of ${j.name || u.name}` : j.name && j.name !== u.name ? `Uploaded as ${j.name}` : 'Uploaded');
+        finish(u, 'done', st === 200 ? ['Uploaded as a new version of ', nm(j.name || u.name)] : j.name && j.name !== u.name ? ['Uploaded as ', nm(j.name)] : 'Uploaded');
         scheduleRefresh(u.parent);
       } else if (st === 401) {
         finish(u, 'error', 'Not uploaded: signed out.');
         signedOut('Your session has ended. Sign in again.');
       } else if (st === 403 && j.code === 'csrf_failed' && !u.retried) {
         u.retried = true;
-        u.state = 'queued';
+        u.state = 'waiting';
+        u.status.textContent = 'Retrying…';
         try {
-          if (await refreshSession()) return pump();
+          if (await refreshSession()) {
+            if (u.state !== 'waiting') return; // cancelled meanwhile
+            u.state = 'queued';
+            return pump();
+          }
         } catch {
           /* below */
         }
@@ -1852,6 +1929,12 @@
       if (open) nav.querySelector('a').focus();
     });
     window.addEventListener('hashchange', () => route());
+    // Ctrl/Cmd+Z: the Undo of the newest toast (not while typing, not under a dialog).
+    document.addEventListener('keydown', (e) => {
+      if (!(e.ctrlKey || e.metaKey) || e.shiftKey || e.altKey || (e.key !== 'z' && e.key !== 'Z')) return;
+      if (e.target.closest('input, textarea, select, [contenteditable]') || document.querySelector('dialog[open]')) return;
+      if (lastUndo && lastUndo()) e.preventDefault();
+    });
     $('act-new-folder').addEventListener('click', newFolderDialog);
     $('act-upload').addEventListener('click', () => $('file-input').click());
     $('file-input').addEventListener('change', (e) => {
