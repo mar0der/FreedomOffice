@@ -133,7 +133,7 @@ to it and invites are deleted, the org account and any trashed items stay (unrea
 | `GET /api/me` → also `must_change_password`, `orgs: [{id, name, root, role, member_role, members}]` | anyone signed in |
 | `POST /api/me/password {old_password, new_password}` (signs out the other devices) | the user |
 | `POST /api/users {username, display_name?, email?, org?, role?}` → `{user, temporary_password}` | super-admin; org owner/admin with `org` |
-| `POST /api/users/{username}/reset-password` → `{user, temporary_password}` | super-admin |
+| `POST /api/users/{username}/reset-password` → `{user, temporary_password}` | super-admin (not for themselves) |
 | `POST /api/users/{username}/disable`, `/enable` | super-admin |
 | `GET /api/orgs` (super-admin: all), `POST /api/orgs {name}` | members / super-admin |
 | `GET /api/orgs/{org}` (id or name; with `member_list`), `PATCH {name?, member_role?}`, `DELETE` | rename/delete: super-admin; member_role: org owner/admin |
@@ -211,7 +211,8 @@ Not yet: other participants aren't told that someone's role changed (their peer 
 - Web admin (§4): the sign-in form has no CSRF token (there is no session yet), only the origin check;
   a POST with neither Origin nor Referer is judged by its CSRF token alone. Sessions aren't bound to an
   address or browser. Destructive buttons (disable, reset, remove) have no "are you sure" step except
-  deleting an organisation.
+  deleting an organisation. The People page runs a few queries per person (organisations, storage):
+  fine for a family or a team, slow with thousands of accounts.
 
 ## 4. Admin UI
 
@@ -256,8 +257,10 @@ address and username), the delay after repeated failures, Argon2 in its semaphor
 sign-in whatever the activity, isn't a bearer token for the API (device tokens aren't admin sessions
 either), is checked on every request (disabled account, demoted admin, temporary password), and ends with
 sign-out, "sign out of all devices", disable, password reset, and any password change (from the API: all
-web sessions end; from the page: all others). A temporary password allows only `/admin/password` and
-sign-out. Plain-http setups (only possible on loopback or with `allow_insecure_http`, and with an
+web sessions end; from the page: all others). Signing in again from a browser ends the session of the
+cookie it sent; a person keeps at most 10 sessions (the oldest end). A temporary password allows only
+`/admin/password` and sign-out. Nobody resets their own password (web and API, 400 "Use Change password
+for your own account."): the reset would sign them out before they saw the new one. Plain-http setups (only possible on loopback or with `allow_insecure_http`, and with an
 `http://` public URL) get `fo_admin` without `Secure`, since browsers wouldn't send a Secure cookie back;
 anything with TLS or an `https://` `public_url` always gets the `__Host-`/`Secure` cookie. Set `public_url`
 behind a reverse proxy: the origin check compares against it.
@@ -268,7 +271,8 @@ constant time (403 when missing or wrong). Before that, a POST whose `Origin` is
 (`null` included), or that has no Origin and a `Referer` from elsewhere, is refused (403); the sign-in form
 has this check (no session yet) and SameSite=Strict. With neither header the token decides.
 
-**Headers** on every admin response: `Content-Security-Policy: default-src 'none'; style-src 'self';
+**Headers** on every response under `/admin` (a router-wide middleware, so also on 400 from a bad path
+parameter, 404, 405 and 413): `Content-Security-Policy: default-src 'none'; style-src 'self';
 img-src 'self' data:; form-action 'self'; frame-ancestors 'none'; base-uri 'none'`,
 `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Cache-Control: no-store`,
 `Referrer-Policy: same-origin` (not `no-referrer`: with that, browsers send `Origin: null` on form POSTs,
@@ -277,7 +281,8 @@ which would leave the origin check nothing to compare; no referrer leaves the si
 **Shown once.** Temporary passwords (create account, reset) and invite links appear only in the response
 to the POST that made them (no-store), selectable with one click (`user-select: all`); they are never
 logged or stored in clear. Resets are logged as warnings (who reset whom). All user text (names, emails,
-device and browser names, org names, unknown usernames from the URL) is HTML-escaped.
+device and browser names, org names) is HTML-escaped; an unknown username in a URL is answered with a
+fixed "No such user." (API too), never echoed.
 
 ## 5. Security baseline (required for any public test)
 
