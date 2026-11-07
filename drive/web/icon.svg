@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="FreedomOffice Drive">
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="#217346"/>
+  <path d="M14 22a4 4 0 0 1 4-4h9.5l4 4.5H46a4 4 0 0 1 4 4V44a4 4 0 0 1-4 4H18a4 4 0 0 1-4-4z" fill="#ffffff"/>
+  <path d="M14 28h36v16a4 4 0 0 1-4 4H18a4 4 0 0 1-4-4z" fill="#e6f4ea"/>
+  <path d="M32 31.5l7 7h-4.5V45h-5v-6.5H25z" fill="#217346"/>
+</svg>

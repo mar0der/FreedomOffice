@@ -31,6 +31,7 @@ rustls-acme = { version = "0.15", default-features = false, features = ["ring", 
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 rpassword = "7"
 cosync = { path = "../cosync" }
+freedomoffice-drive = { path = "../drive" }
 
 [dev-dependencies]
 ureq = { version = "3", default-features = false }

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["sheets", "server", "cosync", "agents"]
+members = ["sheets", "server", "cosync", "agents", "drive"]
 
 [profile.release]
 opt-level = 3

@@ -659,12 +659,26 @@ pub fn router(app: App) -> Router {
         .route("/l/{token}", get(link_page))
         .route("/l/{token}/download", get(link_download).post(link_download_form))
         .merge(crate::admin::routes())
+        .merge(crate::drive::routes())
         .fallback(|| async { ApiError::not_found() })
         .layer(DefaultBodyLimit::max(JSON_LIMIT))
         .layer(middleware::from_fn(crate::admin::harden_admin))
+        .layer(middleware::from_fn_with_state(app.clone(), hsts))
         .layer(middleware::from_fn_with_state(app.clone(), crate::web::web_gate))
         .layer(middleware::from_fn(log_requests))
         .with_state(app)
+}
+
+/// `Strict-Transport-Security` on every answer when browsers reach this server over https
+/// (it serves TLS itself, or `public_url` is https behind a proxy): they then refuse a
+/// downgraded plain-http visit for a year.
+async fn hsts(State(app): State<App>, req: Request, next: Next) -> Response {
+    let https = app.cfg.public_url.trim().to_ascii_lowercase().starts_with("https://") || !matches!(app.cfg.tls(), Ok(crate::config::Tls::None));
+    let mut res = next.run(req).await;
+    if https {
+        res.headers_mut().insert(header::STRICT_TRANSPORT_SECURITY, HeaderValue::from_static("max-age=31536000"));
+    }
+    res
 }
 
 /// Logs method, path (secrets in link paths redacted), status and time. Never bodies or headers.
@@ -819,8 +833,11 @@ async fn logout(State(app): State<App>, headers: HeaderMap) -> ApiResult {
     Ok(res)
 }
 
-/// The signed-in user, with the organisations they belong to (each with its folder).
+/// The signed-in user, with the organisations they belong to (each with its folder), what
+/// their own files take (`storage`, every kept version and the trash included) and the
+/// server's limits a client should know before uploading (`server`).
 async fn me(State(app): State<App>, headers: HeaderMap) -> ApiResult {
+    let limits = json!({ "max_upload_mb": app.cfg.max_upload_mb, "allow_links": app.cfg.allow_links });
     app.run(move |s| {
         let who = auth_any(s, &headers)?;
         let u = user_of(&who)?;
@@ -830,6 +847,8 @@ async fn me(State(app): State<App>, headers: HeaderMap) -> ApiResult {
             orgs.push(org_json(s, &o, Some(r))?);
         }
         v["orgs"] = json!(orgs);
+        v["storage"] = usage_json(&s.usage_of(&u.id)?);
+        v["server"] = limits;
         ok_json(v)
     })
     .await

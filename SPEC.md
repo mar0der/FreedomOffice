@@ -183,6 +183,16 @@ have been meant for someone else). The account keeps its own email; `invites.use
 membership and the invite's use are one transaction (`Store::accept_invite_existing`), single use; the
 live sessions are re-checked afterwards.
 
+Names (`util::clean_name`: files, folders, organisations; created, renamed or uploaded): trimmed, 1-255
+characters, none of `/ \ : * ? " < > |` or control characters, not `.`/`..`, and no invisible or
+text-direction characters: U+200B-U+200F, U+202A-U+202E, U+2060-U+2064, U+2066-U+2069, U+061C, U+FEFF
+(400 "A name can't contain invisible or text-direction characters ..."), except a zero-width joiner
+(U+200D) between two emoji, which emoji sequences need. Names stored before this rule stay valid: they
+are listed, served, moved and can be renamed to a clean name.
+
+`Strict-Transport-Security: max-age=31536000` on every answer when the server serves TLS itself or
+`public_url` is https (not on a plain-http loopback setup).
+
 Passwords (`util::check_new_password`, all new and changed passwords including the CLI): at least 12
 characters, not the username and not containing it (usernames of 3+ characters), not one repeated
 character, not in the embedded list `server/src/common_passwords.txt` — also after stripping leading and
@@ -308,6 +318,11 @@ stderr, MCP `write_range` and `replaced_changes` return it under `replaced`.
   still add a row per network and minute (rows go after 365 days, or with `audit-prune`). Browsers that send
   neither `Sec-Fetch-Site` nor `Origin` (very old ones) rely on SameSite=Strict and the CSRF header alone.
   Web sessions, like admin sessions, aren't bound to an address or browser.
+- Drive app (§6): the upload conflict pre-check compares names with JavaScript's `toLowerCase()`, the
+  server with Rust's `to_lowercase()`; for the rare characters where they differ the server's answer (409,
+  then the same question) decides. Cancelling an upload after its last byte was sent can't undo it: the
+  server may already have stored it (it then shows up in the folder, and in its version history if it
+  replaced a file).
 
 ## 4. Admin UI
 
@@ -607,9 +622,87 @@ otherwise). Super-admin: every event. Org owner/admin: only events whose `org_id
 manage (an `org` they don't manage: 404). Anyone else: 403. `/admin/audit` shows the same with the same
 rules (filters person / organisation / action group, 50 per page, "Older"/"Newest").
 
+### The Drive web app (D1b, `drive-web` branch) **(exists)**
+
+Crate `drive/` (`freedomoffice-drive`, a library): `drive/web/index.html`, `app.js`, `style.css`,
+`icon.svg`, embedded with `include_str!`; `asset(path) -> Option<(bytes, content type)>` and `version()`
+(a 12-hex-digit hash of the assets). Plain JavaScript: no framework, build step, CDN, external fonts, inline
+scripts, inline styles or `on*=` attributes; every name is rendered with `textContent`, never as HTML (the
+crate's tests scan the sources for `innerHTML`, `insertAdjacentHTML`, `eval`, `style=`, `localStorage`,
+other origins and the like).
+
+Routes (`server/src/drive.rs`):
+
+| Route | Answer |
+|---|---|
+| `GET /drive`, `GET /drive/` | index.html, `Cache-Control: no-store`; it names `/drive/assets/<file>?v=<version()>` |
+| `GET /drive/assets/{app.js,style.css,icon.svg}` | the file (`text/javascript`, `text/css`, `image/svg+xml`); `public, max-age=31536000, immutable` with the current `?v=`, else `public, max-age=300` |
+| anything else under `/drive/assets/` | 404 (also `index.html` there), `no-store` |
+
+Every one of those answers: `Content-Security-Policy: default-src 'none'; script-src 'self'; style-src
+'self'; img-src 'self' data: blob:; connect-src 'self'; form-action 'self'; frame-ancestors 'none';
+base-uri 'none'`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: same-origin` (the API's origin check
+needs `Origin` on POSTs), `X-Frame-Options: DENY`, `Cross-Origin-Resource-Policy: same-origin`. Client
+routing uses the hash: `#/files` (My files), `#/files/<id>` (a folder; a file's id shows its folder with the
+file selected), `#/shared`, `#/recent`, `#/trash`; organisations are `#/files/<org root>`.
+
+`GET /api/me` gained (for the app) `storage: {files, versions, bytes}` (the person's own files, every
+kept version and the trash included) and `server: {max_upload_mb, allow_links}`.
+
+Behaviour:
+- Start: `GET /api/web/session` → the app, or the sign-in (`POST /api/web/login`). `must_change_password`
+  shows "Choose a new password" (`POST /api/me/password`), also reachable as "Change password". Sign out:
+  `POST /api/web/logout`.
+- The CSRF token is kept in a JavaScript variable only (never in a URL, cookie or storage); every request
+  other than GET/HEAD sends `X-FO-CSRF`. 401 anywhere → the sign-in ("Your session has ended"; uploads are
+  aborted, dialogs closed). 403 `csrf_failed` → `GET /api/web/session` and the request once more.
+  403 `password_change_required` → the password screen. 408/409/412/413/423/429/507 and network failures
+  get sentences of their own. sessionStorage holds only the sort order.
+- Nav: My files, Shared with me, Recent, each organisation (from `/api/me`), Recycle bin, storage use, and
+  "Administration" (`/admin`) for the super-admin and org owners/admins.
+- List: name with a type icon, modified (local time; full date as a tooltip), modified by, size; folders
+  first; sort by any column; breadcrumbs (walking `parent` up with `GET /api/items/{id}` until the drive's
+  root or the first folder the person can't see, then "Shared with me"); loading, empty and error states.
+  Select with checkboxes, click, Ctrl/Cmd-click, Shift-click, Shift+arrows, Ctrl/Cmd+A, Escape. Keyboard:
+  rows are one tab stop (arrows, Home/End move), Enter opens, Space selects, Delete deletes (nothing in the
+  Recycle bin), F2 renames. The actions above the list are plain buttons (no `role="toolbar"`). Names are
+  rendered with `unicode-bidi: isolate` (inside sentences: `<bdi>`), so direction characters in an older
+  name can't reorder the text around it.
+- Opening: folders browse; images (png/jpg/gif/webp up to 30 MB) preview in a dialog through a `blob:` URL
+  of `fetch(content)` (SVG never previews); PDF opens in a new tab at `content` without `download=1`
+  (the server's PDF CSP); `.xlsx/.xlsm/.csv/.fsheet` open `freedomoffice://open?server=<encodeURIComponent(
+  location.origin)>&item=<id>` with a "Don't have FreedomSheets?" hint; anything else downloads
+  (`?download=1`, also each version in the history): a `HEAD` first, so a missing item shows an error
+  toast, then a hidden `<a download>`. An image that fails to decode says it can't be previewed. Nothing
+  else renders inline.
+- New folder, rename (`PATCH {name}`), move (`PATCH {parent}`, a folder picker that stays inside the top
+  of the item's breadcrumbs: My files, the organisation's folder, or the highest folder shared with the
+  person above it; from Recent / Shared with me the item's own folder decides, and an item shared on its
+  own can't be moved), delete (`DELETE`, then a toast with Undo = restore; toasts pause while hovered or
+  focused, and Ctrl/Cmd+Z runs the newest Undo), version history (download `?version=n&download=1`,
+  restore `POST .../versions/{n}/restore`). The breadcrumb cache is emptied on every navigation.
+- Recycle bin: `GET /api/trash`, Restore. There is no permanent delete in the API, so the app has none.
+- Uploads: button (multiple) or drag and drop onto the list (folders are refused with a message), one
+  `XMLHttpRequest` per file (`POST /api/files?parent=&name=&conflict=`, `X-FO-CSRF`, the raw file) with a
+  progress bar and Cancel each, at most 3 at once (the server allows 4 per person; a 429 is retried up to 3
+  times after 3/6/9 s). Files over `max_upload_mb` are refused before sending; 413 shows the server's
+  message. A name that exists in the open folder asks first: Replace (`replace`; not for folders),
+  Keep both (`rename`), Skip, optionally for all; a 409 that still happens asks the same. Conflict
+  questions come one at a time. A 403 `csrf_failed` keeps the upload waiting until the session is re-read,
+  then sends it once more. Leaving the page
+  while uploading asks first.
+- Share (edit access): people (`GET /api/users?query=`, which suggests people sharing an organisation and
+  finds anyone else by exact username) with view/edit, each of the person's organisations with view/edit,
+  the current access (owner, people, organisations; inherited ones show their folder and can't be removed
+  here) with Remove; share links (role, expiry, optional password; the URL is shown once with Copy; list and
+  delete) unless `server.allow_links` is false, and a 403 `links_disabled` replaces the section with a note.
+
+Checked with headless Chrome (DevTools protocol over `--remote-debugging-pipe`) against a throwaway server
+on 127.0.0.1: the flows above, no console errors or CSP violations, light/dark/phone screenshots.
+
 ### Open in FreedomSheets
 
-Drive links to `freedomoffice://open?server=<percent-encoded public_url>&item=<id>` for `.xlsx`, `.csv`,
+Drive links to `freedomoffice://open?server=<percent-encoded public_url>&item=<id>` for `.xlsx`, `.xlsm`, `.csv`,
 `.fsheet`. FreedomSheets registers the scheme (Windows: `HKCU\Software\Classes\freedomoffice`, written at
 start only if missing, already pointing at that exe, or pointing at an absolute exe path that no longer
 exists; Linux: `MimeType=x-scheme-handler/freedomoffice;` in
