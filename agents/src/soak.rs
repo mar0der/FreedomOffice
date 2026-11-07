@@ -422,6 +422,9 @@ pub fn run(apis: &[Api], item: &str, cfg: &Config) -> Result<Report, String> {
     let mut handles = Vec::new();
     for i in 0..cfg.clients {
         let (api, item, cfg, jdir) = (apis[i % apis.len()].clone(), item.to_string(), cfg.clone(), jdir.clone());
+        // One journal folder per client: a journal is kept per (server, account, document), so
+        // clients signed in as the same account would share one file (and its client id).
+        let jdir = jdir.map(|d| d.join(format!("client{i}")));
         handles.push(std::thread::spawn(move || client(api, item, cfg, i, jdir)));
     }
     let mut lives = Vec::new();
@@ -491,7 +494,9 @@ pub fn run(apis: &[Api], item: &str, cfg: &Config) -> Result<Report, String> {
         });
     }
     // Everything is acknowledged, so no journal may be left.
-    let journals_left = jdir.as_deref().map_or(0, |d| cosync::journal::Journal::all(d).len());
+    let journals_left = jdir
+        .as_deref()
+        .map_or(0, |d| (0..cfg.clients).map(|i| cosync::journal::Journal::all(&d.join(format!("client{i}"))).len()).sum());
     if let (Some(d), true) = (&jdir, own_dir) {
         let _ = std::fs::remove_dir_all(d);
     }

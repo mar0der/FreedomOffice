@@ -1263,6 +1263,39 @@ mod e2e {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Changes made before the server's `Welcome` has said it is an old (protocol 1) one wait as
+    /// separate content/format parts, with row changes among them; they become whole cells at
+    /// that moment, and applied to the state they were made on they must give exactly the
+    /// workbook the person has (they once wrote other cells' data into the wrong cells).
+    #[test]
+    fn changes_made_before_an_old_servers_welcome_become_the_same_whole_cells() {
+        use cosync::Op;
+        let (server, dir, mut a, b, _) = two_people("prewelcome");
+        a.app.live_drop_for_test();
+        let before = a.app.wb.clone();
+        type_at(&mut a.app, 2, 1, "first");
+        a.app.toggle_bold();
+        a.app.select_range(rg("2:3"));
+        a.app.insert_rows();
+        type_at(&mut a.app, 6, 1, "after the rows");
+        a.app.apply_style(|s| s.fill = Some(0xFFEE00));
+        type_at(&mut a.app, 3, 1, "moved down");
+        a.app.select_range(rg("1:1"));
+        a.app.delete_rows();
+        type_at(&mut a.app, 1, 2, "last");
+        a.app.live_flush();
+        assert!(a.app.live_pending_ops().iter().any(|o| matches!(o, Op::Content { .. } | Op::Format { .. })));
+        a.app.live_welcome_for_test(1);
+        let pending = a.app.live_pending_ops();
+        assert!(!pending.iter().any(|o| matches!(o, Op::Content { .. } | Op::Format { .. })), "{pending:?}");
+        let mut replayed = before;
+        crate::live::apply_ops(&mut replayed, &pending, false, &mut crate::live::ApplyState::default());
+        let diffs = crate::live::compare(&a.app.wb, &replayed);
+        assert!(diffs.is_empty(), "{diffs:#?}\n{pending:?}");
+        drop((server, b));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A types a value while B makes the same cell bold, at the same time: both survive on both
     /// sides, and nobody is told anything was replaced (they edited different things).
     #[test]

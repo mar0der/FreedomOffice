@@ -313,16 +313,20 @@ impl Live {
             self.buf_changes += std::mem::take(&mut self.fly_changes);
             self.sess.rebase_on_reload(seq)
         };
-        if self.legacy {
-            if let Some(b) = &mut self.sess.inflight {
-                b.ops = live::collapse_cells(&self.wb, &b.ops);
-            }
-            self.sess.buffer = live::collapse_cells(&self.wb, &self.sess.buffer);
-        }
+        // (applied first: the whole cells are read from the workbook that holds them)
         self.apply(&pending, false);
+        self.collapse_pending();
         self.unsaved = true;
         self.resumed += j.pending_changes();
         self.stats.journal_restores += 1;
+    }
+
+    /// Protocol 1 mode: whatever waits to be sent becomes whole cells (also what was made
+    /// before the server said which protocol it speaks). The workbook has it all applied.
+    fn collapse_pending(&mut self) {
+        if self.legacy {
+            live::collapse_pending(&self.wb, self.sess.inflight.as_mut().map(|b| &mut b.ops), &mut self.sess.buffer);
+        }
     }
 
     /// How many changes were put back from a journal since the last call.
@@ -521,12 +525,7 @@ impl Live {
                 // before this Welcome and is still waiting).
                 self.legacy = proto < cosync::MIN_PROTO;
                 self.comments = proto >= cosync::COMMENTS_PROTO;
-                if self.legacy {
-                    if let Some(b) = &mut self.sess.inflight {
-                        b.ops = live::collapse_cells(&self.wb, &b.ops);
-                    }
-                    self.sess.buffer = live::collapse_cells(&self.wb, &self.sess.buffer);
-                }
+                self.collapse_pending();
                 self.editor = you.editor;
                 self.me = Some(you);
                 self.peers = peers.into_iter().map(|p| (p.id, p)).collect();

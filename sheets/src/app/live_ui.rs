@@ -758,6 +758,10 @@ impl App {
         let l = self.live.as_mut().expect("live");
         l.state = state;
         l.applying = false;
+        if l.legacy {
+            // (a journal from before the server was known to speak protocol 1 holds separate parts)
+            live::collapse_pending(&self.wb, l.sess.inflight.as_mut().map(|b| &mut b.ops), &mut l.sess.buffer);
+        }
         self.wb.recalc();
         self.generation += 1;
         self.edits += 1;
@@ -1068,10 +1072,7 @@ impl App {
                 l.legacy = proto < cosync::MIN_PROTO;
                 l.comments = proto >= cosync::COMMENTS_PROTO;
                 if l.legacy {
-                    if let Some(b) = &mut l.sess.inflight {
-                        b.ops = live::collapse_cells(&self.wb, &b.ops);
-                    }
-                    l.sess.buffer = live::collapse_cells(&self.wb, &l.sess.buffer);
+                    live::collapse_pending(&self.wb, l.sess.inflight.as_mut().map(|b| &mut b.ops), &mut l.sess.buffer);
                 }
                 if l.welcomed && l.editor && !you.editor && !l.sess.has_pending() {
                     // Made a viewer while disconnected (with nothing unsent; see live_caught_up).
@@ -2415,6 +2416,14 @@ impl App {
         if let Some(l) = &mut self.live {
             l.legacy = true;
         }
+    }
+
+    /// The server's `Welcome` as an old server (protocol `proto`) sends it, handled as received.
+    pub(crate) fn live_welcome_for_test(&mut self, proto: u32) {
+        let Some(l) = &self.live else { return };
+        let Some(you) = l.me.clone() else { return };
+        let seq = l.sess.seq;
+        self.live_msg(ServerMsg::Welcome { seq, you, peers: Vec::new(), proto });
     }
 
     pub(crate) fn live_notice_for_test(&self) -> Option<Notice> {

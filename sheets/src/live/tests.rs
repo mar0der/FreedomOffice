@@ -238,3 +238,298 @@ fn mentions_are_matched_by_user_or_display_name() {
     let text = "hi @Ann Lee, ok";
     assert_eq!(comments::mention_spans(text, &members), [(3, 11)]);
 }
+
+// ---------------------------------------------------------------------------
+// Protocol 1 mode: separate content/format parts become whole cells
+// ---------------------------------------------------------------------------
+
+/// `ops` applied to `base` (as the editor does), and the same state reached from `base` by the
+/// whole-cell form `collapse_cells` gives (what a protocol 1 server is sent).
+fn collapsed_state_matches(base: &Workbook, ops: &[Op]) -> Result<(), String> {
+    let mut a = base.clone();
+    let mut st = ApplyState::default();
+    apply_ops(&mut a, ops, false, &mut st);
+    let whole = collapse_cells(&a, ops);
+    if whole.iter().any(|o| matches!(o, Op::Content { .. } | Op::Format { .. })) {
+        return Err(format!("parts left in {whole:?}"));
+    }
+    let mut b = base.clone();
+    apply_ops(&mut b, &whole, false, &mut st);
+    let d = compare(&a, &b);
+    if d.is_empty() { Ok(()) } else { Err(format!("{d:?} for {ops:?} -> {whole:?}")) }
+}
+
+fn content(s: cosync::SheetId, r: u32, c: u32, t: &str) -> Op {
+    Op::Content { s, r, c, v: Some(Box::new(CellData { v: Val::Text(t.into()), ..Default::default() })), adj: vec![] }
+}
+
+fn bold(s: cosync::SheetId, r: u32, c: u32) -> Op {
+    Op::Format { s, r, c, st: style_json(&crate::model::Style { bold: true, ..Default::default() }) }
+}
+
+#[test]
+fn whole_cells_follow_later_row_and_column_changes_in_the_same_list() {
+    // Changes made before the server said which protocol it speaks wait as parts, with row and
+    // column changes among them; each names its cell as it was at its moment.
+    let base = book();
+    let s = base.sheets[0].uid;
+    let first = [content(s, 3, 0, "x"), Op::Rows { s, at: 1, n: 2 }, content(s, 8, 0, "y"), bold(s, 3, 0), Op::Cols { s, at: 0, n: 1 }, bold(s, 5, 1)];
+    collapsed_state_matches(&base, &first).unwrap();
+    // A cell written and then deleted with its row writes nothing; one clearing another's content.
+    let gone = [content(s, 2, 0, "z"), Op::Rows { s, at: 2, n: -1 }, Op::Rows { s, at: 0, n: 1 }, Op::Content { s, r: 3, c: 0, v: None, adj: vec![] }];
+    collapsed_state_matches(&base, &gone).unwrap();
+    let out = collapse_cells(&base, &gone);
+    assert!(out.iter().filter(|o| matches!(o, Op::Cell { .. })).count() == 1, "{out:?}");
+}
+
+#[test]
+fn whole_cells_equal_the_state_for_random_edit_sequences() {
+    let base = book();
+    let s = base.sheets[0].uid;
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    let mut next = move |n: u32| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed % n as u64) as u32
+    };
+    for round in 0..300 {
+        let mut ops = Vec::new();
+        for i in 0..1 + next(12) {
+            ops.push(match next(10) {
+                0 => Op::Rows { s, at: next(8), n: if next(3) == 0 { -1 } else { 1 + next(2) as i32 } },
+                1 => Op::Cols { s, at: next(4), n: if next(3) == 0 { -1 } else { 1 } },
+                2 | 3 => bold(s, next(8), next(3)),
+                4 => Op::Content { s, r: next(8), c: next(3), v: None, adj: vec![] },
+                5 => Op::Cell { s, r: next(8), c: next(3), v: Some(Box::new(CellData { v: Val::Num(i as f64), ..Default::default() })), adj: vec![] },
+                _ => content(s, next(8), next(3), &format!("t{round}-{i}")),
+            });
+        }
+        if let Err(e) = collapsed_state_matches(&base, &ops) {
+            panic!("round {round}: {e}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A protocol 1 server in-process: clients that only learn at `Welcome` what it speaks
+// ---------------------------------------------------------------------------
+
+mod old_server_model {
+    use std::collections::VecDeque;
+
+    use cosync::client::{Batch, Session, Step};
+    use cosync::server::{Commit, Log};
+
+    use super::*;
+
+    /// What the server sends a client.
+    enum To {
+        Welcome(u64),
+        Ops { seq: u64, cid: String, id: u64, ops: Vec<Op> },
+        Ack { id: u64, seq: u64, extra: Vec<(u32, Op)> },
+    }
+
+    struct Client {
+        wb: Workbook,
+        sess: Session,
+        cid: String,
+        /// Connected: the server has this client's connection.
+        online: bool,
+        /// A `Welcome` has been seen at some time: the client knows the server only has whole cells.
+        legacy: bool,
+        caught_up: bool,
+        target: u64,
+        inbox: VecDeque<To>,
+        /// Batches sent and not yet handled by the server.
+        outbox: VecDeque<Batch>,
+        state: ApplyState,
+    }
+
+    impl Client {
+        fn new(base: &Workbook, i: usize) -> Client {
+            let cid = format!("c{i}");
+            let mut sess = Session::new(cid.clone(), 0);
+            sess.offline();
+            Client { wb: base.clone(), sess, cid, online: false, legacy: false, caught_up: false, target: 0, inbox: VecDeque::new(), outbox: VecDeque::new(), state: ApplyState::default() }
+        }
+
+        /// Local change, as the editor makes it: applied, collapsed to whole cells once the
+        /// client knows the server is old, then sent or kept.
+        fn edit(&mut self, ops: Vec<Op>) {
+            apply_ops(&mut self.wb, &ops, false, &mut self.state);
+            let ops = if self.legacy { collapse_cells(&self.wb, &ops) } else { ops };
+            if let Some(b) = self.sess.local(ops) {
+                self.outbox.push_back(b);
+            }
+        }
+
+        fn stepped(&mut self, step: Step) {
+            apply_ops(&mut self.wb, &step.apply, true, &mut self.state);
+            if let Some(b) = step.send {
+                self.outbox.push_back(b);
+            }
+        }
+
+        fn caught_up_check(&mut self) {
+            if self.online && !self.caught_up && self.sess.seq >= self.target {
+                self.caught_up = true;
+                if let Some(b) = self.sess.resume() {
+                    self.outbox.push_back(b);
+                }
+            }
+        }
+
+        fn receive(&mut self) {
+            let Some(m) = self.inbox.pop_front() else { return };
+            match m {
+                To::Welcome(head) => {
+                    self.legacy = true;
+                    // (what the app and fsheets do on the old server's Welcome)
+                    collapse_pending(&self.wb, self.sess.inflight.as_mut().map(|b| &mut b.ops), &mut self.sess.buffer);
+                    self.target = head;
+                }
+                To::Ops { seq, cid, id, ops } => {
+                    let step = self.sess.remote_based(seq, &cid, id, None, ops);
+                    self.stepped(step);
+                }
+                To::Ack { id, seq, extra } => {
+                    let step = self.sess.ack(id, seq, extra);
+                    self.stepped(step);
+                }
+            }
+            self.caught_up_check();
+        }
+    }
+
+    struct World {
+        log: Log,
+        server_wb: Workbook,
+        clients: Vec<Client>,
+        state: ApplyState,
+    }
+
+    impl World {
+        fn connect(&mut self, i: usize) {
+            let c = &mut self.clients[i];
+            if c.online {
+                return;
+            }
+            c.online = true;
+            c.caught_up = false;
+            c.sess.offline();
+            c.inbox.clear();
+            c.outbox.clear();
+            c.inbox.push_back(To::Welcome(self.log.head()));
+            c.target = self.log.head();
+            for e in self.log.since(c.sess.seq).expect("kept").to_vec() {
+                c.inbox.push_back(To::Ops { seq: e.seq, cid: e.cid, id: e.id, ops: e.ops });
+            }
+        }
+
+        fn disconnect(&mut self, i: usize, deliver: bool) {
+            if deliver {
+                self.serve(i);
+            }
+            let c = &mut self.clients[i];
+            c.online = false;
+            c.caught_up = false;
+            c.sess.offline();
+            c.inbox.clear();
+            c.outbox.clear();
+        }
+
+        /// The server handles one batch of client `i`.
+        fn serve(&mut self, i: usize) {
+            let Some(b) = self.clients[i].outbox.pop_front() else { return };
+            let cid = self.clients[i].cid.clone();
+            match self.log.commit(b.base, &cid, b.id, "u", b.ops).expect("commit") {
+                Commit::New { seq, ops, extra } => {
+                    apply_ops(&mut self.server_wb, &ops, true, &mut self.state);
+                    for (j, c) in self.clients.iter_mut().enumerate() {
+                        if !c.online {
+                            continue;
+                        }
+                        if j == i {
+                            c.inbox.push_back(To::Ack { id: b.id, seq, extra: extra.clone() });
+                        } else {
+                            c.inbox.push_back(To::Ops { seq, cid: cid.clone(), id: b.id, ops: ops.clone() });
+                        }
+                    }
+                }
+                Commit::Duplicate { seq } => {
+                    if self.clients[i].online {
+                        self.clients[i].inbox.push_back(To::Ack { id: b.id, seq, extra: vec![] });
+                    }
+                }
+            }
+        }
+    }
+
+    fn random_edit(next: &mut impl FnMut(u32) -> u32, s: cosync::SheetId, tag: &str) -> Op {
+        match next(12) {
+            0 => Op::Rows { s, at: next(10), n: if next(3) == 0 { -1 } else { 1 + next(2) as i32 } },
+            1 => Op::Cols { s, at: next(5), n: if next(3) == 0 { -1 } else { 1 } },
+            2..=4 => bold(s, next(10), next(4)),
+            5 => Op::Content { s, r: next(10), c: next(4), v: None, adj: vec![] },
+            6 => Op::Cell { s, r: next(10), c: next(4), v: Some(Box::new(CellData { v: Val::Num(next(100) as f64), ..Default::default() })), adj: vec![] },
+            _ => content(s, next(10), next(4), tag),
+        }
+    }
+
+    /// Clients make random changes (also before their first `Welcome`, and while disconnected),
+    /// lose their connections at random and come back: all must end with the server's state.
+    #[test]
+    fn clients_of_a_protocol_1_server_converge_with_changes_made_before_its_welcome() {
+        let base = book();
+        let s = base.sheets[0].uid;
+        let mut failures = Vec::new();
+        for seed in 1..=150u64 {
+            let mut rng = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut next = move |n: u32| {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                (rng >> 11) as u32 % n
+            };
+            let mut w = World { log: Log::new(0), server_wb: base.clone(), clients: (0..3).map(|i| Client::new(&base, i)).collect(), state: ApplyState::default() };
+            for step in 0..200 {
+                let i = next(3) as usize;
+                match next(100) {
+                    0..=34 => {
+                        let tag = format!("s{seed}-{step}");
+                        let ops = vec![random_edit(&mut next, s, &tag)];
+                        w.clients[i].edit(ops);
+                    }
+                    35..=59 => w.clients[i].receive(),
+                    60..=84 => w.serve(i),
+                    85..=89 => {
+                        let deliver = next(2) == 0;
+                        w.disconnect(i, deliver)
+                    }
+                    _ => w.connect(i),
+                }
+            }
+            // Everybody comes back and everything is handled.
+            for _ in 0..10_000 {
+                let mut busy = false;
+                for i in 0..3 {
+                    w.connect(i);
+                    busy |= !w.clients[i].inbox.is_empty() || !w.clients[i].outbox.is_empty();
+                    w.clients[i].receive();
+                    w.serve(i);
+                }
+                if !busy && w.clients.iter().all(|c| c.caught_up && !c.sess.has_pending() && c.sess.seq == w.log.head()) {
+                    break;
+                }
+            }
+            for (i, c) in w.clients.iter().enumerate() {
+                let d = compare(&w.server_wb, &c.wb);
+                if !d.is_empty() || c.sess.has_pending() {
+                    failures.push(format!("seed {seed}: client {i} differs from the server: {:?}", d.first()));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{} runs diverged, e.g. {:?}", failures.len(), &failures[..failures.len().min(3)]);
+    }
+}
