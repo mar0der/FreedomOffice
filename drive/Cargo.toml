@@ -1,0 +1,13 @@
+[package]
+name = "freedomoffice-drive"
+version = "26.45.2"
+edition = "2024"
+description = "FreedomOffice Drive - the web app (static files embedded into freedomoffice-server at /drive)"
+license = "MIT"
+repository = "https://github.com/mar0der/FreedomOffice"
+
+[lib]
+name = "freedomoffice_drive"
+path = "src/lib.rs"
+
+[dependencies]

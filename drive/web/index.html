@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="same-origin">
+<title>FreedomOffice Drive</title>
+<link rel="icon" type="image/svg+xml" href="/drive/assets/icon.svg?v={{v}}">
+<link rel="stylesheet" href="/drive/assets/style.css?v={{v}}">
+<script src="/drive/assets/app.js?v={{v}}" defer></script>
+</head>
+<body>
+<noscript><p class="noscript">FreedomOffice Drive needs JavaScript. Turn it on for this site and reload the page.</p></noscript>
+
+<div id="boot" class="boot" role="status">Loading…</div>
+
+<main id="signin" class="auth" hidden>
+  <div class="auth-card">
+    <p class="auth-brand"><img src="/drive/assets/icon.svg?v={{v}}" alt="" width="40" height="40"> FreedomOffice <span>Drive</span></p>
+    <form id="signin-form" class="stack" novalidate>
+      <h1>Sign in</h1>
+      <div id="signin-error" class="msg error" role="alert" hidden></div>
+      <div id="signin-note" class="msg" role="status" hidden></div>
+      <label for="signin-user">Username</label>
+      <input id="signin-user" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required>
+      <label for="signin-pass">Password</label>
+      <input id="signin-pass" name="password" type="password" autocomplete="current-password" required>
+      <button type="submit" id="signin-submit">Sign in</button>
+    </form>
+  </div>
+</main>
+
+<main id="pwchange" class="auth" hidden>
+  <div class="auth-card">
+    <p class="auth-brand"><img src="/drive/assets/icon.svg?v={{v}}" alt="" width="40" height="40"> FreedomOffice <span>Drive</span></p>
+    <form id="pw-form" class="stack" novalidate>
+      <h1 id="pw-title">Choose a new password</h1>
+      <p id="pw-intro" class="muted">You signed in with a temporary password. Choose your own to continue.</p>
+      <div id="pw-error" class="msg error" role="alert" hidden></div>
+      <input type="text" id="pw-username" name="username" autocomplete="username" hidden>
+      <label for="pw-old">Current password</label>
+      <input id="pw-old" type="password" autocomplete="current-password" required>
+      <label for="pw-new">New password</label>
+      <input id="pw-new" type="password" autocomplete="new-password" required minlength="12" aria-describedby="pw-rules">
+      <p id="pw-rules" class="muted small">At least 12 characters; not a common password and not your username.</p>
+      <label for="pw-confirm">New password again</label>
+      <input id="pw-confirm" type="password" autocomplete="new-password" required>
+      <div class="buttons">
+        <button type="submit" id="pw-submit">Change password</button>
+        <button type="button" id="pw-cancel" class="secondary" hidden>Cancel</button>
+        <button type="button" id="pw-signout" class="secondary">Sign out</button>
+      </div>
+    </form>
+  </div>
+</main>
+
+<div id="shell" class="shell" hidden>
+  <a class="skip" href="#main">Skip to the file list</a>
+  <header class="top">
+    <button type="button" id="nav-toggle" class="secondary nav-toggle" aria-controls="sidenav" aria-expanded="false">Menu</button>
+    <a class="brand" href="#/files"><img src="/drive/assets/icon.svg?v={{v}}" alt="" width="28" height="28"> FreedomOffice <span>Drive</span></a>
+    <div class="who">
+      <span id="who-name" class="who-name"></span>
+      <button type="button" id="pw-open" class="link">Change password</button>
+      <button type="button" id="signout" class="secondary">Sign out</button>
+    </div>
+  </header>
+  <div class="layout">
+    <nav id="sidenav" class="sidenav" aria-label="Drive">
+      <ul class="navlist">
+        <li><a href="#/files" data-nav="files">My files</a></li>
+        <li><a href="#/shared" data-nav="shared">Shared with me</a></li>
+        <li><a href="#/recent" data-nav="recent">Recent</a></li>
+      </ul>
+      <div id="orgs-block" hidden>
+        <h2 class="navhead" id="orgs-head">Organisations</h2>
+        <ul class="navlist" id="org-nav" aria-labelledby="orgs-head"></ul>
+      </div>
+      <ul class="navlist">
+        <li><a href="#/trash" data-nav="trash">Recycle bin</a></li>
+      </ul>
+      <div class="storage" id="storage" hidden>
+        <h2 class="navhead">Storage</h2>
+        <p id="storage-text"></p>
+      </div>
+      <p class="adminlink"><a id="admin-link" href="/admin" hidden>Administration</a></p>
+    </nav>
+    <main id="main" class="content" tabindex="-1">
+      <nav aria-label="Breadcrumb" class="crumbs"><ol id="crumbs"></ol></nav>
+      <h1 id="view-title" class="view-title"></h1>
+      <div class="toolbar" id="toolbar" role="toolbar" aria-label="Actions" aria-controls="list">
+        <button type="button" id="act-new-folder" class="secondary">New folder</button>
+        <button type="button" id="act-upload">Upload</button>
+        <input type="file" id="file-input" multiple hidden>
+        <span id="sel-count" class="selcount" aria-live="polite"></span>
+        <button type="button" class="secondary" data-act="open">Open</button>
+        <button type="button" class="secondary" data-act="sheets">Open in Sheets</button>
+        <button type="button" class="secondary" data-act="download">Download</button>
+        <button type="button" class="secondary" data-act="share">Share</button>
+        <button type="button" class="secondary" data-act="rename">Rename</button>
+        <button type="button" class="secondary" data-act="move">Move</button>
+        <button type="button" class="secondary" data-act="versions">Version history</button>
+        <button type="button" class="secondary" data-act="restore">Restore</button>
+        <button type="button" class="danger" data-act="delete">Delete</button>
+      </div>
+      <p id="sheets-hint" class="muted small hint" hidden></p>
+      <p id="view-note" class="muted small" hidden></p>
+      <div id="dropzone" class="listwrap">
+        <div id="list-state" class="liststate" role="status"></div>
+        <table id="list" class="list" role="grid" aria-multiselectable="true" aria-labelledby="view-title">
+          <thead>
+            <tr>
+              <th class="col-check" scope="col"><input type="checkbox" id="select-all" aria-label="Select all"></th>
+              <th class="col-name" scope="col" data-col="name"><button type="button" class="sort" data-sort="name">Name</button></th>
+              <th class="col-mod" scope="col" data-col="modified"><button type="button" class="sort" data-sort="modified" id="col-mod-label">Modified</button></th>
+              <th class="col-by" scope="col" data-col="by"><button type="button" class="sort" data-sort="by">Modified by</button></th>
+              <th class="col-size num" scope="col" data-col="size"><button type="button" class="sort" data-sort="size">Size</button></th>
+            </tr>
+          </thead>
+          <tbody id="rows"></tbody>
+        </table>
+        <div id="empty" class="empty" hidden></div>
+        <div class="drop-hint" aria-hidden="true">Drop files here to upload them</div>
+      </div>
+    </main>
+  </div>
+  <section id="uploads" class="uploads" aria-labelledby="uploads-title" hidden>
+    <div class="uploads-head">
+      <h2 id="uploads-title">Uploads</h2>
+      <button type="button" id="uploads-clear" class="link">Clear finished</button>
+      <button type="button" id="uploads-hide" class="link">Hide</button>
+    </div>
+    <ul id="upload-list" class="upload-list"></ul>
+  </section>
+</div>
+
+<div id="toasts" class="toasts" role="status" aria-live="polite"></div>
+</body>
+</html>
