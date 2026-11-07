@@ -4,6 +4,7 @@
 //! command made by comparing the state before it (the undo snapshot) with the state after.
 //! No UI here: see `app::live_ui`; the connection is in `conn`.
 
+#[cfg(feature = "ui")]
 pub mod conn;
 mod diff;
 
@@ -616,7 +617,6 @@ pub fn describe(op: &Op) -> String {
 }
 
 /// Cell contents by position of every sheet (for convergence tests).
-#[cfg(test)]
 pub fn contents(wb: &Workbook) -> std::collections::HashMap<(String, u32, u32), String> {
     let mut out = std::collections::HashMap::new();
     for sh in &wb.sheets {

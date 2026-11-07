@@ -119,7 +119,6 @@ pub enum LabelPos {
 }
 
 impl LabelPos {
-    #[cfg(test)]
     pub const ALL: [LabelPos; 10] = [
         LabelPos::Auto,
         LabelPos::Center,

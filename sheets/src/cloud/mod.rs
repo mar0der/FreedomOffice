@@ -267,7 +267,7 @@ fn env_dir(var: &str) -> Option<PathBuf> {
 
 /// Per-user settings: `%APPDATA%\FreedomOffice`, `~/.config/freedomoffice` (XDG),
 /// `~/Library/Application Support/FreedomOffice` (macOS).
-pub(crate) fn roaming_dir() -> Option<PathBuf> {
+pub fn roaming_dir() -> Option<PathBuf> {
     if cfg!(windows) {
         env_dir("APPDATA").map(|a| a.join("FreedomOffice"))
     } else if cfg!(target_os = "macos") {
@@ -279,7 +279,7 @@ pub(crate) fn roaming_dir() -> Option<PathBuf> {
 
 /// Per-user data that stays on this machine: `%LOCALAPPDATA%\FreedomOffice`,
 /// `~/.local/share/freedomoffice` (XDG), `~/Library/Application Support/FreedomOffice` (macOS).
-pub(crate) fn local_dir() -> Option<PathBuf> {
+pub fn local_dir() -> Option<PathBuf> {
     if cfg!(windows) {
         env_dir("LOCALAPPDATA").map(|a| a.join("FreedomOffice"))
     } else if cfg!(target_os = "macos") {
@@ -289,7 +289,7 @@ pub(crate) fn local_dir() -> Option<PathBuf> {
     }
 }
 
-pub(crate) const NO_SETTINGS_DIR: &str = "The folder for FreedomOffice settings couldn't be found (APPDATA / HOME isn't set).";
+pub const NO_SETTINGS_DIR: &str = "The folder for FreedomOffice settings couldn't be found (APPDATA / HOME isn't set).";
 
 /// Writes a file only the current user can read (sign-in tokens). On Windows the content
 /// is already DPAPI-encrypted; elsewhere the file is created with mode 0600.

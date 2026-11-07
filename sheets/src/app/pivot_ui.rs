@@ -1435,7 +1435,7 @@ mod tests {
     fn pivot_ui_smoke() {
         let ctx = egui::Context::default();
         let mut app = App::with_context(&ctx, 0, None);
-        app.wb = crate::pivot::tests::sample(true);
+        app.wb = crate::pivot::sample::sample(true);
         app.select(1, 1, false);
         app.open_create_pivot();
         let Some(PDialog::Create { source, .. }) = &app.pivots.dialog else { panic!("no dialog") };
