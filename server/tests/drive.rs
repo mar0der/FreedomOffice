@@ -531,3 +531,68 @@ fn uploads_stream_to_disk_within_the_limit() {
     assert_eq!(r.body.len(), 8 * 64 * 1024);
     assert_eq!(s.audit(&s.token("alice"), "action=item.version_restore").len(), 1);
 }
+
+const DRIVE_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
+
+fn assert_drive_headers(r: &Resp, what: &str) {
+    assert_eq!(r.header("content-security-policy"), Some(DRIVE_CSP), "{what}");
+    assert_eq!(r.header("x-content-type-options"), Some("nosniff"), "{what}");
+    assert_eq!(r.header("referrer-policy"), Some("same-origin"), "{what}");
+    assert_eq!(r.header("x-frame-options"), Some("DENY"), "{what}");
+    assert!(r.header("access-control-allow-origin").is_none(), "{what}");
+}
+
+#[test]
+fn the_drive_app_is_served_with_strict_headers() {
+    let s = start();
+    let v = freedomoffice_drive::version();
+    for path in ["/drive", "/drive/"] {
+        let r = s.send("GET", path, &[], None);
+        assert_eq!(r.status, 200, "{path}");
+        assert_drive_headers(&r, path);
+        assert_eq!(r.header("content-type"), Some("text/html; charset=utf-8"));
+        assert_eq!(r.header("cache-control"), Some("no-store"));
+        let html = r.text();
+        assert!(html.contains(&format!("/drive/assets/app.js?v={v}")), "{html}");
+        assert!(!html.contains("{{v}}"));
+    }
+    for (file, ct) in [("app.js", "text/javascript; charset=utf-8"), ("style.css", "text/css; charset=utf-8"), ("icon.svg", "image/svg+xml")] {
+        let r = s.send("GET", &format!("/drive/assets/{file}?v={v}"), &[], None);
+        assert_eq!(r.status, 200, "{file}");
+        assert_drive_headers(&r, file);
+        assert_eq!(r.header("content-type"), Some(ct), "{file}");
+        assert_eq!(r.header("cache-control"), Some("public, max-age=31536000, immutable"), "{file}");
+        assert_eq!(r.body, freedomoffice_drive::asset(file).unwrap().0, "{file}");
+        // Another (older) version, or none: only briefly cached.
+        let r = s.send("GET", &format!("/drive/assets/{file}?v=000000000000"), &[], None);
+        assert_eq!(r.header("cache-control"), Some("public, max-age=300"), "{file}");
+        let r = s.send("GET", &format!("/drive/assets/{file}"), &[], None);
+        assert_eq!(r.header("cache-control"), Some("public, max-age=300"), "{file}");
+        assert_eq!(s.send("HEAD", &format!("/drive/assets/{file}"), &[], None).status, 200, "{file}");
+    }
+    for bad in ["/drive/assets/nope.js", "/drive/assets/index.html", "/drive/assets/%2e%2e/Cargo.toml", "/drive/assets/app.js/x", "/drive/assets/APP.JS", "/drive/assets/"] {
+        let r = s.send("GET", bad, &[], None);
+        assert_eq!(r.status, 404, "{bad}");
+    }
+    let r = s.send("GET", "/drive/assets/nope.js", &[], None);
+    assert_drive_headers(&r, "unknown asset");
+    assert_eq!(r.header("cache-control"), Some("no-store"));
+    // Not a /drive answer: the API keeps its own headers.
+    assert!(s.send("GET", "/api/health", &[], None).header("content-security-policy").is_none());
+}
+
+#[test]
+fn me_tells_the_drive_app_its_storage_and_limits() {
+    let s = start_with(|c| {
+        c.max_upload_mb = 7;
+        c.allow_links = false;
+    });
+    let w = s.web("bob");
+    let root = w.get("/api/me").json()["root"].as_str().unwrap().to_string();
+    let token = s.token("bob");
+    assert_eq!(s.upload(&token, &root, "a.txt", b"hello").status, 201);
+    let me = w.get("/api/me").json();
+    assert_eq!(me["server"], json!({ "max_upload_mb": 7, "allow_links": false }));
+    assert_eq!(me["storage"]["files"], 1);
+    assert_eq!(me["storage"]["bytes"], 5);
+}

@@ -5,6 +5,7 @@ pub mod admin;
 pub mod api;
 pub mod config;
 pub mod content;
+pub mod drive;
 pub mod live;
 pub mod store;
 pub mod tls;

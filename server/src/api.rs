@@ -610,6 +610,7 @@ pub fn router(app: App) -> Router {
         .route("/l/{token}", get(link_page))
         .route("/l/{token}/download", get(link_download).post(link_download_form))
         .merge(crate::admin::routes())
+        .merge(crate::drive::routes())
         .fallback(|| async { ApiError::not_found() })
         .layer(DefaultBodyLimit::max(JSON_LIMIT))
         .layer(middleware::from_fn(crate::admin::harden_admin))
@@ -744,8 +745,11 @@ async fn logout(State(app): State<App>, headers: HeaderMap) -> ApiResult {
     .await
 }
 
-/// The signed-in user, with the organisations they belong to (each with its folder).
+/// The signed-in user, with the organisations they belong to (each with its folder), what
+/// their own files take (`storage`, every kept version and the trash included) and the
+/// server's limits a client should know before uploading (`server`).
 async fn me(State(app): State<App>, headers: HeaderMap) -> ApiResult {
+    let limits = json!({ "max_upload_mb": app.cfg.max_upload_mb, "allow_links": app.cfg.allow_links });
     app.run(move |s| {
         let who = auth_any(s, &headers)?;
         let u = user_of(&who)?;
@@ -755,6 +759,8 @@ async fn me(State(app): State<App>, headers: HeaderMap) -> ApiResult {
             orgs.push(org_json(s, &o, Some(r))?);
         }
         v["orgs"] = json!(orgs);
+        v["storage"] = usage_json(&s.usage_of(&u.id)?);
+        v["server"] = limits;
         ok_json(v)
     })
     .await

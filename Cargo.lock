@@ -1234,12 +1234,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "freedomoffice-drive"
+version = "26.45.2"
+
+[[package]]
 name = "freedomoffice-server"
 version = "26.45.2"
 dependencies = [
  "argon2",
  "axum",
  "cosync",
+ "freedomoffice-drive",
  "futures-util",
  "getrandom 0.3.4",
  "rpassword",
