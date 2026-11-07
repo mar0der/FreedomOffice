@@ -251,7 +251,7 @@ fn becoming_a_viewer_with_unsent_changes_ends_the_session() {
             "role" => app.live_event_for_test(Event::Msg(cosync::ServerMsg::Role { role: "view".into() })),
             "welcome" => {
                 // Reconnecting after access was changed: the server says we are a viewer.
-                let you = cosync::Peer { id: 1, name: "Me".into(), user: "me".into(), color: 0, editor: false, presence: None };
+                let you = cosync::Peer { id: 1, name: "Me".into(), user: "me".into(), color: 0, editor: false, agent: false, presence: None };
                 app.live_event_for_test(Event::Msg(cosync::ServerMsg::Welcome { seq: 0, you, peers: vec![] }));
             }
             // Sending them was refused.
@@ -462,7 +462,7 @@ fn view_only_participants_change_nothing() {
 #[test]
 fn live_messages_are_cleared_by_new_or_open() {
     use crate::live::conn::Event;
-    let join = Event::Msg(cosync::ServerMsg::Join { peer: cosync::Peer { id: 7, name: "PO Client B".into(), user: "pob".into(), color: 1, editor: true, presence: None } });
+    let join = Event::Msg(cosync::ServerMsg::Join { peer: cosync::Peer { id: 7, name: "PO Client B".into(), user: "pob".into(), color: 1, editor: true, agent: false, presence: None } });
     let (_ctx, mut app) = super::data_ui::sample_app();
     app.live_for_test();
     app.live_event_for_test(join);

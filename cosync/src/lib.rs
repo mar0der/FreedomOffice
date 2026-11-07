@@ -199,6 +199,10 @@ pub struct Peer {
     /// Colour slot (the app maps it to a colour).
     pub color: u8,
     pub editor: bool,
+    /// A headless agent (script, MCP tool) rather than a person at the app. Optional on the
+    /// wire (absent = false), so older apps and servers ignore it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub agent: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub presence: Option<Presence>,
 }
