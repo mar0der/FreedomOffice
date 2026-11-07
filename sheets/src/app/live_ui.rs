@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cosync::client::{Batch, Session};
+use cosync::journal::Journal;
 use cosync::{ClientMsg, Op, Peer, Presence, Rect as CRect, ServerMsg, SheetId};
 use eframe::egui::{self, Align2, Color32, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 
@@ -109,6 +110,25 @@ pub struct ReplacedNote {
 const REPLACED_SECS: u64 = 90;
 const REPLACED_KEEP: usize = 20;
 
+/// Where and as whom a session keeps its journal (see `cosync::journal`).
+struct Jrn {
+    dir: std::path::PathBuf,
+    user: String,
+    name: String,
+    version: i64,
+    sheets: String,
+    /// A journal file for this document exists (written by this session or found at the start).
+    written: bool,
+    /// A large journal write was postponed (see `journal_save`).
+    dirty: bool,
+    at: Instant,
+    /// The last write failed with this (shown once).
+    error: Option<String>,
+}
+
+/// Postponing writes of journals of more than this many operations to once a second.
+const JOURNAL_BIG_OPS: usize = 2000;
+
 enum Job {
     Snapshot(u64, Result<DriveItem, String>),
     Reloaded(Result<CloudDoc, String>),
@@ -168,6 +188,18 @@ pub struct Live {
     snap_busy: bool,
     pub snap_seq: u64,
     reloading: bool,
+    /// The journal of unacknowledged changes (none without a data folder).
+    journal: Option<Jrn>,
+    /// Journaled changes of an earlier run, put back once the replay reaches their sequence
+    /// number. Until then the window is read-only (a few moments).
+    restore: Option<Journal>,
+    /// How many separate changes the batch in flight / the buffer hold ("N waiting").
+    fly_changes: usize,
+    buf_changes: usize,
+    /// Changes being sent that were made before the app was closed: told when they are in.
+    resumed: Option<usize>,
+    /// Times the latest version was fetched because the server no longer had our base.
+    reloads: usize,
     tx: Sender<Job>,
     rx: Receiver<Job>,
     /// Tests: a full copy of the workbook after the last change, to check that the generated
@@ -221,6 +253,12 @@ impl Live {
             snap_busy: false,
             snap_seq: seq,
             reloading: false,
+            journal: None,
+            restore: None,
+            fly_changes: 0,
+            buf_changes: 0,
+            resumed: None,
+            reloads: 0,
             tx,
             rx,
             verify: None,
@@ -236,12 +274,99 @@ impl Live {
             if b.id != self.batch_id {
                 self.batch_id = b.id;
                 self.sent_units = self.units.len();
+                self.fly_changes = std::mem::take(&mut self.buf_changes);
             }
             if let Some(c) = &self.conn {
                 c.send(ClientMsg::Ops { base: b.base, id: b.id, made: (b.made < b.base && !self.legacy).then_some(b.made), ops: b.ops });
             }
         }
     }
+}
+
+impl Live {
+    /// Changes made here that the server has not acknowledged.
+    pub fn waiting(&self) -> usize {
+        (self.fly_changes + self.buf_changes).max(self.sess.has_pending() as usize)
+    }
+
+    /// Writes the journal of unacknowledged changes (atomically, private to the user), or
+    /// removes it when everything is acknowledged. `force`: now, even a large one.
+    fn journal_save(&mut self, force: bool) {
+        if self.restore.is_some() {
+            // Earlier changes are still to be put back: their journal stays as it is.
+            return;
+        }
+        let ops = self.sess.inflight.as_ref().map_or(0, |b| b.ops.len()) + self.sess.buffer.len();
+        let Some(j) = &mut self.journal else { return };
+        if !self.sess.has_pending() {
+            if j.written {
+                Journal::remove(&j.dir, &self.url, &j.user, &self.item);
+                j.written = false;
+            }
+            j.dirty = false;
+            return;
+        }
+        if !force && ops > JOURNAL_BIG_OPS && j.at.elapsed() < Duration::from_secs(1) {
+            j.dirty = true;
+            return;
+        }
+        let mut jr = Journal::new("sheets", &self.url, &j.user, &self.item, &j.name, self.sess.state());
+        jr.version = j.version;
+        jr.sheets = j.sheets.clone();
+        jr.file_seq = self.snap_seq;
+        jr.local = self.local.display().to_string();
+        jr.inflight_changes = self.fly_changes;
+        jr.buffer_changes = self.buf_changes;
+        match jr.write(&j.dir) {
+            Ok(()) => {
+                j.written = true;
+                j.error = None;
+            }
+            Err(e) => {
+                j.error.get_or_insert(format!("Couldn't keep your unsent changes in a file ({e}); they are lost if this window closes before the server has them."));
+            }
+        }
+        j.dirty = false;
+        j.at = Instant::now();
+    }
+}
+
+/// Where the copy of changes the server never got goes: `<journal folder>/kept/`.
+fn kept_path(dir: &std::path::Path, stem: &str) -> std::path::PathBuf {
+    let clean: String = stem.chars().map(|c| if c.is_control() || r#"<>:"/\|?*"#.contains(c) { '_' } else { c }).collect();
+    let kept = dir.join("kept");
+    let _ = std::fs::create_dir_all(&kept);
+    kept.join(format!("{clean} (changes not saved to the server {}).xlsx", utc_stamp()))
+}
+
+fn set_private(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    let _ = path;
+}
+
+fn kept_note(kept: &Option<std::path::PathBuf>) -> String {
+    kept.as_ref().map(|p| format!(" A copy with them was also saved to {}.", p.display())).unwrap_or_default()
+}
+
+/// "2026-11-07 18.05.09" (UTC) from the system clock, for file names.
+fn utc_stamp() -> String {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let (days, rem) = ((secs / 86_400) as i64, secs % 86_400);
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + (m <= 2) as i64;
+    format!("{y:04}-{m:02}-{d:02} {:02}.{:02}.{:02}", rem / 3600, rem % 3600 / 60, rem % 60)
 }
 
 /// A random id for this app instance's batches.
@@ -336,8 +461,9 @@ impl App {
         if ch.ops.is_empty() {
             return;
         }
-        if !l.editor {
-            // View-only: put it back (commands normally refuse before changing anything).
+        if !l.editor || l.restore.is_some() {
+            // View-only (or earlier changes are still being put back): undo it (commands
+            // normally refuse before changing anything).
             l.applying = true;
             let mut st = l.state.clone();
             live::apply_ops(&mut self.wb, &ch.inverse, false, &mut st);
@@ -370,7 +496,10 @@ impl App {
         }
         let ops = if l.legacy { live::collapse_cells(&self.wb, &ch.ops) } else { ch.ops };
         let b = l.sess.local(ops);
+        l.buf_changes += 1;
         l.send_batch(b);
+        // Kept on disk before anything else happens: a crash now loses nothing.
+        l.journal_save(true);
     }
 
     // ------------------------------------------------------------------
@@ -492,13 +621,84 @@ impl App {
             self.wb.recalc();
         }
         live::sort_sheets(&mut self.wb);
+        let user = server.account.username.clone();
         let mut l = Live::new(doc.item_id.clone(), url.clone(), Some(server), base.seq);
         l.sess.online = false;
         l.local = doc.local.clone();
+        if let Some(dir) = self.journal_dir.clone() {
+            let mut jr = Jrn { dir, user, name: doc.name.clone(), version: base.version, sheets: base.sheets.clone(), written: false, dirty: false, at: Instant::now(), error: None };
+            // Changes of an earlier run that the server never acknowledged.
+            if let Some(j) = Journal::find(&jr.dir, url, &jr.user, &doc.item_id) {
+                jr.written = true;
+                l.sess = Session::new(j.session.cid.clone(), base.seq);
+                l.sess.online = false;
+                l.fly_changes = j.inflight_changes;
+                l.buf_changes = j.buffer_changes;
+                l.batch_id = j.session.inflight.as_ref().map_or(0, |b| b.id);
+                l.resumed = Some(j.pending_changes());
+                l.restore = Some(j);
+            }
+            l.journal = Some(jr);
+        }
+        let resuming = l.restore.is_some();
         self.live = Some(l);
         self.cloud.autosave = true;
         self.live_connect(Some(base.version));
         self.status = Some(format!("Connecting to {} for live editing...", crate::cloud::server::host_of(url)));
+        if resuming {
+            // Right away when the file already is at their sequence number (or newer).
+            self.live_restore_due(false);
+            if self.live.as_ref().is_some_and(|l| l.restore.is_some()) {
+                self.status = Some("Getting your earlier unsent changes ready...".into());
+            }
+        }
+    }
+
+    /// Puts the journaled changes of an earlier run back into the session when the replay has
+    /// reached the sequence number they were made at (`force`: the replay is over without
+    /// reaching it; also when the file already is newer): they are applied to the workbook
+    /// and sent like changes made while offline. In the second case they are re-based on the
+    /// newer state as after a long offline period (as `live_reloaded` does).
+    fn live_restore_due(&mut self, force: bool) {
+        let Some(l) = &mut self.live else { return };
+        let Some(j) = &l.restore else { return };
+        let (target, seq) = (j.session.seq, l.sess.seq);
+        if seq < target && !force {
+            return;
+        }
+        let j = l.restore.take().expect("restore");
+        // The workbook is the server's state at `seq`.
+        let mut st = j.session.clone();
+        let pending = if seq == target {
+            l.sess.restore(&st)
+        } else {
+            st.seq = seq;
+            l.sess.restore(&st);
+            l.sess.rebase_on_reload(seq)
+        };
+        l.confirmed = Some(self.wb.clone());
+        l.confirmed_state = l.state.clone();
+        l.units.clear();
+        l.sent_units = 0;
+        l.undo.clear();
+        l.redo.clear();
+        if seq != target {
+            // One batch now: the counts follow it.
+            l.buf_changes += std::mem::take(&mut l.fly_changes);
+            l.batch_id = 0;
+        }
+        l.applying = true;
+        let mut state = l.state.clone();
+        live::apply_ops(&mut self.wb, &pending, false, &mut state);
+        let l = self.live.as_mut().expect("live");
+        l.state = state;
+        l.applying = false;
+        self.wb.recalc();
+        self.generation += 1;
+        self.edits += 1;
+        self.cf.invalidate();
+        self.after_sheets_changed(true, &[]);
+        self.status = Some("Sending your earlier unsent changes...".into());
     }
 
     fn live_connect(&mut self, version: Option<i64>) {
@@ -661,6 +861,7 @@ impl App {
 
     /// Frame hook: connection events, snapshots, presence, reconnecting.
     pub fn poll_live(&mut self) {
+        self.poll_journal_resume();
         if self.live.is_none() {
             return;
         }
@@ -698,6 +899,14 @@ impl App {
             self.live_snapshot();
         }
         self.live_presence();
+        if let Some(l) = &mut self.live {
+            if l.journal.as_ref().is_some_and(|j| j.dirty && j.at.elapsed() >= Duration::from_secs(1)) {
+                l.journal_save(true);
+            }
+            if let Some(e) = l.journal.as_mut().and_then(|j| j.error.take()) {
+                self.status = Some(e);
+            }
+        }
         if let Some(l) = &self.live {
             self.dirty = l.sess.has_pending();
             if let Some(c) = &self.ctx {
@@ -739,7 +948,7 @@ impl App {
                         if let Some(e) = self.cloud.servers.iter_mut().find(|e| e.session.account.url == url) {
                             e.error = Some(format!("Your sign-in to {host} has expired or was revoked. Sign in again (File > Account)."));
                         }
-                        self.live_ended(msg);
+                        self.live_ended(msg, false);
                         return;
                     }
                     (_, Some(404)) => {
@@ -843,6 +1052,7 @@ impl App {
                 let who = l.peers.get(&by).map(|p| p.peer.name.clone()).unwrap_or_else(|| "someone else".to_string());
                 self.live_replaced(&step.replaced, &who);
                 self.live_step(step);
+                self.live_restore_due(false);
                 self.live_caught_up();
             }
             ServerMsg::Ack { id, seq, extra } => {
@@ -1026,7 +1236,11 @@ impl App {
             l.peers.clear();
             l.retry_at = None;
             l.stopped = Some(VIEW_ONLY_NOW.to_string());
-            l.notice = Some(Notice { text: format!("{name}: you can now only view this workbook. Your latest changes weren't saved to the server; they are still in this window."), save_copy: true });
+            let kept = self.live_keep_copy();
+            let text = format!("{name}: you can now only view this workbook. Your latest changes weren't saved to the server; they are still in this window.{}", kept_note(&kept));
+            if let Some(l) = &mut self.live {
+                l.notice = Some(Notice { text, save_copy: true });
+            }
             self.status = Some(VIEW_ONLY_NOW.to_string());
         } else {
             l.notice = Some(Notice { text: format!("{name}: you can now only view this workbook"), save_copy: false });
@@ -1038,7 +1252,7 @@ impl App {
     /// and offers to save a copy (with any changes the server didn't get).
     fn live_revoked(&mut self, reason: &str) {
         let url = self.live.as_ref().map(|l| l.url.clone());
-        self.live_ended(access_removed(reason));
+        self.live_ended(access_removed(reason), true);
         // Often because the person left an organisation: its place in Open / Save As goes.
         if let Some(url) = url {
             self.server_refresh_orgs(&url, false);
@@ -1048,7 +1262,11 @@ impl App {
     /// The session can't go on (access removed, signed out): no reconnecting; the window keeps
     /// the workbook, read-only, with `text` and "Save a copy" (with any changes the server
     /// didn't get, a cell being typed in included).
-    fn live_ended(&mut self, text: String) {
+    ///
+    /// `keep`: the changes the server never got are also saved as a file of their own and their
+    /// journal is retired (access is gone for good); otherwise (signed out) the journal stays,
+    /// so they are sent when the person has signed in again and reopened the workbook.
+    fn live_ended(&mut self, text: String, keep: bool) {
         let _ = self.live_keep_local_changes();
         let Some(l) = &mut self.live else { return };
         l.conn = None;
@@ -1058,8 +1276,31 @@ impl App {
         l.retry_at = None;
         l.editor = false;
         l.stopped = Some(text.clone());
-        l.notice = Some(Notice { text: text.clone(), save_copy: true });
+        let unsent = l.sess.has_pending();
+        let kept = if keep && unsent { self.live_keep_copy() } else { None };
+        let more = if unsent && !keep { " Your unsent changes are kept and will be sent when you reopen it." } else { "" };
+        if let Some(l) = &mut self.live {
+            l.notice = Some(Notice { text: format!("{text}{}{more}", kept_note(&kept)), save_copy: true });
+        }
         self.status = Some(text);
+    }
+
+    /// Saves the window's workbook (which holds changes the server never got) as a file of its
+    /// own next to the journal and retires the journal, so those changes are never dropped
+    /// silently even when the window is closed without "Save a copy". None without a journal
+    /// folder.
+    fn live_keep_copy(&mut self) -> Option<std::path::PathBuf> {
+        let l = self.live.as_mut()?;
+        let j = l.journal.as_mut()?;
+        let stem = self.wb.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "Book1".into());
+        let path = kept_path(&j.dir, &stem);
+        let mut wb = self.wb.clone();
+        wb.path = None;
+        crate::io::save(&wb, &path).ok()?;
+        set_private(&path);
+        Journal::remove(&j.dir, &l.url, &j.user, &l.item);
+        j.written = false;
+        Some(path)
     }
 
     /// Before access changes: the cell being typed in is committed and what a drag changed so
@@ -1136,6 +1377,9 @@ impl App {
             return;
         }
         l.catch_up = None;
+        // The replay is over: earlier unsent changes that didn't find their place join now.
+        self.live_restore_due(true);
+        let Some(l) = &mut self.live else { return };
         if !l.editor && l.sess.has_pending() {
             // Access was changed to view-only while our changes were unsent.
             self.live_view_only(true);
@@ -1157,6 +1401,9 @@ impl App {
 
     fn live_step(&mut self, step: cosync::client::Step) {
         let Some(l) = &mut self.live else { return };
+        if step.own {
+            l.fly_changes = 0;
+        }
         if let Some(c) = &mut l.confirmed {
             live::apply_ops(c, &step.committed, true, &mut l.confirmed_state);
         }
@@ -1173,12 +1420,17 @@ impl App {
         }
         let Some(l) = &mut self.live else { return };
         l.send_batch(send);
+        l.journal_save(false);
         if !l.sess.has_pending() {
             l.units.clear();
             l.sent_units = 0;
+            let resumed = l.resumed.take().filter(|_| l.restore.is_none());
             if let Some(c) = l.confirmed.take() {
                 l.state = std::mem::take(&mut l.confirmed_state);
                 self.live_adopt(c);
+            }
+            if let Some(n) = resumed.filter(|n| *n > 0) {
+                self.status = Some(if n == 1 { "1 change made offline was saved to the server.".to_string() } else { format!("{n} changes made offline were saved to the server.") });
             }
         }
     }
@@ -1466,6 +1718,13 @@ impl App {
         let Some(l) = &mut self.live else { return };
         // Our unacknowledged changes go on top of the latest version.
         let pending = l.sess.rebase_on_reload(base.seq);
+        l.reloads += 1;
+        if let Some(j) = &mut l.journal {
+            j.version = base.version;
+            j.sheets = base.sheets.clone();
+        }
+        l.fly_changes = 0;
+        l.buf_changes = (l.buf_changes + std::mem::take(&mut l.fly_changes)).max(1);
         l.confirmed = Some(wb.clone());
         l.confirmed_state = ApplyState::default();
         l.units.clear();
@@ -1487,6 +1746,9 @@ impl App {
         if let Some(d) = &mut self.cloud.doc {
             d.etag = doc.etag.clone();
             d.live = doc.live.clone();
+        }
+        if let Some(l) = &mut self.live {
+            l.journal_save(true);
         }
         self.live_connect(Some(base.version));
     }
@@ -1597,11 +1859,38 @@ impl App {
 
     /// View-only participants can't change anything (asked by every command's guard).
     pub(super) fn live_read_only(&mut self) -> bool {
+        if self.live.as_ref().is_some_and(|l| l.restore.is_some()) {
+            self.status = Some("Your earlier unsent changes are being put back first. Try again in a moment.".into());
+            return true;
+        }
         if self.live.as_ref().is_some_and(|l| !l.editor) {
             self.status = Some("You have view-only access to this workbook.".into());
             return true;
         }
         false
+    }
+
+    /// The status bar's offline message while the live connection is down (editing goes on):
+    /// what is waiting and when the next attempt to reconnect is.
+    pub(super) fn live_offline_text(&self) -> Option<String> {
+        let l = self.live.as_ref()?;
+        if l.stopped.is_some() || l.online || !l.welcomed || l.restore.is_some() {
+            return None;
+        }
+        let n = l.waiting();
+        let mut t = String::from("Offline \u{2014} changes will be sent when you're back online");
+        if n > 0 {
+            t.push_str(&format!(" ({n} waiting)"));
+        }
+        match (l.reloading, &l.retry_at) {
+            (true, _) => t.push_str(". Getting the latest version..."),
+            (false, Some(at)) => {
+                let secs = at.saturating_duration_since(Instant::now()).as_secs_f32().ceil() as u64;
+                if secs == 0 { t.push_str(". Reconnecting now...") } else { t.push_str(&format!(". Reconnecting in {secs} s...")) }
+            }
+            (false, None) => t.push_str(". Reconnecting..."),
+        }
+        Some(t)
     }
 
     /// Title bar suffix for live documents.
@@ -1617,11 +1906,19 @@ impl App {
     }
 }
 
+/// The live state stored next to the local copy of a document.
+pub(crate) fn state_path(local: &std::path::Path) -> std::path::PathBuf {
+    local.with_file_name(format!("{}.live", local.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()))
+}
+
 /// Saves the workbook (as the version) and its live state, and uploads both.
 fn upload_snapshot(server: &ServerSession, item: &str, seq: u64, wb: &Workbook, local: &std::path::Path) -> Result<DriveItem, String> {
     crate::io::save(wb, local)?;
     let data = std::fs::read(local).map_err(|e| e.to_string())?;
     let state = live::encode_state(&live::state_ops(wb))?;
+    // The lossless state next to the copy, as at Open: a copy rebuilt from it later (after a
+    // crash) has the same sheet ids as this version.
+    let _ = std::fs::write(state_path(local), &state);
     server.live_snapshot(item, seq, &live::sheets_meta(wb), &data, &state)
 }
 
@@ -1641,6 +1938,170 @@ fn verify_change(before: &Workbook, ch: &live::Change, after: &Workbook) -> Vec<
         errors.push(format!("inverse: {d}"));
     }
     errors
+}
+
+// ---------------------------------------------------------------------------
+// Unsent changes of an earlier run
+// ---------------------------------------------------------------------------
+
+type Probed = (Journal, Arc<ServerSession>, crate::cloud::server::Probe);
+
+/// Finding journals at the start: the first document with unsent changes is opened (when the
+/// window is still the empty one), which resumes its live session (see `live_reset`).
+#[derive(Default)]
+pub struct Resume {
+    done: bool,
+    rx: Option<Receiver<Probed>>,
+    retry_at: Option<Instant>,
+    skip: Vec<String>,
+}
+
+/// How long to wait before asking a server that couldn't be reached about unsent changes again.
+const RESUME_RETRY: Duration = Duration::from_secs(15);
+
+/// A copy of a document with the unsent changes of a journal applied, from the local copy kept
+/// at the last open or snapshot (used when the server no longer lets this account open the
+/// document). Saved in the journal folder; returns its path.
+fn kept_from_cache(j: &Journal, dir: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let local = std::path::PathBuf::from(&j.local);
+    let mut wb = crate::io::load(&local).map_err(|e| format!("the local copy of the workbook couldn't be read ({e})"))?;
+    if wb.sheets.is_empty() {
+        wb.sheets.push(crate::model::Sheet::new("Sheet1"));
+    }
+    live::assign_ids(&mut wb, &j.sheets);
+    if let Ok(data) = std::fs::read(state_path(&local)) {
+        wb = live::join_workbook(wb, Some(&data));
+    }
+    live::sort_sheets(&mut wb);
+    let mut pending: Vec<Op> = j.session.inflight.as_ref().map(|b| b.ops.clone()).unwrap_or_default();
+    pending.extend(j.session.buffer.iter().cloned());
+    live::apply_ops(&mut wb, &pending, false, &mut ApplyState::default());
+    wb.recalc();
+    wb.path = None;
+    let stem = std::path::Path::new(&j.name).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "Book1".into());
+    let path = kept_path(dir, &stem);
+    crate::io::save(&wb, &path)?;
+    set_private(&path);
+    Ok(path)
+}
+
+fn changes_text(n: usize) -> String {
+    if n == 1 { "1 change".to_string() } else { format!("{n} changes") }
+}
+
+impl App {
+    /// Frame hook: at the start, look for journals of an earlier run and open the document
+    /// they belong to.
+    pub(super) fn poll_journal_resume(&mut self) {
+        if self.live_resume.done {
+            return;
+        }
+        let Some(dir) = self.journal_dir.clone() else {
+            self.live_resume.done = true;
+            return;
+        };
+        if !self.cloud.started {
+            return;
+        }
+        if self.live.is_some() || self.cloud.doc.is_some() || self.dirty || self.wb.path.is_some() || self.cloud.opening.is_some() {
+            // Something else is open: the journal is used when its document is opened.
+            self.live_resume.done = true;
+            return;
+        }
+        if let Some(rx) = &self.live_resume.rx {
+            match rx.try_recv() {
+                Ok(probed) => {
+                    self.live_resume.rx = None;
+                    self.journal_probed(&dir, probed);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(_) => self.live_resume.rx = None,
+            }
+            return;
+        }
+        if self.live_resume.retry_at.is_some_and(|t| Instant::now() < t) {
+            if let Some(c) = &self.ctx {
+                c.request_repaint_after(Duration::from_secs(1));
+            }
+            return;
+        }
+        let Some(j) = Journal::all(&dir).into_iter().find(|j| !self.live_resume.skip.contains(&j.item)) else {
+            self.live_resume.done = true;
+            return;
+        };
+        let Some(e) = self.cloud.servers.iter().find(|e| e.session.account.url == j.url && e.session.account.username == j.user) else {
+            self.status = Some(format!("Sign in to {} (File > Account) to send the {} you made offline to {}.", crate::cloud::server::host_of(&j.url), changes_text(j.pending_changes()), j.name));
+            self.live_resume.skip.push(j.item);
+            return;
+        };
+        if e.checking {
+            return;
+        }
+        if e.error.is_some() {
+            self.status = Some(format!("Your sign-in to {} expired. Sign in again (File > Account) to send the {} you made offline to {}.", crate::cloud::server::host_of(&j.url), changes_text(j.pending_changes()), j.name));
+            self.live_resume.skip.push(j.item);
+            return;
+        }
+        let session = e.session.clone();
+        let (tx, rx) = channel();
+        let ctx = self.ctx.clone();
+        self.live_resume.rx = Some(rx);
+        self.status = Some(format!("Checking {} for your unsent changes...", j.name));
+        std::thread::spawn(move || {
+            let probe = session.probe_item(&j.item);
+            let _ = tx.send((j, session, probe));
+            if let Some(c) = ctx {
+                c.request_repaint();
+            }
+        });
+    }
+
+    fn journal_probed(&mut self, dir: &std::path::Path, (j, session, probe): Probed) {
+        use crate::cloud::server::Probe;
+        let n = changes_text(j.pending_changes());
+        match probe {
+            Probe::Found(item) => {
+                // Opening downloads the latest version and resumes the live session with the
+                // journal's changes (`live_reset`).
+                self.live_resume.done = true;
+                self.status = Some(format!("Opening {} to send your {n}...", j.name));
+                self.cloud_open_with(crate::cloud::Conn::Server(session), item);
+            }
+            Probe::Missing | Probe::Denied => {
+                let why = if matches!(probe, Probe::Missing) { "it was deleted or is no longer shared with you" } else { "you no longer have access to it" };
+                self.journal_orphaned(dir, j, why);
+            }
+            Probe::Failed(e) => {
+                self.status = Some(format!("Couldn't reach {} to send your {n} to {} ({e}). They are kept; trying again...", crate::cloud::server::host_of(&j.url), j.name));
+                self.live_resume.retry_at = Some(Instant::now() + RESUME_RETRY);
+            }
+        }
+    }
+
+    /// The document is gone or no longer open to this account: the unsent changes are kept in
+    /// a copy (made from the local copy of the document) and opened for the person to save
+    /// wherever they like.
+    fn journal_orphaned(&mut self, dir: &std::path::Path, j: Journal, why: &str) {
+        let n = changes_text(j.pending_changes());
+        self.live_resume.done = true;
+        match kept_from_cache(&j, dir) {
+            Ok(path) => {
+                Journal::remove(dir, &j.url, &j.user, &j.item);
+                self.open_path(path.clone());
+                self.dialog = Some(super::dialogs::Dialog::Message {
+                    title: "Changes not saved to the server".into(),
+                    text: format!("Your {n} to \"{}\" couldn't be sent: {why}.\n\nThey are kept in a copy of the workbook, which is open now. Use File > Save As to keep it where you like.\n\n{}", j.name, path.display()),
+                });
+            }
+            Err(e) => {
+                self.live_resume.skip.push(j.item.clone());
+                self.dialog = Some(super::dialogs::Dialog::Message {
+                    title: "Changes not saved to the server".into(),
+                    text: format!("Your {n} to \"{}\" couldn't be sent: {why}. A copy couldn't be made: {e}.\n\nThey stay in the journal file, which is kept: {}", j.name, j.path_in(dir).display()),
+                });
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1682,6 +2143,14 @@ impl App {
     /// Connected, caught up and nothing unacknowledged.
     pub(crate) fn live_quiet(&self) -> bool {
         self.live.as_ref().is_some_and(|l| l.online && !l.sess.has_pending() && l.confirmed.is_none())
+    }
+
+    pub(crate) fn live_waiting(&self) -> usize {
+        self.live.as_ref().map_or(0, |l| l.waiting())
+    }
+
+    pub(crate) fn live_reloads(&self) -> usize {
+        self.live.as_ref().map_or(0, |l| l.reloads)
     }
 
     pub(crate) fn live_seq(&self) -> u64 {

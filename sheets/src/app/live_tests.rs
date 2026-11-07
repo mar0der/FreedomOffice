@@ -1170,6 +1170,10 @@ mod e2e {
         b.app.toggle_bold();
         a.app.select(3, 1, false);
         a.app.toggle_bold();
+        // A's whole cell is committed first (B hasn't seen it), then B's value, which wins the
+        // content part: without this the two arrive in either order on a loaded machine.
+        a.app.live_flush();
+        pump(&mut [&mut a], "a's bold is committed", |cs| cs[0].app.live_quiet());
         type_at(&mut b.app, 3, 1, "from b");
         settle(&mut [&mut a, &mut b], "mixed protocol edits");
         assert_same(&a, &b, "mixed protocol edits");
@@ -1254,6 +1258,321 @@ mod e2e {
         assert_same(&a, &b, "two formats");
         let told = a.app.live_replaced_for_test().len() + b.app.live_replaced_for_test().len();
         assert_eq!(told, 1, "exactly the one whose formatting lost is told");
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------------------------------------
+    // M3: offline, restarts and journals
+    // ------------------------------------------------------------------
+
+    use cosync::journal::Journal;
+
+    /// The program dies (nothing is sent, nothing is saved) and starts again with the same
+    /// sign-in and data folder.
+    fn reopen(c: Client, jdir: &std::path::Path) -> Client {
+        let Client { ctx: _, app, session, root } = c;
+        drop(app);
+        let ctx = egui::Context::default();
+        let mut app = App::with_context(&ctx, 0, None);
+        app.dialog = None;
+        app.cloud_for_test(session.clone());
+        app.journal_dir = Some(jdir.to_path_buf());
+        Client { ctx, app, session, root }
+    }
+
+    /// Like `pump`, with the cloud events (the document opens by itself at the start).
+    fn pump_all(cs: &mut [&mut Client], what: &str, mut done: impl FnMut(&mut [&mut Client]) -> bool) {
+        let end = Instant::now() + Duration::from_secs(30);
+        loop {
+            for c in cs.iter_mut() {
+                c.app.poll_cloud(&c.ctx);
+                c.app.poll_live();
+            }
+            if done(cs) {
+                return;
+            }
+            assert!(Instant::now() < end, "timed out waiting for: {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn texts(c: &Client) -> Vec<String> {
+        let mut out = Vec::new();
+        for sh in &c.app.wb.sheets {
+            for (r, row) in &sh.rows {
+                for col in row.keys() {
+                    let t = crate::numfmt::value_to_text(sh.display_value(*r, *col));
+                    if !t.is_empty() {
+                        out.push(t);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn count(c: &Client, t: &str) -> usize {
+        texts(c).iter().filter(|x| *x == t).count()
+    }
+
+    /// Ben's changes made offline survive his app dying; the next start finds the journal,
+    /// opens the workbook by itself, sends them once (a second restart finds nothing), says so,
+    /// and the journal holds no credential and is private.
+    #[test]
+    fn unsent_changes_survive_a_restart_and_are_sent_exactly_once() {
+        let (server, dir, mut a, mut b, id) = two_people("restart");
+        let jdir = dir.join("journal");
+        b.app.journal_dir = Some(jdir.clone());
+        b.app.live_leave(true);
+        open(&mut b, &id);
+        settle(&mut [&mut a, &mut b], "ben reopened with a journal");
+        assert!(Journal::all(&jdir).is_empty(), "nothing pending, nothing kept");
+
+        b.app.live_drop_for_test();
+        type_at(&mut b.app, 6, 2, "off 1");
+        type_at(&mut b.app, 7, 2, "off 2");
+        b.app.select_range(rg("3:3"));
+        b.app.insert_rows();
+        b.app.live_flush();
+        let kept = Journal::all(&jdir);
+        assert_eq!(kept.len(), 1, "the journal is written with every change");
+        assert_eq!(kept[0].pending_changes(), 3);
+        let file = kept[0].path_in(&jdir);
+        let raw = std::fs::read_to_string(&file).unwrap();
+        assert!(!raw.contains(b.session.token()), "no token in the journal");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        // Ann edits meanwhile; then Ben's app dies.
+        type_at(&mut a.app, 0, 4, "ann while away");
+        pump(&mut [&mut a], "ann's change is in", |cs| cs[0].app.live_quiet());
+        let mut b = reopen(b, &jdir);
+
+        let mut told = false;
+        pump_all(&mut [&mut a, &mut b], "ben's earlier changes are in", |cs| {
+            told |= cs[1].app.status.as_deref().is_some_and(|s| s.contains("3 changes made offline were saved to the server"));
+            cs[1].app.live_quiet() && cs[0].app.live_quiet() && cs[0].app.live_seq() == cs[1].app.live_seq() && told
+        });
+        assert_same(&a, &b, "after the restart");
+        for c in [&a, &b] {
+            assert_eq!(text(c, "Sheet1", 7, 2), "off 1", "the row inserted above moved it down by one");
+            assert_eq!(text(c, "Sheet1", 8, 2), "off 2");
+            assert_eq!(text(c, "Sheet1", 0, 4), "ann while away");
+            assert_eq!((text(c, "Sheet1", 2, 0), text(c, "Sheet1", 3, 0)), (String::new(), "3".to_string()), "the row was inserted once");
+        }
+        assert!(Journal::all(&jdir).is_empty(), "everything acknowledged: no journal");
+
+        // Another restart replays nothing.
+        let before = crate::live::contents(&a.app.wb);
+        let mut b = reopen(b, &jdir);
+        for _ in 0..40 {
+            b.app.poll_cloud(&b.ctx);
+            b.app.poll_live();
+            a.app.poll_live();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(b.app.live.is_none(), "no journal: nothing is opened by itself");
+        assert_eq!(crate::live::contents(&a.app.wb), before, "no duplicates");
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The batch was committed but its acknowledgement never reached the app that died: the
+    /// restart recognises it instead of inserting the row a second time.
+    #[test]
+    fn a_batch_committed_before_the_crash_is_not_sent_again() {
+        let (server, dir, mut a, mut b, id) = two_people("committed");
+        let jdir = dir.join("journal");
+        b.app.journal_dir = Some(jdir.clone());
+        b.app.live_leave(true);
+        open(&mut b, &id);
+        settle(&mut [&mut a, &mut b], "ben reopened with a journal");
+        let seq = a.app.live_seq();
+        b.app.select_range(rg("3:3"));
+        b.app.insert_rows();
+        type_at(&mut b.app, 0, 6, "after the row");
+        b.app.live_flush();
+        assert!(Journal::all(&jdir).len() == 1 && b.app.live_pending_ops().len() >= 2);
+        // Ben's app sends the first batch and dies before reading the answer.
+        pump(&mut [&mut a], "ann sees ben's row", |cs| cs[0].app.live_seq() > seq);
+        let mut b = reopen(b, &jdir);
+        pump_all(&mut [&mut a, &mut b], "resumed", |cs| cs[1].app.live_quiet() && cs[0].app.live_quiet() && cs[0].app.live_seq() == cs[1].app.live_seq() && cs[1].app.live.is_some());
+        assert_same(&a, &b, "after the restart");
+        for c in [&a, &b] {
+            assert_eq!((text(c, "Sheet1", 2, 0), text(c, "Sheet1", 3, 0)), (String::new(), "3".to_string()), "one row inserted, not two");
+            assert_eq!(text(c, "Sheet1", 0, 6), "after the row");
+        }
+        assert!(Journal::all(&jdir).is_empty());
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Access removed while the app was closed: the changes are never dropped; they are in a
+    /// copy that opens.
+    #[test]
+    fn access_lost_while_closed_keeps_the_changes_in_a_copy() {
+        let (server, dir, mut a, mut b, id) = two_people("lost");
+        let jdir = dir.join("journal");
+        b.app.journal_dir = Some(jdir.clone());
+        b.app.live_leave(true);
+        open(&mut b, &id);
+        settle(&mut [&mut a, &mut b], "joined");
+        b.app.live_drop_for_test();
+        type_at(&mut b.app, 6, 2, "mine 1");
+        type_at(&mut b.app, 7, 2, "mine 2");
+        b.app.live_flush();
+        assert_eq!(Journal::all(&jdir).len(), 1);
+        a.session.remove_permission(&id, "ben").unwrap();
+        let mut b = reopen(b, &jdir);
+        pump_all(&mut [&mut b], "the copy opens", |cs| cs[0].app.dialog.is_some());
+        let Some(crate::app::dialogs::Dialog::Message { title, text: msg }) = &b.app.dialog else { panic!("a message, got {:?}", b.app.dialog.is_some()) };
+        assert!(title.contains("not saved") && msg.contains("2 changes") && msg.contains("no longer shared"), "{title}: {msg}");
+        let path = b.app.wb.path.clone().expect("the copy is open");
+        assert!(path.starts_with(&jdir) && path.exists());
+        assert!(Journal::all(&jdir).is_empty(), "the changes moved into the copy");
+        assert!(b.app.live.is_none());
+        assert_eq!((text(&b, "Sheet1", 6, 2), text(&b, "Sheet1", 7, 2)), ("mine 1".to_string(), "mine 2".to_string()));
+        let again = crate::io::load(&path).unwrap();
+        assert_eq!(crate::numfmt::value_to_text(again.sheets[0].display_value(6, 2)), "mine 1");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Edit access lost while closed: the document opens, shows the changes read-only with
+    /// "Save a copy", and keeps them in a copy file too.
+    #[test]
+    fn view_only_after_a_restart_keeps_the_changes_and_offers_a_copy() {
+        let (server, dir, mut a, mut b, id) = two_people("viewer");
+        let jdir = dir.join("journal");
+        b.app.journal_dir = Some(jdir.clone());
+        b.app.live_leave(true);
+        open(&mut b, &id);
+        settle(&mut [&mut a, &mut b], "joined");
+        b.app.live_drop_for_test();
+        type_at(&mut b.app, 6, 2, "mine 1");
+        b.app.live_flush();
+        a.session.grant(&id, "ben", false).unwrap();
+        let mut b = reopen(b, &jdir);
+        pump_all(&mut [&mut a, &mut b], "ben is told", |cs| cs[1].app.live_notice_for_test().is_some());
+        let n = b.app.live_notice_for_test().unwrap();
+        assert!(n.save_copy && n.text.contains("weren't saved to the server"), "{}", n.text);
+        assert!(n.text.contains("A copy with them was also saved"), "{}", n.text);
+        assert_eq!(text(&b, "Sheet1", 6, 2), "mine 1", "still in the window");
+        assert!(Journal::all(&jdir).is_empty());
+        let kept: Vec<_> = std::fs::read_dir(jdir.join("kept")).unwrap().flatten().collect();
+        assert_eq!(kept.len(), 1);
+        let copy = crate::io::load(&kept[0].path()).unwrap();
+        assert_eq!(crate::numfmt::value_to_text(copy.sheets[0].display_value(6, 2)), "mine 1");
+        assert_eq!(text(&a, "Sheet1", 6, 2), "", "the server never got it");
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A long time offline: many changes on both sides, structural ones too, a snapshot that
+    /// cuts the log; every one of Ben's changes is there once reconnected, and so is Ann's.
+    #[test]
+    fn a_long_offline_period_with_many_changes_on_both_sides_loses_nothing() {
+        let (server, dir, mut a, mut b, _) = two_people("long");
+        b.app.live_drop_for_test();
+        for i in 0..40u32 {
+            match i % 9 {
+                4 => {
+                    b.app.select_range(rg("36:37"));
+                    b.app.insert_rows();
+                }
+                7 => {
+                    b.app.select_range(rg("U:U"));
+                    b.app.insert_cols();
+                }
+                _ => {}
+            }
+            type_at(&mut b.app, i % 20, 10 + i / 20, &format!("b{i}"));
+        }
+        b.app.select_range(rg("90:91"));
+        b.app.delete_rows();
+        b.app.live_flush();
+        assert!(b.app.live_waiting() >= 40);
+        for i in 0..40u32 {
+            match i % 8 {
+                3 => {
+                    a.app.select_range(rg("1:2"));
+                    a.app.insert_rows();
+                }
+                6 => {
+                    a.app.select_range(rg("B:B"));
+                    a.app.insert_cols();
+                }
+                _ => {}
+            }
+            type_at(&mut a.app, 200 + i * 20, 3, &format!("a{i}"));
+            if i % 10 == 9 {
+                pump(&mut [&mut a], "a's changes are in", |cs| cs[0].app.live_quiet());
+            }
+        }
+        a.app.select_range(rg("120:122"));
+        a.app.delete_rows();
+        pump(&mut [&mut a], "a's changes are in", |cs| cs[0].app.live_quiet());
+        a.app.live_snapshot();
+        let seq = a.app.live_seq();
+        pump(&mut [&mut a], "snapshot", |cs| cs[0].app.live_snap_seq() == seq);
+        type_at(&mut a.app, 0, 7, "after the snapshot");
+        a.app.select_range(rg("1:1"));
+        a.app.insert_rows();
+        pump(&mut [&mut a], "a's last changes are in", |cs| cs[0].app.live_quiet());
+        // The server keeps the log from the snapshot before the latest: a second one cuts it
+        // past Ben's base.
+        std::thread::sleep(Duration::from_millis(1100));
+        a.app.live_snapshot();
+        let seq = a.app.live_seq();
+        pump(&mut [&mut a], "second snapshot", |cs| cs[0].app.live_snap_seq() == seq);
+        b.app.live_reconnect_for_test();
+        settle(&mut [&mut a, &mut b], "reloaded and caught up");
+        assert!(b.app.live_reloads() >= 1, "the server cut the log: ben reloaded");
+        assert_same(&a, &b, "after the long offline period");
+        for c in [&a, &b] {
+            let missing: Vec<String> = (0..40).flat_map(|i| [format!("a{i}"), format!("b{i}")]).filter(|t| count(c, t) != 1).collect();
+            assert!(missing.is_empty(), "missing or doubled: {missing:?}");
+            for i in 0..40 {
+                assert_eq!(count(c, &format!("b{i}")), 1, "ben's change {i}");
+                assert_eq!(count(c, &format!("a{i}")), 1, "ann's change {i}");
+            }
+            assert_eq!(count(c, "after the snapshot"), 1);
+        }
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Offline is said plainly in the status bar, with what is waiting and when the next
+    /// attempt is; editing is not blocked; online again, it goes away.
+    #[test]
+    fn the_offline_state_is_clear_and_editing_goes_on() {
+        let (server, dir, mut a, mut b, _) = two_people("offline-ui");
+        assert!(b.app.live_offline_text().is_none());
+        b.app.live_drop_for_test();
+        let t = b.app.live_offline_text().expect("offline text");
+        assert!(t.starts_with("Offline \u{2014} changes will be sent when you're back online") && !t.contains("waiting") && t.contains("Reconnecting in"), "{t}");
+        type_at(&mut b.app, 6, 2, "typed offline");
+        type_at(&mut b.app, 7, 2, "typed offline 2");
+        b.app.live_flush();
+        let t = b.app.live_offline_text().unwrap();
+        assert!(t.contains("(2 waiting)"), "{t}");
+        // The window draws it and still takes input.
+        let _ = b.ctx.run(egui::RawInput::default(), |ctx| b.app.frame(ctx));
+        type_at(&mut b.app, 8, 2, "and another");
+        b.app.live_flush();
+        assert!(b.app.live_offline_text().unwrap().contains("(3 waiting)"));
+        b.app.live_reconnect_for_test();
+        settle(&mut [&mut a, &mut b], "back online");
+        assert!(b.app.live_offline_text().is_none());
+        assert_eq!(text(&a, "Sheet1", 8, 2), "and another");
         drop(server);
         let _ = std::fs::remove_dir_all(&dir);
     }

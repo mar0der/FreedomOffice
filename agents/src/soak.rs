@@ -2,6 +2,7 @@
 //! (cells, row/column inserts and deletes, presence) with random disconnects and reconnects;
 //! at the end every client and a freshly joined one must hold identical cell maps.
 
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use cosync::{CellData, Op, SheetId, Val};
@@ -27,6 +28,12 @@ pub struct Config {
     /// Edits land in the top-left `hot_rows` x `hot_cols` cells so clients collide often.
     pub hot_rows: u32,
     pub hot_cols: u32,
+    /// Chance (percent) per action that the client is killed (dropped without leaving, right
+    /// after its edit was sent, before any answer was read) and started again from its journal.
+    pub restart_pct: f64,
+    /// Where the clients keep their journals (a fresh temporary folder, removed afterwards,
+    /// when not given).
+    pub journal_dir: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -41,6 +48,8 @@ impl Default for Config {
             format_pct: 25.0,
             hot_rows: 12,
             hot_cols: 6,
+            restart_pct: 2.0,
+            journal_dir: None,
         }
     }
 }
@@ -52,6 +61,10 @@ pub struct Report {
     pub totals: Stats,
     /// Disconnects the harness caused on purpose.
     pub forced_disconnects: u64,
+    /// Clients killed on purpose and restarted from their journal.
+    pub restarts: u64,
+    /// Journal files still there at the end (everything was acknowledged: must be 0).
+    pub journals_left: usize,
     pub head_seq: u64,
     pub cells: usize,
     pub digest: String,
@@ -63,7 +76,7 @@ pub struct Report {
 
 impl Report {
     pub fn converged(&self) -> bool {
-        self.clients_identical && self.joiner_identical
+        self.clients_identical && self.joiner_identical && self.journals_left == 0
     }
 
     pub fn print(&self) {
@@ -82,6 +95,10 @@ impl Report {
             t.closes, t.snapshot_requests, t.snapshots
         );
         println!("  reloads from the latest version: {}", t.reloads);
+        println!(
+            "  clients killed and restarted from their journal: {} (journals put back: {}, left behind: {})",
+            self.restarts, t.journal_restores, self.journals_left
+        );
         println!(
             "  own edits replaced by someone's concurrent edit (told to the editor): {}",
             t.replaced
@@ -146,6 +163,7 @@ fn add(a: &mut Stats, b: &Stats) {
     a.snapshots += b.snapshots;
     a.replaced += b.replaced;
     a.reloads += b.reloads;
+    a.journal_restores += b.journal_restores;
 }
 
 /// A random cell format (a few attributes, so concurrent format edits collide often).
@@ -166,9 +184,10 @@ fn first_sheet(l: &Live) -> Result<SheetId, String> {
 
 /// One client's script. Returns the session (so the caller can compare it) and the number of
 /// disconnects it caused on purpose.
-fn client(api: Api, item: String, cfg: Config, idx: usize) -> Result<(Live, u64), String> {
+fn client(api: Api, item: String, cfg: Config, idx: usize, jdir: Option<PathBuf>) -> Result<(Live, u64, u64), String> {
     let mut rng = Rng::new(cfg.seed ^ (idx as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-    let mut live = Live::open(&api, &item, true)?;
+    let mut live = Live::open_in(&api, &item, true, jdir.as_deref())?;
+    let mut restarts = 0u64;
     let sheet = first_sheet(&live)?;
     let pause = Duration::from_millis(cfg.interval_ms);
     let mut forced = 0u64;
@@ -241,6 +260,19 @@ fn client(api: Api, item: String, cfg: Config, idx: usize) -> Result<(Live, u64)
                 );
             }
         }
+        if jdir.is_some() && live.stopped.is_none() && rng.chance(cfg.restart_pct) {
+            // Killed right after the edit went out: its answer is never read. The next
+            // start finds the journal, puts the unconfirmed changes back and sends them; a
+            // batch the server did commit is recognised, not applied twice.
+            let before = live.stats.clone();
+            drop(live);
+            live = Live::open_in(&api, &item, true, jdir.as_deref())?;
+            let mut merged = before;
+            add(&mut merged, &live.stats);
+            live.stats = merged;
+            restarts += 1;
+            back_at = None;
+        }
         if live.connected() {
             live.pump(pause);
         } else {
@@ -262,7 +294,7 @@ fn client(api: Api, item: String, cfg: Config, idx: usize) -> Result<(Live, u64)
         }
         live.pump(Duration::from_millis(20));
     }
-    Ok((live, forced))
+    Ok((live, forced, restarts))
 }
 
 /// Runs the harness: client `i` signs in with `apis[i % apis.len()]`.
@@ -271,17 +303,25 @@ pub fn run(apis: &[Api], item: &str, cfg: &Config) -> Result<Report, String> {
         return Err("Need at least one client.".into());
     }
     let started = Instant::now();
+    let own_dir = cfg.journal_dir.is_none() && cfg.restart_pct > 0.0;
+    let jdir: Option<PathBuf> = match (&cfg.journal_dir, own_dir) {
+        (Some(d), _) => Some(d.clone()),
+        (None, true) => Some(std::env::temp_dir().join(format!("fsheets-soak-journal-{}-{:x}", std::process::id(), Rng::random_seed()))),
+        (None, false) => None,
+    };
     let mut handles = Vec::new();
     for i in 0..cfg.clients {
-        let (api, item, cfg) = (apis[i % apis.len()].clone(), item.to_string(), cfg.clone());
-        handles.push(std::thread::spawn(move || client(api, item, cfg, i)));
+        let (api, item, cfg, jdir) = (apis[i % apis.len()].clone(), item.to_string(), cfg.clone(), jdir.clone());
+        handles.push(std::thread::spawn(move || client(api, item, cfg, i, jdir)));
     }
     let mut lives = Vec::new();
     let mut forced = 0;
+    let mut restarts = 0;
     for (i, h) in handles.into_iter().enumerate() {
-        let (l, f) = h.join().map_err(|_| format!("client {i} panicked"))??;
+        let (l, f, r) = h.join().map_err(|_| format!("client {i} panicked"))??;
         lives.push(l);
         forced += f;
+        restarts += r;
     }
     // Settle: everyone has the server's last sequence number and nothing is pending.
     let end = Instant::now() + Duration::from_secs(30);
@@ -335,6 +375,11 @@ pub fn run(apis: &[Api], item: &str, cfg: &Config) -> Result<Report, String> {
                 })
         });
     }
+    // Everything is acknowledged, so no journal may be left.
+    let journals_left = jdir.as_deref().map_or(0, |d| cosync::journal::Journal::all(d).len());
+    if let (Some(d), true) = (&jdir, own_dir) {
+        let _ = std::fs::remove_dir_all(d);
+    }
     let mut totals = Stats::default();
     for l in &lives {
         add(&mut totals, &l.stats);
@@ -344,6 +389,8 @@ pub fn run(apis: &[Api], item: &str, cfg: &Config) -> Result<Report, String> {
         seed: cfg.seed,
         totals,
         forced_disconnects: forced,
+        restarts,
+        journals_left,
         head_seq,
         cells: lives[0].cell_count(),
         digest,

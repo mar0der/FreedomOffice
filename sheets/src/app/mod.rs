@@ -233,6 +233,11 @@ pub struct App {
     /// Closing found changes the server didn't confirm (or store in its file): the next
     /// close doesn't wait again, and the recovery copy is kept.
     pub live_unconfirmed: bool,
+    /// Where unacknowledged live changes are kept (`<data folder>/LiveJournal`); none in tests
+    /// unless one is given.
+    pub journal_dir: Option<PathBuf>,
+    /// Finding journals of an earlier run at the start.
+    pub live_resume: live_ui::Resume,
 }
 
 const MAX_UNDO: usize = 100;
@@ -339,6 +344,8 @@ impl App {
             live: None,
             live_closing: None,
             live_unconfirmed: false,
+            journal_dir: if cfg!(test) { None } else { crate::cloud::local_dir().map(|d| d.join("LiveJournal")) },
+            live_resume: Default::default(),
         };
         if let Some(p) = path {
             app.open_path(p);

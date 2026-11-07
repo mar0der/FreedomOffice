@@ -13,12 +13,14 @@
 //! to `/live/snapshot` once everything is acknowledged, which becomes a version.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use serde_json::{Value as Json, json};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
 use cosync::client::{Batch, Replaced, Session, Step};
+use cosync::journal::Journal;
 use cosync::{CellData, CellWrite, ClientMsg, Op, Peer, Presence, Rect, ServerMsg, SheetId, close};
 use freedom_sheets::live::{self, ApplyState};
 use freedom_sheets::model::{Sheet, Workbook};
@@ -53,6 +55,8 @@ pub struct Stats {
     pub replaced: u64,
     /// Times the server asked this client to start again from the file's latest version.
     pub reloads: u64,
+    /// Times unsent changes of an earlier run were put back from the journal.
+    pub journal_restores: u64,
 }
 
 /// One of this client's own cell edits that a concurrent edit by someone else replaced (the
@@ -129,6 +133,17 @@ pub struct Live {
     pub legacy: bool,
     /// Set by a reload: the connection was dropped on purpose and should be reopened.
     reconnect: bool,
+    /// Where unacknowledged changes are kept (see `cosync::journal`); none: not kept.
+    journal: Option<PathBuf>,
+    jwritten: bool,
+    /// Journaled changes of an earlier run, put back once the replay reaches their sequence
+    /// number (see `restore_due`).
+    restore: Option<Journal>,
+    /// How many separate edits the batch in flight / the buffer hold.
+    fly_changes: usize,
+    buf_changes: usize,
+    /// Changes put back from the journal and not yet reported (see [`Live::take_resumed`]).
+    resumed: usize,
 }
 
 fn version_of_etag(etag: &str) -> Option<i64> {
@@ -149,7 +164,14 @@ fn would_block(e: &tungstenite::Error) -> bool {
 impl Live {
     /// Downloads the file, reads its workbook as the starting state and connects.
     pub fn open(api: &Api, item: &str, agent: bool) -> Result<Live, String> {
-        let mut live = Live::prepare(api, item, agent)?;
+        Live::open_in(api, item, agent, None)
+    }
+
+    /// Like `open`, keeping the changes the server hasn't acknowledged in a journal in `dir`
+    /// (written with every edit, removed when everything is acknowledged), and putting back
+    /// the ones an earlier run left there.
+    pub fn open_in(api: &Api, item: &str, agent: bool, dir: Option<&Path>) -> Result<Live, String> {
+        let mut live = Live::prepare_in(api, item, agent, dir)?;
         live.connect()?;
         Ok(live)
     }
@@ -185,6 +207,10 @@ impl Live {
 
     /// Like `open`, without connecting.
     pub fn prepare(api: &Api, item: &str, agent: bool) -> Result<Live, String> {
+        Live::prepare_in(api, item, agent, None)
+    }
+
+    pub fn prepare_in(api: &Api, item: &str, agent: bool, dir: Option<&Path>) -> Result<Live, String> {
         let (wb, seq, version) = Live::download(api, item)?;
         let notes = Vec::new();
         let mut cid = [0u8; 6];
@@ -194,9 +220,13 @@ impl Live {
             if agent { "agent" } else { "client" },
             cid.iter().map(|b| format!("{b:02x}")).collect::<String>()
         );
+        // Changes of an earlier run keep their client id: a batch that was committed but never
+        // acknowledged is then recognised by the server's replay.
+        let restore = dir.and_then(|d| Journal::find(d, &api.url, &api.username, item));
+        let cid = restore.as_ref().map_or(cid, |j| j.session.cid.clone());
         let mut sess = Session::new(cid.clone(), seq);
         sess.offline();
-        Ok(Live {
+        let mut live = Live {
             api: api.clone(),
             item: item.to_string(),
             cid,
@@ -224,7 +254,90 @@ impl Live {
             replaced: Vec::new(),
             legacy: false,
             reconnect: false,
-        })
+            journal: dir.map(Path::to_path_buf),
+            jwritten: restore.is_some(),
+            fly_changes: restore.as_ref().map_or(0, |j| j.inflight_changes),
+            buf_changes: restore.as_ref().map_or(0, |j| j.buffer_changes),
+            restore,
+            resumed: 0,
+        };
+        live.restore_due(false);
+        Ok(live)
+    }
+
+    /// The journal of unacknowledged changes: written after every change (atomically, private
+    /// to the user), removed once everything is acknowledged.
+    fn journal_save(&mut self) {
+        if self.restore.is_some() {
+            return;
+        }
+        let Some(dir) = self.journal.clone() else { return };
+        if !self.sess.has_pending() {
+            if self.jwritten {
+                Journal::remove(&dir, &self.api.url, &self.api.username, &self.item);
+                self.jwritten = false;
+            }
+            return;
+        }
+        let mut j = Journal::new("fsheets", &self.api.url, &self.api.username, &self.item, &self.item, self.sess.state());
+        j.version = self.version.unwrap_or(0);
+        j.inflight_changes = self.fly_changes;
+        j.buffer_changes = self.buf_changes;
+        match j.write(&dir) {
+            Ok(()) => self.jwritten = true,
+            Err(e) => self.last_error = Some(format!("Couldn't keep unsent changes in the journal: {e}")),
+        }
+    }
+
+    /// Puts the journaled changes of an earlier run back into the session when the replay has
+    /// reached the sequence number they were made at (`force`: the replay is over without
+    /// reaching it, or the file already is newer: they are re-based on the newer state as
+    /// after a long offline period). They are applied to the workbook and sent as any change
+    /// made while offline.
+    fn restore_due(&mut self, force: bool) {
+        let Some(j) = &self.restore else { return };
+        let (target, seq) = (j.session.seq, self.sess.seq);
+        if seq < target && !force {
+            return;
+        }
+        let j = self.restore.take().expect("restore");
+        let mut st = j.session.clone();
+        let pending = if seq == target {
+            self.sess.restore(&st)
+        } else {
+            st.seq = seq;
+            self.sess.restore(&st);
+            self.buf_changes += std::mem::take(&mut self.fly_changes);
+            self.sess.rebase_on_reload(seq)
+        };
+        if self.legacy {
+            if let Some(b) = &mut self.sess.inflight {
+                b.ops = live::collapse_cells(&self.wb, &b.ops);
+            }
+            self.sess.buffer = live::collapse_cells(&self.wb, &self.sess.buffer);
+        }
+        self.apply(&pending, false);
+        self.unsaved = true;
+        self.resumed += j.pending_changes();
+        self.stats.journal_restores += 1;
+    }
+
+    /// How many changes were put back from a journal since the last call.
+    pub fn take_resumed(&mut self) -> usize {
+        std::mem::take(&mut self.resumed)
+    }
+
+    /// Waits (a few seconds at most) for the replay to reach the journaled changes, so a new
+    /// edit is made on top of them.
+    fn finish_restore(&mut self) {
+        let end = Instant::now() + Duration::from_secs(20);
+        while self.restore.is_some() && Instant::now() < end {
+            if self.ws.is_none() && (self.stopped.is_some() || self.connect().is_err()) {
+                break;
+            }
+            self.pump(Duration::from_millis(20));
+        }
+        self.restore_due(true);
     }
 
     pub fn connected(&self) -> bool {
@@ -233,7 +346,7 @@ impl Live {
 
     /// Connected, caught up with the server and nothing waiting for an acknowledgement.
     pub fn synced(&self) -> bool {
-        self.ws.is_some() && self.caught_up && !self.sess.has_pending()
+        self.ws.is_some() && self.caught_up && !self.sess.has_pending() && self.restore.is_none()
     }
 
     pub fn seq(&self) -> u64 {
@@ -315,6 +428,7 @@ impl Live {
         self.stats.batches_sent += 1;
         if !resend {
             self.stats.ops_sent += b.ops.len() as u64;
+            self.fly_changes = std::mem::take(&mut self.buf_changes);
         }
         self.send(ClientMsg::Ops {
             base: b.base,
@@ -428,6 +542,7 @@ impl Live {
                 let who = self.peers.get(&by).map(|p| p.name.clone()).unwrap_or_default();
                 self.note_replaced(&step.replaced, &who);
                 self.stepped(step);
+                self.restore_due(false);
                 self.check_caught_up();
             }
             ServerMsg::Ack { id, seq, extra } => {
@@ -473,6 +588,7 @@ impl Live {
     fn reload(&mut self) -> Result<(), String> {
         let (mut wb, seq, version) = Live::download(&self.api, &self.item)?;
         let pending = self.sess.rebase_on_reload(seq);
+        self.buf_changes = (self.buf_changes + std::mem::take(&mut self.fly_changes)).max(usize::from(!pending.is_empty()));
         live::apply_ops(&mut wb, &pending, false, &mut self.apply_state);
         self.wb = wb;
         self.needs_recalc = true;
@@ -480,6 +596,8 @@ impl Live {
         self.welcomed = false;
         self.reconnect = true;
         self.stats.reloads += 1;
+        self.restore_due(true);
+        self.journal_save();
         Ok(())
     }
 
@@ -506,6 +624,9 @@ impl Live {
     }
 
     fn stepped(&mut self, step: Step) {
+        if step.own {
+            self.fly_changes = 0;
+        }
         self.apply(&step.apply, true);
         if !step.own {
             self.stats.remote_batches += 1;
@@ -513,6 +634,7 @@ impl Live {
         if let Some(b) = step.send {
             self.send_batch(b, false);
         }
+        self.journal_save();
     }
 
     fn check_caught_up(&mut self) {
@@ -521,6 +643,7 @@ impl Live {
             && self.ws.is_some()
             && self.sess.seq >= self.catch_target
         {
+            self.restore_due(true);
             self.caught_up = true;
             let had = self.sess.inflight.is_some();
             if let Some(b) = self.sess.resume() {
@@ -535,12 +658,19 @@ impl Live {
         if ops.is_empty() {
             return;
         }
+        if self.restore.is_some() {
+            self.finish_restore();
+        }
         self.apply(&ops, false);
         self.unsaved = true;
         let ops = if self.legacy { live::collapse_cells(&self.wb, &ops) } else { ops };
-        if let Some(b) = self.sess.local(ops) {
+        let b = self.sess.local(ops);
+        self.buf_changes += 1;
+        if let Some(b) = b {
             self.send_batch(b, false);
         }
+        // Kept on disk before anything else happens: a crash now loses nothing.
+        self.journal_save();
     }
 
     fn apply(&mut self, ops: &[Op], remote: bool) {

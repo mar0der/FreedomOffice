@@ -36,7 +36,9 @@ fsheets export --item ID --out FILE.xlsx|csv|tsv [--sheet NAME] [--overwrite]
 fsheets add-sheet --item ID --name NAME
 fsheets versions --item ID
 fsheets mcp   [--server URL --user NAME --password-file F] [--token-file F]
-fsheets soak  --server URL --item ID --users a,b,c --secrets-dir DIR [--clients 4] [--edits 150] [--seed N]
+fsheets soak  --server URL --item ID --users a,b,c --secrets-dir DIR [--clients 4] [--edits 150] [--seed N] [--restart-pct 2] [--journal-dir D]
+fsheets logout --token-file F    # end the sign-in on the server and delete the file
+fsheets journal [--discard ID]   # changes an earlier run made but the server never confirmed
 fsheets probe --server URL --item ID --users a,b --secrets-dir DIR
 fsheets seed  --token-file F --folder ID
 ```
@@ -45,7 +47,12 @@ fsheets seed  --token-file F --folder ID
 `--token-file`, the commands use the only `*.token` in `~/.config/freedomsheets-agents/`.
 Changing commands (`set`, `write`, `add-sheet`) join the live session, wait for the server's
 acknowledgement, save a snapshot (a version in the history, as the app does when it leaves) and
-leave.
+leave. Every `fsheets` session journals what the server hasn't acknowledged (`~/.local/share/freedomsheets-agents/journal`,
+mode 0600; `$FSHEETS_JOURNAL_DIR`): if the process dies or the connection never comes back, the
+next command or MCP call on that workbook sends those changes first and says so
+(`resumed_from_journal`). A command that cannot get the acknowledgement fails with an error saying so;
+it never reports success early. `soak` kills clients right after an edit and restarts them from their
+journals (`--restart-pct`, default 2); it fails if any journal is left.
 
 ## Use with Claude / other agents
 
@@ -145,6 +152,7 @@ Runs on this branch:
 |---|---|---|
 | in-process test, seed 0x5eed | 3 x 80 actions | 211 ops in 138 batches, 138 acks, 276 remote batches applied, 5 forced disconnects/5 reconnects, converged yes (fresh joiner too), 3.5 s |
 | shared test instance (Tailscale, TLS), Budget.xlsx | 4 x 200 actions | 732 ops in 607 batches, 605 acks, 1821 remote batches applied, 18 forced disconnects/18 reconnects, final seq 607, 173 cells, converged yes (fresh joiner too), 9.9 s |
+| shared test instance, soak-m3.xlsx (M3: clients killed right after an edit and restarted from their journals) | 4 x 200 / 300 / 400 / 300 actions, kill chance 3 / 5 / 8 / 12 % per action | seeds 3001-3004: 734 to 1449 ops, 24 / 64 / 131 / 147 kills with 22 / 62 / 119 / 138 journals put back, 19 to 44 forced disconnects, 3 snapshots and (seed 3004) 3 reloads, up to 52013 remote batches applied; converged yes (fresh joiner too) and no journal left in all four, 11 to 23 s each |
 
 ## Shared test instance
 
@@ -196,7 +204,7 @@ Evidence is the harness (`probe`, `soak`) and the code on this branch.
 |---|---|---|
 | Presence / cursors | **Done**, minus a few things. Selection, active cell, "editing" flag, colour slot and names are relayed (rate limit 15/s) and painted by the app (coloured borders, name flag for a few seconds). Agents appear with `agent: true` but the app does not yet show that (no robot badge). No cursor for a cell being edited inside the formula bar, no following ("jump to user"), presence is per sheet only. | `cosync::Presence`, `app/live_ui.rs::paint_presence`, test `agents_are_marked_and_see_each_other` |
 | Cell conflicts | **Done (M2, DECISIONS #12-15).** A cell is two targets: content (value/formula/rich text) and format; a value edit and a format edit of one cell made at the same time both survive (`fsheets probe`: value kept: true, format kept: true), two value edits or two format edits are last-writer-wins and the loser is told ("Your change to B3 was replaced by Alice's" in the app; `fsheets` prints it, MCP `write_range` / `replaced_changes` return it). Not done: per-attribute format merge (bold vs fill by two people at once keeps only the later style). | `cosync` `Op::Content` / `Op::Format`, `soak` (format edits in the random actions), `probe` |
-| Offline / reconnect | **Partly.** Reconnect resumes from the last seq, resends the unacknowledged batch, duplicates are recognised by (cid, batch id): 18 forced reconnects in the 4-client run converged. Edits made offline are buffered in memory only: closing/killing the app loses unsent live ops; the app's AutoRecover writes a whole recovery .xlsx every 2 minutes when dirty, which is a copy to reopen, not a replay of ops into the session. There is a limit of what the server keeps (`Reload` when the base is too old): then pending changes are re-based as one batch, but conflicts are not shown. An agent that restarts loses its pending batch the same way. | `cosync::client::Session`, `app/mod.rs::autosave` (INTERVAL 120 s), `Live` in `agents/src/live.rs` |
+| Offline / reconnect | **Done (M3, DECISIONS #17-21).** Reconnect resumes from the last seq, resends the unacknowledged batch, duplicates are recognised by (cid, batch id). Unsent changes are kept in a journal (`cosync::journal`: atomic, 0600, no credentials, written with every change, removed when acknowledged) so closing or killing the app or an agent, offline or mid-send, loses nothing: the next start reopens the document, puts the changes back when the replay reaches their seq and sends them once ("3 changes made offline were saved to the server"). Lost access keeps them as a copy file (app: opened, or Save a copy). A long offline period (server replies `reload`) keeps every change (test with 40 + 40 changes, structural ones included). Status bar: "Offline — changes will be sent when you're back online (N waiting)", countdown, editing never blocked. The soak kills and restarts clients from their journals (`--restart-pct`): 12 seeds locally and the run on the test instance converge, no journal left. Not done: conflicts after a `reload` are not shown (changes are re-based, not transformed); a batch in doubt whose commit is older than a newer snapshot can apply twice; the cell being typed in is not in the journal until committed. | `cosync/src/journal.rs`, `app/live_ui.rs` (`journal_save`, `live_restore_due`, `poll_journal_resume`), `agents/src/live.rs`, `soak.rs` |
 | Per-user undo under concurrency | **Done.** Undo is per person: a stack of inverse ops carried over other people's changes (`cosync::carry_down`), and a step is blocked when someone else changed what it would restore (like Excel). Redo likewise, 100 steps. Not covered by the headless harness (no undo in `fsheets`). | `app/live_ui.rs` (`Undo`, `live_undo`, `carry_down` at line ~1084) |
 | Autosave | **Done for agents (M1b); was partly.** `fsheets` now answers the server's `Snapshot` request like the app (soak test `clients_answer_the_servers_snapshot_requests`: the server asks past 200 batches, a client uploads, the file gets a version, a fresh joiner is identical) and snapshots when a one-shot command or `leave_session` ends with unsaved changes. Earlier finding: **Partly.** Committed batches are stored in SQLite at once (nothing is lost on a server restart); the server asks one editor for a snapshot every 200 batches / 120 s of changes / after a pause, and that becomes a version. Without a GUI editor nobody answers: in the soak the server asked once and `fsheets` ignored it, so the saved *file* stays at the old version while the log grows (a new joiner replays the log, so nothing is lost, but downloads and the web preview show the old file). Fixed by the lib target above. | `server/src/live.rs` (`SNAPSHOT_*`, `maybe_ask_snapshot`), soak report "snapshot requests ignored" |
 | Version history | **Done server side**: every snapshot/save is a version (newest 25 plus the first of each day), restore and download exist; live restore is refused while a session runs (423). Gap: no per-user attribution inside a snapshot (a version is "modified by" the snapshotting client), and no "what changed" view, which Excel Online has. | `server/src/api.rs` versions endpoints, `live_busy` |

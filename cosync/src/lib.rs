@@ -12,6 +12,7 @@
 //! committed since. Concurrent writes to the same target keep the one committed last.
 
 pub mod client;
+pub mod journal;
 pub mod server;
 mod transform;
 

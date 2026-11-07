@@ -3,6 +3,8 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use serde::{Deserialize, Serialize};
+
 use crate::transform::write_key;
 use crate::{cell_write, transform, CellWrite, Op, SheetId};
 
@@ -26,7 +28,7 @@ pub struct Replaced {
 }
 
 /// A batch to send to the server.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Batch {
     pub id: u64,
     pub base: u64,
@@ -58,6 +60,19 @@ impl Step {
     }
 }
 
+/// What a session must remember to carry on after the program was closed or crashed (see
+/// `journal`): the client id (so a batch that was committed but not acknowledged is recognised),
+/// the sequence number its changes are based on, the batch in flight and the buffered changes.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SessionState {
+    pub cid: String,
+    pub seq: u64,
+    pub next_id: u64,
+    pub inflight: Option<Batch>,
+    pub buffer: Vec<Op>,
+    pub buffer_since: Option<u64>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Session {
     /// This app instance (identifies its batches in replays).
@@ -79,6 +94,31 @@ pub struct Session {
 impl Session {
     pub fn new(cid: impl Into<String>, seq: u64) -> Self {
         Session { cid: cid.into(), seq, inflight: None, buffer: Vec::new(), buffer_since: None, next_id: 1, recent: VecDeque::new(), online: true }
+    }
+
+    /// The part of the session worth keeping on disk.
+    pub fn state(&self) -> SessionState {
+        SessionState { cid: self.cid.clone(), seq: self.seq, next_id: self.next_id, inflight: self.inflight.clone(), buffer: self.buffer.clone(), buffer_since: self.buffer_since }
+    }
+
+    /// A session as it was (offline, until `resume`).
+    pub fn from_state(st: &SessionState) -> Self {
+        let mut s = Session::new(st.cid.clone(), st.seq);
+        s.online = false;
+        s.restore(st);
+        s
+    }
+
+    /// Puts journaled changes back into a session that has just caught up to `st.seq` (its
+    /// client id must be `st.cid`): returns the changes to apply to the local workbook, which
+    /// is in the state at that sequence number. Batch ids carry on after the journaled ones.
+    pub fn restore(&mut self, st: &SessionState) -> Vec<Op> {
+        debug_assert!(self.seq == st.seq && self.cid == st.cid && !self.has_pending());
+        self.next_id = self.next_id.max(st.next_id);
+        self.inflight = st.inflight.clone();
+        self.buffer = st.buffer.clone();
+        self.buffer_since = st.buffer_since;
+        self.pending()
     }
 
     /// Unacknowledged local changes, oldest first.
