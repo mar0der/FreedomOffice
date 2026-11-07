@@ -37,6 +37,10 @@ COMMANDS:
     tokens revoke USERNAME       Sign a user out of every device
     backup DIR                   Consistent copy of the database and all documents into DIR
                                  (files already in DIR are skipped; run nightly, then rsync DIR)
+    audit-prune --before YYYY-MM-DD [--user USERNAME]
+                                 Erase audit events older than the date (UTC), optionally only
+                                 those done by or to one person (e.g. a request to delete their
+                                 data); the erasure itself is recorded. Stop the server first.
 
 OPTIONS:
     --config FILE   Configuration file (default /etc/freedomoffice/server.toml)
@@ -244,6 +248,18 @@ fn run(config_path: &Path, mut args: Vec<String>) -> Result<(), String> {
             let s = store(config_path)?;
             let (n, bytes) = s.backup(&dir).map_err(|e| e.to_string())?;
             println!("Backed up the database and {n} new document version(s) ({:.1} MB) to {}.", bytes as f64 / 1048576.0, dir.display());
+            Ok(())
+        }
+        "audit-prune" => {
+            let before = take_opt(&mut args, "--before").ok_or("Expected --before YYYY-MM-DD. See --help.")?;
+            let user = take_opt(&mut args, "--user");
+            if !args.is_empty() {
+                return Err("Expected `audit-prune --before YYYY-MM-DD [--user USERNAME]`.".into());
+            }
+            let at = freedomoffice_server::util::parse_date(&before).ok_or("--before must be a date like 2026-01-31.")?;
+            let s = store(config_path)?;
+            let n = s.audit_erase(at, user.as_deref(), "cli").map_err(|e| e.to_string())?;
+            println!("Erased {n} audit event(s) before {before}{}.", if user.is_some() { " done by or to that person" } else { "" });
             Ok(())
         }
         other => Err(format!("Unknown command '{other}'. See --help.")),

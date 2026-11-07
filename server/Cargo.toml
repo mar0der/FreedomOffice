@@ -36,3 +36,6 @@ freedomoffice-drive = { path = "../drive" }
 [dev-dependencies]
 ureq = { version = "3", default-features = false }
 tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

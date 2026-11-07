@@ -596,3 +596,164 @@ fn me_tells_the_drive_app_its_storage_and_limits() {
     assert_eq!(me["storage"]["files"], 1);
     assert_eq!(me["storage"]["bytes"], 5);
 }
+
+// ---------------------------------------------------------------------------
+// Review fixes: audit flooding, typed passwords, limits, logout, upload limits
+// ---------------------------------------------------------------------------
+
+#[test]
+fn repeated_events_are_counted_not_stored_one_by_one() {
+    let s = start();
+    let at = s.token("alice");
+    let bt = s.token("bob");
+    let root = s.root(&bt);
+    let id = s.upload(&bt, &root, "Loop.txt", b"x").json()["id"].as_str().unwrap().to_string();
+    for i in 0..60 {
+        let name = format!("{}{i}.txt", "n".repeat(230));
+        assert_eq!(s.api("PATCH", &format!("/api/items/{id}"), &bt, json!({ "name": name })).status, 200);
+    }
+    let renames = s.audit(&at, "action=item.rename");
+    assert_eq!(renames.len(), 1, "one row a minute per person and item");
+    assert_eq!(renames[0]["count"], 60);
+    assert!(renames[0]["detail"].as_str().unwrap().chars().count() <= 200, "detail is capped");
+    assert!(renames[0]["detail"].as_str().unwrap().starts_with("Loop.txt -> "), "the first rename");
+    let last = renames[0]["last_detail"].as_str().unwrap();
+    assert!(last.starts_with("nnn") && last.chars().count() <= 200, "and the last one: {last}");
+    // New versions: counted the same way.
+    let auth = format!("Bearer {bt}");
+    for _ in 0..3 {
+        assert_eq!(s.send("PUT", &format!("/api/items/{id}/content"), &[("Authorization", &auth)], Some(b"v".to_vec())).status, 200);
+    }
+    let versions = s.audit(&at, "action=file.version");
+    assert_eq!((versions.len(), versions[0]["count"].as_i64()), (1, Some(3)));
+    // New folders are recorded, counted per person and parent folder.
+    for i in 0..5 {
+        assert_eq!(s.api("POST", "/api/folders", &bt, json!({ "name": format!("Archive {i}") })).status, 201);
+    }
+    let folders = s.audit(&at, "action=folder.create");
+    assert_eq!((folders.len(), folders[0]["count"].as_i64()), (1, Some(5)));
+    assert!(folders[0]["last_detail"].as_str().unwrap().starts_with("Archive 4"));
+    // The admin page shows the count and the last detail.
+    let r = s.send("POST", "/admin/login", &[("Content-Type", "application/x-www-form-urlencoded"), ("Origin", ORIGIN)], Some(format!("username=alice&password={PW}").into_bytes()));
+    let cookie = r.header("set-cookie").unwrap().split(';').next().unwrap().to_string();
+    let page = s.send("GET", "/admin/audit?action=folder.create", &[("Cookie", &cookie)], None).text();
+    assert!(page.contains("x5 until") && page.contains("last: Archive 4"), "{page}");
+}
+
+#[test]
+fn failed_sign_ins_never_keep_unknown_names() {
+    let s = start();
+    let at = s.token("alice");
+    // Someone types their password into the username field, then random names follow.
+    let _ = s.web_login_raw("MySecretPass99", "whatever-123", &[]);
+    for i in 0..8 {
+        let _ = s.web_login_raw(&format!("nobody{i}"), "whatever-123", &[]);
+    }
+    let _ = s.web_login_raw("bob", "wrong-password-1", &[]);
+    let failed = s.audit(&at, "action=sign_in.failed");
+    let dump = serde_json::to_string(&failed).unwrap();
+    assert!(!dump.contains("MySecretPass99") && !dump.contains("nobody"), "{dump}");
+    let unknown: Vec<&Value> = failed.iter().filter(|e| e["target_user"] == "").collect();
+    assert_eq!(unknown.len(), 1, "one row for every unknown name from this address: {failed:?}");
+    assert_eq!(unknown[0]["count"], 9, "(the address limit stops the 11th attempt before anything is recorded)");
+    assert!(unknown[0]["detail"].as_str().unwrap().contains("unknown username"));
+    assert!(failed.iter().any(|e| e["target_user"] == "bob" && e["count"] == 1));
+}
+
+#[test]
+fn ipv6_neighbours_share_one_sign_in_limit() {
+    let s = start();
+    let login = |ip: &str, user: &str| {
+        s.send("POST", "/api/login", &[("Content-Type", "application/json"), ("X-Forwarded-For", ip)], Some(json!({ "username": user, "password": "wrong-password-1" }).to_string().into_bytes())).status
+    };
+    for i in 1..=10 {
+        assert_eq!(login(&format!("2001:db8:1:2::{i:x}"), &format!("guess{i}")), 401);
+    }
+    assert_eq!(login("2001:db8:1:2:ffff::1", "guess99"), 429, "the same /64");
+    assert_eq!(login("2001:db8:1:3::1", "guess99"), 401, "another /64");
+}
+
+#[test]
+fn logout_clears_the_cookie_and_sign_outs_are_audited() {
+    let s = start();
+    let at = s.token("alice");
+    let w = s.web("bob");
+    let r = w.call("POST", "/api/logout", json!({}));
+    assert_eq!(r.status, 204);
+    assert!(r.header("set-cookie").unwrap().starts_with(&format!("{COOKIE}=;")), "the cookie is cleared");
+    let t = s.token("carol");
+    let r = s.api("POST", "/api/logout", &t, json!({}));
+    assert_eq!(r.status, 204);
+    assert!(r.header("set-cookie").is_none(), "no cookie for a device");
+    // The admin page's sign-out too.
+    let r = s.send("POST", "/admin/login", &[("Content-Type", "application/x-www-form-urlencoded"), ("Origin", ORIGIN)], Some(format!("username=alice&password={PW}").into_bytes()));
+    let cookie = r.header("set-cookie").unwrap().split(';').next().unwrap().to_string();
+    let page = s.send("GET", "/admin/password", &[("Cookie", &cookie)], None).text();
+    let at_csrf = page.find("name=\"csrf\" value=\"").unwrap() + "name=\"csrf\" value=\"".len();
+    let csrf = page[at_csrf..at_csrf + page[at_csrf..].find('"').unwrap()].to_string();
+    let r = s.send("POST", "/admin/logout", &[("Cookie", &cookie), ("Origin", ORIGIN), ("Content-Type", "application/x-www-form-urlencoded")], Some(format!("csrf={csrf}").into_bytes()));
+    assert_eq!(r.status, 303);
+    let outs: Vec<(String, String)> = s.audit(&at, "action=sign_out").iter().map(|e| (e["target_user"].as_str().unwrap().to_string(), e["detail"].as_str().unwrap().to_string())).collect();
+    for want in [("bob", "web"), ("carol", "app"), ("alice", "admin")] {
+        assert!(outs.contains(&(want.0.to_string(), want.1.to_string())), "{want:?} in {outs:?}");
+    }
+}
+
+/// Starts a chunked upload and sends one chunk, leaving the connection open.
+fn open_upload(s: &Srv, token: &str, path: &str) -> TcpStream {
+    let mut c = TcpStream::connect(s.url.trim_start_matches("http://")).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    let head = format!("POST {path} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\nabcd\r\n");
+    c.write_all(head.as_bytes()).unwrap();
+    c
+}
+
+fn status_of(mut c: TcpStream) -> u16 {
+    let mut out = Vec::new();
+    let _ = c.read_to_end(&mut out);
+    String::from_utf8_lossy(&out).split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0)
+}
+
+#[test]
+fn uploads_are_limited_per_person_stall_and_disk() {
+    let s = start_with(|c| c.upload_idle_ms = 1500);
+    let t = s.token("bob");
+    let root = s.root(&t);
+    let open: Vec<TcpStream> = (0..4).map(|i| open_upload(&s, &t, &format!("/api/files?parent={root}&name=Slow{i}.bin"))).collect();
+    std::thread::sleep(Duration::from_millis(300));
+    let r = s.upload(&t, &root, "Fifth.bin", b"x");
+    assert_eq!(r.status, 429, "{}", r.text());
+    let ct = s.token("carol");
+    assert_eq!(s.upload(&ct, &s.root(&ct), "Other.bin", b"x").status, 201, "per person");
+    // The stalled uploads are dropped and leave nothing behind.
+    for c in open {
+        assert_eq!(status_of(c), 408);
+    }
+    let incoming = s.cfg.data_dir.join("incoming");
+    assert_eq!(std::fs::read_dir(&incoming).map(|d| d.count()).unwrap_or(0), 0);
+    assert_eq!(s.upload(&t, &root, "Fifth.bin", b"x").status, 201, "the slots came back");
+    drop(s);
+    // Too little disk space would be left: 507 before anything is stored.
+    let s = start_with(|c| c.upload_reserve_mb = u64::MAX / (2 << 20));
+    let t = s.token("bob");
+    let r = s.upload(&t, &s.root(&t), "Full.bin", b"x");
+    assert_eq!(r.status, 507, "{}", r.text());
+}
+
+#[test]
+fn the_cli_erases_audit_events() {
+    let s = start();
+    let at = s.token("alice");
+    let _ = s.web_login_raw("bob", "wrong-password-1", &[]);
+    assert!(s.audit(&at, "").len() >= 2);
+    let cfg_file = s.dir.join("server.toml");
+    std::fs::write(&cfg_file, format!("data_dir = {:?}\n", s.cfg.data_dir.to_str().unwrap())).unwrap();
+    let bin = env!("CARGO_BIN_EXE_freedomoffice-server");
+    let out = std::process::Command::new(bin).args(["--config", cfg_file.to_str().unwrap(), "audit-prune", "--before", "2999-01-01", "--user", "bob"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let left = s.audit(&at, "limit=200");
+    assert!(left.iter().all(|e| e["actor"] != "bob" && e["target_user"] != "bob"), "{left:?}");
+    assert!(left.iter().any(|e| e["action"] == "audit.erase"));
+    let bad = std::process::Command::new(bin).args(["--config", cfg_file.to_str().unwrap(), "audit-prune", "--before", "2026-02-30"]).output().unwrap();
+    assert!(!bad.status.success());
+}

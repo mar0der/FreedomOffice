@@ -135,9 +135,12 @@ the system font folders and Office for Mac, printing uses CUPS as on Linux.
 
 The FreedomOffice server's web page opens files with links like
 `freedomoffice://open?server=https%3A%2F%2Ffiles.example.com&item=<id>`. Sheets opens the
-file with the account already signed in to that server (and joins its live session); with no
-account for that server it shows File > Account with the address filled in. On Windows the
-link handler is registered for the current user at start (only if no other program has it).
+file with the account already signed in to that server (and joins its live session), asking
+which account to use if there are several. For a server you haven't signed in to it first asks
+whether you trust it (showing the server's name, decoded from punycode, and its ASCII form);
+Continue shows File > Account with the address filled in. On Windows the link handler is
+registered for the current user at start, only if no other program has it (or the program
+registered for it is no longer there).
 
 On Linux, add a desktop entry `~/.local/share/applications/freedom-sheets.desktop`
 (`Exec` takes `%u`, the link or file):

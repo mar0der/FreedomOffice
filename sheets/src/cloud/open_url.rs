@@ -183,6 +183,104 @@ pub fn same_server(a: &str, b: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Host names as people read them (punycode, RFC 3492)
+// ---------------------------------------------------------------------------
+
+/// A server's host name for a confirmation: as read (`xn--` labels decoded) and as sent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostName {
+    /// Decoded form (same as `raw` when there's nothing to decode or decoding failed).
+    pub shown: String,
+    /// The ASCII form, with the port.
+    pub raw: String,
+    /// An `xn--` label couldn't be decoded: the name may imitate another one.
+    pub undecodable: bool,
+}
+
+/// The host (and port) of a base URL, `xn--` labels decoded.
+pub fn host_name(url: &str) -> HostName {
+    let raw = super::server::host_of(url).to_ascii_lowercase();
+    let (host, port) = match raw.rsplit_once(':') {
+        Some((h, p)) if p.bytes().all(|b| b.is_ascii_digit()) => (h, Some(p)),
+        _ => (raw.as_str(), None),
+    };
+    let mut undecodable = false;
+    let labels: Vec<String> = host
+        .split('.')
+        .map(|l| match l.strip_prefix("xn--") {
+            Some(enc) => punycode_decode(enc).unwrap_or_else(|| {
+                undecodable = true;
+                l.to_string()
+            }),
+            None => l.to_string(),
+        })
+        .collect();
+    let mut shown = if undecodable { host.to_string() } else { labels.join(".") };
+    if let Some(p) = port {
+        shown = format!("{shown}:{p}");
+    }
+    HostName { shown, raw, undecodable }
+}
+
+/// Decodes the part of an IDNA label after `xn--`. `None` for anything malformed, overflowing,
+/// with control characters, or that decodes to plain ASCII (never a valid `xn--` label).
+pub fn punycode_decode(input: &str) -> Option<String> {
+    const BASE: u32 = 36;
+    const TMIN: u32 = 1;
+    const TMAX: u32 = 26;
+    const SKEW: u32 = 38;
+    const DAMP: u32 = 700;
+    fn adapt(delta: u32, points: u32, first: bool) -> u32 {
+        let mut delta = if first { delta / DAMP } else { delta / 2 };
+        delta += delta / points;
+        let mut k = 0;
+        while delta > ((BASE - TMIN) * TMAX) / 2 {
+            delta /= BASE - TMIN;
+            k += BASE;
+        }
+        k + (BASE - TMIN + 1) * delta / (delta + SKEW)
+    }
+    if input.is_empty() || input.len() > 63 || !input.is_ascii() {
+        return None;
+    }
+    let (basic, digits) = match input.rfind('-') {
+        Some(i) => (&input[..i], &input[i + 1..]),
+        None => ("", input),
+    };
+    let mut out: Vec<char> = basic.chars().collect();
+    let (mut n, mut i, mut bias) = (128u32, 0u32, 72u32);
+    let mut it = digits.bytes().peekable();
+    while it.peek().is_some() {
+        let old = i;
+        let mut w = 1u32;
+        let mut k = BASE;
+        loop {
+            let d = match it.next()? {
+                c @ b'a'..=b'z' => (c - b'a') as u32,
+                c @ b'A'..=b'Z' => (c - b'A') as u32,
+                c @ b'0'..=b'9' => (c - b'0') as u32 + 26,
+                _ => return None,
+            };
+            i = i.checked_add(d.checked_mul(w)?)?;
+            let t = if k <= bias { TMIN } else if k >= bias + TMAX { TMAX } else { k - bias };
+            if d < t {
+                break;
+            }
+            w = w.checked_mul(BASE - t)?;
+            k += BASE;
+        }
+        let len = out.len() as u32 + 1;
+        bias = adapt(i - old, len, old == 0);
+        n = n.checked_add(i / len)?;
+        i %= len;
+        out.insert(i as usize, char::from_u32(n)?);
+        i += 1;
+    }
+    let s: String = out.into_iter().collect();
+    (!s.is_ascii() && !s.chars().any(char::is_control)).then_some(s)
+}
+
+// ---------------------------------------------------------------------------
 // Windows: HKCU\Software\Classes\freedomoffice
 // ---------------------------------------------------------------------------
 
@@ -209,15 +307,72 @@ fn same_path(a: &str, b: &str) -> bool {
     !a.trim().is_empty() && n(a) == n(b)
 }
 
-/// Whether to (re)write the scheme registration: only when no handler is registered at all, or
-/// the registered one is this same program (moved files re-register; another installed handler
-/// is never taken over). `existing`: `None` when the key is missing, else its command (`None`
-/// when it has none or it can't be read).
+/// The programs a `shell\open\command` may run: the quoted path, or for an unquoted command
+/// every prefix ending at a space, with and without ".exe" (Windows tries them in turn), up to
+/// the first argument (`%1`, `"%1"`).
 #[cfg_attr(not(windows), allow(dead_code))]
-pub fn should_register(existing: Option<Option<&str>>, exe: &str) -> bool {
+fn command_candidates(cmd: &str) -> Vec<String> {
+    let cmd = cmd.trim();
+    if cmd.starts_with('"') {
+        return vec![command_program(cmd).to_string()];
+    }
+    let mut out = Vec::new();
+    let mut end = 0;
+    for (n, tok) in cmd.split(' ').enumerate() {
+        if n > 0 && (tok.starts_with('%') || tok.starts_with('"')) {
+            break;
+        }
+        end += usize::from(n > 0) + tok.len();
+        if tok.is_empty() {
+            continue;
+        }
+        let p = &cmd[..end];
+        out.push(p.to_string());
+        if !p.to_ascii_lowercase().ends_with(".exe") {
+            out.push(format!("{p}.exe"));
+        }
+    }
+    out
+}
+
+/// What the takeover check may ask about this computer (the real disk on Windows; stand-ins in
+/// tests).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub struct Disk<'a> {
+    /// A file is there.
+    pub exists: &'a dyn Fn(&str) -> bool,
+    /// The drive letter is a network drive (`GetDriveTypeW` = `DRIVE_REMOTE`).
+    pub remote_drive: &'a dyn Fn(char) -> bool,
+}
+
+/// A path on a local drive whose absence is meaningful: `C:\...` or `C:/...` on a drive that
+/// isn't a network drive. Never UNC or device paths (`\\server\...`, `//server/...`,
+/// `\\?\UNC\...`, `\\?\...`): a share that can't be reached right now isn't an uninstall.
+/// Relative names (looked up on PATH) don't count either.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn local_drive_path(p: &str, disk: &Disk) -> bool {
+    let b = p.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/') && !(disk.remote_drive)(b[0].to_ascii_uppercase() as char)
+}
+
+/// The registered program is gone: every program the command may run is on a local drive
+/// (no environment variables) and isn't there.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn handler_missing(cmd: &str, disk: &Disk) -> bool {
+    let c = command_candidates(cmd);
+    !c.is_empty() && c.iter().all(|p| !p.is_empty() && !p.contains('%') && local_drive_path(p, disk) && !(disk.exists)(p))
+}
+
+/// Whether to (re)write the scheme registration: only when no handler is registered, the
+/// registered one is this same program (moved files re-register), or the registered program no
+/// longer exists (uninstalled). Another installed handler is never taken over. `existing`:
+/// `None` when the key is missing, else its command (`None` when it has none or it can't be
+/// read). Only a program on a local drive counts as gone (see `local_drive_path`).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn should_register(existing: Option<Option<&str>>, exe: &str, disk: &Disk) -> bool {
     match existing {
         None => true,
-        Some(Some(cmd)) => same_path(command_program(cmd), exe),
+        Some(Some(cmd)) => same_path(command_program(cmd), exe) || handler_missing(cmd, disk),
         Some(None) => false,
     }
 }
@@ -245,7 +400,7 @@ pub fn register_windows_handler() {
             let sub = wide(&format!("{SCHEME}\\shell\\open\\command"));
             let mut size = 0u32;
             let rc = RegGetValueW(HKEY_CLASSES_ROOT, sub.as_ptr(), std::ptr::null(), RRF_RT_REG_SZ, std::ptr::null_mut(), std::ptr::null_mut(), &mut size);
-            if rc != 0 || size < 2 || size > 64 * 1024 {
+            if rc != 0 || !(2..=64 * 1024).contains(&size) {
                 Some(None)
             } else {
                 let mut buf = vec![0u16; (size as usize).div_ceil(2)];
@@ -259,7 +414,15 @@ pub fn register_windows_handler() {
             }
         }
     };
-    if !should_register(existing.as_ref().map(|o| o.as_deref()), &exe) {
+    // Missing means "not found"; any other answer (access denied, drive not ready) keeps it.
+    let exists = |p: &str| std::fs::metadata(p).map_or_else(|e| e.kind() != std::io::ErrorKind::NotFound, |_| true);
+    let remote_drive = |letter: char| {
+        const DRIVE_REMOTE: u32 = 4;
+        let root = wide(&format!("{letter}:\\"));
+        unsafe { windows_sys::Win32::Storage::FileSystem::GetDriveTypeW(root.as_ptr()) == DRIVE_REMOTE }
+    };
+    let disk = Disk { exists: &exists, remote_drive: &remote_drive };
+    if !should_register(existing.as_ref().map(|o| o.as_deref()), &exe, &disk) {
         return;
     }
     let base = format!("Software\\Classes\\{SCHEME}");
@@ -409,15 +572,92 @@ mod tests {
     #[test]
     fn windows_registration_never_takes_over_another_handler() {
         let exe = r"C:\Program Files\FreedomOffice\FreedomSheets.exe";
-        assert!(should_register(None, exe), "nothing registered");
-        assert!(should_register(Some(Some(&handler_command(exe))), exe), "ours");
-        assert!(should_register(Some(Some(r#""c:/program files/freedomoffice/freedomsheets.exe" "%1""#)), exe), "ours, other spelling");
-        assert!(should_register(Some(Some(r"C:\Tools\FreedomSheets.exe %1")), r"c:\tools\freedomsheets.exe"), "unquoted");
-        assert!(!should_register(Some(Some(r#""C:\Other\FreedomSheets.exe" "%1""#)), exe), "another copy");
-        assert!(!should_register(Some(Some(r#""C:\Program Files\Evil\handler.exe" "%1""#)), exe));
-        assert!(!should_register(Some(Some(r"C:\Program")), exe), "unquoted prefix isn't ours");
-        assert!(!should_register(Some(Some("")), exe));
-        assert!(!should_register(Some(None), exe), "key without a readable command");
+        let local = |_: char| false;
+        let all = Disk { exists: &|_: &str| true, remote_drive: &local };
+        assert!(should_register(None, exe, &all), "nothing registered");
+        assert!(should_register(Some(Some(&handler_command(exe))), exe, &all), "ours");
+        assert!(should_register(Some(Some(r#""c:/program files/freedomoffice/freedomsheets.exe" "%1""#)), exe, &all), "ours, other spelling");
+        assert!(should_register(Some(Some(r"C:\Tools\FreedomSheets.exe %1")), r"c:\tools\freedomsheets.exe", &all), "unquoted");
+        assert!(!should_register(Some(Some(r#""C:\Other\FreedomSheets.exe" "%1""#)), exe, &all), "another copy");
+        assert!(!should_register(Some(Some(r#""C:\Program Files\Evil\handler.exe" "%1""#)), exe, &all));
+        assert!(!should_register(Some(Some(r"C:\Program")), exe, &all), "unquoted prefix isn't ours");
+        assert!(!should_register(Some(Some("")), exe, &all));
+        assert!(!should_register(Some(None), exe, &all), "key without a readable command");
         assert_eq!(handler_command(exe), r#""C:\Program Files\FreedomOffice\FreedomSheets.exe" "%1""#);
+    }
+
+    #[test]
+    fn punycode_labels_are_decoded() {
+        assert_eq!(punycode_decode("mnchen-3ya").as_deref(), Some("münchen"));
+        assert_eq!(punycode_decode("bcher-kva").as_deref(), Some("bücher"));
+        assert_eq!(punycode_decode("tda").as_deref(), Some("ü"));
+        assert_eq!(punycode_decode("a-b--3ra").as_deref(), Some("a-b-ü"));
+        assert_eq!(punycode_decode("80ak6aa92e").as_deref(), Some("аррӏе"), "Cyrillic look-alike of apple");
+        assert_eq!(punycode_decode("ihqwcrb4cv8a8dqg056pqjye").as_deref(), Some("他们为什么不说中文"), "RFC 3492 sample");
+        for bad in ["", "abc-", "a", "99999999a", "999999999999999999a", "99999999999", "mnchen-3y!", "-", "mnchen-3ya\u{e9}"] {
+            assert_eq!(punycode_decode(bad), None, "{bad:?}");
+        }
+        let h = host_name("https://xn--80ak6aa92e.com:8443");
+        assert_eq!((h.shown.as_str(), h.raw.as_str(), h.undecodable), ("аррӏе.com:8443", "xn--80ak6aa92e.com:8443", false));
+        let h = host_name("https://files.example.com/office");
+        assert_eq!((h.shown.as_str(), h.raw.as_str(), h.undecodable), ("files.example.com", "files.example.com", false));
+        let h = host_name("https://xn--99999999a.example.com");
+        assert_eq!((h.shown.as_str(), h.undecodable), ("xn--99999999a.example.com", true));
+    }
+
+    #[test]
+    fn windows_registration_replaces_a_handler_that_is_gone() {
+        let exe = r"C:\Users\ann\FreedomSheets.exe";
+        let gone = |_: &str| false;
+        let local = |_: char| false;
+        let none = Disk { exists: &gone, remote_drive: &local };
+        let reg = |cmd: &str, disk: &Disk| should_register(Some(Some(cmd)), exe, disk);
+        // The registered program was uninstalled from a local drive (quoted, unquoted, C:/).
+        assert!(reg(r#""C:\Old\FreedomSheets.exe" "%1""#, &none));
+        assert!(reg(r"C:\Old\Sheets.exe %1", &none));
+        assert!(reg(r#""d:/apps/handler.exe" "%1""#, &none));
+        // Still installed: kept.
+        let old = |p: &str| p.eq_ignore_ascii_case(r"C:\Old\FreedomSheets.exe");
+        assert!(!reg(r#""C:\Old\FreedomSheets.exe" "%1""#, &Disk { exists: &old, remote_drive: &local }));
+        // Unquoted with spaces: Windows also tries "C:\Program Files\Other\h.exe"; it's there.
+        let other = |p: &str| p.eq_ignore_ascii_case(r"C:\Program Files\Other\h.exe");
+        let other = Disk { exists: &other, remote_drive: &local };
+        assert!(!reg(r"C:\Program Files\Other\h.exe %1", &other));
+        assert!(!reg(r"C:\Program Files\Other\h %1", &other));
+        // Can't tell: names looked up on PATH, environment variables, empty or unreadable.
+        assert!(!reg("rundll32 url.dll,FileProtocolHandler %1", &none));
+        assert!(!reg(r#""%ProgramFiles%\Other\h.exe" "%1""#, &none));
+        assert!(!reg(r#""" "%1""#, &none));
+        assert!(!reg("", &none));
+        assert!(!should_register(Some(None), exe, &none));
+    }
+
+    #[test]
+    fn windows_registration_keeps_handlers_on_network_paths() {
+        let exe = r"C:\Users\ann\FreedomSheets.exe";
+        let gone = |_: &str| false;
+        let local = |_: char| false;
+        let none = Disk { exists: &gone, remote_drive: &local };
+        let reg = |cmd: &str, disk: &Disk| should_register(Some(Some(cmd)), exe, disk);
+        // UNC and device paths: a share that can't be reached now isn't an uninstall.
+        for cmd in [
+            r#""\\nas\apps\handler.exe" "%1""#,
+            r"\\nas\apps\handler.exe %1",
+            r#""//nas/apps/handler.exe" "%1""#,
+            r#""\\?\UNC\nas\apps\handler.exe" "%1""#,
+            r#""\\?\C:\Old\handler.exe" "%1""#,
+            r#""\\.\C:\Old\handler.exe" "%1""#,
+        ] {
+            assert!(!reg(cmd, &none), "{cmd}");
+        }
+        // A mapped network drive (Z:): kept; the same path on a local drive is replaced.
+        let z_remote = |d: char| d == 'Z';
+        let mapped = Disk { exists: &gone, remote_drive: &z_remote };
+        assert!(!reg(r#""Z:\apps\handler.exe" "%1""#, &mapped));
+        assert!(!reg(r#""z:/apps/handler.exe" "%1""#, &mapped), "drive letters in either case");
+        assert!(reg(r#""Y:\apps\handler.exe" "%1""#, &mapped));
+        assert!(reg(r#""Z:\apps\handler.exe" "%1""#, &none));
+        // Our own exe is still re-registered from anywhere.
+        assert!(should_register(Some(Some(r#""\\nas\apps\FreedomSheets.exe" "%1""#)), r"\\nas\apps\FreedomSheets.exe", &none));
     }
 }

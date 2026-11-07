@@ -41,6 +41,14 @@ pub struct Config {
     /// configurable in server.toml; tests shorten it.
     #[serde(skip)]
     pub login_delay_ms: u64,
+    /// An upload that sends nothing for this long is dropped (408). Fixed at 60 s; tests
+    /// shorten it.
+    #[serde(skip)]
+    pub upload_idle_ms: u64,
+    /// Uploads are refused (507) unless at least `max_upload_mb` plus this much stays free on
+    /// the data disk. Fixed at 1 GB; tests change it.
+    #[serde(skip)]
+    pub upload_reserve_mb: u64,
 }
 
 impl Default for Config {
@@ -61,6 +69,8 @@ impl Default for Config {
             link_access_hours: 12,
             allow_links: true,
             login_delay_ms: 1000,
+            upload_idle_ms: 60_000,
+            upload_reserve_mb: 1024,
         }
     }
 }
