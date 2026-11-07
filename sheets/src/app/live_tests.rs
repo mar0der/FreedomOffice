@@ -575,6 +575,45 @@ mod e2e {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Closing while a cell is still being typed in: the text counts as typed (it reaches the
+    /// server's file) instead of being thrown away.
+    #[test]
+    fn closing_while_typing_keeps_the_typed_text() {
+        let dir = std::env::temp_dir().join(format!("fo-live-typing-{}", freedomoffice_server::util::new_id()));
+        let cfg = Config { data_dir: dir.join("data"), ..Config::default() };
+        {
+            let st = Store::open(&cfg.db_path(), &cfg.files_dir(), cfg.versions_to_keep).unwrap();
+            st.create_user("ann", "Ann Lee", "", PW, false).unwrap();
+        }
+        let server = freedomoffice_server::spawn(cfg).unwrap();
+        let url = server.url();
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("start.xlsx");
+        crate::io::save(&crate::model::Workbook::new(), &file).unwrap();
+        let mut a = client(&url, "ann", &dir);
+        let id = a.session.upload_new("root", "Typing.xlsx", &std::fs::read(&file).unwrap(), "fail").unwrap().id;
+        open(&mut a, &id);
+        settle(&mut [&mut a], "joined");
+
+        a.app.select(2, 1, false);
+        a.app.begin_edit(Some("half typed".into()), super::EditMode::Enter);
+        a.app.live_begin_close();
+        assert!(a.app.edit.is_none(), "the entry was committed");
+        let t = Instant::now();
+        while !a.app.live_close_done() {
+            a.app.poll_live();
+            a.app.live_poll_close();
+            assert!(t.elapsed() < Duration::from_secs(10), "closing doesn't hang");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let after = a.session.item(&id).unwrap();
+        let doc = a.session.open(&after, &dir.join("check")).unwrap();
+        let wb = crate::io::load(&doc.local).unwrap();
+        assert_eq!(crate::numfmt::value_to_text(wb.sheets[0].display_value(2, 1)), "half typed");
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The connection drops while closing waits for the last change: the window doesn't close
     /// silently (the save prompt says why), and exiting anyway keeps the recovery copy.
     #[test]

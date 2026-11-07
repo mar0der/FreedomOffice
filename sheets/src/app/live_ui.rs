@@ -530,8 +530,10 @@ impl App {
             self.allow_close = true;
             return;
         }
+        if !self.commit_edit(false) {
+            return;
+        }
         self.live_flush();
-        self.cancel_edit();
         self.live_closing = Some(Closing { end: Instant::now() + LEAVE_WAIT, snap_tried: false });
         self.status = Some("Saving to the server...".into());
         self.repaint_soon();

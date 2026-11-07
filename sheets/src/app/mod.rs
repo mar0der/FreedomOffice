@@ -1140,8 +1140,14 @@ impl App {
 
         // Close handling with unsaved-changes prompt.
         if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
+            // A cell being typed in counts as typed (like leaving the cell): commit it first so
+            // a live close sends it and a normal close asks to save it. A rejected entry (bad
+            // formula, validation) keeps the window open with its message.
+            let committed = self.live_closing.is_some() || self.commit_edit(false);
+            if !committed {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             // Live and connected: every change goes to the server, no save prompt.
-            if self.live_closing.is_some() || self.live_close_needs_wait() {
+            } else if self.live_closing.is_some() || self.live_close_needs_wait() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.live_begin_close();
             } else if self.dirty {
