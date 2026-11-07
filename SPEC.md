@@ -126,8 +126,10 @@ Version 3 (Drive, §6): `admin_sessions` + `kind 'admin'|'web'` (existing rows b
 append-only `audit(id, at, actor_id, actor_name, ip, action, org_id, item_id, target_user, detail)` with
 triggers that abort every `UPDATE` and every `DELETE` of a row younger than 365 days.
 
-Version 4 (Drive review): `audit` + `count`, `last_at`, `agg_key` (repeats within a minute are one row);
-the update trigger now allows only `count` going up (and `last_at` with it), nothing else.
+Version 4 (Drive review): `audit` + `count`, `last_at`, `last_detail`, `agg_key` (repeats within a minute
+are one row); the update trigger now allows only `count` going up (with `last_at` and `last_detail`),
+nothing else. The migration drops the version 3 update trigger first (it would refuse filling `last_at`
+on a database that has events). the21th (version 2) goes 2 → 3 → 4 in one transaction.
 
 **No downgrade:** an older server binary can't open a migrated database (version 0 code: its schema
 statements refer to `permissions.user_id`; version 1 code refuses a newer `user_version`). Back up (`freedomoffice-server backup`) before upgrading.
@@ -429,9 +431,11 @@ origins can't read anything. Code: `server/src/web.rs` (session), `server/src/co
   taken / conflict, 408 an upload stalled, 412 `If-Match` mismatch, 413 too large, 416 bad range, 423
   being edited live, 429 limited (sign-in attempts, or more than 4 uploads at once), 507 the server's disk
   is nearly full.
-- Every request's store work is one SQLite transaction (nested savepoints): a change and its audit row
-  are kept together or not at all, so an error answer never follows a change that was made (version
-  files that a save prunes are deleted only after the commit).
+- Every request's store work is one SQLite transaction (`BEGIN IMMEDIATE`, so a CLI writing at the same
+  time makes it wait rather than fail half-way; nested work uses savepoints): a change and its audit row
+  are kept together or not at all, so an error answer never follows a change that was made. Files follow
+  the transaction: version files a save prunes are deleted only after the outermost commit (a nested
+  rollback forgets them), and files written by work that rolls back (or panics) are removed again.
 
 #### Downloads (`GET /api/items/{id}/content`, `/l/{token}/download`)
 
@@ -492,10 +496,11 @@ and the email an invite was made for are recorded). A username that was typed at
 recorded only if that account exists (people type passwords into the username field).
 
 **Counting repeats.** Some events are counted instead of stored one by one: a repeat with the same key
-within 60 s of the row's first event adds 1 to its `count` (and sets `last_at`); the row keeps the first
-event's details. Keys: `sign_in.failed` per network (IPv4 address, IPv6 /64) and account (all unknown
-usernames from one network share one key); `item.rename`, `item.move` and `file.version` per actor and
-item. So a rename loop or a password-guessing run adds about one row a minute, not one per request.
+within 60 s of the row's first event adds 1 to its `count` (and sets `last_at` and `last_detail`, the
+latest repeat's detail); the row keeps the first event's details. Keys: `sign_in.failed` per network
+(IPv4 address, IPv6 /64) and account (all unknown usernames from one network share one key);
+`item.rename`, `item.move` and `file.version` per actor and item; `folder.create` per actor and parent
+folder (`item` is the first folder). /admin/audit shows "xN until <time>" and the last detail. So a rename loop or a password-guessing run adds about one row a minute, not one per request.
 
 **Erasing.** `freedomoffice-server --config <cfg> audit-prune --before YYYY-MM-DD [--user USERNAME]` (CLI,
 stop the server first) deletes the events before that date (UTC), or only those done by or to that person.
@@ -526,7 +531,7 @@ someone's personal data from the log is honoured.
 | `item.trash`, `item.restore`, `item.rename`, `item.move`, `item.version_restore` | | - / item's org / item / name(s), folders, versions |
 | `file.upload` | a *new* file was uploaded | - / item's org / item / name, size, folder |
 | `file.version` | a new version was saved: upload with `replace`, `PUT .../content`, a live snapshot (counted per actor and item) | - / item's org / item / name, version, `upload`/`save`/`live` |
-| `folder.create` | | - / item's org / item / name, parent |
+| `folder.create` | (counted per actor and parent folder) | - / item's org / item / name, parent |
 | `audit.erase` | `audit-prune` ran | - / - / - / how many, before which date |
 
 `item.rename` and `item.move` are counted per actor and item as well.
@@ -535,7 +540,7 @@ Share-link holders appear as `actor_id = "link:<link id>"` with an empty `actor_
 
 `GET /api/admin/audit?before=<id>&limit=<1..200, default 50>&org=<id or name>&user=<username>&action=<action
 or group>` → `{events: [{id, at, actor, actor_id, ip, action, org: {id, name} | null, item, target_user,
-detail, count, last_at}], next_before}` newest first (`count` ≥ 1; `last_at` = `at` when 1); `next_before` (or null) is the `before` of the next page. `user`
+detail, count, last_at, last_detail}], next_before}` newest first (`count` ≥ 1; `last_at` = `at` and `last_detail` empty when 1); `next_before` (or null) is the `before` of the next page. `user`
 matches actor or target (case-insensitive); `action=org` matches every `org.*` (only `a-z`, `_`, `.`; 400
 otherwise). Super-admin: every event. Org owner/admin: only events whose `org_id` is an organisation they
 manage (an `org` they don't manage: 404). Anyone else: 403. `/admin/audit` shows the same with the same
