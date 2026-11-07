@@ -5,6 +5,7 @@
 //! * `GET /api/items/{id}/sheet/cells?sheet=&r1=&r2=&c1=&c2=`: the cells of a window.
 //! * `GET /api/items/{id}/sheet/cell?sheet=&r=&c=`: one cell for the formula bar.
 //! * `GET /api/items/{id}/sheet/csv?sheet=`: a sheet as CSV (displayed values).
+//! * `GET /api/items/{id}/sheet/image?sheet=&n=`: a picture; `GET .../sheet/charts?sheet=`: charts with their data.
 //!
 //! Access is the content endpoint's: the same authentication (bearer token, web session, share
 //! link) and a viewer role is enough. The workbook is the saved file version plus the live log
@@ -281,6 +282,27 @@ pub(crate) async fn cell(State(app): State<App>, headers: HeaderMap, Path(id): P
     let (_, l) = book(&app, &headers, &id).await?;
     let mut v = l.book.cell(sheet, r, c).map_err(ApiError::bad)?;
     v["rev"] = json!(l.rev);
+    json_ok(v)
+}
+
+/// One picture of a sheet, as a browser can show it (png, jpeg, gif, bmp), never as a page.
+pub(crate) async fn image(State(app): State<App>, headers: HeaderMap, Path(id): Path<String>, Query(q): Query<HashMap<String, String>>) -> ApiResult {
+    let (sheet, n) = (num(&q, "sheet")? as usize, num(&q, "n")? as usize);
+    let (_, l) = book(&app, &headers, &id).await?;
+    let (ext, data) = l.book.image(sheet, n).ok_or_else(ApiError::not_found)?;
+    let mut res = data.as_ref().clone().into_response();
+    let h = res.headers_mut();
+    h.insert(header::CONTENT_TYPE, HeaderValue::from_str(&format!("image/{ext}")).unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")));
+    h.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
+    h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("sandbox; default-src 'none'"));
+    Ok(no_store(res))
+}
+
+/// The charts of a sheet with their data (for viewers that aren't in a live session).
+pub(crate) async fn charts(State(app): State<App>, headers: HeaderMap, Path(id): Path<String>, Query(q): Query<HashMap<String, String>>) -> ApiResult {
+    let sheet = num(&q, "sheet")? as usize;
+    let (_, l) = book(&app, &headers, &id).await?;
+    let v = tokio::task::spawn_blocking(move || l.book.charts(sheet)).await.map_err(|_| ApiError::internal())?.map_err(ApiError::bad)?;
     json_ok(v)
 }
 

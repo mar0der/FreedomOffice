@@ -361,6 +361,15 @@ impl Bridge {
                     out.server.push(ClientMsg::Presence { p });
                 }
             }
+            "charts" => {
+                self.ready();
+                if let Some(i) = self.sheet_index(v) {
+                    match self.book.charts(i) {
+                        Ok(c) => out.browser.push(json!({ "t": "charts", "id": id, "sheet": i, "charts": c })),
+                        Err(e) => out.browser.push(json!({ "t": "error", "message": e, "id": id })),
+                    }
+                }
+            }
             "copy" => self.copy(v, &mut out),
             "find" => self.find(v, &mut out),
             "edit" | "clear" | "fmt" | "undo" | "redo" | "ins" | "del" | "size" | "hide" | "freeze" | "merge" | "paste" | "fill" | "autofill" | "sheet_add" | "sheet_rename" | "sheet_del" | "sheet_move" | "sheet_hide" | "sheet_color" => self.change(t, v, &mut out),

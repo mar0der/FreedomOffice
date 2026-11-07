@@ -60,6 +60,55 @@ fn windows_are_limited() {
     assert!(b.window_at(0, 0, 0, 999, 39).is_ok());
 }
 
+fn rich_xlsx() -> Vec<u8> {
+    use rust_xlsxwriter::{Chart, ChartType, ConditionalFormat2ColorScale, ConditionalFormatCell, ConditionalFormatCellRule, ConditionalFormatDataBar, Note};
+    let mut wb = Workbook::new();
+    let ws = wb.add_worksheet();
+    ws.set_name("Data").unwrap();
+    for i in 0..5u32 {
+        ws.write_number(i, 0, f64::from(i + 1)).unwrap();
+        ws.write_number(i, 1, f64::from(i + 1)).unwrap();
+        ws.write_number(i, 2, f64::from(i + 1)).unwrap();
+    }
+    ws.add_conditional_format(0, 0, 4, 0, &ConditionalFormatCell::new().set_rule(ConditionalFormatCellRule::GreaterThan(3)).set_format(Format::new().set_background_color(0xff0000).set_bold())).unwrap();
+    ws.add_conditional_format(0, 1, 4, 1, &ConditionalFormat2ColorScale::new().set_minimum_color(0xffffff).set_maximum_color(0x00ff00)).unwrap();
+    ws.add_conditional_format(0, 2, 4, 2, &ConditionalFormatDataBar::new()).unwrap();
+    ws.insert_note(0, 4, &Note::new("remember")).unwrap();
+    let mut ch = Chart::new(ChartType::Column);
+    ch.add_series().set_values("Data!$A$1:$A$5").set_name("Mine");
+    ch.title().set_name("Numbers");
+    ws.insert_chart(7, 0, &ch).unwrap();
+    wb.save_to_buffer().unwrap()
+}
+
+#[test]
+fn conditional_formats_notes_and_charts_are_described() {
+    let b = Book::open("a.xlsx", &rich_xlsx(), &LiveInput::default()).unwrap();
+    let w = b.window_at(0, 0, 0, 10, 5).unwrap();
+    let styles = w["styles"].as_array().unwrap();
+    let cell = |r: u64, c: u64| w["cells"].as_array().unwrap().iter().find(|x| x[0] == r && x[1] == c).cloned().unwrap();
+    let style_of = |r: u64, c: u64| {
+        let si = cell(r, c)[4].as_u64().unwrap();
+        if si == 0 { Json::Null } else { styles[si as usize - 1].clone() }
+    };
+    // "greater than 3": fill and bold on 4 and 5 only.
+    assert_eq!(style_of(3, 0)["f"], "#ff0000");
+    assert_eq!(style_of(3, 0)["b"], 1);
+    assert!(style_of(1, 0).is_null());
+    // The colour scale gives different fills; the data bar travels per cell.
+    assert_ne!(style_of(0, 1)["f"], style_of(4, 1)["f"]);
+    assert_eq!(style_of(4, 1)["f"], "#00ff00");
+    let bar = &cell(4, 2)[6]["bar"];
+    assert!(bar[1].as_f64().unwrap() > bar[0].as_f64().unwrap(), "{bar}");
+    // A note marks its (empty) cell.
+    assert_eq!(cell(0, 4)[6]["note"], 1);
+    // The chart with its data.
+    let ch = b.charts(0).unwrap();
+    assert_eq!((ch[0]["kind"].as_str(), ch[0]["title"].as_str(), ch[0]["series"][0]["name"].as_str()), (Some("column"), Some("Numbers"), Some("Mine")));
+    assert_eq!(ch[0]["series"][0]["values"], json!([1.0, 2.0, 3.0, 4.0, 5.0]));
+    assert_eq!(b.meta()["sheets"][0]["charts"], 1);
+}
+
 #[test]
 fn csv_files_read_as_text_and_never_as_formulas() {
     let b = Book::open("pe\u{202e}ople.csv", b"a,b\n=1+1,\"x,y\"\n", &LiveInput::default()).unwrap();
