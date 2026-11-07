@@ -8,6 +8,7 @@
 
 pub mod a1;
 pub mod api;
+pub mod comments;
 pub mod config;
 pub mod live;
 pub mod mcp;

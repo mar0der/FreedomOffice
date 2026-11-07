@@ -36,6 +36,10 @@ pub struct Config {
     /// client typed (wherever others' row/column changes moved it) and is put back only when it
     /// still holds exactly that; when someone else changed it since, the undo is blocked.
     pub undo_pct: f64,
+    /// Chance (percent) per action of a comment action: a new thread, a reply, an edit or a
+    /// delete of the client's own comment, resolving or reopening a thread (and, for a
+    /// client that manages the document, deleting someone else's comment).
+    pub comment_pct: f64,
     /// Where the clients keep their journals (a fresh temporary folder, removed afterwards,
     /// when not given).
     pub journal_dir: Option<PathBuf>,
@@ -55,6 +59,7 @@ impl Default for Config {
             hot_cols: 6,
             restart_pct: 2.0,
             undo_pct: 8.0,
+            comment_pct: 8.0,
             journal_dir: None,
         }
     }
@@ -73,6 +78,10 @@ pub struct Report {
     /// because someone else had changed the cell since.
     pub undos: u64,
     pub undos_blocked: u64,
+    /// Comment actions made (threads started, replies, edits, resolves, deletes).
+    pub comment_actions: u64,
+    /// Comment threads at the end.
+    pub threads: usize,
     /// Journal files still there at the end (everything was acknowledged: must be 0).
     pub journals_left: usize,
     pub head_seq: u64,
@@ -113,6 +122,7 @@ impl Report {
             "  undos applied {}, blocked because someone else changed the cell {}",
             self.undos, self.undos_blocked
         );
+        println!("  comment actions {}, threads at the end {}", self.comment_actions, self.threads);
         println!(
             "  own edits replaced by someone's concurrent edit (told to the editor): {}",
             t.replaced
@@ -205,6 +215,40 @@ struct Done {
     restarts: u64,
     undos: u64,
     blocked: u64,
+    comments: u64,
+}
+
+/// One random comment action of a client; false when there was nothing to do.
+fn comment_action(live: &mut Live, rng: &mut Rng, sheet: SheetId, idx: usize, i: usize, (r, c): (u32, u32)) -> bool {
+    use freedom_sheets::live::comments::{self, Who};
+    let Some(me) = live.me.clone() else { return false };
+    if !live.comments || !live.editor {
+        return false;
+    }
+    let who = Who { user: me.user.clone(), name: format!("{} (agent)", me.name), manager: me.manager };
+    let Some(si) = freedom_sheets::live::index_of(&live.wb, sheet) else { return false };
+    let threads = live.wb.sheets[si].threads.clone();
+    let pick = (!threads.is_empty()).then(|| &threads[rng.below(threads.len() as u64) as usize]);
+    let text = format!("soak c{idx}-{i}");
+    let op = match (rng.below(10), pick) {
+        (0..=2, _) | (_, None) => comments::add_thread(sheet, r, c, &who, &text),
+        (3..=5, Some(t)) => comments::reply(sheet, &t.id, &who, &text),
+        (6, Some(t)) => match t.comments.iter().find(|x| x.by == me.user) {
+            Some(own) => comments::edit(sheet, &t.id, &own.id, &who, &format!("{text} (edited)")),
+            None => comments::resolve(sheet, &t.id, !t.done),
+        },
+        (7, Some(t)) => comments::resolve(sheet, &t.id, !t.done),
+        (_, Some(t)) => {
+            // Own comments (a reply, or the thread), or anyone's when the client manages the document.
+            let mine = t.comments.iter().rev().find(|x| x.by == me.user).or(if who.manager { t.comments.last() } else { None });
+            match mine {
+                Some(cm) => comments::delete(sheet, &t.id, &cm.id, &who),
+                None => return false,
+            }
+        }
+    };
+    live.edit(vec![op]);
+    true
 }
 
 /// The text of a cell, if it holds exactly plain text.
@@ -233,6 +277,7 @@ fn client(api: Api, item: String, cfg: Config, idx: usize, jdir: Option<PathBuf>
     let mut live = Live::open_in(&api, &item, true, jdir.as_deref())?;
     let mut restarts = 0u64;
     let (mut undone, mut blocked) = (0u64, 0u64);
+    let mut comments = 0u64;
     // (the unique text typed, what the cell held before)
     let mut undos: Vec<(String, Option<CellData>)> = Vec::new();
     let sheet = first_sheet(&live)?;
@@ -260,7 +305,11 @@ fn client(api: Api, item: String, cfg: Config, idx: usize, jdir: Option<PathBuf>
             rng.below(cfg.hot_rows as u64) as u32,
             rng.below(cfg.hot_cols as u64) as u32,
         );
-        if !undos.is_empty() && rng.chance(cfg.undo_pct) {
+        if cfg.comment_pct > 0.0 && rng.chance(cfg.comment_pct) {
+            if comment_action(&mut live, &mut rng, sheet, idx, i, (r, c)) {
+                comments += 1;
+            }
+        } else if !undos.is_empty() && rng.chance(cfg.undo_pct) {
             let (text, before) = undos.pop().expect("one");
             match find_text(&live, sheet, &text) {
                 Some((r, c)) => {
@@ -355,7 +404,7 @@ fn client(api: Api, item: String, cfg: Config, idx: usize, jdir: Option<PathBuf>
         }
         live.pump(Duration::from_millis(20));
     }
-    Ok(Done { live, forced, restarts, undos: undone, blocked })
+    Ok(Done { live, forced, restarts, undos: undone, blocked, comments })
 }
 
 /// Runs the harness: client `i` signs in with `apis[i % apis.len()]`.
@@ -379,6 +428,7 @@ pub fn run(apis: &[Api], item: &str, cfg: &Config) -> Result<Report, String> {
     let mut forced = 0;
     let mut restarts = 0;
     let (mut undos, mut undos_blocked) = (0, 0);
+    let mut comment_actions = 0;
     for (i, h) in handles.into_iter().enumerate() {
         let d = h.join().map_err(|_| format!("client {i} panicked"))??;
         lives.push(d.live);
@@ -386,6 +436,7 @@ pub fn run(apis: &[Api], item: &str, cfg: &Config) -> Result<Report, String> {
         restarts += d.restarts;
         undos += d.undos;
         undos_blocked += d.blocked;
+        comment_actions += d.comments;
     }
     // Settle: everyone has the server's last sequence number and nothing is pending.
     let end = Instant::now() + Duration::from_secs(30);
@@ -456,6 +507,8 @@ pub fn run(apis: &[Api], item: &str, cfg: &Config) -> Result<Report, String> {
         restarts,
         undos,
         undos_blocked,
+        comment_actions,
+        threads: lives[0].wb.sheets.iter().map(|s| s.threads.len()).sum(),
         journals_left,
         head_seq,
         cells: lives[0].cell_count(),

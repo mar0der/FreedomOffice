@@ -357,6 +357,94 @@ ending, offline or in the middle of sending (`cosync::journal`, used by the app 
   (`--undo-pct`, default 8): a client puts its latest text back only while the cell still holds exactly that
   text (found wherever others' row/column changes moved it), else the undo is blocked.
 
+### Comments: threaded comments like Excel 365 (M5, protocol 3)
+
+A *thread* is anchored to a cell: an id, a resolved flag, and comments (the first one, then replies). A
+*comment* has an id, the author's user name (`by`; "" for someone with a link) and display name (`name`),
+the time it was written (`at`, milliseconds since 1970 UTC, from the writer's clock) and its text (at most
+32 767 characters; mentions are written `@Name`), and `edited` (time of the last edit, absent = never).
+A thread has at most 1000 comments and a cell can have several threads. Plain notes (`note`) are separate
+and unchanged. Ids are GUIDs like `{8F3A9B7C-1D2E-4F50-A1B2-C3D4E5F60718}` (the form Excel uses, so they are
+the same in the file).
+
+Operations (protocol 3; every one has the sheet id `s`):
+
+| Operation | Effect | Who |
+|---|---|---|
+| `thread_add {s,r,c,th}` | adds the thread `th` (`id`, `done`, `comments`) at cell (r, c); ignored if the id exists | anyone who can edit; every comment's `by` must be the sender |
+| `comment_add {s,th,cm}` | a reply `cm` to thread `th` | `cm.by` = the sender |
+| `comment_edit {s,th,id,text,at,by}` | sets a comment's text and `edited` | only its author (`by` = author = sender) |
+| `comment_del {s,th,id,by,adm}` | deletes a comment; the first comment takes the thread | its author, or `adm` |
+| `thread_del {s,th,by,adm}` | deletes the thread with its replies | the first comment's author, or `adm` |
+| `thread_done {s,th,done}` | resolve (`true`) or reopen | anyone who can edit |
+
+`adm` is true only for a *manager* of the document: its owner, or an owner/admin of its organisation (the
+server sets `Peer.manager` from the role it computes anyway). The server checks every comment operation
+against the connection before committing: `by` must be the sender's user name, `adm` needs a manager, a
+protocol 2 connection and a viewer can't send them (viewers are closed with 4403 as for any change). An
+operation that fails the check is dropped from the batch, the rest commits, and the sender gets
+`error "You can't change that comment."` and `reload`. Applying repeats the author rule on every client
+(`cosync::apply_thread_op`), so all end identically.
+
+Merge rules: operations address threads and comments by id, so they need no transformation over row/column
+changes; a `thread_add` in flight moves with rows/columns inserted or deleted above/left of it like a note
+and is dropped if its cell's row/column is deleted; threads move with their cell (`shift_threads`) and go
+with a deleted row, column or sheet, taking replies, edits and resolves made concurrently with them.
+Concurrent `comment_edit`s of one comment and concurrent `thread_done`s are last-writer-wins; adds, deletes
+and replies commute. Threads are ordered by (time of the first comment, id), replies by (time, id), never
+by arrival. Anything addressed to a thread or comment that is gone does nothing.
+
+**Compatibility.** `PROTO` is 3, `MIN_PROTO` 2. A protocol 2 client (the M4 app / `fsheets`) still connects
+and edits cells, but is never sent comment operations (the server removes them from the batches it sends,
+also in the replay when it joins; the connection says `proto=<n>` in its WebSocket URL, absent = 2), is
+not asked for snapshots, and its snapshot uploads are refused with 426 unless they carry `X-Live-Proto: 3`
+(so a client that doesn't know comments can't write a workbook without them over the file). A protocol 3
+client that gets a `welcome` with `proto` below 3 turns comments off ("This server can't share comments
+yet") and keeps editing as before; with `proto` 1 it speaks protocol 1 as described above.
+
+**In the file.** Written like Excel 365 does: `xl/threadedComments/threadedComment<N>.xml` for sheet N
+(`<threadedComment ref="B2" dT="2026-11-07T14:05:09.123" personId="{…}" id="{…}" done="1">` with
+`parentId="{first comment id}"` on replies, `<text>`), `xl/persons/person.xml` (`displayName`, `userId` =
+user name, `providerId="None"`), the content types and relationships, and a legacy comment on each
+commented cell whose author is `tc={thread id}` with the stand-in text Excel writes plus the thread, so
+LibreOffice and older Excel show the conversation as a note. Reading: threaded comments become threads,
+the stand-in comment is dropped; a file with only legacy comments (e.g. after LibreOffice saved it)
+keeps them as notes. `xl/freedomoffice/comments.json` holds what the standard cannot (second threads on a
+cell, plain notes on a cell that has a thread, last-edit times), is ignored by other programs and only adds
+to what the standard parts say. The lossless live state stored with snapshots has the threads as
+`thread_add` operations.
+
+**In the app.** A purple marker in the top-right corner of a commented cell (pale when resolved; notes keep
+their red one); hovering shows the thread as a card; clicking the marker, "New/Open Comment" in the cell's
+right-click menu, Review > New Comment or Ctrl+Alt+M open the Comments pane on the right: all threads of the
+sheet in cell order (filter All / Unresolved / Mine), new comment, reply (Ctrl+Enter), resolve/reopen,
+"..." > Edit / Delete (shown only where allowed), `@` completion from the members of the document's
+organisation, the people in the session and earlier authors, mentions highlighted. Author names and times
+are shown in the viewer's own time zone ("Today 14:05", "Nov 3, 14:05"). Changes appear for everyone at once;
+viewers read but don't write (the pane says so); there is no commenter role. In a file that isn't on a server
+the author is the person at this computer. Agents' names end in "(agent)".
+
+**For agents.** `fsheets comments list|add|reply|resolve` and the MCP tools `list_comments`, `add_comment`,
+`reply_comment`, `resolve_comment` (README in `agents/`).
+
+**For the web viewer** (read-only, same access as the other viewer endpoints):
+`GET /api/items/{id}/sheet` has `threads` for all sheets, `GET /api/items/{id}/sheet/comments?sheet=N` the
+threads of sheet N (`{sheet, threads, rev}`; 400 for a bad index). Each thread:
+
+```json
+{ "sheet": 0, "id": "{8F3A…}", "r": 4, "c": 28, "ref": "AC5", "done": false,
+  "comments": [ { "id": "{8F3A…}", "by": "alice", "name": "Alice Admin", "at": 1700000000000,
+                  "text": "Is this right? @Bob Builder" },
+                { "id": "{91C0…}", "by": "bob", "name": "Bob Builder", "at": 1700000060000,
+                  "text": "Yes", "edited": 1700000090000 } ] }
+```
+
+`r`, `c` are zero-based, `sheet` is the index in `sheets`, `at`/`edited` are milliseconds since 1970 UTC
+(render in the viewer's time zone), `edited` is absent when never edited, the first comment is the thread's,
+the rest are replies in order, and `@Name` in the text is a mention (match it against the names you know to
+highlight it). Threads are in the JSON of `/sheet` as of the last live change, like the cells (they follow
+`rev`). Editing comments from the browser needs bridge operations and is not built.
+
 ### Known limits
 
 - Anyone can lock a username out for 15 minutes with 10 wrong passwords (per-username lockout DoS).

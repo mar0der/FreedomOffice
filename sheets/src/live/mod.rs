@@ -6,6 +6,7 @@
 
 #[cfg(feature = "ui")]
 pub mod conn;
+pub mod comments;
 mod diff;
 
 use cosync::{CellData, Op, SheetId, Val, RESCUE_SHEET};
@@ -354,6 +355,9 @@ fn apply_op(wb: &mut Workbook, op: &Op, remote: bool, st: &mut ApplyState, out: 
                     sh.note_authors.remove(&(*r, *c));
                 }
             }
+        }
+        Op::ThreadAdd { .. } | Op::ThreadDel { .. } | Op::CommentAdd { .. } | Op::CommentEdit { .. } | Op::CommentDel { .. } | Op::ThreadDone { .. } => {
+            cosync::apply_thread_op(&mut wb.sheets[i].threads, op);
         }
         Op::Link { r, c, url, .. } => {
             let sh = &mut wb.sheets[i];

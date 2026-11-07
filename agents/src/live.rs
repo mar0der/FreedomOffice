@@ -131,6 +131,8 @@ pub struct Live {
     /// The server speaks protocol 1 (its Welcome has no `proto`): only whole `Cell` operations
     /// are sent, without `made`, and nothing is reported as replaced.
     pub legacy: bool,
+    /// The server understands comment threads (protocol 3; known once it has said Welcome).
+    pub comments: bool,
     /// Set by a reload: the connection was dropped on purpose and should be reopened.
     reconnect: bool,
     /// Where unacknowledged changes are kept (see `cosync::journal`); none: not kept.
@@ -253,6 +255,7 @@ impl Live {
             last_snapshot: None,
             replaced: Vec::new(),
             legacy: false,
+            comments: false,
             reconnect: false,
             journal: dir.map(Path::to_path_buf),
             jwritten: restore.is_some(),
@@ -516,7 +519,8 @@ impl Live {
             ServerMsg::Welcome { seq, you, peers, proto } => {
                 // An older server only knows whole cells: send only those (also what was made
                 // before this Welcome and is still waiting).
-                self.legacy = proto < cosync::PROTO;
+                self.legacy = proto < cosync::MIN_PROTO;
+                self.comments = proto >= cosync::COMMENTS_PROTO;
                 if self.legacy {
                     if let Some(b) = &mut self.sess.inflight {
                         b.ops = live::collapse_cells(&self.wb, &b.ops);

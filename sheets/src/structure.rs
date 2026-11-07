@@ -62,6 +62,7 @@ pub fn shift_sheet(sh: &mut Sheet, rows: bool, at: u32, n: i64) {
         .collect();
     let key = |(r, c): (u32, u32)| if rows { map(r).map(|nr| (nr, c)) } else { map(c).map(|nc| (r, nc)) };
     sh.note_authors = sh.note_authors.drain().filter_map(|(k, a)| key(k).map(|k| (k, a))).collect();
+    cosync::shift_threads(&mut sh.threads, rows, at, n.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
     sh.rich = sh.rich.drain().filter_map(|(k, t)| key(k).map(|k| (k, t))).collect();
     for p in &mut sh.images {
         if let Some(k) = key(p.anchor) {

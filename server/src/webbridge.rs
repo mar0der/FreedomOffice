@@ -138,7 +138,7 @@ async fn run(app: App, mut browser: WebSocket, item: Item, who: Principal, role:
 
     // Join the live session in this process.
     let (mut hub_end, server_end) = pair();
-    let join = crate::live::Join { actor: api::actor(&who), item: it.clone(), version: Some(it.version), who: who.clone(), role, since: base.seq, cid, agent: false };
+    let join = crate::live::Join { actor: api::actor(&who), item: it.clone(), version: Some(it.version), who: who.clone(), role, since: base.seq, cid, agent: false, proto: cosync::PROTO };
     let (store, hub) = (app.store.clone(), app.hub.clone());
     let live_task = tokio::spawn(crate::live::run(store, hub, server_end, join));
     let hello = serde_json::to_string(&bridge.hello()).unwrap_or_default();

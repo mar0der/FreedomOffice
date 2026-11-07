@@ -430,6 +430,9 @@ pub struct Sheet {
     pub zoom: f32,
     /// Authors of cell notes (threaded comments are kept as notes with their author).
     pub note_authors: HashMap<(u32, u32), String>,
+    /// Threaded comments (Excel 365 style), sorted by (time of the first comment, id): see
+    /// `cosync::threads`. Plain notes above are separate.
+    pub threads: Vec<cosync::Thread>,
     /// Pictures floating over the cells.
     pub images: Vec<Picture>,
     /// What-If data tables ({=TABLE(r,c)} areas).
@@ -665,6 +668,7 @@ impl Sheet {
             protection: None,
             zoom: 1.0,
             note_authors: HashMap::new(),
+            threads: Vec::new(),
             images: Vec::new(),
             data_tables: Vec::new(),
             scenarios: Default::default(),

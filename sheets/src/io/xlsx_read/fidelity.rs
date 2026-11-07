@@ -236,15 +236,25 @@ pub(super) fn parse_comments(xml: &str, theme: &Theme, sheet: &mut Sheet) {
     }
 }
 
-/// `xl/persons/person.xml`: person id -> display name.
-pub(super) fn parse_persons(xml: &str) -> HashMap<String, String> {
+/// A person of `xl/persons/person.xml`: display name and user id.
+#[derive(Clone, Debug, Default)]
+pub(super) struct Person {
+    pub name: String,
+    pub user: String,
+}
+
+/// `xl/persons/person.xml`: person id -> who.
+pub(super) fn parse_persons(xml: &str) -> HashMap<String, Person> {
     let mut out = HashMap::new();
     let mut rd = Reader::from_str(xml);
     loop {
         match rd.read_event() {
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) if local(&e) == "person" => {
                 if let Some(id) = attr(&e, "id") {
-                    out.insert(id, attr(&e, "displayName").unwrap_or_default());
+                    let name = attr(&e, "displayName").unwrap_or_default();
+                    // (Excel's own user ids are account ids; for people without one the name is all there is.)
+                    let user = attr(&e, "userId").filter(|u| !u.is_empty()).unwrap_or_else(|| name.clone());
+                    out.insert(id, Person { name, user });
                 }
             }
             Ok(Event::Eof) | Err(_) => break,
@@ -254,14 +264,19 @@ pub(super) fn parse_persons(xml: &str) -> HashMap<String, String> {
     out
 }
 
-/// Threaded comments become notes: the first comment's text and author, then the replies.
-pub(super) fn parse_threaded(xml: &str, persons: &HashMap<String, String>, sheet: &mut Sheet) {
+/// `2024-01-02T10:30:00.12` (UTC, with or without `Z`) as milliseconds since 1970.
+fn parse_stamp(s: &str) -> i64 {
+    chrono::NaiveDateTime::parse_from_str(s.trim().trim_end_matches('Z'), "%Y-%m-%dT%H:%M:%S%.f").map(|d| d.and_utc().timestamp_millis()).unwrap_or(0)
+}
+
+/// Threaded comments: a thread per first comment, with its replies, on the cell the file puts
+/// them on. The legacy comment that stands for a thread in the same file is dropped.
+pub(super) fn parse_threaded(xml: &str, persons: &HashMap<String, Person>, sheet: &mut Sheet) {
     struct Tc {
         at: (u32, u32),
-        id: String,
         parent: Option<String>,
-        author: String,
-        text: String,
+        done: bool,
+        cm: cosync::Comment,
     }
     let mut list: Vec<Tc> = Vec::new();
     let mut rd = Reader::from_str(xml);
@@ -269,37 +284,70 @@ pub(super) fn parse_threaded(xml: &str, persons: &HashMap<String, String>, sheet
         match rd.read_event() {
             Ok(Event::Start(e)) if local(&e) == "threadedComment" => {
                 let at = attr(&e, "ref").and_then(|s| parse_ref(&s));
-                let id = attr(&e, "id").unwrap_or_default();
-                let parent = attr(&e, "parentId");
-                let author = attr(&e, "personId").and_then(|p| persons.get(&p).cloned()).unwrap_or_default();
-                let mut text = String::new();
+                let who = attr(&e, "personId").and_then(|p| persons.get(&p).cloned()).unwrap_or_default();
+                let mut cm = cosync::Comment { id: attr(&e, "id").unwrap_or_default(), by: who.user, name: who.name, at: attr(&e, "dT").map_or(0, |d| parse_stamp(&d)), ..Default::default() };
+                let (parent, done) = (attr(&e, "parentId"), attr(&e, "done").is_some_and(|d| d == "1" || d.eq_ignore_ascii_case("true")));
                 loop {
                     match rd.read_event() {
-                        Ok(Event::Start(c)) if local(&c) == "text" => text = read_text(&mut rd, "text"),
+                        Ok(Event::Start(c)) if local(&c) == "text" => cm.text = decode_ooxml_escapes(read_text(&mut rd, "text")),
                         Ok(Event::End(c)) if c.name().0.rsplit(':').next() == Some("threadedComment") => break,
                         Ok(Event::Eof) | Err(_) => break,
                         _ => {}
                     }
                 }
                 if let Some(at) = at {
-                    list.push(Tc { at, id, parent, author, text: decode_ooxml_escapes(text) });
+                    list.push(Tc { at, parent, done, cm });
                 }
             }
             Ok(Event::Eof) | Err(_) => break,
             _ => {}
         }
     }
-    for root in list.iter().filter(|c| c.parent.is_none()) {
-        let mut text = root.text.clone();
-        for reply in list.iter().filter(|c| c.parent.as_deref() == Some(root.id.as_str())) {
-            let who = if reply.author.is_empty() { "Reply".to_string() } else { reply.author.clone() };
-            text.push_str(&format!("\n\n{who}:\n{}", reply.text));
+    for (n, root) in list.iter().enumerate().filter(|(_, c)| c.parent.is_none()) {
+        let mut first = root.cm.clone();
+        if first.id.is_empty() {
+            first.id = format!("{{legacy-{}-{}-{n}}}", root.at.0, root.at.1);
         }
-        sheet.notes.insert(root.at, text);
-        if root.author.is_empty() {
+        let mut comments = vec![first.clone()];
+        comments.extend(list.iter().filter(|c| c.parent.as_deref() == Some(root.cm.id.as_str()) && !root.cm.id.is_empty()).map(|c| c.cm.clone()));
+        let th = cosync::Thread { id: first.id, r: root.at.0, c: root.at.1, done: root.done, comments };
+        cosync::apply_thread_op(&mut sheet.threads, &cosync::Op::ThreadAdd { s: 0, r: root.at.0, c: root.at.1, th: Box::new(th) });
+        // The legacy comment is only the stand-in Excel keeps for older versions.
+        if sheet.note_authors.get(&root.at).is_some_and(|a| a.starts_with("tc=")) || sheet.notes.get(&root.at).is_some_and(|t| t.starts_with("[Threaded comment]")) {
+            sheet.notes.remove(&root.at);
             sheet.note_authors.remove(&root.at);
-        } else {
-            sheet.note_authors.insert(root.at, root.author.clone());
+        }
+    }
+}
+
+/// `xl/freedomoffice/comments.json` (see the writer): second threads on a cell, plain notes on
+/// cells that have a thread, and when comments were last edited.
+pub(super) fn apply_custom(json: &str, sheets: &mut [Sheet]) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else { return };
+    for t in v["threads"].as_array().into_iter().flatten() {
+        let (Some(si), Ok(th)) = (t["sheet"].as_u64(), serde_json::from_value::<cosync::Thread>(t["thread"].clone())) else { continue };
+        if let Some(sh) = sheets.get_mut(si as usize) {
+            let (r, c) = (th.r, th.c);
+            cosync::apply_thread_op(&mut sh.threads, &cosync::Op::ThreadAdd { s: 0, r, c, th: Box::new(th) });
+        }
+    }
+    for n in v["notes"].as_array().into_iter().flatten() {
+        let (Some(si), Some(r), Some(c), Some(text)) = (n["sheet"].as_u64(), n["r"].as_u64(), n["c"].as_u64(), n["text"].as_str()) else { continue };
+        if let Some(sh) = sheets.get_mut(si as usize) {
+            let k = (r as u32, c as u32);
+            sh.notes.entry(k).or_insert_with(|| text.to_string());
+            if let Some(a) = n["author"].as_str() {
+                sh.note_authors.entry(k).or_insert_with(|| a.to_string());
+            }
+        }
+    }
+    if let Some(ed) = v["edited"].as_object() {
+        for sh in sheets.iter_mut() {
+            for cm in sh.threads.iter_mut().flat_map(|t| t.comments.iter_mut()) {
+                if let Some(ms) = ed.get(&cm.id).and_then(serde_json::Value::as_i64) {
+                    cm.edited = ms;
+                }
+            }
         }
     }
 }

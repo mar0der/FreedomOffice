@@ -438,3 +438,70 @@ fn an_agent_edits_through_mcp_and_people_see_it() {
     // Closing the pipe ends the server cleanly.
     assert!(c.close().success());
 }
+
+/// An agent comments through MCP: the people in the workbook see an agent's thread, reply, and
+/// the agent lists, resolves and cannot comment on a workbook it may only read.
+#[test]
+fn an_agent_comments_through_mcp_and_people_see_it() {
+    let srv = start();
+    let dir = srv.dir.join("work");
+    std::fs::create_dir_all(&dir).unwrap();
+    let alice = Api::login(&srv.url, "alice", PW, "test").unwrap();
+    let root = alice.root().unwrap();
+    let item = alice.upload_new(&root, "Notes.xlsx", sample::make("budget").unwrap()).unwrap().id;
+    let share = |role: &str| {
+        let r = alice
+            .send("POST", &format!("/api/items/{item}/permissions"), &[("Content-Type", "application/json")], Some(format!(r#"{{"username":"agent","role":"{role}"}}"#).into_bytes()))
+            .unwrap();
+        assert!(r.ok(), "{}", r.status);
+    };
+    share("edit");
+    let mut c = Client::start(&srv, &dir);
+    c.rpc("initialize", json!({ "protocolVersion": "2025-06-18" }));
+    let list = c.rpc("tools/list", json!({}));
+    let names: Vec<&str> = list["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+    for want in ["list_comments", "add_comment", "reply_comment", "resolve_comment"] {
+        assert!(names.contains(&want), "{want} missing from {names:?}");
+    }
+
+    // A person has the workbook open; the agent starts a thread on B2.
+    let mut person = Live::open(&alice, &item, false).unwrap();
+    assert!(person.wait_synced(Duration::from_secs(10)));
+    let added = c.tool("add_comment", json!({ "item": item, "cell": "B2", "text": "Is this total right? @alice" })).unwrap();
+    let thread = added["thread"].as_str().unwrap().to_string();
+    assert_eq!(added["cell"], "B2");
+    person.pump(Duration::from_millis(500));
+    let sheet = person.first_sheet().unwrap();
+    let si = freedom_sheets::live::index_of(&person.wb, sheet).unwrap();
+    let t = &person.wb.sheets[si].threads[0];
+    assert_eq!((t.id.as_str(), t.r, t.c, t.comments[0].by.as_str(), t.comments[0].name.as_str()), (thread.as_str(), 1, 1, "agent", "agent (agent)"));
+
+    // The person replies; the agent sees the reply, then resolves.
+    let who = freedom_sheets::live::comments::Who { user: "alice".into(), name: "alice".into(), manager: true };
+    person.edit(vec![freedom_sheets::live::comments::reply(sheet, &thread, &who, "Yes, checked.")]);
+    assert!(person.wait_synced(Duration::from_secs(5)));
+    let listed = c.tool("list_comments", json!({ "item": item })).unwrap();
+    assert_eq!(listed["count"], 1);
+    let t = &listed["threads"][0];
+    assert_eq!((t["cell"].as_str(), t["resolved"].as_bool(), t["comments"].as_array().unwrap().len()), (Some("B2"), Some(false), 2));
+    assert_eq!((t["comments"][1]["author"].as_str(), t["comments"][1]["text"].as_str()), (Some("alice"), Some("Yes, checked.")));
+    assert!(t["comments"][0]["at"].as_str().unwrap().ends_with('Z'));
+    c.tool("reply_comment", json!({ "item": item, "thread": thread, "text": "Thanks." })).unwrap();
+    c.tool("resolve_comment", json!({ "item": item, "thread": thread })).unwrap();
+    person.pump(Duration::from_millis(500));
+    assert!(person.wb.sheets[si].threads[0].done && person.wb.sheets[si].threads[0].comments.len() == 3);
+    assert_eq!(c.tool("list_comments", json!({ "item": item, "open_only": true })).unwrap()["count"], 0);
+    c.tool("resolve_comment", json!({ "item": item, "thread": thread, "resolved": false })).unwrap();
+    assert_eq!(c.tool("list_comments", json!({ "item": item, "open_only": true })).unwrap()["count"], 1);
+    // Mistakes are explained.
+    assert!(c.tool("reply_comment", json!({ "item": item, "thread": "{nope}", "text": "x" })).unwrap_err().contains("no comment thread"));
+    assert!(c.tool("add_comment", json!({ "item": item, "cell": "B2:C3", "text": "x" })).unwrap_err().contains("one cell"));
+    assert!(c.tool("add_comment", json!({ "item": item, "cell": "B2", "text": "  " })).is_err());
+    // Read-only access: the agent can read comments, not write them.
+    drop(person);
+    share("view");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(c.tool("list_comments", json!({ "item": item })).unwrap()["count"], 1);
+    assert!(c.tool("add_comment", json!({ "item": item, "cell": "C3", "text": "no" })).unwrap_err().contains("view-only"));
+    c.close();
+}

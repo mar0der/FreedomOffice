@@ -152,6 +152,9 @@ pub fn read<R: Read + Seek>(src: R) -> Result<Workbook, String> {
     if wb.sheets.is_empty() {
         wb.sheets.push(Sheet::new("Sheet1"));
     }
+    if let Some(custom) = pkg.text("xl/freedomoffice/comments.json") {
+        fidelity::apply_custom(&custom, &mut wb.sheets);
+    }
     wb.active = active.min(wb.sheets.len() - 1);
     wb.names = info.names;
     // PivotTables are laid out from their caches (or their sources when a cache has no records).

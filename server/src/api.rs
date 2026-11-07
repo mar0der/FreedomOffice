@@ -659,6 +659,7 @@ pub fn router(app: App) -> Router {
         .route("/api/items/{id}/sheet/cells", get(crate::sheetweb::cells))
         .route("/api/items/{id}/sheet/cell", get(crate::sheetweb::cell))
         .route("/api/items/{id}/sheet/csv", get(crate::sheetweb::csv))
+        .route("/api/items/{id}/sheet/comments", get(crate::sheetweb::comments))
         .route("/api/items/{id}/sheet/image", get(crate::sheetweb::image))
         .route("/api/items/{id}/sheet/charts", get(crate::sheetweb::charts))
         .route("/api/items/{id}/web-live", get(crate::webbridge::handler))
@@ -2893,7 +2894,7 @@ async fn live(
         return Err(ApiError::bad("cid is required."));
     }
     let agent = q.get("agent").is_some_and(|v| v == "1");
-    let join = crate::live::Join { actor: actor(&who), item, version, who, role, since: since as u64, cid, agent };
+    let join = crate::live::Join { actor: actor(&who), item, version, who, role, since: since as u64, cid, agent, proto: q.get("proto").and_then(|v| v.parse().ok()).unwrap_or(cosync::MIN_PROTO).clamp(cosync::MIN_PROTO, cosync::PROTO) };
     let (store, hub) = (app.store.clone(), app.hub.clone());
     Ok(ws.max_message_size(cosync::MAX_MESSAGE_BYTES).max_frame_size(cosync::MAX_MESSAGE_BYTES).on_upgrade(move |socket| crate::live::run(store, hub, socket, join)))
 }
@@ -2929,12 +2930,17 @@ async fn live_ticket(State(app): State<App>, headers: HeaderMap, Path(id): Path<
     .await
 }
 
-/// `POST /api/items/{id}/live/snapshot?seq=<n>` with the workbook: a live client's copy that
+/// `POST /api/items/{id}/live/snapshot?seq=<n>` (header `X-Live-Proto: 3` or more) with the workbook: a live client's copy that
 /// contains every change up to `n`, stored as a new version. `X-Live-Sheets` carries the
 /// sheet ids and order keys; with `X-Live-State-Offset: <k>` the first k bytes are the
 /// workbook and the rest the client's lossless live state (kept with the version).
 async fn live_snapshot(State(app): State<App>, headers: HeaderMap, Path(id): Path<String>, Query(q): Query<HashMap<String, String>>, body: Bytes) -> ApiResult {
     let seq: u64 = q.get("seq").and_then(|v| v.parse().ok()).ok_or_else(|| ApiError::bad("seq is required."))?;
+    // A client that predates comments would write a workbook without them over the file.
+    let proto: u32 = headers.get("x-live-proto").and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok()).unwrap_or(0);
+    if proto < cosync::COMMENTS_PROTO {
+        return Err(ApiError::new(StatusCode::UPGRADE_REQUIRED, "Please update FreedomOffice Sheets: this version can't save the workbook's comments."));
+    }
     let sheets: String = headers.get("x-live-sheets").and_then(|v| v.to_str().ok()).unwrap_or("").chars().take(64 * 1024).collect();
     let split = match headers.get("x-live-state-offset").and_then(|v| v.to_str().ok()) {
         Some(v) => v.parse::<usize>().ok().filter(|k| *k <= body.len()).ok_or_else(|| ApiError::bad("Invalid X-Live-State-Offset."))?,

@@ -118,6 +118,10 @@ enum Target {
     /// A cell's style.
     CellFormat(SheetId, u32, u32),
     Note(SheetId, u32, u32),
+    /// The text of one comment (by id).
+    CommentText(SheetId, String),
+    /// Whether a thread is resolved.
+    ThreadDone(SheetId, String),
     Link(SheetId, u32, u32),
     RowH(SheetId, u32),
     ColW(SheetId, u32),
@@ -150,6 +154,10 @@ fn target(op: &Op) -> Option<Target> {
         Cell { s, r, c, .. } => Target::CellContent(*s, *r, *c),
         Note { s, r, c, .. } => Target::Note(*s, *r, *c),
         Link { s, r, c, .. } => Target::Link(*s, *r, *c),
+        CommentEdit { s, id, .. } => Target::CommentText(*s, id.clone()),
+        ThreadDone { s, th, .. } => Target::ThreadDone(*s, th.clone()),
+        // Added, replied to and deleted by id: these never conflict, they commute.
+        ThreadAdd { .. } | ThreadDel { .. } | CommentAdd { .. } | CommentDel { .. } => return None,
         RowH { s, r, .. } => Target::RowH(*s, *r),
         ColW { s, c, .. } => Target::ColW(*s, *c),
         RowHidden { s, r, .. } => Target::RowHidden(*s, *r),
@@ -332,7 +340,7 @@ fn shift_content(x: &Op, s: SheetId, rows: bool, at: u32, n: i32, y: &Op) -> Vec
         }
     };
     let keep = match &mut x {
-        Cell { r, c, .. } | Content { r, c, .. } | Format { r, c, .. } | Note { r, c, .. } | Link { r, c, .. } => !same || mv(if rows { r } else { c }),
+        Cell { r, c, .. } | Content { r, c, .. } | Format { r, c, .. } | Note { r, c, .. } | Link { r, c, .. } | ThreadAdd { r, c, .. } => !same || mv(if rows { r } else { c }),
         RowH { r, .. } | RowHidden { r, .. } | RowLevel { r, .. } => !(same && rows) || mv(r),
         ColW { c, .. } | ColHidden { c, .. } | ColLevel { c, .. } => !(same && !rows) || mv(c),
         Merge { rg, .. } => {

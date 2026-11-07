@@ -59,6 +59,9 @@ enum Out {
 
 struct Conn {
     peer: Peer,
+    /// The protocol the client speaks (`proto` of its URL: a client that predates comments sends
+    /// none, which is 2). Comment operations are only sent to, and taken from, protocol 3.
+    proto: u32,
     tx: mpsc::Sender<Out>,
     /// Told when the queue is full.
     kick: Arc<Notify>,
@@ -105,8 +108,17 @@ impl Doc {
 
     fn broadcast(&self, except: u64, msg: &ServerMsg) {
         let text = json(msg);
+        // Comment operations are left out of what a client that doesn't know them is sent
+        // (built once, only when there is such a client).
+        let mut old: Option<String> = None;
         for c in self.conns.iter().filter(|c| c.peer.id != except) {
-            c.push(Out::Text(text.clone()));
+            match msg {
+                ServerMsg::Ops { ops, .. } if c.proto < cosync::COMMENTS_PROTO && ops.iter().any(cosync::Op::is_thread_op) => {
+                    let t = old.get_or_insert_with(|| json(&for_old_clients(msg.clone())));
+                    c.push(Out::Text(t.clone()));
+                }
+                _ => c.push(Out::Text(text.clone())),
+            }
         }
     }
 
@@ -132,7 +144,8 @@ impl Doc {
         if !due || self.snap_asked.is_some_and(|t| t.elapsed() < SNAPSHOT_RETRY) {
             return;
         }
-        let editors: Vec<u64> = self.conns.iter().filter(|c| c.peer.editor).map(|c| c.peer.id).collect();
+        // (A client that doesn't know comments would write a snapshot without them.)
+        let editors: Vec<u64> = self.conns.iter().filter(|c| c.peer.editor && c.proto >= cosync::COMMENTS_PROTO).map(|c| c.peer.id).collect();
         if editors.is_empty() {
             return;
         }
@@ -140,6 +153,17 @@ impl Doc {
         let id = editors[self.snap_turn % editors.len()];
         self.send(id, &ServerMsg::Snapshot);
         self.snap_asked = Some(Instant::now());
+    }
+}
+
+/// A message for a client that doesn't know comment operations: the same batch without them.
+fn for_old_clients(msg: ServerMsg) -> ServerMsg {
+    match msg {
+        ServerMsg::Ops { seq, cid, id, by, base, mut ops } => {
+            ops.retain(|o| !o.is_thread_op());
+            ServerMsg::Ops { seq, cid, id, by, base, ops }
+        }
+        m => m,
     }
 }
 
@@ -346,6 +370,7 @@ impl Hub {
             match v {
                 Verdict::Role(r) => {
                     c.role = r;
+                    c.peer.manager = r >= Role::Owner;
                     let editor = r >= Role::Edit;
                     if editor != c.peer.editor {
                         c.peer.editor = editor;
@@ -420,7 +445,8 @@ fn peer_of(who: &Principal, role: Role, id: u64, agent: bool) -> Peer {
         Principal::User { user, .. } => (user.display_name.clone(), user.username.clone()),
         Principal::Link { .. } => (if role >= Role::Edit { "Guest (link)".to_string() } else { "Guest viewer (link)".to_string() }, String::new()),
     };
-    Peer { id, name, user, color: 0, editor: role >= Role::Edit, agent, presence: None }
+    // (Owner is the document's owner or a manager of its organisation; a share link never is.)
+    Peer { id, name, user, color: 0, editor: role >= Role::Edit, manager: role >= Role::Owner && matches!(who, Principal::User { .. }), agent, presence: None }
 }
 
 /// A simple token bucket.
@@ -461,6 +487,8 @@ pub struct Join {
     pub cid: String,
     /// The client says it is a headless agent (`agent=1`); shown to others in presence.
     pub agent: bool,
+    /// The protocol the client speaks (`proto=<n>`; absent = 2).
+    pub proto: u32,
 }
 
 /// Runs one participant's connection until it closes.
@@ -479,7 +507,7 @@ where
     let item_id = j.item.id.clone();
     let setup = {
         let (store, hub, kick, end) = (store.clone(), hub.clone(), kick.clone(), end.clone());
-        let (item_id, who, since, version, cid, actor, agent) = (j.item.id.clone(), j.who.clone(), j.since, j.version, j.cid.clone(), j.actor.clone(), j.agent);
+        let (item_id, who, since, version, cid, actor, agent, proto) = (j.item.id.clone(), j.who.clone(), j.since, j.version, j.cid.clone(), j.actor.clone(), j.agent, j.proto);
         // The last field: registered (false: only the queued farewell goes out, nothing is read).
         type Setup = (Arc<Mutex<Doc>>, mpsc::Sender<Out>, mpsc::Receiver<Out>, Role, bool);
         tokio::task::spawn_blocking(move || -> Result<Setup, String> {
@@ -525,11 +553,14 @@ where
             let peers: Vec<Peer> = d.conns.iter().map(|c| c.peer.clone()).collect();
             let _ = tx.try_send(Out::Text(json(&ServerMsg::Welcome { seq: d.log.head(), you: peer.clone(), peers, proto: cosync::PROTO })));
             for e in replay {
-                let msg = ServerMsg::Ops { seq: e.seq, cid: e.cid, id: e.id, by: 0, base: e.base, ops: e.ops };
+                let mut msg = ServerMsg::Ops { seq: e.seq, cid: e.cid, id: e.id, by: 0, base: e.base, ops: e.ops };
+                if proto < cosync::COMMENTS_PROTO {
+                    msg = for_old_clients(msg);
+                }
                 let _ = tx.try_send(Out::Text(json(&msg)));
             }
             d.broadcast(conn_id, &ServerMsg::Join { peer: peer.clone() });
-            d.conns.push(Conn { peer, tx: tx.clone(), kick, who, role, revoked: false, end });
+            d.conns.push(Conn { peer, proto, tx: tx.clone(), kick, who, role, revoked: false, end });
             Ok((doc.clone(), tx, rx, role, true))
         })
         .await
@@ -598,7 +629,7 @@ where
                 };
                 match msg {
                     ClientMsg::Hello { sheets, proto } => {
-                        if proto < cosync::PROTO {
+                        if proto < cosync::MIN_PROTO {
                             // A protocol 1 client would apply the split cell operations as whole
                             // cells and diverge: ask for an update instead (nothing it sent is lost).
                             let _ = tx.try_send(Out::Text(json(&ServerMsg::Error { message: "This version of FreedomOffice Sheets is too old to edit this workbook live. Please update the app.".into() })));
@@ -701,6 +732,26 @@ fn commit(store: &Mutex<Store>, doc: &Mutex<Doc>, item: &str, conn: u64, (base, 
         d.close(conn, close::READ_ONLY, "You have view-only access to this workbook.");
         return false;
     }
+    let mut ops = ops;
+    let refused = match d.conns.iter().find(|c| c.peer.id == conn) {
+        Some(c) => check_threads(&mut ops, &c.peer.user, c.peer.manager, c.proto),
+        None => 0,
+    };
+    if refused > 0 {
+        tracing::warn!("live: connection {conn} sent {refused} comment operation(s) for item {item} that its user may not make; dropped");
+    }
+    let ok = commit_batch(&mut d, store, item, conn, (base, made), cid, id, actor, ops);
+    if ok && refused > 0 {
+        // Only a stale client gets here (the app doesn't offer what is refused): after its
+        // acknowledgement it is told to reload, which puts it back in step with the others.
+        d.send(conn, &ServerMsg::Error { message: "You can't change that comment.".into() });
+        d.send(conn, &ServerMsg::Reload);
+    }
+    ok
+}
+
+#[allow(clippy::too_many_arguments)]
+fn commit_batch(d: &mut Doc, store: &Mutex<Store>, item: &str, conn: u64, (base, made): (u64, u64), cid: &str, id: u64, actor: &str, ops: Vec<cosync::Op>) -> bool {
     let (sheets_before, last_before) = (d.log.sheets.clone(), d.log.last_commit(cid, actor));
     match d.log.commit_made(base, made, cid, id, actor, ops) {
         Ok(Commit::New { seq, ops, extra }) => {
@@ -741,6 +792,24 @@ fn commit(store: &Mutex<Store>, doc: &Mutex<Doc>, item: &str, conn: u64, (base, 
     }
 }
 
+/// Drops the comment operations the sender may not make and returns how many: the author of
+/// every comment it adds, edits or deletes must be the sender (`by` is the user name; the
+/// server is what makes it trustworthy), `adm` needs a manager, and a client that predates
+/// comments sends none.
+fn check_threads(ops: &mut Vec<cosync::Op>, user: &str, manager: bool, proto: u32) -> usize {
+    use cosync::Op::*;
+    let before = ops.len();
+    ops.retain(|op| match op {
+        ThreadAdd { th, .. } => proto >= cosync::COMMENTS_PROTO && th.comments.iter().all(|c| c.by == user),
+        CommentAdd { cm, .. } => proto >= cosync::COMMENTS_PROTO && cm.by == user,
+        CommentEdit { by, .. } => proto >= cosync::COMMENTS_PROTO && by == user,
+        ThreadDel { by, adm, .. } | CommentDel { by, adm, .. } => proto >= cosync::COMMENTS_PROTO && by == user && (!adm || manager),
+        ThreadDone { .. } => proto >= cosync::COMMENTS_PROTO,
+        _ => true,
+    });
+    before - ops.len()
+}
+
 #[cfg(test)]
 mod tests {
     use futures_util::FutureExt;
@@ -762,9 +831,9 @@ mod tests {
         let store = Mutex::new(store);
         let hub = Hub::default();
         let (tx, mut rx) = mpsc::channel(16);
-        let peer = Peer { id: 1, name: String::new(), user: String::new(), color: 0, editor: false, agent: false, presence: None };
+        let peer = Peer { id: 1, name: String::new(), user: String::new(), color: 0, editor: false, manager: false, agent: false, presence: None };
         let mut d = Doc { log: Log::new(0), conns: vec![], unsnapped: 0, unsnapped_since: None, last_commit: None, last_snap: None, snap_asked: None, snap_turn: 0, retired: false };
-        d.conns.push(Conn { peer, tx, kick: Arc::new(Notify::new()), who: Principal::Link { link }, role: Role::View, revoked: true, end: Arc::new(Notify::new()) });
+        d.conns.push(Conn { peer, proto: 3, tx, kick: Arc::new(Notify::new()), who: Principal::Link { link }, role: Role::View, revoked: true, end: Arc::new(Notify::new()) });
         let doc = Arc::new(Mutex::new(d));
         lock(&hub.docs).insert(item.id.clone(), doc.clone());
         hub.recheck(&store);
@@ -780,10 +849,10 @@ mod tests {
     /// instead of the server queueing for it without bound.
     #[test]
     fn a_connection_that_does_not_read_is_kicked() {
-        let peer = |id| Peer { id, name: String::new(), user: String::new(), color: 0, editor: true, agent: false, presence: None };
+        let peer = |id| Peer { id, name: String::new(), user: String::new(), color: 0, editor: true, manager: false, agent: false, presence: None };
         let (tx, _rx) = mpsc::channel(2);
         let kick = Arc::new(Notify::new());
-        let d = Doc { log: Log::new(0), conns: vec![Conn { peer: peer(1), tx, kick: kick.clone(), who: link(), role: Role::Edit, revoked: false, end: Arc::new(Notify::new()) }], unsnapped: 0, unsnapped_since: None, last_commit: None, last_snap: None, snap_asked: None, snap_turn: 0, retired: false };
+        let d = Doc { log: Log::new(0), conns: vec![Conn { peer: peer(1), proto: 3, tx, kick: kick.clone(), who: link(), role: Role::Edit, revoked: false, end: Arc::new(Notify::new()) }], unsnapped: 0, unsnapped_since: None, last_commit: None, last_snap: None, snap_asked: None, snap_turn: 0, retired: false };
         for _ in 0..2 {
             d.broadcast(9, &ServerMsg::Leave { id: 9 });
         }
@@ -796,10 +865,10 @@ mod tests {
     /// minutes), but idle snapshots don't flood the version history.
     #[test]
     fn a_pause_in_editing_asks_for_a_snapshot() {
-        let peer = |id| Peer { id, name: String::new(), user: String::new(), color: 0, editor: true, agent: false, presence: None };
+        let peer = |id| Peer { id, name: String::new(), user: String::new(), color: 0, editor: true, manager: false, agent: false, presence: None };
         let (tx, mut rx) = mpsc::channel(16);
         let ago = |s: u64| Instant::now().checked_sub(Duration::from_secs(s));
-        let mut d = Doc { log: Log::new(0), conns: vec![Conn { peer: peer(1), tx, kick: Arc::new(Notify::new()), who: link(), role: Role::Edit, revoked: false, end: Arc::new(Notify::new()) }], unsnapped: 1, unsnapped_since: ago(1), last_commit: ago(1), last_snap: None, snap_asked: None, snap_turn: 0, retired: false };
+        let mut d = Doc { log: Log::new(0), conns: vec![Conn { peer: peer(1), proto: 3, tx, kick: Arc::new(Notify::new()), who: link(), role: Role::Edit, revoked: false, end: Arc::new(Notify::new()) }], unsnapped: 1, unsnapped_since: ago(1), last_commit: ago(1), last_snap: None, snap_asked: None, snap_turn: 0, retired: false };
         let asked = |rx: &mut mpsc::Receiver<Out>| {
             let mut n = 0;
             while let Ok(o) = rx.try_recv() {

@@ -34,9 +34,10 @@ fsheets write --item ID [--sheet NAME] --range A1 --values '[[1,2],["=A1+B1",3]]
 fsheets eval  --item ID [--sheet NAME] "=SUM(A1:A5)"
 fsheets export --item ID --out FILE.xlsx|csv|tsv [--sheet NAME] [--overwrite]
 fsheets add-sheet --item ID --name NAME
+fsheets comments list|add|reply|resolve --item ID ...   # threaded comments (M5)
 fsheets versions --item ID
 fsheets mcp   [--server URL --user NAME --password-file F] [--token-file F]
-fsheets soak  --server URL --item ID --users a,b,c --secrets-dir DIR [--clients 4] [--edits 150] [--seed N] [--restart-pct 2] [--journal-dir D]
+fsheets soak  --server URL --item ID --users a,b,c --secrets-dir DIR [--clients 4] [--edits 150] [--seed N] [--restart-pct 2] [--comment-pct 8] [--journal-dir D]
 fsheets logout --token-file F    # end the sign-in on the server and delete the file
 fsheets journal [--discard ID]   # changes an earlier run made but the server never confirmed
 fsheets probe --server URL --item ID --users a,b --secrets-dir DIR
@@ -109,6 +110,8 @@ Once the token is cached, `"args": ["mcp"]` is enough (or `--token-file /path/to
 | `export` | `.xlsx`, or `.csv`/`.tsv` of one sheet, to a local path (no overwrite unless asked) |
 | `join_session`, `leave_session` | stay connected as an agent (people see it in presence, with the range it works on; edits appear live); leave saves a version |
 | `who_is_here` | the people in the workbook and the range each works on |
+| `list_comments` | the comment threads (M5), all sheets or one: id, sheet, cell, resolved, and the comments with author, UTC time and text; `open_only` leaves out resolved threads |
+| `add_comment`, `reply_comment`, `resolve_comment` | start a thread on a cell (`@Name` mentions), reply to a thread by id, resolve it (`resolved: false` reopens). They go through the live session, so the people in the workbook see them at once, with the agent's name marked "(agent)". Needs edit access and a server that supports comments (the tool says so otherwise) |
 | `list_versions` | the version history |
 
 Without `join_session` each call joins for the moment it takes (so it sees what was edited live)
@@ -133,7 +136,16 @@ fsheets cat --item <id> --sheet Data         # calculated values; --formulas for
 fsheets eval --item <id> --sheet Data "=AVERAGE(B2:B9)"
 fsheets export --item <id> --out /tmp/forecast.csv --sheet Data
 fsheets versions --item <id>
+fsheets comments add --item <id> --sheet Data --cell B2 --text "Is this total right? @Ann Lee"
+fsheets comments list --item <id> --open     # unresolved threads, with their ids
+fsheets comments reply --item <id> --thread '{8F3A9B7C-…}' --text "Checked, it is."
+fsheets comments resolve --item <id> --thread '{8F3A9B7C-…}'      # --reopen to undo
 ```
+
+Comments (M5) are Excel-style threads on cells, shared live and saved in the .xlsx the way Excel
+does (SPEC.md "Comments"). `fsheets` can read, start, reply to and resolve them; an agent may edit or
+delete only its own comments, which the CLI and MCP tools don't offer yet. Against a server older than
+M5 (protocol 2 or 1) comments are off and every comment command says so; cells keep working.
 
 ## Soak harness
 
@@ -144,7 +156,15 @@ client must be synced to the same seq, and a freshly joined client (which replay
 from the file's version) must hold the same cell map. Pace is 40 ms per action because the
 server allows about 30 batches/s per connection (closes with 4429 beyond that).
 
+Since M5 the mix includes comment actions (`--comment-pct`, default 8 % of the actions): a new thread,
+a reply, editing or deleting the client's own comment, resolving or reopening, and, for a client that
+manages the document (the file's owner or an org owner/admin), deleting someone else's. The report adds
+"comment actions" and "threads at the end", and the clients, the digest and the fresh joiner must agree on
+the threads too (`state_ops` carries them).
+
 Test: `cargo test -p freedomsheets-agents` (server in-process on 127.0.0.1:0, temp data dir).
+`cargo test -p freedomsheets-agents --test old_server -- --ignored` also builds the real servers of the
+commit before M2 (protocol 1) and before M5 (protocol 2) from git and checks `fsheets` against them.
 
 Runs on this branch:
 
@@ -154,6 +174,20 @@ Runs on this branch:
 | shared test instance (Tailscale, TLS), Budget.xlsx | 4 x 200 actions | 732 ops in 607 batches, 605 acks, 1821 remote batches applied, 18 forced disconnects/18 reconnects, final seq 607, 173 cells, converged yes (fresh joiner too), 9.9 s |
 | shared test instance, soak-m3.xlsx (M3: clients killed right after an edit and restarted from their journals) | 4 x 200 / 300 / 400 / 300 actions, kill chance 3 / 5 / 8 / 12 % per action | seeds 3001-3004: 734 to 1449 ops, 24 / 64 / 131 / 147 kills with 22 / 62 / 119 / 138 journals put back, 19 to 44 forced disconnects, 3 snapshots and (seed 3004) 3 reloads, up to 52013 remote batches applied; converged yes (fresh joiner too) and no journal left in all four, 11 to 23 s each |
 | shared test instance, soak-m4.xlsx (M4: undo action in the mix, plus kills/restarts) | 4 x 200 / 300 / 400 actions, kill chance 3 / 5 / 3 %, undo chance 8 / 12 / 20 % | seeds 4001-4003: 743 / 1075 / 1444 ops, 34 / 131 / 225 undos applied and 4 / 30 / 56 blocked (someone else had changed the cell), 25 / 64 / 46 kills with 21 / 60 / 44 journals put back, 14 to 35 forced disconnects, 3 to 6 snapshots; converged yes (fresh joiner too), no journal left, 12 to 21 s each |
+| shared test instance, soak-m5.xlsx in TestOrg (M5: threads, replies, edits, resolves and deletes in the mix, the file's owner test-a also deleting others' comments) | 4 clients x 250 / 250 / 400 / 300 actions, comment chance 25 / 25 / 40 / 60 %, kills 2 / 2 / 5 / 5 %, undo 8 / 8 / 8 / 15 % | seeds 5001-5004: 908 / 860 / 1418 / 1094 ops, 227 / 239 / 575 / 666 comment actions, 41 / 64 / 192 / 263 threads at the end, 19 / 18 / 80 / 46 kills with all journals put back or sent and none left, 4 to 6 snapshots in the long runs; converged yes (fresh joiner identical too) in all four, 13 to 25 s each. The exported file has `threadedComment1.xml`, `person.xml`, the legacy comments and the custom part, and LibreOffice opens it with 168 comments. |
+
+### Checking the app by eye (nested X server)
+
+`DISPLAY=:0 Xephyr :80 -screen 1280x800 -no-host-grab &` is only the parent of a nested window; nothing
+drives display :0 itself. A throwaway server (`freedomoffice-server init/user add/org add`, 127.0.0.1,
+passwords from a 0600 file) and two profiles (`HOME` per person with `servers.bin` holding that person's
+token, copied file to file) let two `FreedomSheets` instances open the same workbook with
+`FreedomSheets "freedomoffice://open?server=http%3A%2F%2F127.0.0.1%3APORT&item=ID"` on `DISPLAY=:80`;
+`xdotool` clicks and keys, `xwd -root -display :80` + `ffmpeg` for screenshots (only one of the two
+windows is mapped at a time, since there is no window manager). M5's comment check (new comment with
+Ctrl+Alt+M, @mention completion, reply and resolve seen live in the other window, the owner's Delete on
+someone else's reply, an agent's thread from `fsheets comments add`, the hover card, the right-click menu)
+was done this way.
 
 ## Shared test instance
 

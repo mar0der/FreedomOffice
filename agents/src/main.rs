@@ -9,7 +9,7 @@ use std::time::Duration;
 use fsheets::api::Api;
 use fsheets::config::{self, Account};
 use fsheets::live::Live;
-use fsheets::{sample, soak, work};
+use fsheets::{comments, sample, soak, work};
 use serde_json::{Value as Json, json};
 
 const USAGE: &str = "fsheets - headless FreedomOffice client (command line and MCP server for agents)
@@ -39,6 +39,14 @@ USAGE:
                                   Save as .xlsx, or one sheet as .csv / .tsv
     fsheets add-sheet --item ID --name NAME
                                   Add a sheet
+    fsheets comments list --item ID [--sheet NAME] [--open]
+                                  The comment threads (all sheets, or one); --open leaves out resolved ones
+    fsheets comments add --item ID [--sheet NAME] --cell B2 --text TEXT
+                                  Start a comment thread on a cell (shown as an agent to the others)
+    fsheets comments reply --item ID --thread ID --text TEXT
+                                  Reply to a thread
+    fsheets comments resolve --item ID --thread ID [--reopen]
+                                  Resolve a thread (or reopen it)
     fsheets versions --item ID    The version history
     fsheets journal [--discard ID]
                                   List changes an earlier run made but the server never confirmed (they
@@ -47,7 +55,7 @@ USAGE:
                                   MCP server on standard input/output for AI agents
     fsheets soak --server URL --item ID --users a,b,c --secrets-dir DIR
                  [--clients 4] [--edits 150] [--seed N] [--interval-ms 40]
-                 [--restart-pct 2] [--undo-pct 8] [--journal-dir DIR]
+                 [--restart-pct 2] [--undo-pct 8] [--comment-pct 8] [--journal-dir DIR]
                                   Several clients edit at random, disconnect and reconnect; all must converge
     fsheets probe --server URL --item ID --users a,b --secrets-dir DIR
                                   Show what concurrent edits of one cell do
@@ -350,6 +358,55 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
                     .unwrap_or_default()
             );
         }
+        "comments" => {
+            let api = token(&mut args)?;
+            if args.is_empty() {
+                return Err("Expected: fsheets comments list|add|reply|resolve. See --help.".into());
+            }
+            let sub = args.remove(0);
+            let item = need(opt(&mut args, "--item"), "--item")?;
+            let sheet = opt(&mut args, "--sheet");
+            match sub.as_str() {
+                "list" => {
+                    let open_only = flag(&mut args, "--open");
+                    let mut live = join(&api, &item)?;
+                    let out = comments::list(&mut live, sheet.as_deref(), open_only)?;
+                    for t in out["threads"].as_array().into_iter().flatten() {
+                        println!(
+                            "{} {}!{}{}",
+                            t["id"].as_str().unwrap_or(""),
+                            t["sheet"].as_str().unwrap_or(""),
+                            t["cell"].as_str().unwrap_or(""),
+                            if t["resolved"].as_bool().unwrap_or(false) { "  (resolved)" } else { "" }
+                        );
+                        for c in t["comments"].as_array().into_iter().flatten() {
+                            let who = c["name"].as_str().filter(|n| !n.is_empty()).or(c["author"].as_str()).unwrap_or("");
+                            println!("    {} {}: {}", c["at"].as_str().unwrap_or(""), who, c["text"].as_str().unwrap_or("").replace('\n', "\n        "));
+                        }
+                    }
+                    live.disconnect();
+                }
+                "add" => {
+                    let cell = need(opt(&mut args, "--cell"), "--cell")?;
+                    let text = need(opt(&mut args, "--text"), "--text")?;
+                    let (out, saved) = change(&api, &item, |l| comments::add(l, sheet.as_deref(), &cell, &text))?;
+                    println!("Started thread {} on {}!{}{}.", out["thread"].as_str().unwrap_or(""), out["sheet"].as_str().unwrap_or(""), out["cell"].as_str().unwrap_or(""), saved.map(|v| format!(" (saved as version {v})")).unwrap_or_default());
+                }
+                "reply" => {
+                    let thread = need(opt(&mut args, "--thread"), "--thread")?;
+                    let text = need(opt(&mut args, "--text"), "--text")?;
+                    let (out, saved) = change(&api, &item, |l| comments::reply(l, &thread, &text))?;
+                    println!("Replied to {}{}.", out["thread"].as_str().unwrap_or(""), saved.map(|v| format!(" (saved as version {v})")).unwrap_or_default());
+                }
+                "resolve" => {
+                    let thread = need(opt(&mut args, "--thread"), "--thread")?;
+                    let reopen = flag(&mut args, "--reopen");
+                    let (out, saved) = change(&api, &item, |l| comments::resolve(l, &thread, !reopen))?;
+                    println!("{} {}{}.", if reopen { "Reopened" } else { "Resolved" }, out["thread"].as_str().unwrap_or(""), saved.map(|v| format!(" (saved as version {v})")).unwrap_or_default());
+                }
+                other => return Err(format!("Unknown comments command '{other}'. See --help.")),
+            }
+        }
         "logout" => {
             // Ends the sign-in on the server and deletes the token file.
             let path = opt(&mut args, "--token-file").map(PathBuf::from).ok_or("--token-file is required.")?;
@@ -414,6 +471,9 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
             }
             if let Some(v) = opt(&mut args, "--undo-pct") {
                 cfg.undo_pct = v.parse().map_err(|_| "--undo-pct must be a number")?;
+            }
+            if let Some(v) = opt(&mut args, "--comment-pct") {
+                cfg.comment_pct = v.parse().map_err(|_| "--comment-pct must be a number")?;
             }
             if let Some(v) = opt(&mut args, "--restart-pct") {
                 cfg.restart_pct = v.parse().map_err(|_| "--restart-pct must be a number")?;

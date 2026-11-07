@@ -225,6 +225,32 @@ impl Mcp {
                 self.note_saved(&item, &mut out, version);
                 Ok(out)
             }
+            "list_comments" => {
+                let item = self.item(a)?;
+                let (sheet, open) = (str_arg(a, "sheet"), a["open_only"].as_bool().unwrap_or(false));
+                Ok(self.with_live(&item, false, |l| crate::comments::list(l, sheet, open))?.0)
+            }
+            "add_comment" => {
+                let item = self.item(a)?;
+                let (sheet, cell, text) = (str_arg(a, "sheet"), need_str(a, "cell")?, need_str(a, "text")?);
+                let (mut out, version) = self.with_live(&item, true, |l| crate::comments::add(l, sheet, cell, text))?;
+                self.note_saved(&item, &mut out, version);
+                Ok(out)
+            }
+            "reply_comment" => {
+                let item = self.item(a)?;
+                let (thread, text) = (need_str(a, "thread")?, need_str(a, "text")?);
+                let (mut out, version) = self.with_live(&item, true, |l| crate::comments::reply(l, thread, text))?;
+                self.note_saved(&item, &mut out, version);
+                Ok(out)
+            }
+            "resolve_comment" => {
+                let item = self.item(a)?;
+                let (thread, resolved) = (need_str(a, "thread")?, a["resolved"].as_bool().unwrap_or(true));
+                let (mut out, version) = self.with_live(&item, true, |l| crate::comments::resolve(l, thread, resolved))?;
+                self.note_saved(&item, &mut out, version);
+                Ok(out)
+            }
             "evaluate" => {
                 let item = self.item(a)?;
                 let (sheet, src) = (str_arg(a, "sheet"), need_str(a, "formula")?);
@@ -530,6 +556,30 @@ fn tools() -> Json {
             "Adds a sheet at the end.",
             json!({ "item": item, "name": { "type": "string" } }),
             &["name"]
+        ),
+        tool(
+            "list_comments",
+            "The comment threads of a workbook (Excel-style threaded comments): for each thread its id, sheet, cell, whether it is resolved, and the comments with author, time (UTC) and text, oldest first. Without `sheet` all sheets.",
+            json!({ "item": item, "sheet": sheet, "open_only": { "type": "boolean", "description": "Leave out resolved threads." } }),
+            &[]
+        ),
+        tool(
+            "add_comment",
+            "Starts a comment thread on a cell. It appears live for the people editing, with this agent's name marked (agent). Mention a person with @Name in the text. Needs edit access.",
+            json!({ "item": item, "sheet": sheet, "cell": { "type": "string", "description": "One cell, like B2 or Data!B2." }, "text": { "type": "string" } }),
+            &["cell", "text"]
+        ),
+        tool(
+            "reply_comment",
+            "Replies to a comment thread (the id is from list_comments or add_comment).",
+            json!({ "item": item, "thread": { "type": "string" }, "text": { "type": "string" } }),
+            &["thread", "text"]
+        ),
+        tool(
+            "resolve_comment",
+            "Resolves a comment thread, or reopens it with resolved=false.",
+            json!({ "item": item, "thread": { "type": "string" }, "resolved": { "type": "boolean", "description": "Default true." } }),
+            &["thread"]
         ),
         tool(
             "evaluate",
