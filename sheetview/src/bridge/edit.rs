@@ -424,6 +424,7 @@ impl Bridge {
             Ok(x) => x,
             Err(e) => return out.browser.push(json!({ "t": "rejected", "message": e })),
         };
+        self.ready();
         let cut = v.get("cut").and_then(Json::as_bool).unwrap_or(false) && self.editor;
         let mut text = String::new();
         let mut cells = Vec::new();
