@@ -1341,7 +1341,7 @@
         'form',
         { class: 'stack', on: { submit: (e) => (e.preventDefault(), grantPerson()) } },
         h('label', { for: pid }, 'Share with a person'),
-        h('div', { class: 'row' }, who, prole, add),
+        h('div', { class: 'hrow' }, who, prole, add),
         h('p', { id: `${pid}-help`, class: 'muted small' }, 'People in your organisations are suggested; anyone else by their exact username.'),
         suggestions,
       );
@@ -1351,7 +1351,7 @@
       const orgSel = h('select', { id: oid }, orgs.map((o) => h('option', { value: o.id }, o.name)));
       const orole = h('select', { 'aria-label': 'Access for the organisation' }, h('option', { value: 'view' }, 'Can view'), h('option', { value: 'edit' }, 'Can edit'));
       const orgForm = orgs.length
-        ? h('form', { class: 'stack', on: { submit: (e) => (e.preventDefault(), grantOrg()) } }, h('label', { for: oid }, 'Share with everyone in an organisation'), h('div', { class: 'row' }, orgSel, orole, h('button', { type: 'submit', class: 'secondary' }, 'Share')))
+        ? h('form', { class: 'stack', on: { submit: (e) => (e.preventDefault(), grantOrg()) } }, h('label', { for: oid }, 'Share with everyone in an organisation'), h('div', { class: 'hrow' }, orgSel, orole, h('button', { type: 'submit', class: 'secondary' }, 'Share')))
         : null;
       // Links.
       const linksBox = h('div', { class: 'links' });
@@ -1569,7 +1569,7 @@
           },
           'Copy',
         );
-        clear(fresh).append(h('p', { class: 'small' }, "Copy the link now: it won't be shown again."), h('div', { class: 'row' }, field, copy));
+        clear(fresh).append(h('p', { class: 'small' }, "Copy the link now: it won't be shown again."), h('div', { class: 'hrow' }, field, copy));
         fresh.hidden = false;
         field.focus();
         field.select();
@@ -1695,6 +1695,7 @@
   function send(u) {
     u.state = 'uploading';
     u.status.textContent = 'Starting…';
+    updateUploadsTitle();
     const xhr = new XMLHttpRequest();
     u.xhr = xhr;
     xhr.open('POST', uploadUrl(u.parent, u.name, u.conflict));
@@ -1841,6 +1842,7 @@
       }
     });
     $('pw-open').addEventListener('click', () => showPasswordChange(false));
+    $('pw-open-nav').addEventListener('click', () => showPasswordChange(false));
     $('signout').addEventListener('click', signOut);
     $('nav-toggle').addEventListener('click', () => {
       const nav = $('sidenav');
