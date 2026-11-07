@@ -174,6 +174,20 @@ Runs on this branch:
 | shared test instance (Tailscale, TLS), Budget.xlsx | 4 x 200 actions | 732 ops in 607 batches, 605 acks, 1821 remote batches applied, 18 forced disconnects/18 reconnects, final seq 607, 173 cells, converged yes (fresh joiner too), 9.9 s |
 | shared test instance, soak-m3.xlsx (M3: clients killed right after an edit and restarted from their journals) | 4 x 200 / 300 / 400 / 300 actions, kill chance 3 / 5 / 8 / 12 % per action | seeds 3001-3004: 734 to 1449 ops, 24 / 64 / 131 / 147 kills with 22 / 62 / 119 / 138 journals put back, 19 to 44 forced disconnects, 3 snapshots and (seed 3004) 3 reloads, up to 52013 remote batches applied; converged yes (fresh joiner too) and no journal left in all four, 11 to 23 s each |
 | shared test instance, soak-m4.xlsx (M4: undo action in the mix, plus kills/restarts) | 4 x 200 / 300 / 400 actions, kill chance 3 / 5 / 3 %, undo chance 8 / 12 / 20 % | seeds 4001-4003: 743 / 1075 / 1444 ops, 34 / 131 / 225 undos applied and 4 / 30 / 56 blocked (someone else had changed the cell), 25 / 64 / 46 kills with 21 / 60 / 44 journals put back, 14 to 35 forced disconnects, 3 to 6 snapshots; converged yes (fresh joiner too), no journal left, 12 to 21 s each |
+| shared test instance, soak-m5.xlsx in TestOrg (M5: threads, replies, edits, resolves and deletes in the mix, the file's owner test-a also deleting others' comments) | 4 clients x 250 / 250 / 400 / 300 actions, comment chance 25 / 25 / 40 / 60 %, kills 2 / 2 / 5 / 5 %, undo 8 / 8 / 8 / 15 % | seeds 5001-5004: 908 / 860 / 1418 / 1094 ops, 227 / 239 / 575 / 666 comment actions, 41 / 64 / 192 / 263 threads at the end, 19 / 18 / 80 / 46 kills with all journals put back or sent and none left, 4 to 6 snapshots in the long runs; converged yes (fresh joiner identical too) in all four, 13 to 25 s each. The exported file has `threadedComment1.xml`, `person.xml`, the legacy comments and the custom part, and LibreOffice opens it with 168 comments. |
+
+### Checking the app by eye (nested X server)
+
+`DISPLAY=:0 Xephyr :80 -screen 1280x800 -no-host-grab &` is only the parent of a nested window; nothing
+drives display :0 itself. A throwaway server (`freedomoffice-server init/user add/org add`, 127.0.0.1,
+passwords from a 0600 file) and two profiles (`HOME` per person with `servers.bin` holding that person's
+token, copied file to file) let two `FreedomSheets` instances open the same workbook with
+`FreedomSheets "freedomoffice://open?server=http%3A%2F%2F127.0.0.1%3APORT&item=ID"` on `DISPLAY=:80`;
+`xdotool` clicks and keys, `xwd -root -display :80` + `ffmpeg` for screenshots (only one of the two
+windows is mapped at a time, since there is no window manager). M5's comment check (new comment with
+Ctrl+Alt+M, @mention completion, reply and resolve seen live in the other window, the owner's Delete on
+someone else's reply, an agent's thread from `fsheets comments add`, the hover card, the right-click menu)
+was done this way.
 
 ## Shared test instance
 
