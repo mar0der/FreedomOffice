@@ -37,3 +37,9 @@ Started 2026-11-07 16:15 Dubai, from `orgs` at c0d9c74. Brief: inbox/20261107-14
   Default: moving Drive to production (:8080 behind tailscale serve, schema v2 -> v4 one-way after a DB backup) waits for a separate go from Petar.
 - D-2: drive-web (D1b + all review fixes, b20d195) merged into collab-365 (e84e12f). The fix range was not re-reviewed by the independent reviewer; acceptable for a tailnet-only test instance; re-review before production.
 - D-3: Pushed collab-365 + collab-365-m1 after a secret scan (file names, key patterns, and the 6 real generated passwords/tokens checked against the full history: 0 hits). `server/src/common_passwords.txt` is the weak-password blocklist, not a secret.
+
+## 2026-11-07 19:45 — Web Sheets becomes top priority (Guardian note: petar-roadmap-web-sheets)
+- W-1: branch `collab-365-web` from collab-365 619c911, developed in parallel to M4 (desktop). Web work stays out of sheets/src/app to avoid conflicts; cosync/server/lib changes must be additive.
+- W-2: order W1 read-only -> W2 live co-edit -> W3 structure/format/export. WASM vs server-side bridge for W2 is decided after a spike (default: bridge, keeps formulas/OT/journal in Rust).
+- W-3: test-instance redeploys are serialised with `flock ~/freedomoffice-shared-test/deploy.lock`, always after a backup; the account `petar` and all data are preserved (Petar uses that instance now).
+- W-4: model: continuing with Sonnet developers (Guardian: Opus OK now, but no independent policy change).
