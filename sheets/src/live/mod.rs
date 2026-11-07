@@ -57,6 +57,32 @@ pub fn entered_text(op: &Op) -> String {
     }
 }
 
+/// Protocol 1 mode (the server's `Welcome` has no `proto`): that server only knows whole `Cell`
+/// operations. Replaces every `Content`/`Format` by one `Cell` carrying the cell's full current
+/// data in `wb` (the workbook the operations were just applied to, whose formulas already
+/// include any structure changes), at the place of the first operation on that cell. Other
+/// operations are kept as they are.
+pub fn collapse_cells(wb: &Workbook, ops: &[Op]) -> Vec<Op> {
+    let mut out: Vec<Op> = Vec::with_capacity(ops.len());
+    let mut done = std::collections::HashSet::new();
+    for op in ops {
+        match op {
+            Op::Content { s, r, c, .. } | Op::Format { s, r, c, .. } => {
+                if !done.insert((*s, *r, *c)) {
+                    continue;
+                }
+                let v = index_of(wb, *s).and_then(|i| {
+                    let sh = &wb.sheets[i];
+                    sh.get(*r, *c).filter(|x| !x.is_blank()).map(|x| Box::new(cell_data(wb, sh, *r, *c, x)))
+                });
+                out.push(Op::Cell { s: *s, r: *r, c: *c, v, adj: Vec::new() });
+            }
+            _ => out.push(op.clone()),
+        }
+    }
+    out
+}
+
 /// Style content (None for the default style).
 pub fn style_json(st: &Style) -> Option<Json> {
     if *st == Style::default() { None } else { serde_json::to_value(st).ok() }

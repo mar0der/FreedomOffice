@@ -270,8 +270,10 @@ A v1 client would apply them as whole cells and diverge, and the server cannot t
 workbook state, only the log), so the server answers a `hello` with `proto < 2` with
 `error "This version of FreedomOffice Sheets is too old to edit this workbook live. Please update the app."`
 and closes with `4426` (`close::UPGRADE`); nothing the client sent is committed. A v2 client that gets a
-`welcome` without `proto` (an older server) stops with a message instead of sending operations the server
-would reject. Stored logs and live-state blobs from before still replay: `cell` is unchanged.
+`welcome` without `proto` (an older server) switches to protocol 1 mode: it sends only whole `cell`
+operations (every `content`/`format` its diff makes is collapsed into one `cell` carrying the cell's full
+current data, also for changes still waiting from before the `welcome`), omits `made`, and shows no
+"replaced" messages (an old server relays no `base`). It converges with other clients like any v1 client. Stored logs and live-state blobs from before still replay: `cell` is unchanged.
 
 **"Your change was replaced".** A relayed `ops` carries `base`: what the sender had seen when it *made* the
 changes (a batch sent after catching up from offline or while an earlier one was in flight is based on

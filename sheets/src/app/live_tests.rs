@@ -264,6 +264,45 @@ fn value_and_format_changes_are_separate_operations() {
     assert!(app.live_errors().is_empty());
 }
 
+/// Against a protocol 1 server (its Welcome has no `proto`) a new app keeps working: it sends only
+/// whole `Cell` operations, including what was made before the Welcome arrived.
+#[test]
+fn against_a_protocol_1_server_only_whole_cells_are_sent() {
+    use cosync::Op;
+    let (_ctx, mut app) = super::data_ui::sample_app();
+    app.live_for_test();
+    // Made before the Welcome: still a Content / Format at this point.
+    type_at(&mut app, 30, 0, "early");
+    app.select(31, 0, false);
+    app.toggle_bold();
+    app.live_flush();
+    assert!(app.live_pending_ops().iter().any(|o| matches!(o, Op::Content { .. } | Op::Format { .. })));
+    let you = cosync::Peer { id: 1, name: "Me".into(), user: "me".into(), editor: true, ..Default::default() };
+    // (A protocol 1 Welcome has no `proto` field.)
+    let welcome: cosync::ServerMsg = serde_json::from_value(serde_json::json!({ "t": "welcome", "seq": 0, "you": you, "peers": [] })).unwrap();
+    app.live_event_for_test(crate::live::conn::Event::Msg(welcome));
+    let all_cells = |app: &App| {
+        let ops = app.live_pending_ops();
+        !ops.is_empty() && ops.iter().all(|o| matches!(o, Op::Cell { .. }))
+    };
+    assert!(all_cells(&app), "{:?}", app.live_pending_ops());
+    // And what is made afterwards: value, format, both, clear.
+    type_at(&mut app, 32, 0, "later");
+    app.select(32, 0, false);
+    app.toggle_bold();
+    app.apply_style(|s| s.fill = Some(0x112233));
+    app.clear(true, false);
+    app.select(30, 0, false);
+    app.clear(true, true);
+    app.live_flush();
+    assert!(all_cells(&app), "{:?}", app.live_pending_ops());
+    // The whole cell carries the full current state: the bold, filled, now empty cell keeps its format.
+    let cells: Vec<Op> = app.live_pending_ops();
+    let last32 = cells.iter().rev().find(|o| matches!(o, Op::Cell { r: 32, .. })).unwrap();
+    assert!(matches!(last32, Op::Cell { v: Some(d), .. } if d.v.is_empty() && d.st.is_some()));
+    assert!(app.live_errors().is_empty());
+}
+
 /// An editor made a viewer while changes are unsent: the session ends (instead of resending
 /// them on every reconnect), the changes stay in the window, and the message bar offers to save
 /// a copy. The same whichever way the server says it: the `role` message while connected, the
@@ -1091,6 +1130,35 @@ mod e2e {
     fn is_bold(c: &Client, r: u32, col: u32) -> bool {
         let sh = &c.app.wb.sheets[0];
         sh.get(r, col).is_some_and(|x| c.app.wb.style(x.style).bold)
+    }
+
+    /// A client in protocol 1 mode (as against an old server) and a normal one edit the same
+    /// workbook through a real server: both converge; the old-style one sends only whole cells and
+    /// is never told "replaced".
+    #[test]
+    fn a_protocol_1_mode_client_converges_with_a_current_one() {
+        use cosync::Op;
+        let (server, dir, mut a, mut b, _) = two_people("legacy");
+        a.app.live_legacy_for_test();
+        type_at(&mut a.app, 2, 1, "legacy value");
+        a.app.live_flush();
+        assert!(a.app.live_pending_ops().iter().all(|o| matches!(o, Op::Cell { .. })), "{:?}", a.app.live_pending_ops());
+        b.app.select(2, 1, false);
+        b.app.toggle_bold();
+        a.app.select(3, 1, false);
+        a.app.toggle_bold();
+        type_at(&mut b.app, 3, 1, "from b");
+        settle(&mut [&mut a, &mut b], "mixed protocol edits");
+        assert_same(&a, &b, "mixed protocol edits");
+        assert_eq!(text(&a, "Sheet1", 3, 1), "from b");
+        // The same cell at once: last commit wins, and the legacy client is told nothing.
+        type_at(&mut a.app, 5, 1, "from a");
+        type_at(&mut b.app, 5, 1, "from b");
+        settle(&mut [&mut a, &mut b], "same cell");
+        assert_same(&a, &b, "same cell");
+        assert!(a.app.live_replaced_for_test().is_empty());
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A types a value while B makes the same cell bold, at the same time: both survive on both

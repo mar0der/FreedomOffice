@@ -159,6 +159,9 @@ pub struct Live {
     pub notice: Option<Notice>,
     /// Own edits that others' concurrent edits replaced (newest last).
     pub replaced: Vec<ReplacedNote>,
+    /// The server speaks protocol 1 (its Welcome has no `proto`): only whole `Cell` operations
+    /// are sent, without `made`, and no "replaced" messages are shown.
+    pub legacy: bool,
     /// A Welcome arrived (the role it gave is known).
     welcomed: bool,
     snap_wanted: bool,
@@ -212,6 +215,7 @@ impl Live {
             stopped: None,
             notice: None,
             replaced: Vec::new(),
+            legacy: false,
             welcomed: false,
             snap_wanted: false,
             snap_busy: false,
@@ -234,7 +238,7 @@ impl Live {
                 self.sent_units = self.units.len();
             }
             if let Some(c) = &self.conn {
-                c.send(ClientMsg::Ops { base: b.base, id: b.id, made: (b.made < b.base).then_some(b.made), ops: b.ops });
+                c.send(ClientMsg::Ops { base: b.base, id: b.id, made: (b.made < b.base && !self.legacy).then_some(b.made), ops: b.ops });
             }
         }
     }
@@ -364,7 +368,8 @@ impl App {
         if l.confirmed.is_none() {
             l.units.push_back(ch.inverse);
         }
-        let b = l.sess.local(ch.ops);
+        let ops = if l.legacy { live::collapse_cells(&self.wb, &ch.ops) } else { ch.ops };
+        let b = l.sess.local(ops);
         l.send_batch(b);
     }
 
@@ -781,15 +786,14 @@ impl App {
         match m {
             ServerMsg::Welcome { seq, you, peers, proto } => {
                 let Some(l) = &mut self.live else { return };
-                if proto < cosync::PROTO {
-                    // An older server would refuse the cell content/format operations.
-                    let msg = "This server is older than this version of FreedomOffice Sheets and can't be edited live with it. Ask the server's administrator to update it.".to_string();
-                    l.conn = None;
-                    l.online = false;
-                    l.sess.offline();
-                    l.stopped = Some(msg.clone());
-                    self.status = Some(msg);
-                    return;
+                // An older server only knows whole cells: send only those (also what was made
+                // before this Welcome and is still waiting).
+                l.legacy = proto < cosync::PROTO;
+                if l.legacy {
+                    if let Some(b) = &mut l.sess.inflight {
+                        b.ops = live::collapse_cells(&self.wb, &b.ops);
+                    }
+                    l.sess.buffer = live::collapse_cells(&self.wb, &l.sess.buffer);
                 }
                 if l.welcomed && l.editor && !you.editor && !l.sess.has_pending() {
                     // Made a viewer while disconnected (with nothing unsent; see live_caught_up).
@@ -898,6 +902,9 @@ impl App {
     /// Own edits that `who`'s concurrent edit replaced: remembered for the message bar.
     fn live_replaced(&mut self, replaced: &[cosync::client::Replaced], who: &str) {
         let Some(l) = &mut self.live else { return };
+        if l.legacy {
+            return;
+        }
         for r in replaced {
             let format = r.part == cosync::CellWrite::Format;
             let mine = live::entered_text(&r.mine);
@@ -1719,6 +1726,13 @@ impl App {
             if let Some(l) = &mut self.live {
                 l.replaced.retain(|x| x != &n);
             }
+        }
+    }
+
+    /// Pretends the server is a protocol 1 one (as its Welcome without `proto` would say).
+    pub(crate) fn live_legacy_for_test(&mut self) {
+        if let Some(l) = &mut self.live {
+            l.legacy = true;
         }
     }
 

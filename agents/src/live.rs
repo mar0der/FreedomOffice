@@ -122,6 +122,9 @@ pub struct Live {
     pub last_snapshot: Option<i64>,
     /// Own edits that were replaced and not yet reported (see [`Live::take_replaced`]).
     replaced: Vec<ReplacedEvent>,
+    /// The server speaks protocol 1 (its Welcome has no `proto`): only whole `Cell` operations
+    /// are sent, without `made`, and nothing is reported as replaced.
+    pub legacy: bool,
 }
 
 fn version_of_etag(etag: &str) -> Option<i64> {
@@ -207,6 +210,7 @@ impl Live {
             unsaved: false,
             last_snapshot: None,
             replaced: Vec::new(),
+            legacy: false,
         })
     }
 
@@ -301,7 +305,7 @@ impl Live {
         self.send(ClientMsg::Ops {
             base: b.base,
             id: b.id,
-            made: (b.made < b.base).then_some(b.made),
+            made: (b.made < b.base && !self.legacy).then_some(b.made),
             ops: b.ops,
         });
     }
@@ -378,10 +382,14 @@ impl Live {
     fn handle(&mut self, m: ServerMsg) {
         match m {
             ServerMsg::Welcome { seq, you, peers, proto } => {
-                if proto < cosync::PROTO {
-                    self.stopped = Some("The server is older than this fsheets (it lacks separate cell content and format operations): update the server.".into());
-                    self.disconnect();
-                    return;
+                // An older server only knows whole cells: send only those (also what was made
+                // before this Welcome and is still waiting).
+                self.legacy = proto < cosync::PROTO;
+                if self.legacy {
+                    if let Some(b) = &mut self.sess.inflight {
+                        b.ops = live::collapse_cells(&self.wb, &b.ops);
+                    }
+                    self.sess.buffer = live::collapse_cells(&self.wb, &self.sess.buffer);
                 }
                 self.editor = you.editor;
                 self.me = Some(you);
@@ -438,6 +446,9 @@ impl Live {
     }
 
     fn note_replaced(&mut self, replaced: &[Replaced], who: &str) {
+        if self.legacy {
+            return;
+        }
         for r in replaced {
             let sheet = live::index_of(&self.wb, r.s).map(|i| self.wb.sheets[i].name.clone()).unwrap_or_default();
             self.stats.replaced += 1;
@@ -488,6 +499,7 @@ impl Live {
         }
         self.apply(&ops, false);
         self.unsaved = true;
+        let ops = if self.legacy { live::collapse_cells(&self.wb, &ops) } else { ops };
         if let Some(b) = self.sess.local(ops) {
             self.send_batch(b, false);
         }
