@@ -22,17 +22,21 @@ use std::collections::BTreeMap;
 use cosync::client::{Batch, Session, Step};
 use cosync::{CellData, ClientMsg, Op, Peer, Presence, Rect, ServerMsg};
 use freedom_sheets::live::{self, ApplyState};
-use freedom_sheets::model::{cell_from_input, Cell, HAlign, Range, Style, Workbook, MAX_COLS, MAX_ROWS};
+use freedom_sheets::model::{cell_from_input, Cell, HAlign, Range, Style, VAlign, Workbook, MAX_COLS, MAX_ROWS};
 use serde_json::{json, Value as Json};
 
 use crate::Book;
 
+mod edit;
+
 /// Cells one `clear` or `fmt` may touch.
-const MAX_EDIT_CELLS: u64 = 20_000;
+pub(self) const MAX_EDIT_CELLS: u64 = 20_000;
 /// Longest text a person may enter in a cell.
-const MAX_ENTRY: usize = 32_768;
+pub(self) const MAX_ENTRY: usize = 32_768;
 /// Undo steps kept.
 const MAX_UNDO: usize = 200;
+/// Operations kept for undo and redo together (older steps are forgotten first).
+const MAX_UNDO_OPS: usize = 300_000;
 
 /// What a step produced.
 #[derive(Default)]
@@ -75,6 +79,10 @@ pub struct Bridge {
     undo: Vec<Undo>,
     redo: Vec<Undo>,
     snapshot_wanted: bool,
+    /// Messages for the browser that an operation adds to its answer.
+    extra: Vec<Json>,
+    clip: Option<edit::Clip>,
+    clip_seq: u64,
     /// The session can't go on (set with the reason shown to the person).
     pub stopped: Option<String>,
 }
@@ -104,6 +112,9 @@ impl Bridge {
             undo: Vec::new(),
             redo: Vec::new(),
             snapshot_wanted: false,
+            extra: Vec::new(),
+            clip: None,
+            clip_seq: 0,
             stopped: None,
         }
     }
@@ -168,7 +179,12 @@ impl Bridge {
         out.browser.push(json!({ "t": "status", "state": state }));
     }
 
+    /// The sheet a message names: by live id (`suid`, a string) or by index (`sheet`).
     fn sheet_index(&self, v: &Json) -> Option<usize> {
+        if let Some(u) = v.get("suid").and_then(Json::as_str) {
+            let u: u64 = u.parse().ok()?;
+            return self.book.workbook().sheets.iter().position(|s| s.uid == u);
+        }
         let i = v.get("sheet")?.as_u64()? as usize;
         (i < self.book.workbook().sheets.len()).then_some(i)
     }
@@ -345,7 +361,9 @@ impl Bridge {
                     out.server.push(ClientMsg::Presence { p });
                 }
             }
-            "edit" | "clear" | "fmt" | "undo" | "redo" => self.change(t, v, &mut out),
+            "copy" => self.copy(v, &mut out),
+            "find" => self.find(v, &mut out),
+            "edit" | "clear" | "fmt" | "undo" | "redo" | "ins" | "del" | "size" | "hide" | "freeze" | "merge" | "paste" | "fill" | "autofill" | "sheet_add" | "sheet_rename" | "sheet_del" | "sheet_move" | "sheet_hide" | "sheet_color" => self.change(t, v, &mut out),
             _ => out.browser.push(json!({ "t": "error", "message": "Unknown message." })),
         }
         out
@@ -363,6 +381,21 @@ impl Bridge {
             "edit" => self.make_edit(v),
             "clear" => self.make_clear(v),
             "fmt" => self.make_fmt(v),
+            "ins" => self.make_insert(v, false),
+            "del" => self.make_insert(v, true),
+            "size" => self.make_size(v),
+            "hide" => self.make_hide(v),
+            "freeze" => self.make_freeze(v),
+            "merge" => self.make_merge(v),
+            "paste" => self.make_paste(v),
+            "fill" => self.make_fill(v),
+            "autofill" => self.make_autofill(v),
+            "sheet_add" => self.make_sheet_add(v),
+            "sheet_rename" => self.make_sheet_rename(v),
+            "sheet_del" => self.make_sheet_del(v),
+            "sheet_move" => self.make_sheet_move(v),
+            "sheet_hide" => self.make_sheet_hide(v),
+            "sheet_color" => self.make_sheet_color(v),
             "undo" => match self.undo.pop() {
                 Some(u) => {
                     let ops = u.0.clone();
@@ -399,7 +432,7 @@ impl Bridge {
         let sheets = self.apply(&ops, false);
         if let Some(u) = record {
             self.undo.push(u);
-            if self.undo.len() > MAX_UNDO {
+            while self.undo.len() > MAX_UNDO || (self.undo.len() > 1 && self.undo.iter().map(|u| u.0.len() + u.1.len()).sum::<usize>() > MAX_UNDO_OPS) {
                 self.undo.remove(0);
             }
         }
@@ -407,6 +440,7 @@ impl Bridge {
             out.server.push(batch_msg(b));
         }
         self.changed(out, sheets);
+        out.browser.append(&mut self.extra);
         self.status(out);
     }
 
@@ -416,6 +450,22 @@ impl Bridge {
         let (r1, c1, r2, c2) = (g("r1")?, g("c1")?, g("r2")?, g("c2")?);
         if r2 >= u64::from(MAX_ROWS) || c2 >= u64::from(MAX_COLS) || r1 > r2 || c1 > c2 {
             return Err("Invalid range.".into());
+        }
+        // A whole row, column or sheet is cut to the cells in use (what there is to change).
+        let (mut r2, mut c2) = (r2, c2);
+        if v.get("clamp").and_then(Json::as_bool).unwrap_or(false) {
+            let (er, ec) = self.book.workbook().sheets[i].extent_with_spills().map_or((0, 0), |(r, c)| (u64::from(r), u64::from(c)));
+            let (mut er, mut ec) = (er, ec);
+            for m in &self.book.workbook().sheets[i].merges {
+                er = er.max(u64::from(m.r2));
+                ec = ec.max(u64::from(m.c2));
+            }
+            if r2 > er {
+                r2 = er.max(r1);
+            }
+            if c2 > ec {
+                c2 = ec.max(c1);
+            }
         }
         if (r2 - r1 + 1) * (c2 - c1 + 1) > MAX_EDIT_CELLS {
             return Err("That is too many cells at once.".into());
@@ -521,6 +571,26 @@ impl Bridge {
                                 _ => return Err("Invalid alignment.".into()),
                             }
                         }
+                        "v" => {
+                            st.valign = match val.as_str() {
+                                Some("t") => VAlign::Top,
+                                Some("c") => VAlign::Center,
+                                Some("b") => VAlign::Bottom,
+                                _ => return Err("Invalid alignment.".into()),
+                            }
+                        }
+                        "w" => st.wrap = val.as_bool().ok_or("Invalid format.")?,
+                        "z" => {
+                            let pt = val.as_f64().filter(|p| (6.0..=72.0).contains(p)).ok_or("Text size must be between 6 and 72.")?;
+                            if (pt - 11.0).abs() < 0.01 {
+                                st.size10 = 0;
+                            } else {
+                                st.set_font_size(pt as f32);
+                            }
+                        }
+                        "ind" => st.indent = val.as_u64().filter(|n| *n <= 15).ok_or("Invalid indent.")? as u8,
+                        "bd" => Bridge::apply_border(val.as_str().unwrap_or(""), rg, r, c, &mut st)?,
+                        "reset" => st = Style::default(),
                         "nf" => {
                             let f = val.as_str().ok_or("Invalid number format.")?;
                             if f.len() > 100 {
