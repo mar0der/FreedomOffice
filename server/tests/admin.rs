@@ -514,10 +514,11 @@ fn user_text_is_escaped() {
     assert!(a.get("/admin/people").body.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
     assert!(a.get("/admin/people/mallory").body.contains("&lt;b&gt;bold&lt;/b&gt;"));
     assert!(a.get(&format!("/admin/orgs/{org}")).body.contains("Tom &amp; Jerry&#39;s"));
-    // Unknown users in the URL are escaped too.
+    // Unknown usernames from the URL aren't echoed.
     let r = a.get("/admin/people/%3Cscript%3E");
     assert_eq!(r.status, 404);
-    assert!(r.body.contains("&lt;script&gt;") && !r.body.contains("<script>"));
+    assert!(r.body.contains("No such user.") && !r.body.contains("script&gt;") && !r.body.contains("<script>"));
+    assert_eq!(s.api("POST", "/api/users/%3Cb%3E/disable", Some(&at), json!({})).json()["error"], "No such user.");
 }
 
 // ---------------------------------------------------------------------------
@@ -584,4 +585,120 @@ fn disabling_from_the_admin_page_ends_live_sessions() {
     assert_eq!(a.post("/admin/people/alice/disable", &[]).status, 400);
     assert_eq!(a.post("/admin/people/bob/enable", &[]).status, 303);
     s.token("bob", PW, "test");
+}
+
+#[test]
+fn nobody_resets_their_own_password() {
+    let s = start();
+    let a = s.browser("alice");
+    let at = s.token("alice", PW, "test");
+    // No Reset button on your own page (there is one on other people's).
+    assert!(!a.get("/admin/people/alice").body.contains("/admin/people/alice/reset-password"));
+    assert!(a.get("/admin/people/bob").body.contains("/admin/people/bob/reset-password"));
+    // Posting it anyway is refused, and nothing changed.
+    let r = a.post("/admin/people/alice/reset-password", &[]);
+    assert_eq!(r.status, 400);
+    assert!(r.body.contains("Use Change password for your own account."));
+    let r = s.api("POST", "/api/users/alice/reset-password", Some(&at), json!({}));
+    assert_eq!(r.status, 400);
+    assert_eq!(r.json()["error"], "Use Change password for your own account.");
+    assert_eq!(a.get("/admin").status, 200, "still signed in on the web");
+    assert_eq!(s.api("GET", "/api/me", Some(&at), json!({})).status, 200, "and in the API");
+    s.token("alice", PW, "the old password still works");
+}
+
+#[test]
+fn an_org_change_that_isnt_allowed_changes_nothing() {
+    let s = start();
+    let at = s.token("alice", PW, "test");
+    let team = s.org(&at, "Team");
+    s.org(&at, "Taken");
+    s.member(&at, &team, "bob", "admin");
+    let bt = s.token("bob", PW, "test");
+    let role = || s.store().org(&team).unwrap().unwrap().member_role.as_str().to_string();
+    // Bob may set the default role but not rename: the whole request is refused.
+    let r = s.api("PATCH", &format!("/api/orgs/{team}"), Some(&bt), json!({ "name": "Bobs", "member_role": "view" }));
+    assert_eq!(r.status, 403);
+    assert_eq!(role(), "edit");
+    // A rename that can't happen (name taken) doesn't set the role either.
+    let r = s.api("PATCH", &format!("/api/orgs/{team}"), Some(&at), json!({ "name": "Taken", "member_role": "view" }));
+    assert_eq!(r.status, 409);
+    assert_eq!(role(), "edit");
+    assert_eq!(s.store().org(&team).unwrap().unwrap().name, "Team");
+    let r = s.api("PATCH", &format!("/api/orgs/{team}"), Some(&at), json!({ "name": "Team 2", "member_role": "view" }));
+    assert_eq!(r.status, 200);
+    assert_eq!((role(), s.store().org(&team).unwrap().unwrap().name), ("view".to_string(), "Team 2".to_string()));
+}
+
+#[test]
+fn every_admin_response_has_the_headers() {
+    let s = start();
+    let a = s.browser("alice");
+    let csrf = a.csrf();
+    let check = |r: &Resp, what: &str| {
+        assert!(r.header("content-security-policy").is_some_and(|v| v.starts_with("default-src 'none'")), "CSP on {what}");
+        assert_eq!(r.header("cache-control"), Some("no-store"), "{what}");
+        assert_eq!(r.header("x-content-type-options"), Some("nosniff"), "{what}");
+        assert_eq!(r.header("x-frame-options"), Some("DENY"), "{what}");
+    };
+    // A session id that isn't a number: axum's own 400.
+    let r = a.post_raw("/admin/people/bob/sessions/device/abc/revoke", &[("Origin", ORIGIN)], &[("csrf", &csrf)]);
+    assert_eq!(r.status, 400);
+    check(&r, "a rejected path");
+    let r = a.get("/admin/nothing-here");
+    assert_eq!(r.status, 404);
+    check(&r, "404");
+    let r = s.send("PUT", "/admin/login", &[], None);
+    assert_eq!(r.status, 405);
+    check(&r, "405");
+    let r = s.send("POST", "/admin/login", &[("Origin", ORIGIN)], Some(vec![b'x'; 128 * 1024]));
+    assert_eq!(r.status, 413);
+    check(&r, "413");
+    // Not the API.
+    assert!(s.send("GET", "/api/health", &[], None).header("content-security-policy").is_none());
+}
+
+#[test]
+fn signing_in_again_replaces_the_old_session() {
+    let s = start();
+    let first = s.browser("alice");
+    // Signing in from the same browser (it sends its cookie): the old session ends.
+    let r = s.send("POST", "/admin/login", &[("Origin", ORIGIN), ("Cookie", &first.cookie)], Some(form(&[("username", "alice"), ("password", PW)])));
+    assert_eq!(r.status, 303);
+    assert_eq!(first.get("/admin").status, 303, "the old cookie is dead");
+    let st = s.store();
+    let alice = st.user_by_name("alice").unwrap().unwrap();
+    assert_eq!(st.admin_sessions_of(&alice.id).unwrap().len(), 1);
+    // From many browsers: at most 10 sessions, the oldest go.
+    let many: Vec<_> = (0..11).map(|_| s.browser("alice")).collect();
+    assert_eq!(st.admin_sessions_of(&alice.id).unwrap().len(), 10);
+    assert_eq!(many[0].get("/admin").status, 303);
+    assert_eq!(many[10].get("/admin").status, 200);
+}
+
+#[test]
+fn sessions_expire_and_demotions_apply_at_once() {
+    let s = start();
+    let at = s.token("alice", PW, "test");
+    let team = s.org(&at, "Team");
+    s.member(&at, &team, "bob", "admin");
+    let b = s.browser("bob");
+    assert_eq!(b.get(&format!("/admin/orgs/{team}")).status, 200);
+    // Made a server administrator and back: the very next request knows.
+    assert_eq!(s.api("POST", "/api/users/bob/admin", Some(&at), json!({ "is_admin": true })).status, 200);
+    assert_eq!(b.get("/admin/people").status, 200);
+    assert_eq!(s.api("POST", "/api/users/bob/admin", Some(&at), json!({ "is_admin": false })).status, 200);
+    assert_eq!(b.get("/admin/people").status, 403);
+    assert_eq!(b.post("/admin/people/carol/disable", &[]).status, 403);
+    // Org admin to member: no admin page for the org any more.
+    assert_eq!(s.api("PATCH", &format!("/api/orgs/{team}/members/bob"), Some(&at), json!({ "role": "member" })).status, 200);
+    assert_eq!(b.get(&format!("/admin/orgs/{team}")).status, 403);
+    assert_eq!(b.post(&format!("/admin/orgs/{team}/settings"), &[("member_role", "view")]).status, 403);
+    assert!(b.get("/admin").body.contains("You don't administer anything"));
+    // A session past its 12 hours is over, whatever its activity.
+    let st = s.store();
+    st.conn.execute("UPDATE admin_sessions SET expires = strftime('%s','now') - 1", []).unwrap();
+    let r = b.get("/admin");
+    assert_eq!(r.status, 303);
+    assert_eq!(r.location(), "/admin/login");
 }

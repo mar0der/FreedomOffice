@@ -245,6 +245,9 @@ pub struct AdminSession {
 /// How long a web admin session lasts (absolute, from sign-in).
 pub const ADMIN_SESSION_SECS: i64 = 12 * 3600;
 
+/// Web admin sessions kept per person; signing in once more ends the oldest.
+pub const ADMIN_SESSIONS_PER_USER: i64 = 10;
+
 /// Who is calling: a signed-in user (with the device token row) or a share-link holder.
 #[derive(Clone, Debug)]
 pub enum Principal {
@@ -882,6 +885,11 @@ impl Store {
             "INSERT INTO admin_sessions (user_id, hash, agent, created, expires, last_used) VALUES (?1, ?2, ?3, ?4, ?5, ?4)",
             params![user_id, util::token_hash(&token), agent, t, t + ADMIN_SESSION_SECS],
         )?;
+        // At most ADMIN_SESSIONS_PER_USER: the oldest go.
+        self.conn.execute(
+            "DELETE FROM admin_sessions WHERE user_id = ?1 AND id NOT IN (SELECT id FROM admin_sessions WHERE user_id = ?1 ORDER BY id DESC LIMIT ?2)",
+            params![user_id, ADMIN_SESSIONS_PER_USER],
+        )?;
         self.conn.execute("UPDATE users SET last_login = ?1 WHERE id = ?2", params![t, user_id])?;
         Ok(token)
     }
@@ -923,6 +931,15 @@ impl Store {
     /// Ends one web admin session (sign-out).
     pub fn end_admin_session(&self, id: i64) -> Res<()> {
         self.conn.execute("DELETE FROM admin_sessions WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    /// Ends the web admin session with this secret, if there is one (whoever's it is: a browser
+    /// that signs in again leaves its old session behind).
+    pub fn end_admin_session_by_secret(&self, token: &str) -> Res<()> {
+        if !token.is_empty() && token.len() <= 200 {
+            self.conn.execute("DELETE FROM admin_sessions WHERE hash = ?1", [util::token_hash(token)])?;
+        }
         Ok(())
     }
 
@@ -2078,6 +2095,90 @@ mod tests {
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = org;
+    }
+
+    /// A database written by the organisations server (schema 1, with organisations, members,
+    /// device tokens and grants) gets the web admin tables; everything in it still works and its
+    /// foreign keys are intact.
+    #[test]
+    fn migrates_a_schema_1_database() {
+        let dir = temp();
+        let (db, files) = (dir.join("freedomoffice.db"), dir.join("files"));
+        let (file_id, team_id, token);
+        {
+            // Exactly what the schema 1 code created, filled through the store functions that
+            // existed then (none of them touches the version 2 additions).
+            let conn = Connection::open(&db).unwrap();
+            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+            conn.execute_batch(SCHEMA_V0).unwrap();
+            conn.execute_batch(MIGRATION_V1).unwrap();
+            conn.execute_batch("PRAGMA user_version = 1").unwrap();
+            std::fs::create_dir_all(&files).unwrap();
+            let s = Store { conn, files: files.clone(), versions_to_keep: 25, allow_links: true };
+            let alice = s.create_user("alice", "Alice", "", "old-password-123", true).unwrap();
+            let bob = s.create_user("bob", "Bob", "", "old-password-123", false).unwrap();
+            let carol = s.create_user("carol", "Carol", "", "old-password-123", false).unwrap();
+            let team = s.create_org("Team", &alice.id).unwrap();
+            s.set_member(&team, &bob, OrgRole::Admin, &alice.id).unwrap();
+            s.set_member(&team, &carol, OrgRole::Member, &alice.id).unwrap();
+            let (org_file, _) = s.create_file(&team.root_id, "Org.xlsx", b"org", &bob.id, OnConflict::Fail).unwrap();
+            let (mine, _) = s.create_file(&alice.root_id, "Mine.xlsx", b"mine", &alice.id, OnConflict::Fail).unwrap();
+            s.grant(&mine, &carol, Role::View, &alice.id).unwrap();
+            s.grant_org(&mine, &team, Role::Edit, &alice.id).unwrap();
+            let t = util::new_token();
+            s.conn.execute("INSERT INTO tokens (user_id, hash, device, created, last_used) VALUES (?1, ?2, 'laptop', 1, 1)", params![bob.id, util::token_hash(&t)]).unwrap();
+            assert!(s.conn.prepare("SELECT 1 FROM admin_sessions").is_err(), "a real schema 1 database");
+            (file_id, team_id, token) = (mine.id, team.id, t);
+            let _ = org_file;
+        }
+        let s = Store::open(&db, &files, 25).unwrap();
+        assert_eq!(s.conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), SCHEMA_VERSION);
+        let fk: Vec<String> = s.conn.prepare("PRAGMA foreign_key_check").unwrap().query_map([], |r| r.get::<_, String>(0)).unwrap().collect::<Result<_, _>>().unwrap();
+        assert!(fk.is_empty(), "foreign key problems in {fk:?}");
+        // Organisations, members, tokens and grants survive.
+        let team = s.org(&team_id).unwrap().unwrap();
+        let roles: Vec<(String, OrgRole)> = s.members(&team.id).unwrap().into_iter().map(|m| (m.user.username, m.role)).collect();
+        assert_eq!(roles, vec![("bob".to_string(), OrgRole::Admin), ("carol".to_string(), OrgRole::Member)]);
+        let Some(Principal::User { user, .. }) = s.authenticate(&token).unwrap() else { panic!("the device token still works") };
+        assert_eq!(user.username, "bob");
+        let mine = s.item(&file_id).unwrap().unwrap();
+        assert_eq!(s.role(&user_of(&s, "carol"), &mine, false).unwrap(), Some(Role::Edit), "max of her view grant and Team's edit grant");
+        assert_eq!(s.role(&user_of(&s, "bob"), &mine, false).unwrap(), Some(Role::Edit));
+        assert_eq!(s.org_grants(&mine).unwrap().len(), 1);
+        let org_file = s.find_child(&team.root_id, "Org.xlsx").unwrap().unwrap();
+        assert_eq!(s.role(&user_of(&s, "bob"), &org_file, false).unwrap(), Some(Role::Owner));
+        assert_eq!(s.usage_of(&team.account_id).unwrap().bytes, 3);
+        // The version 2 additions work.
+        assert!(s.last_logins().unwrap().is_empty(), "nobody signed in since the upgrade");
+        let secret = s.create_admin_session(&user.id, "browser").unwrap();
+        assert_eq!(s.admin_session(&secret).unwrap().unwrap().0.username, "bob");
+        assert!(s.last_logins().unwrap().contains_key(&user.id));
+        drop(s);
+        // Opening again changes nothing.
+        let s = Store::open(&db, &files, 25).unwrap();
+        assert!(s.admin_session(&secret).unwrap().is_some());
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Web admin sessions: absolute expiry, at most ADMIN_SESSIONS_PER_USER, ended by secret.
+    #[test]
+    fn admin_sessions_expire_and_are_capped() {
+        let dir = temp();
+        let s = Store::open(&dir.join("db"), &dir.join("files"), 25).unwrap();
+        let u = s.create_user("ann", "Ann", "", "old-password-123", false).unwrap();
+        let first = s.create_admin_session(&u.id, "").unwrap();
+        s.conn.execute("UPDATE admin_sessions SET expires = ?1", [now() - 1]).unwrap();
+        assert!(s.admin_session(&first).unwrap().is_none(), "expired");
+        assert!(s.admin_sessions_of(&u.id).unwrap().is_empty());
+        let secrets: Vec<String> = (0..ADMIN_SESSIONS_PER_USER + 2).map(|_| s.create_admin_session(&u.id, "").unwrap()).collect();
+        assert_eq!(s.admin_sessions_of(&u.id).unwrap().len() as i64, ADMIN_SESSIONS_PER_USER);
+        assert!(s.admin_session(&secrets[0]).unwrap().is_none() && s.admin_session(&secrets[1]).unwrap().is_none(), "the oldest went");
+        assert!(s.admin_session(secrets.last().unwrap()).unwrap().is_some());
+        s.end_admin_session_by_secret(secrets.last().unwrap()).unwrap();
+        assert!(s.admin_session(secrets.last().unwrap()).unwrap().is_none());
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// SPEC §3: org admins own the org's files, members get the member role, grants to a whole

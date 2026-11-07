@@ -142,6 +142,18 @@ fn harden(res: &mut Response) {
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
 }
 
+/// Middleware for the whole router: every response under `/admin` gets the admin headers,
+/// also errors the handlers never see (a rejected path parameter, 404, 405, body too large).
+pub async fn harden_admin(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let path = req.uri().path();
+    let admin = path == "/admin" || path.starts_with("/admin/");
+    let mut res = next.run(req).await;
+    if admin {
+        harden(&mut res);
+    }
+    res
+}
+
 fn redirect(to: &str) -> Response {
     let mut res = StatusCode::SEE_OTHER.into_response();
     if let Ok(v) = HeaderValue::from_str(to) {
@@ -473,7 +485,17 @@ async fn login(State(app): State<App>, ConnectInfo(Peer(peer)): ConnectInfo<Peer
     };
     let agent: String = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
     let (uid, temp) = (user.id.clone(), user.must_change_password);
-    match app.run(move |s| Ok(s.create_admin_session(&uid, &agent)?)).await {
+    let old = session_secret(app.cfg(), &headers);
+    let created = app
+        .run(move |s| {
+            // The session this browser had (if any) ends: the new cookie replaces it.
+            if let Some(old) = old {
+                s.end_admin_session_by_secret(&old)?;
+            }
+            Ok(s.create_admin_session(&uid, &agent)?)
+        })
+        .await;
+    match created {
         Ok(secret) => {
             tracing::info!("user '{}' signed in to the admin page from {ip}", user.username);
             let mut res = redirect(if temp { "/admin/password" } else { "/admin" });
@@ -1052,7 +1074,10 @@ async fn person_page(State(app): State<App>, headers: HeaderMap, Path(username):
         } else if u.id != ctx.me.id {
             body.push_str(&ctx.button(&format!("{base}/disable"), "Disable and sign out", "danger"));
         }
-        body.push_str(&ctx.button(&format!("{base}/reset-password"), "Reset password", ""));
+        // Your own password: Change password (a reset would sign you out before you saw it).
+        if u.id != ctx.me.id {
+            body.push_str(&ctx.button(&format!("{base}/reset-password"), "Reset password", ""));
+        }
         body.push_str(&ctx.button(&format!("{base}/sign-out"), "Sign out of all devices", ""));
         let admin_label = if u.is_admin { "Remove server administrator" } else { "Make server administrator" };
         body.push_str(&ctx.form(&format!("{base}/admin"), "inline", &format!("<input type=\"hidden\" name=\"on\" value=\"{}\"><button type=\"submit\">{admin_label}</button>", if u.is_admin { "0" } else { "1" })));

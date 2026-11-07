@@ -563,6 +563,7 @@ pub fn router(app: App) -> Router {
         .merge(crate::admin::routes())
         .fallback(|| async { ApiError::not_found() })
         .layer(DefaultBodyLimit::max(JSON_LIMIT))
+        .layer(middleware::from_fn(crate::admin::harden_admin))
         .layer(middleware::from_fn(log_requests))
         .with_state(app)
 }
@@ -790,7 +791,7 @@ fn need_owner_for(me: &User, mine: Option<OrgRole>, involved: &[Option<OrgRole>]
 }
 
 pub(crate) fn person_by_name(s: &Store, username: &str) -> Result<User, ApiError> {
-    s.user_by_name(username)?.ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, format!("There's no user named '{}'.", username.trim())))
+    s.user_by_name(username)?.ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "No such user."))
 }
 
 #[derive(Deserialize)]
@@ -873,8 +874,11 @@ pub(crate) async fn reset_password_as(app: &App, caller: Caller, username: Strin
     let (c, n) = (caller.clone(), username.clone());
     let target = app
         .run(move |s| {
-            need_admin(&c.person(s)?)?;
-            person_by_name(s, &n)
+            let me = c.person(s)?;
+            need_admin(&me)?;
+            let u = person_by_name(s, &n)?;
+            not_self_reset(&me, &u)?;
+            Ok(u)
         })
         .await?;
     let pw = util::temp_password_for(&target.username);
@@ -885,12 +889,22 @@ pub(crate) async fn reset_password_as(app: &App, caller: Caller, username: Strin
             let me = caller.person(s)?;
             need_admin(&me)?;
             let u = person_by_name(s, &username)?;
+            not_self_reset(&me, &u)?;
             let n = s.set_temp_password_hash(&u.id, &hash)?;
             tracing::warn!("administrator '{}' reset the password of '{}' ({n} sign-in(s) ended)", me.username, u.username);
             s.user_by_id(&u.id)?.ok_or_else(ApiError::not_found)
         })
         .await?;
     Ok((u, pw))
+}
+
+/// A reset signs the person out everywhere, so resetting your own password would lock you out
+/// before you saw the new one: change it instead.
+fn not_self_reset(me: &User, target: &User) -> Result<(), ApiError> {
+    if me.id == target.id {
+        return Err(ApiError::bad("Use Change password for your own account."));
+    }
+    Ok(())
 }
 
 /// The server administrator disables (signs out everywhere, ends live sessions) or enables an
@@ -1122,15 +1136,25 @@ struct PatchOrgBody {
 /// Renames an organisation (the server administrator) and/or sets its members' default role
 /// ("edit"/"view"; an org owner/admin). The organisation afterwards and the caller's role.
 pub(crate) fn patch_org_as(s: &Store, me: &User, org: &str, name: Option<&str>, member_role: Option<&str>) -> Result<(Org, Option<OrgRole>), ApiError> {
-    let (mut o, mine) = org_for(s, me, org)?;
-    if let Some(r) = member_role {
-        need_manage(me, mine)?;
-        let r = Role::parse(r).ok_or_else(|| ApiError::bad("member_role must be view or edit."))?;
-        s.set_org_member_role(&o, r)?;
-    }
-    if let Some(n) = name {
+    let (o, mine) = org_for(s, me, org)?;
+    // Every check before any change: a request that may not do all of it changes nothing.
+    let role = match member_role {
+        Some(r) => {
+            need_manage(me, mine)?;
+            Some(Role::parse(r).filter(|r| *r != Role::Owner).ok_or_else(|| ApiError::bad("member_role must be view or edit."))?)
+        }
+        None => None,
+    };
+    if name.is_some() {
         need_admin(me)?;
-        o = s.rename_org(&o, n)?;
+    }
+    // The rename can still be refused (taken, invalid name); it goes first, so then nothing
+    // has changed either.
+    if let Some(n) = name {
+        s.rename_org(&o, n)?;
+    }
+    if let Some(r) = role {
+        s.set_org_member_role(&o, r)?;
     }
     Ok((s.org(&o.id)?.ok_or_else(ApiError::not_found)?, mine))
 }
