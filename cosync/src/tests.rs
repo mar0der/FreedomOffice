@@ -1018,13 +1018,13 @@ fn new_cell_operations_follow_rows_columns_and_sheets() {
     // Inserting rows above moves a content or format edit; deleting its row drops it.
     for op in [content(1, 3, 1, "x"), fmt(1, 3, 1, "red")] {
         let here = |d: &Doc, r: u32, c: u32| format_of(d, 1, r, c).is_some() || cell(d, 1, r, c) == Some("x");
-        let d = tp1(&base(), &[op.clone()], &[rows(1, 1, 2)]);
+        let d = tp1(&base(), std::slice::from_ref(&op), &[rows(1, 1, 2)]);
         assert!(here(&d, 5, 1) && !here(&d, 3, 1));
-        let d = tp1(&base(), &[op.clone()], &[rows(1, 2, -3)]);
+        let d = tp1(&base(), std::slice::from_ref(&op), &[rows(1, 2, -3)]);
         assert!(!here(&d, 3, 1) && !here(&d, 2, 1));
-        let d = tp1(&base(), &[cols(1, 0, 1)], &[op.clone()]);
+        let d = tp1(&base(), &[cols(1, 0, 1)], std::slice::from_ref(&op));
         assert!(here(&d, 3, 2) && !here(&d, 3, 1));
-        let d = tp1(&base(), &[op.clone()], &[Op::DelSheet { s: 1, name: "Sheet1".into() }]);
+        let d = tp1(&base(), std::slice::from_ref(&op), &[Op::DelSheet { s: 1, name: "Sheet1".into() }]);
         assert!(d.sheets.iter().all(|s| s.id != 1));
     }
     // Value and format of the same cell, with a row inserted above: all three survive, in place.
@@ -1034,7 +1034,7 @@ fn new_cell_operations_follow_rows_columns_and_sheets() {
     assert_eq!((cell(&d, 1, 5, 0), format_of(&d, 1, 5, 0)), (Some("typed"), Some(RED)));
     // A formula in a content op records the structure changes it was transformed over.
     let f = Op::Content { s: 1, r: 9, c: 0, v: Some(Box::new(CellData { f: Some("A3+A5".into()), ..Default::default() })), adj: vec![] };
-    let (a, _) = transform(&[f.clone()], &[rows(1, 1, 2)], true);
+    let (a, _) = transform(std::slice::from_ref(&f), &[rows(1, 1, 2)], true);
     assert!(matches!(&a[..], [Op::Content { r: 11, adj, .. }] if *adj == vec![rows(1, 1, 2)]));
     // A whole cell reduced to its content part keeps the adjustments.
     let w = Op::Cell { s: 1, r: 9, c: 0, v: Some(Box::new(CellData { f: Some("A3".into()), ..Default::default() })), adj: vec![] };

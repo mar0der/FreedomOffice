@@ -400,22 +400,7 @@ fn validate_op(op: &Op, in_adj: bool) -> Result<(), String> {
                 return Err("invalid sheet position".into());
             }
         }
-        Cell { r, c, v, adj, .. } => {
-            row(*r)?;
-            col(*c)?;
-            if let Some(d) = v {
-                if d.f.as_ref().is_some_and(|f| f.len() > 64 * 1024) {
-                    return Err("formula too long".into());
-                }
-                if let Val::Text(t) | Val::Err(t) = &d.v {
-                    if t.len() > MAX_TEXT {
-                        return Err("text too long".into());
-                    }
-                }
-            }
-            adj_ok(adj)?;
-        }
-        Content { r, c, v, adj, .. } => {
+        Cell { r, c, v, adj, .. } | Content { r, c, v, adj, .. } => {
             row(*r)?;
             col(*c)?;
             if let Some(d) = v {
