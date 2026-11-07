@@ -335,7 +335,7 @@ fn org_admins_see_only_their_orgs() {
     // Same rules as the API: dave shares no org with bob, so he needs an invite.
     let r = b.post(&format!("/admin/orgs/{team}/members"), &[("username", "dave"), ("role", "member")]);
     assert_eq!(r.status, 403);
-    assert!(r.body.contains("send them an invite instead"));
+    assert!(r.body.contains("send them an invite link; they can accept it with their existing account"));
     // Within his org he manages: roles and the default role.
     assert_eq!(b.post(&format!("/admin/orgs/{team}/members/carol/role"), &[("role", "admin")]).status, 303);
     assert_eq!(b.post(&format!("/admin/orgs/{team}/settings"), &[("member_role", "view")]).status, 303);

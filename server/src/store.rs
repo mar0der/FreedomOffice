@@ -90,6 +90,15 @@ pub struct Invite {
     pub used: i64,
 }
 
+/// What accepting an invite with an existing account did.
+#[derive(Clone, Debug)]
+pub enum InviteAccepted {
+    /// Added to the organisation with this role (the invite is used up).
+    Joined(User, Org, OrgRole),
+    /// Was a member already, with this role; nothing changed and the invite stays usable.
+    AlreadyMember(User, Org, OrgRole),
+}
+
 /// Bytes of all kept versions of the files an account owns.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Usage {
@@ -1753,6 +1762,42 @@ impl Store {
         Ok((self.user_by_id(&id)?.ok_or(StoreError::NotFound)?, org))
     }
 
+    /// Uses an invite for an account that exists already (the caller checked its password):
+    /// adds it to the organisation with the invite's role, in one transaction, once. The
+    /// account must be enabled and have no temporary password. Someone who is a member
+    /// already gets `AlreadyMember` and the invite stays unused (it may have been meant for
+    /// someone else who clicked the wrong button, and nothing changed).
+    pub fn accept_invite_existing(&self, token: &str, user_id: &str) -> Res<InviteAccepted> {
+        let tx = self.conn.unchecked_transaction()?;
+        let inv = self.invite_by_token(token)?.ok_or(StoreError::NotFound)?;
+        let org = self.org(&inv.org_id)?.ok_or(StoreError::NotFound)?;
+        if !self.invite_still_authorised(&inv)? {
+            return Err(StoreError::Forbidden("This invite is no longer valid (whoever sent it can't add people any more). Ask for a new one.".into()));
+        }
+        let user = self.user_by_id(user_id)?.ok_or(StoreError::NotFound)?;
+        if user.disabled || user.org_id.is_some() {
+            return Err(StoreError::Forbidden("This account is disabled, so it can't join an organisation. Ask your administrator.".into()));
+        }
+        if user.must_change_password {
+            return Err(StoreError::Forbidden(
+                "This account still has a temporary password. Sign in from FreedomOffice Sheets or the web admin and choose your own password first, then open this link again."
+                    .into(),
+            ));
+        }
+        if let Some(role) = self.member_role(&org.id, &user.id)? {
+            return Ok(InviteAccepted::AlreadyMember(user, org, role));
+        }
+        if self.conn.execute("UPDATE invites SET used = ?1, used_by = ?2 WHERE id = ?3 AND used = 0", params![now(), user.id, inv.id])? != 1 {
+            return Err(StoreError::NotFound);
+        }
+        self.conn.execute(
+            "INSERT INTO org_members (org_id, user_id, role, added_by, created) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![org.id, user.id, inv.role.as_str(), inv.created_by, now()],
+        )?;
+        tx.commit()?;
+        Ok(InviteAccepted::Joined(user, org, inv.role))
+    }
+
     // ------------------------------------------------------------------
     // Storage use
     // ------------------------------------------------------------------
@@ -2259,6 +2304,41 @@ mod tests {
         let (_, t2) = s.create_invite(&org, "", OrgRole::Member, &boss.id).unwrap();
         s.set_member(&org, &boss, OrgRole::Member, "x").unwrap();
         assert!(matches!(s.accept_invite(&t2, "late", "", &h), Err(StoreError::Forbidden(_))));
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invites_can_be_accepted_by_existing_accounts() {
+        let dir = temp();
+        let s = Store::open(&dir.join("db"), &dir.join("files"), 25).unwrap();
+        let org = s.create_org("Club", "x").unwrap();
+        let boss = s.create_user("boss", "", "", "test-password-1", false).unwrap();
+        s.set_member(&org, &boss, OrgRole::Owner, "x").unwrap();
+        let old = s.create_user("oldie", "", "", "test-password-1", false).unwrap();
+        let (_, token) = s.create_invite(&org, "someone@example.test", OrgRole::Admin, &boss.id).unwrap();
+        // A disabled account and one with a temporary password are refused; the invite stays.
+        s.set_disabled(&old.id, true).unwrap();
+        assert!(matches!(s.accept_invite_existing(&token, &old.id), Err(StoreError::Forbidden(_))));
+        s.set_disabled(&old.id, false).unwrap();
+        s.conn.execute("UPDATE users SET must_change_password = 1 WHERE id = ?1", [&old.id]).unwrap();
+        assert!(matches!(s.accept_invite_existing(&token, &old.id), Err(StoreError::Forbidden(_))));
+        s.conn.execute("UPDATE users SET must_change_password = 0 WHERE id = ?1", [&old.id]).unwrap();
+        assert!(s.member_role(&org.id, &old.id).unwrap().is_none());
+        // A member already: nothing changes and the invite isn't used.
+        assert!(matches!(s.accept_invite_existing(&token, &boss.id), Ok(InviteAccepted::AlreadyMember(_, _, OrgRole::Owner))));
+        assert!(s.invite_by_token(&token).unwrap().is_some());
+        // Joined with the invite's role (the email doesn't have to match); single use.
+        assert!(matches!(s.accept_invite_existing(&token, &old.id), Ok(InviteAccepted::Joined(_, _, OrgRole::Admin))));
+        assert_eq!(s.member_role(&org.id, &old.id).unwrap(), Some(OrgRole::Admin));
+        assert_eq!(s.user_by_id(&old.id).unwrap().unwrap().email, "", "the account keeps its own email");
+        assert!(s.invite_by_token(&token).unwrap().is_none());
+        assert!(matches!(s.accept_invite_existing(&token, &old.id), Err(StoreError::NotFound)));
+        // Void once its maker may no longer add people.
+        let other = s.create_user("other", "", "", "test-password-1", false).unwrap();
+        let (_, t2) = s.create_invite(&org, "", OrgRole::Member, &old.id).unwrap();
+        s.set_member(&org, &old, OrgRole::Member, "x").unwrap();
+        assert!(matches!(s.accept_invite_existing(&t2, &other.id), Err(StoreError::Forbidden(_))));
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
     }

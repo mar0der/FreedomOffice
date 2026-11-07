@@ -788,6 +788,99 @@ fn invites_create_an_account_once() {
 }
 
 #[test]
+fn invites_can_be_accepted_by_existing_accounts() {
+    let s = start_with(|c| c.login_delay_ms = 300);
+    let (a, b) = (s.login("alice"), s.login("bob"));
+    let (org, root) = s.org(&a, "PO Test");
+    assert_eq!(s.add_member(&a, &org, "bob", "owner"), 201);
+    assert_eq!(s.add_member(&a, &org, "carol", "member"), 201);
+    // Carol is removed; Bob can't add her back directly (they share no organisation now).
+    assert_eq!(s.send("DELETE", &format!("/api/orgs/{org}/members/carol"), Some(&b), &[], None).status, 204);
+    let r = s.json("POST", &format!("/api/orgs/{org}/members"), Some(&b), json!({ "username": "carol" }));
+    assert_eq!((r.status, r.json()["code"].as_str()), (403, Some("invite_required")));
+    assert!(r.json()["error"].as_str().unwrap().contains("they can accept it with their existing account"));
+    let invite = |email: &str, role: &str| {
+        let r = s.json("POST", &format!("/api/orgs/{org}/invites"), Some(&b), json!({ "email": email, "role": role }));
+        assert_eq!(r.status, 201);
+        r.json()["url"].as_str().unwrap().rsplit('/').next().unwrap().to_string()
+    };
+    let token = invite("carol.c@example.test", "admin");
+    let info = s.send("GET", &format!("/api/invites/{token}"), None, &[], None).json();
+    assert_eq!(info["accept_with"], json!(["new_account", "existing_account"]));
+    let page = String::from_utf8_lossy(&s.send("GET", &format!("/i/{token}"), None, &[], None).body).to_string();
+    assert!(page.contains("I already have an account") && page.contains("Create an account") && page.contains("carol.c@example.test"));
+    let join = |t: &str, user: &str, pw: &str| s.json("POST", &format!("/api/invites/{t}"), None, json!({ "existing": true, "username": user, "password": pw, "device": "test" }));
+    let open_invites = || s.get(&format!("/api/orgs/{org}/invites"), &b).json()["invites"].as_array().unwrap().len();
+
+    // Bob is a member already: a friendly answer; the invite isn't used up.
+    let r = join(&token, "bob", PW);
+    assert_eq!((r.status, r.json()["already_member"].as_bool()), (200, Some(true)), "{}", String::from_utf8_lossy(&r.body));
+    assert!(r.json()["message"].as_str().unwrap().contains("already a member of PO Test"));
+    assert_eq!(open_invites(), 1);
+
+    // Wrong passwords are refused and count for the username like sign-ins do: after three,
+    // the next sign-in (even the right one) waits.
+    for _ in 0..3 {
+        assert_eq!(join(&token, "carol", "not-carols-password").status, 401);
+    }
+    assert_eq!(join(&token, "c a r o l", PW).status, 401, "not a username");
+    let t = std::time::Instant::now();
+    assert_eq!(s.login_with("carol", PW).status, 200);
+    assert!(t.elapsed() >= Duration::from_millis(300), "wrong invite passwords count toward the sign-in limiter");
+    assert_eq!(open_invites(), 1, "failed attempts don't use the invite");
+
+    // The right password joins her with the invite's role (the email didn't have to match).
+    let r = join(&token, "carol", PW);
+    assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!((r.json()["role"].as_str(), r.json()["already_member"].as_bool()), (Some("admin"), Some(false)));
+    let c = r.json()["token"].as_str().unwrap().to_string();
+    assert_eq!(s.get(&format!("/api/items/{root}"), &c).json()["role"], "owner");
+    assert!(s.get("/api/me", &c).json()["orgs"].as_array().unwrap().iter().any(|o| o["id"] == org.as_str()));
+    assert_eq!(s.get("/api/me", &c).json()["email"], "", "her own email stays");
+    // Used once.
+    assert_eq!(join(&token, "carol", PW).status, 404);
+    assert_eq!(open_invites(), 0);
+
+    // A disabled account is refused (clearly, but only with the right password).
+    s.store().create_user("dave", "Dave", "", PW, false).unwrap();
+    assert_eq!(s.send("POST", "/api/users/dave/disable", Some(&a), &[], None).status, 204);
+    let t2 = invite("", "member");
+    assert_eq!(join(&t2, "dave", "not-daves-password").status, 401);
+    let r = join(&t2, "dave", PW);
+    assert_eq!(r.status, 403);
+    assert!(r.json()["error"].as_str().unwrap().contains("disabled"));
+    // So is one with a temporary password.
+    let r = s.json("POST", "/api/users", Some(&a), json!({ "username": "erin" }));
+    let temp = r.json()["temporary_password"].as_str().unwrap().to_string();
+    let r = join(&t2, "erin", &temp);
+    assert_eq!((r.status, r.json()["code"].as_str()), (403, Some("password_change_required")));
+    assert_eq!(open_invites(), 1, "refusals don't use the invite");
+
+    // The browser form does the same.
+    let form = |t: &str, body: &str| s.send("POST", &format!("/i/{t}"), None, &[("Content-Type", "application/x-www-form-urlencoded")], Some(body.as_bytes().to_vec()));
+    let r = form(&t2, "existing=1&username=bob&password=wrong-password-xx");
+    assert_eq!(r.status, 401);
+    assert!(String::from_utf8_lossy(&r.body).contains("I already have an account"), "the form again, with the error");
+    let r = form(&t2, &format!("existing=1&username=bob&password={PW}"));
+    assert_eq!(r.status, 200);
+    assert!(String::from_utf8_lossy(&r.body).contains("already a member"));
+    assert_eq!(s.send("DELETE", &format!("/api/orgs/{org}/members/carol"), Some(&b), &[], None).status, 204);
+    let r = form(&t2, &format!("existing=1&username=carol&password={PW}"));
+    assert_eq!(r.status, 200);
+    assert!(String::from_utf8_lossy(&r.body).contains("is now in PO Test"));
+    assert_eq!(form(&t2, &format!("existing=1&username=carol&password={PW}")).status, 404);
+
+    // An expired invite can't be used.
+    let t3 = invite("", "member");
+    let db = rusqlite::Connection::open(s.cfg.db_path()).unwrap();
+    db.execute("UPDATE invites SET expires = 1 WHERE used = 0", []).unwrap();
+    assert_eq!(s.send("DELETE", &format!("/api/orgs/{org}/members/carol"), Some(&b), &[], None).status, 204);
+    assert_eq!(join(&t3, "carol", PW).status, 404);
+    // (Every refusal above counted for this address too: it is now at the 10-failure limit.)
+    assert_eq!(s.send("GET", &format!("/i/{t3}"), None, &[], None).status, 429);
+}
+
+#[test]
 fn share_links_can_be_switched_off() {
     let on = start();
     let a = on.login("alice");

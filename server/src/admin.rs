@@ -726,7 +726,7 @@ async fn org_page(State(app): State<App>, headers: HeaderMap, Path(org): Path<St
         body.push_str("<h2>Add people</h2><div class=\"cards\">");
         body.push_str(&format!(
             "<section class=\"card\"><h3>Someone with an account</h3><p class=\"muted\">{}</p>{}</section>",
-            if me.is_admin { "Anyone on this server." } else { "People who are already in one of your organisations; invite anyone else." },
+            if me.is_admin { "Anyone on this server." } else { "People who are already in one of your organisations. Anyone else: send them an invite link; they can accept it with their existing account." },
             ctx.form(
                 &format!("{base}/members"),
                 "stack",
@@ -748,7 +748,7 @@ async fn org_page(State(app): State<App>, headers: HeaderMap, Path(org): Path<St
             )
         ));
         body.push_str(&format!(
-            "<section class=\"card\"><h3>Invite link</h3><p class=\"muted\">Works once, for {INVITE_DAYS} days; the person picks their username and password.</p>{}</section>",
+            "<section class=\"card\"><h3>Invite link</h3><p class=\"muted\">Works once, for {INVITE_DAYS} days; the person signs in with the account they have, or creates one.</p>{}</section>",
             ctx.form(
                 &format!("{base}/invites"),
                 "stack",
@@ -869,7 +869,7 @@ async fn create_invite(State(app): State<App>, headers: HeaderMap, Path(org): Pa
         let (inv, o, url) = api::create_invite_as(s, &ctx.me, &base_url, &org, &email, Some(&field(b, "role")))?;
         let subject = format!("Join {} on FreedomOffice", o.name);
         let text = format!(
-            "Hello,\n\nYou are invited to join {} on FreedomOffice. Open this link to choose your username and password (it works once and expires in {INVITE_DAYS} days):\n\n{url}\n\nThen sign in from FreedomOffice Sheets (File > Account).\n\n{}",
+            "Hello,\n\nYou are invited to join {} on FreedomOffice. Open this link and sign in with your FreedomOffice account, or create one (it works once and expires in {INVITE_DAYS} days):\n\n{url}\n\nThen sign in from FreedomOffice Sheets (File > Account).\n\n{}",
             o.name, ctx.me.display_name
         );
         let mailto = format!("mailto:{}?subject={}&body={}", pct(&inv.email).replace("%40", "@"), pct(&subject), pct(&text));

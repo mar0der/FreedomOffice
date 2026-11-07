@@ -620,6 +620,13 @@ async fn login(State(app): State<App>, ConnectInfo(Peer(peer)): ConnectInfo<Peer
 /// the per-address and per-username limits, the delay after repeated failures, Argon2 in its
 /// slots. The enabled person, or 401 (429 when limited).
 pub(crate) async fn check_sign_in(app: &App, ip: IpAddr, username: &str, password: String) -> Result<User, ApiError> {
+    verify_sign_in(app, ip, username, password, false).await
+}
+
+/// `check_sign_in`, optionally also for a disabled account (the right password for one is
+/// still counted as a failure). Lets callers that need the password checked say "disabled"
+/// to someone who proved they know it.
+async fn verify_sign_in(app: &App, ip: IpAddr, username: &str, password: String, allow_disabled: bool) -> Result<User, ApiError> {
     let ip_key = format!("ip:{ip}");
     let wrong = || ApiError::new(StatusCode::UNAUTHORIZED, "The username or password is incorrect.");
     let name = username.trim().to_string();
@@ -647,7 +654,7 @@ pub(crate) async fn check_sign_in(app: &App, ip: IpAddr, username: &str, passwor
     let pw = password;
     let user = app
         .argon(move || match found {
-            Some((Ok(hash), u)) if util::verify_password(&pw, &hash) && !u.disabled => Some(u),
+            Some((Ok(hash), u)) if (allow_disabled || !u.disabled) && util::verify_password(&pw, &hash) => Some(u),
             Some(_) => None,
             None => {
                 util::dummy_verify(&pw);
@@ -659,7 +666,9 @@ pub(crate) async fn check_sign_in(app: &App, ip: IpAddr, username: &str, passwor
         tracing::warn!("failed sign-in for user '{name}' from {ip}");
         return Err(wrong());
     };
-    app.succeeded(&ip_key, &user_key);
+    if !user.disabled {
+        app.succeeded(&ip_key, &user_key);
+    }
     Ok(user)
 }
 
@@ -1226,7 +1235,7 @@ pub(crate) fn set_member_as(s: &Store, me: &User, org: &str, username: &str, rol
     // Org admins add directly only people they already share an organisation with; anyone
     // else gets an invite (which they accept themselves). The server administrator adds anyone.
     if before.is_none() && !me.is_admin && !s.shares_org(&me.id, &target.id)? {
-        return Err(ApiError::coded(StatusCode::FORBIDDEN, "invite_required", format!("{} isn't in any of your organisations; send them an invite instead.", target.username)));
+        return Err(ApiError::coded(StatusCode::FORBIDDEN, "invite_required", format!("{} isn't in any of your organisations; send them an invite link; they can accept it with their existing account.", target.username)));
     }
     if target.id == me.id && before == Some(OrgRole::Owner) && role != OrgRole::Owner {
         last_owner_check(s, &o)?;
@@ -1469,7 +1478,13 @@ async fn live_invite(app: &App, ip_key: &str, token: String) -> Result<(crate::s
 async fn invite_info(State(app): State<App>, ConnectInfo(Peer(peer)): ConnectInfo<Peer>, headers: HeaderMap, Path(token): Path<String>) -> ApiResult {
     let ip_key = format!("ip:{}", client_ip(&app.cfg, peer, &headers));
     let (inv, org) = live_invite(&app, &ip_key, token).await?;
-    ok_json(json!({ "org": { "id": org.id, "name": org.name }, "email": inv.email, "role": inv.role.as_str(), "expires": iso(inv.expires) }))
+    ok_json(json!({
+        "org": { "id": org.id, "name": org.name },
+        "email": inv.email,
+        "role": inv.role.as_str(),
+        "expires": iso(inv.expires),
+        "accept_with": ["new_account", "existing_account"],
+    }))
 }
 
 #[derive(Deserialize)]
@@ -1480,6 +1495,70 @@ struct AcceptBody {
     display_name: String,
     #[serde(default)]
     device: String,
+    /// Accept with an account that exists already (`username` and `password` are its
+    /// sign-in) instead of creating one.
+    #[serde(default)]
+    existing: bool,
+}
+
+/// What accepting an invite did.
+enum Accepted {
+    /// A new account was made.
+    Created(User, Org),
+    /// An existing account was added, or (`AlreadyMember`) was in the organisation already.
+    Existing(crate::store::InviteAccepted),
+}
+
+impl Accepted {
+    fn user_org(&self) -> (&User, &Org) {
+        use crate::store::InviteAccepted as A;
+        match self {
+            Accepted::Created(u, o) | Accepted::Existing(A::Joined(u, o, _) | A::AlreadyMember(u, o, _)) => (u, o),
+        }
+    }
+
+    fn already_member(&self) -> bool {
+        matches!(self, Accepted::Existing(crate::store::InviteAccepted::AlreadyMember(..)))
+    }
+}
+
+/// Accepts an invite either way (see `accept` and `accept_existing`) and logs what happened.
+async fn accept_any(app: &App, ip: IpAddr, token: String, b: AcceptBody) -> Result<Accepted, ApiError> {
+    let ip_key = format!("ip:{ip}");
+    let r = if b.existing {
+        Accepted::Existing(accept_existing(app, ip, &ip_key, token, &b.username, b.password).await?)
+    } else {
+        let (u, o) = accept(app, &ip_key, token, b).await?;
+        Accepted::Created(u, o)
+    };
+    let (u, o) = r.user_org();
+    match &r {
+        Accepted::Created(..) => tracing::info!("'{}' joined '{}' through an invite", u.username, o.name),
+        _ if r.already_member() => tracing::info!("'{}' opened an invite to '{}' but is a member already", u.username, o.name),
+        _ => tracing::info!("'{}' joined '{}' through an invite (existing account)", u.username, o.name),
+    }
+    Ok(r)
+}
+
+/// Adds an existing account to the invite's organisation. The sign-in is checked exactly as
+/// `/api/login` checks it (invalid usernames refused first, the attempt counted up front in
+/// the limiter, the delay, Argon2 in its slots); a disabled account or one with a temporary
+/// password gets a clear refusal, but only after its password was right.
+async fn accept_existing(app: &App, ip: IpAddr, ip_key: &str, token: String, username: &str, password: String) -> Result<crate::store::InviteAccepted, ApiError> {
+    live_invite(app, ip_key, token.clone()).await?;
+    let user = verify_sign_in(app, ip, username, password, true).await?;
+    if user.disabled {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "This account is disabled, so it can't join an organisation. Ask your administrator."));
+    }
+    if user.must_change_password {
+        return Err(ApiError::coded(
+            StatusCode::FORBIDDEN,
+            "password_change_required",
+            "This account still has a temporary password. Sign in from FreedomOffice Sheets or the web admin and choose your own password first, then open this link again.",
+        ));
+    }
+    let id = user.id;
+    app.run_changing(move |s| Ok(s.accept_invite_existing(&token, &id)?)).await
 }
 
 /// Creates the account and membership for an invite. The username and password are checked
@@ -1492,43 +1571,68 @@ async fn accept(app: &App, ip_key: &str, token: String, b: AcceptBody) -> Result
     app.run_changing(move |s| Ok(s.accept_invite(&token, &username, &b.display_name, &hash)?)).await
 }
 
-/// `POST /api/invites/{token} {username, password, display_name?, device?}`: creates the
-/// account (with the password the person chose) and joins the organisation; signs in.
+/// `POST /api/invites/{token} {username, password, display_name?, device?, existing?}`:
+/// creates the account (with the password the person chose), or with `existing: true` checks
+/// the sign-in of an account that exists already, and joins the organisation; signs in.
+/// 201 when someone joined; 200 with `already_member: true` (invite not used) otherwise.
 async fn accept_invite(State(app): State<App>, ConnectInfo(Peer(peer)): ConnectInfo<Peer>, headers: HeaderMap, Path(token): Path<String>, body: Bytes) -> ApiResult {
-    let ip_key = format!("ip:{}", client_ip(&app.cfg, peer, &headers));
+    let ip = client_ip(&app.cfg, peer, &headers);
     let b: AcceptBody = parse_body(&body)?;
     let device = b.device.clone();
-    let (user, org) = accept(&app, &ip_key, token, b).await?;
-    tracing::info!("'{}' joined '{}' through an invite", user.username, org.name);
+    let r = accept_any(&app, ip, token, b).await?;
+    let already = r.already_member();
+    let (user, org) = r.user_org();
+    let (user, org) = (user.clone(), org.clone());
+    let role = match &r {
+        Accepted::Created(..) => None,
+        Accepted::Existing(crate::store::InviteAccepted::Joined(_, _, role) | crate::store::InviteAccepted::AlreadyMember(_, _, role)) => Some(role.as_str()),
+    };
     app.run(move |s| {
         let token = s.create_token(&user.id, &device)?;
-        Ok((StatusCode::CREATED, axum::Json(json!({ "token": token, "user": user_json(&user), "org": { "id": org.id, "name": org.name } }))).into_response())
+        let mut v = json!({ "token": token, "user": user_json(&user), "org": { "id": org.id, "name": org.name }, "already_member": already });
+        if let Some(role) = role {
+            v["role"] = json!(role);
+        }
+        if already {
+            v["message"] = json!(format!("You're already a member of {}.", org.name));
+        }
+        Ok((if already { StatusCode::OK } else { StatusCode::CREATED }, axum::Json(v)).into_response())
     })
     .await
 }
 
-fn invite_form_html(token: &str, org: &str, error: &str) -> String {
+fn invite_form_html(token: &str, org: &str, email: &str, error: &str) -> String {
     let err = if error.is_empty() { String::new() } else { format!("<p style=\"color:#b00020\">{}</p>", html_escape(error)) };
+    let to = if email.is_empty() { String::new() } else { format!(" This invite was sent to <b>{}</b>.", html_escape(email)) };
+    let action = html_escape(token);
     format!(
-        "<p>You were invited to join <b>{}</b> on this FreedomOffice server. Choose a username and a password \
-         (at least {} characters) to create your account.</p>{err}\
-         <form method=\"post\" action=\"{}\">\
-         <p><label>Username<br><input name=\"username\" autocomplete=\"username\" required maxlength=\"64\" autofocus></label></p>\
+        "<p>You were invited to join <b>{}</b> on this FreedomOffice server.{to}</p>{err}\
+         <h3>I already have an account</h3>\
+         <p>Sign in with your username and password to add your account to {}.</p>\
+         <form method=\"post\" action=\"{action}\"><input type=\"hidden\" name=\"existing\" value=\"1\">\
+         <p><label>Username<br><input name=\"username\" autocomplete=\"username\" required maxlength=\"64\"></label></p>\
+         <p><label>Password<br><input type=\"password\" name=\"password\" autocomplete=\"current-password\" required></label></p>\
+         <p><button type=\"submit\">Join with my account</button></p></form>\
+         <h3>Create an account</h3>\
+         <p>Choose a username and a password (at least {} characters).</p>\
+         <form method=\"post\" action=\"{action}\">\
+         <p><label>Username<br><input name=\"username\" autocomplete=\"username\" required maxlength=\"64\"></label></p>\
          <p><label>Your name<br><input name=\"display_name\" autocomplete=\"name\" maxlength=\"100\"></label></p>\
          <p><label>Password<br><input type=\"password\" name=\"password\" autocomplete=\"new-password\" required minlength=\"{}\"></label></p>\
          <p><button type=\"submit\">Create my account</button></p></form>",
         html_escape(org),
+        html_escape(org),
         util::MIN_PASSWORD,
-        html_escape(token),
         util::MIN_PASSWORD
     )
 }
 
-/// `GET /i/{token}`: the invite page a browser shows (a form to choose username and password).
+/// `GET /i/{token}`: the invite page a browser shows (sign in with an existing account, or
+/// choose a username and password for a new one).
 async fn invite_page(State(app): State<App>, ConnectInfo(Peer(peer)): ConnectInfo<Peer>, headers: HeaderMap, Path(token): Path<String>) -> Response {
     let ip_key = format!("ip:{}", client_ip(&app.cfg, peer, &headers));
     match live_invite(&app, &ip_key, token.clone()).await {
-        Ok((_, org)) => page("Join FreedomOffice", &invite_form_html(&token, &org.name, "")),
+        Ok((inv, org)) => page("Join FreedomOffice", &invite_form_html(&token, &org.name, &inv.email, "")),
         Err(e) => {
             let mut res = page("FreedomOffice", "<p>This invite doesn't exist, was used already or has expired. Ask for a new one.</p>");
             *res.status_mut() = e.status;
@@ -1537,27 +1641,32 @@ async fn invite_page(State(app): State<App>, ConnectInfo(Peer(peer)): ConnectInf
     }
 }
 
-/// `POST /i/{token}` from the invite page.
+/// `POST /i/{token}` from the invite page (either form; `existing=1` for the sign-in one).
 async fn invite_form(State(app): State<App>, ConnectInfo(Peer(peer)): ConnectInfo<Peer>, headers: HeaderMap, Path(token): Path<String>, body: Bytes) -> Response {
-    let ip_key = format!("ip:{}", client_ip(&app.cfg, peer, &headers));
-    let b = AcceptBody { username: form_value(&body, "username"), password: form_value(&body, "password"), display_name: form_value(&body, "display_name"), device: String::new() };
-    match accept(&app, &ip_key, token.clone(), b).await {
-        Ok((user, org)) => {
-            tracing::info!("'{}' joined '{}' through an invite", user.username, org.name);
-            page(
-                "Welcome to FreedomOffice",
-                &format!(
-                    "<p>Your account <b>{}</b> was created and you are now in {}.</p><p>Sign in from FreedomOffice Sheets (File &gt; Account) with your username and password.</p>",
-                    html_escape(&user.username),
-                    html_escape(&org.name)
-                ),
-            )
+    let ip = client_ip(&app.cfg, peer, &headers);
+    let b = AcceptBody {
+        username: form_value(&body, "username"),
+        password: form_value(&body, "password"),
+        display_name: form_value(&body, "display_name"),
+        device: String::new(),
+        existing: form_value(&body, "existing") == "1",
+    };
+    match accept_any(&app, ip, token.clone(), b).await {
+        Ok(r) => {
+            let (user, org) = r.user_org();
+            let (who, org) = (html_escape(&user.username), html_escape(&org.name));
+            let text = match r {
+                Accepted::Created(..) => format!("<p>Your account <b>{who}</b> was created and you are now in {org}.</p>"),
+                _ if r.already_member() => format!("<p>Your account <b>{who}</b> is already a member of {org}; nothing changed.</p>"),
+                _ => format!("<p>Your account <b>{who}</b> is now in {org}.</p>"),
+            };
+            page("Welcome to FreedomOffice", &format!("{text}<p>Sign in from FreedomOffice Sheets (File &gt; Account) with your username and password.</p>"))
         }
         Err(e) => {
             let msg = e.body["error"].as_str().unwrap_or("Something went wrong.").to_string();
-            let org = app.run(move |s| Ok(s.invite_by_token(&token)?.and_then(|i| s.org(&i.org_id).ok().flatten()).map(|o| (o.name, token)))).await.ok().flatten();
+            let org = app.run(move |s| Ok(s.invite_by_token(&token)?.and_then(|i| s.org(&i.org_id).ok().flatten().map(|o| (o.name, i.email))).map(|(n, e)| (n, e, token)))).await.ok().flatten();
             let mut res = match org {
-                Some((name, token)) => page("Join FreedomOffice", &invite_form_html(&token, &name, &msg)),
+                Some((name, email, token)) => page("Join FreedomOffice", &invite_form_html(&token, &name, &email, &msg)),
                 None => page("FreedomOffice", &format!("<p>{}</p>", html_escape(&msg))),
             };
             *res.status_mut() = e.status;
