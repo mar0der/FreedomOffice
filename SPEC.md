@@ -326,3 +326,37 @@ fixed "No such user." (API too), never echoed.
 - Bind to `127.0.0.1` behind a reverse proxy; trust `X-Forwarded-For` only from loopback. **(exists)**
 - Config option `allow_links = false` to switch off share links on a public trial.
 - No secrets in logs, argv or the repo. Temporary passwords and invite links are shown once.
+
+## 6. FreedomOffice Drive (Petar, 2026-11-07: "our own secure OneDrive replacement")
+
+One server, one set of accounts/orgs/permissions for Sheets and Drive. Drive lives in this repo as its own
+crate `drive/`: the web app (static HTML/CSS/JS, no external scripts/CDNs, embedded into
+freedomoffice-server and served at `/drive`) and, later, the desktop sync client (`drive` binary).
+freedomoffice-server stays the only thing that touches the data.
+
+### Where the data lives
+- **the21th is the NAS**: `data_dir` on its own disks (WD Reds when they arrive; moving = stop server,
+  `rsync -aHAX` data_dir, change `data_dir`, start, verify, keep the old copy until a backup has run).
+  Tailscale/LAN only, long term. No public exposure except the temporary the18th trial.
+- **dspeter is the off-site copy** (NAS, 32-bit, receives only): it *pulls* the nightly
+  `freedomoffice-server backup` output over SSH with a read-only rrsync account, without `--delete`
+  (Guardian sets it up; units in `server/deploy/nas/`). The server can't delete or overwrite backups.
+
+### Ransomware / mistake recovery (security first)
+- Every save is a new, never-modified version file; the newest `versions_to_keep` + the first of each day
+  are kept. Deleting moves to the recycle bin (trash); restore brings back the item and its versions.
+  Trash is not purged automatically (a later admin setting: purge after N days, super-admin only).
+- Pulled, append-only backups on dspeter (old versions survive even if the server is wiped).
+- The sync client (D2) never propagates a mass delete or mass rewrite without asking (threshold), and
+  always uploads as new versions.
+- **Audit log** (D1): append-only table of security-relevant events (sign-in ok/failed, password
+  change/reset, account/org/membership/role changes, share/unshare, link create/delete, delete/restore/
+  purge, admin actions) with who, when, IP, item/org. Viewable in /admin (super-admin: all; org admin: their
+  org). Never contains passwords, tokens or file contents.
+
+### Phases
+| Phase | What |
+|---|---|
+| 1 ✔ | Orgs, people, permissions, live permission changes, web admin (done 2026-11-07, running on the21th) |
+| D1 | **Drive web UI** at `/drive`: sign in (cookie session, CSRF like /admin), My files / Shared with me / each org / Recycle bin; browse, breadcrumbs, upload any file type (multiple, drag & drop, progress, size limit), download, new folder, rename, move, delete → recycle bin, restore, version history (download/restore a version), share with a person or the whole org (view/edit), remove access, storage use. Open `.xlsx`/`.csv`/`.fsheet` in FreedomSheets through a `freedomoffice://open?server=…&item=…` link that Sheets registers (Windows registry, Linux .desktop `x-scheme-handler`, macOS `CFBundleURLTypes`). Server additions: cookie-auth for the JSON API (separate from bearer tokens, CSRF header), streaming upload/download with Range, audit log. |
+| D2 | **Sync client** (`drive` binary, Windows/Linux/macOS): mirror a chosen server folder (My files, an org) to a local folder; offline edits; conflicts kept as "name (conflicted copy, <device>, <date>)"; never deletes or overwrites without a version on the server; mass-change guard. Then hardening: tray/status UI, selective sync, resumable large uploads. |
