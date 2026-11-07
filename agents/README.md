@@ -2,13 +2,19 @@
 
 Package `freedomsheets-agents`, library `fsheets`, binary `fsheets`. One client for tests and for
 agents (DECISIONS #9): sign in, list, open an item's live session over the WebSocket protocol of
-`cosync`, keep the cells in memory, send edits and presence.
+`cosync`, keep the workbook in memory (the app's own model and formula engine, through the
+`freedom_sheets` library), send edits and presence, answer the server's snapshot requests.
+Every Freedom app is meant to be natively usable by AI agents through both a CLI and an MCP
+server; for Sheets that is this crate.
 
 | Module | What |
 |---|---|
-| `api` | HTTP: login (password only in that one request), `/api/me`, root/children, content, upload, token file (0600) |
-| `live` | one live session: `Live::open`, `pump`, `edit`/`set_cell`, `send_presence`, `disconnect`/`connect` (resumes from the last seq, resends the unacknowledged batch), `synced()`. OT bookkeeping is `cosync::client::Session`, the code the app runs |
-| `book` | in-memory workbook: sheets, cells (values and formula text), row/column inserts and deletes; starting state read from the .xlsx with calamine |
+| `api` | HTTP: login (password only in that one request), `/api/me`, root/children, shared-with-me, content, upload, versions, live state and snapshot, token file (0600) |
+| `config` | sign-in without passwords on the command line: password file (0600) or cached token (0600) under `~/.config/freedomsheets-agents/` |
+| `live` | one live session: `Live::open` (downloads the file and its lossless live state, joins like the app), `pump`, `edit`/`set_cell`, `send_presence`/`send_selection`, `disconnect`/`connect` (resumes from the last seq, resends the unacknowledged batch), `synced()`, `snapshot()` (answers the server's `Snapshot` request: .xlsx plus live state to `/live/snapshot`, which becomes a version). OT bookkeeping is `cosync::client::Session`, the code the app runs; remote operations are applied with `freedom_sheets::live::apply_ops` to a real `Workbook` (formats, merges, notes and all) |
+| `a1` | A1 notation: `B7`, `A1:C5`, `A:C`, `3:5`, `Data!A1:B2`, `'My sheet'!A1` |
+| `work` | what an agent does with an open workbook: read/write ranges, calculate, add sheets, export, peers, versions. The CLI and MCP are two front ends of it |
+| `mcp` | the MCP server (JSON-RPC 2.0 over stdio, hand written: `rmcp` is not in the offline cargo cache) |
 | `soak` | the multi-client harness and `probe_conflicts` |
 | `sample` | three sample workbooks (rust_xlsxwriter) |
 
@@ -19,16 +25,108 @@ people and older apps). Tested in `server/tests/live.rs` and `cosync/src/tests.r
 ## Commands
 
 ```
-fsheets login --server URL --user NAME --token-file F [--password-file F]   # password from file or stdin
-fsheets ls    --token-file F [--folder ID]
-fsheets cat   --token-file F --item ID [--sheet NAME]
-fsheets set   --token-file F --item ID --cell B7 (--value TEXT | --clear)
+fsheets login --server URL --user NAME [--token-file F] [--password-file F]   # password from file or stdin
+fsheets ls    [--folder ID]                      # My files, org folders, shared with you; or a folder
+fsheets new   --folder ID --name NAME [--sheets A,B]
+fsheets cat   --item ID [--sheet NAME] [--range A1:C5] [--formulas]   # calculated values by default
+fsheets set   --item ID [--sheet NAME] --cell B7 (--value TEXT | --clear)   # =formulas allowed
+fsheets write --item ID [--sheet NAME] --range A1 --values '[[1,2],["=A1+B1",3]]'
+fsheets eval  --item ID [--sheet NAME] "=SUM(A1:A5)"
+fsheets export --item ID --out FILE.xlsx|csv|tsv [--sheet NAME] [--overwrite]
+fsheets add-sheet --item ID --name NAME
+fsheets versions --item ID
+fsheets mcp   [--server URL --user NAME --password-file F] [--token-file F]
 fsheets soak  --server URL --item ID --users a,b,c --secrets-dir DIR [--clients 4] [--edits 150] [--seed N]
 fsheets probe --server URL --item ID --users a,b --secrets-dir DIR
 fsheets seed  --token-file F --folder ID
 ```
 
-`soak`/`probe` read `DIR/<user>.pw`. Nothing takes a password as an argument.
+`soak`/`probe` read `DIR/<user>.pw`. Nothing takes a password as an argument. Without
+`--token-file`, the commands use the only `*.token` in `~/.config/freedomsheets-agents/`.
+Changing commands (`set`, `write`, `add-sheet`) join the live session, wait for the server's
+acknowledgement, save a snapshot (a version in the history, as the app does when it leaves) and
+leave.
+
+## Use with Claude / other agents
+
+`fsheets mcp` is a Model Context Protocol server on standard input/output (newline delimited
+JSON-RPC 2.0, protocol revision 2025-06-18; 2025-03-26 and 2024-11-05 are accepted). It has no
+network listener: the agent's host starts the process and talks to it through pipes; stdout
+carries protocol messages only.
+
+Sign in with the account of the agent (create one such as `agent-claude` on the server). The
+password is read once from a file that only you can read (`chmod 600`, first line), the device
+token is cached next to it (`~/.config/freedomsheets-agents/<user>@<host>.token`, 0600) and used
+from then on; a revoked token falls back to the password file. Passwords are never arguments and
+are never logged. (`fsheets login --server URL --user NAME` can do the first sign in by hand,
+reading the password from a file or standard input.)
+
+Claude Code (`.mcp.json` in a project, or `claude mcp add`):
+
+```json
+{
+  "mcpServers": {
+    "freedomsheets": {
+      "command": "/path/to/fsheets",
+      "args": ["mcp", "--server", "https://your-server.example:8090", "--user", "agent-claude",
+               "--password-file", "/path/to/agent-claude.pw"]
+    }
+  }
+}
+```
+
+Claude Desktop (`claude_desktop_config.json`), same shape:
+
+```json
+{
+  "mcpServers": {
+    "freedomsheets": {
+      "command": "/path/to/fsheets",
+      "args": ["mcp", "--server", "https://your-server.example:8090", "--user", "agent-claude",
+               "--password-file", "/path/to/agent-claude.pw"]
+    }
+  }
+}
+```
+
+Once the token is cached, `"args": ["mcp"]` is enough (or `--token-file /path/to/x.token`).
+
+| Tool | What |
+|---|---|
+| `list_files` | no `folder`: My files (folder id), organisation folders, files shared with you; with `folder`: its files |
+| `open_file`, `create_file` | open a workbook (sheets and used ranges; becomes the default `item`); create an empty .xlsx in a folder |
+| `list_sheets`, `add_sheet` | sheets with used ranges; add a sheet |
+| `read_range` | A1 range (`B7`, `A1:C5`, `A:C`, `Data!A1:B2`, none = used range) as calculated `values` and `formulas` 2D arrays (`display` for formatted text) |
+| `write_range` | a 2D array from the top-left cell; strings starting with `=` are formulas, other strings are read as typed in a cell, numbers/booleans as given, null clears; formats are kept; all or nothing; returns the calculated values |
+| `evaluate` | a formula against the workbook with the app's engine, nothing changed |
+| `export` | `.xlsx`, or `.csv`/`.tsv` of one sheet, to a local path (no overwrite unless asked) |
+| `join_session`, `leave_session` | stay connected as an agent (people see it in presence, with the range it works on; edits appear live); leave saves a version |
+| `who_is_here` | the people in the workbook and the range each works on |
+| `list_versions` | the version history |
+
+Without `join_session` each call joins for the moment it takes (so it sees what was edited live)
+and a write saves a snapshot, which is one version per write: join first when making many edits.
+The agent's presence follows `read_range`/`write_range`/`join_session` (the range it touched).
+An example exchange:
+
+```
+-> {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"write_range",
+    "arguments":{"item":"<id>","range":"H1","values":[[1,2],["=H1+I1",null]]}}}
+<- {"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"{\"values\":[[1.0,2.0],[3.0,null]], ...}"}],"isError":false}}
+```
+
+CLI examples (the same operations, for scripts and shells):
+
+```
+fsheets login --server https://your-server.example:8090 --user agent-claude --password-file ~/agent-claude.pw
+fsheets ls                                   # find folder and file ids
+fsheets new --folder <folder-id> --name Forecast --sheets Data,Notes
+fsheets write --item <id> --sheet Data --range A1 --values '[["Item","Q1"],["Rent",1000],["Total","=SUM(B2:B2)"]]'
+fsheets cat --item <id> --sheet Data         # calculated values; --formulas for the formulas
+fsheets eval --item <id> --sheet Data "=AVERAGE(B2:B9)"
+fsheets export --item <id> --out /tmp/forecast.csv --sheet Data
+fsheets versions --item <id>
+```
 
 ## Soak harness
 
@@ -60,6 +158,14 @@ replacing the binary and revokes the seeding token.
 
 ## Formulas and .xlsx/.csv export with FreedomSheets' own engine (investigation)
 
+**Done in M1b** (steps 1 to 4 below are implemented; the text is the investigation that led to it).
+`freedom-sheets` has a lib target `freedom_sheets` with all non-UI modules; `app`, `crash` and
+`icon` stay in the binary, which needs the default `ui` feature (eframe, rfd, image, winit are
+optional dependencies behind it, and `live::conn` is gated by it). `fsheets` depends on it with
+`default-features = false`. Deviations from the plan: `cloud` moved into the lib too (so
+`pct_encode` needed no move), `io::load_xlsx_bytes`/`io::xlsx_bytes` and `pivot::sample` (test
+data the app's tests share) were added, and a few `pub(crate)` items became `pub`.
+
 Finding: **`sheets` can get a `[lib]` target without egui.** Only `app/` (35 files),
 `live/conn.rs` and `main.rs` use egui/eframe. I tried it: a `sheets/src/lib.rs` declaring
 `chart, condfmt, filter, formula, hash, iconset, io, live, model, numfmt, page, pivot,
@@ -80,7 +186,7 @@ Recommended approach (M1b):
 4. Replace `fsheets::book::Book` by `freedom_sheets::model::Workbook` plus `live::apply_ops`; keep `Book` only as the cheap read model if wanted. Add `fsheets eval "=SUM(A1:A5)"`, `export --format xlsx|csv`, `snapshot`.
 5. Fallbacks if the lib proves too invasive later: ask a live app peer (no protocol for it), or read cached values (formula cells carry no values on the wire; the file's cached values go stale).
 
-Today `fsheets cat` prints formula text for formula cells and does not calculate them.
+Before M1b `fsheets cat` printed formula text and did not calculate; it now prints calculated values.
 
 ## Gap audit vs Excel Online
 
@@ -92,10 +198,10 @@ Evidence is the harness (`probe`, `soak`) and the code on this branch.
 | Cell conflicts | **Gap (planned, DECISIONS #7).** A cell is one target: `Op::Cell` carries value, formula, style and rich text together, last committed wins. A value edit concurrent with a format edit of the same cell loses one of them. Probe result (A types a value, B makes the cell bold, both offline, A reconnects first): final cell `{"st":{"bold":true}}`, A's value is gone, no one is told. Same for two values: the later commit wins silently. Structural vs content works: a row inserted above a concurrent edit moves it (probe: true), and 80-action random soaks with row/column inserts and deletes converge. | `soak::probe_conflicts`, test `concurrent_edits_of_one_cell`, `cosync::Op::Cell`, `transform.rs` |
 | Offline / reconnect | **Partly.** Reconnect resumes from the last seq, resends the unacknowledged batch, duplicates are recognised by (cid, batch id): 18 forced reconnects in the 4-client run converged. Edits made offline are buffered in memory only: closing/killing the app loses unsent live ops; the app's AutoRecover writes a whole recovery .xlsx every 2 minutes when dirty, which is a copy to reopen, not a replay of ops into the session. There is a limit of what the server keeps (`Reload` when the base is too old): then pending changes are re-based as one batch, but conflicts are not shown. An agent that restarts loses its pending batch the same way. | `cosync::client::Session`, `app/mod.rs::autosave` (INTERVAL 120 s), `Live` in `agents/src/live.rs` |
 | Per-user undo under concurrency | **Done.** Undo is per person: a stack of inverse ops carried over other people's changes (`cosync::carry_down`), and a step is blocked when someone else changed what it would restore (like Excel). Redo likewise, 100 steps. Not covered by the headless harness (no undo in `fsheets`). | `app/live_ui.rs` (`Undo`, `live_undo`, `carry_down` at line ~1084) |
-| Autosave | **Partly.** Committed batches are stored in SQLite at once (nothing is lost on a server restart); the server asks one editor for a snapshot every 200 batches / 120 s of changes / after a pause, and that becomes a version. Without a GUI editor nobody answers: in the soak the server asked once and `fsheets` ignored it, so the saved *file* stays at the old version while the log grows (a new joiner replays the log, so nothing is lost, but downloads and the web preview show the old file). Fixed by the lib target above. | `server/src/live.rs` (`SNAPSHOT_*`, `maybe_ask_snapshot`), soak report "snapshot requests ignored" |
+| Autosave | **Done for agents (M1b); was partly.** `fsheets` now answers the server's `Snapshot` request like the app (soak test `clients_answer_the_servers_snapshot_requests`: the server asks past 200 batches, a client uploads, the file gets a version, a fresh joiner is identical) and snapshots when a one-shot command or `leave_session` ends with unsaved changes. Earlier finding: **Partly.** Committed batches are stored in SQLite at once (nothing is lost on a server restart); the server asks one editor for a snapshot every 200 batches / 120 s of changes / after a pause, and that becomes a version. Without a GUI editor nobody answers: in the soak the server asked once and `fsheets` ignored it, so the saved *file* stays at the old version while the log grows (a new joiner replays the log, so nothing is lost, but downloads and the web preview show the old file). Fixed by the lib target above. | `server/src/live.rs` (`SNAPSHOT_*`, `maybe_ask_snapshot`), soak report "snapshot requests ignored" |
 | Version history | **Done server side**: every snapshot/save is a version (newest 25 plus the first of each day), restore and download exist; live restore is refused while a session runs (423). Gap: no per-user attribution inside a snapshot (a version is "modified by" the snapshotting client), and no "what changed" view, which Excel Online has. | `server/src/api.rs` versions endpoints, `live_busy` |
 | Comments | **Gap.** Only plain notes (`Op::Note` with text and author) exist; no threads, replies, resolve, @mentions or notifications. Planned as a new op kind (DECISIONS #8). | `cosync::Op::Note` |
-| Not tracked by `fsheets` | formats, merges, notes, column widths, features: counted as `ignored`; formula `adj`; the lossless live state when the file was last saved by an app session (starting state is then the .xlsx only). Convergence of those is covered by the app's own tests, not by this harness. | `book.rs`, `Live::prepare` notes |
+| Tracked by `fsheets` | **Everything the app synchronises** (M1b): formats, merges, notes, widths, features, `adj` and the lossless live state at join; the soak compares clients with `freedom_sheets::live::compare`. Earlier: only values and formulas. | `live.rs`, `soak.rs` |
 
 Other findings: the live WebSocket authenticates with the bearer token header (the ticket
 endpoint is for browsers); the server's rate limit (30 batches/s, burst 120) closes a client
