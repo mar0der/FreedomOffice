@@ -31,7 +31,7 @@ Versions kept: the newest `versions_to_keep` (default 25) plus the first version
 - `freedomoffice-server --config <cfg> backup <dir>`: consistent online SQLite copy plus every version file
   (incremental; unchanged files are skipped). Safe while the server runs. **(exists)**
 - Production layout: `freedomoffice-backup.timer` nightly to `/var/backups/freedomoffice`.
-  On the21th (user service): a user timer to `~/.local/share/freedomoffice-server-backup/nightly` (to add).
+  On the21th (user service): `freedomoffice-backup.timer` (user unit, 02:30) to `~/.local/share/freedomoffice-server-backup/nightly`.
 - **Off-site: dspeter (NAS, 32-bit)** only *receives* copies. It pulls with rsync over SSH from a
   restricted read-only account (`rrsync -ro`), see `server/deploy/nas/`. No `--delete`, so old versions
   survive on the NAS even after the server prunes them. No server binary runs on the NAS.
