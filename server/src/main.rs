@@ -136,7 +136,7 @@ fn run(config_path: &Path, mut args: Vec<String>) -> Result<(), String> {
                     println!("Created {}{}.", u.username, if u.is_admin { " (administrator)" } else { "" });
                 }
                 "list" => {
-                    println!("{:<24} {:<28} {:<6} {:<9} {}", "USERNAME", "DISPLAY NAME", "ADMIN", "STATUS", "CREATED");
+                    println!("{:<24} {:<28} {:<6} {:<9} CREATED", "USERNAME", "DISPLAY NAME", "ADMIN", "STATUS");
                     for u in s.users().map_err(|e| e.to_string())? {
                         println!(
                             "{:<24} {:<28} {:<6} {:<9} {}",

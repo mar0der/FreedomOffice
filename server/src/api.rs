@@ -489,15 +489,15 @@ fn org_json(s: &Store, o: &Org, mine: Option<OrgRole>) -> Result<Value, ApiError
 
 /// The client address; behind a loopback reverse proxy, the last X-Forwarded-For entry.
 pub(crate) fn client_ip(cfg: &Config, peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
-    if cfg.trust_proxy && peer.ip().is_loopback() {
-        if let Some(ip) = headers
+    if cfg.trust_proxy
+        && peer.ip().is_loopback()
+        && let Some(ip) = headers
             .get("x-forwarded-for")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.rsplit(',').next())
             .and_then(|v| v.trim().parse::<IpAddr>().ok())
-        {
-            return ip;
-        }
+    {
+        return ip;
     }
     peer.ip()
 }
@@ -1654,14 +1654,12 @@ async fn upload_file(State(app): State<App>, headers: HeaderMap, Query(q): Query
         };
         let (p, role) = visible(s, &who, &parent, false)?;
         need_edit(role)?;
-        if on_conflict == OnConflict::Replace {
-            if let Ok(clean) = util::clean_name(&name) {
-                if let Some(existing) = s.find_child(&p.id, &clean)? {
-                    if live_busy(s, &hub, &existing)? {
-                        return Err(locked());
-                    }
-                }
-            }
+        if on_conflict == OnConflict::Replace
+            && let Ok(clean) = util::clean_name(&name)
+            && let Some(existing) = s.find_child(&p.id, &clean)?
+            && live_busy(s, &hub, &existing)?
+        {
+            return Err(locked());
         }
         let (it, created) = s.create_file(&p.id, &name, &body, &actor(&who), on_conflict)?;
         if let Principal::User { user, .. } = &who {
@@ -1736,17 +1734,18 @@ async fn put_content(State(app): State<App>, headers: HeaderMap, Path(id): Path<
         if live_busy(s, &hub, &it)? {
             return Err(locked());
         }
-        if let Some(want) = headers.get(header::IF_MATCH).and_then(|v| v.to_str().ok()).map(norm_etag) {
-            if want != "*" && want != it.etag() {
-                let body = json!({
-                    "error": "Someone else saved changes to this file.",
-                    "etag": it.etag(),
-                    "version": it.version,
-                    "modified_by": display_of(s, &it.modified_by),
-                    "modified": iso(it.modified),
-                });
-                return Ok((StatusCode::PRECONDITION_FAILED, axum::Json(body)).into_response());
-            }
+        if let Some(want) = headers.get(header::IF_MATCH).and_then(|v| v.to_str().ok()).map(norm_etag)
+            && want != "*"
+            && want != it.etag()
+        {
+            let body = json!({
+                "error": "Someone else saved changes to this file.",
+                "etag": it.etag(),
+                "version": it.version,
+                "modified_by": display_of(s, &it.modified_by),
+                "modified": iso(it.modified),
+            });
+            return Ok((StatusCode::PRECONDITION_FAILED, axum::Json(body)).into_response());
         }
         let saved = s.write_content(&it, &body, &actor(&who))?;
         if let Principal::User { user, .. } = &who {

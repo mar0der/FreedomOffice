@@ -991,10 +991,10 @@ impl Store {
             if !util::ct_eq(&stored, &hash) || expires <= now() {
                 return Ok(None);
             }
-            if let Some(link) = self.link(&link_id)? {
-                if link.expires.is_none_or(|e| e > now()) {
-                    return Ok(Some(Principal::Link { link }));
-                }
+            if let Some(link) = self.link(&link_id)?
+                && link.expires.is_none_or(|e| e > now())
+            {
+                return Ok(Some(Principal::Link { link }));
             }
         }
         Ok(None)
@@ -1279,10 +1279,10 @@ impl Store {
             }
             None => item.parent_id.clone().unwrap_or_default(),
         };
-        if let Some(other) = self.find_child(&parent_id, &name)? {
-            if other.id != item.id {
-                return Err(StoreError::Conflict(format!("An item named '{name}' already exists there.")));
-            }
+        if let Some(other) = self.find_child(&parent_id, &name)?
+            && other.id != item.id
+        {
+            return Err(StoreError::Conflict(format!("An item named '{name}' already exists there.")));
         }
         self.conn.execute(
             "UPDATE items SET name = ?1, parent_id = ?2, modified = ?3, modified_by = ?4 WHERE id = ?5",
@@ -1472,12 +1472,13 @@ impl Store {
         let ids = st.query_map([&user.id], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
         let mut out = Vec::new();
         for id in ids {
-            if let Some(it) = self.item(&id)? {
-                if it.kind == Kind::File && self.role(who, &it, false)?.is_some() {
-                    out.push(it);
-                    if out.len() >= limit {
-                        break;
-                    }
+            if let Some(it) = self.item(&id)?
+                && it.kind == Kind::File
+                && self.role(who, &it, false)?.is_some()
+            {
+                out.push(it);
+                if out.len() >= limit {
+                    break;
                 }
             }
         }
