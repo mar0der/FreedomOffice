@@ -1692,6 +1692,7 @@ pub(crate) fn audit_json(s: &Store, e: &crate::store::AuditEvent) -> Value {
         "detail": e.detail,
         "count": e.count,
         "last_at": iso(e.last_at.max(e.at)),
+        "last_detail": e.last_detail,
     })
 }
 
@@ -2035,7 +2036,7 @@ async fn create_folder(State(app): State<App>, headers: HeaderMap, body: Bytes) 
         let (p, role) = visible(s, &who, &parent, false)?;
         need_edit(role)?;
         let it = s.create_folder(&p.id, &b.name, &actor(&who))?;
-        s.audit_item(audit_by(&who, "folder.create").detail(format!("{} in {}", it.name, p.name)), &it)?;
+        s.audit_item(audit_by(&who, "folder.create").detail(format!("{} in {}", it.name, p.name)).aggregate(format!("folder.create|{}|{}", actor(&who), p.id)), &it)?;
         let role = s.role(&who, &it, false)?.unwrap_or(role);
         Ok((StatusCode::CREATED, axum::Json(item_json(s, &it, role))).into_response())
     })

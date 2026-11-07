@@ -551,6 +551,9 @@ fn repeated_events_are_counted_not_stored_one_by_one() {
     assert_eq!(renames.len(), 1, "one row a minute per person and item");
     assert_eq!(renames[0]["count"], 60);
     assert!(renames[0]["detail"].as_str().unwrap().chars().count() <= 200, "detail is capped");
+    assert!(renames[0]["detail"].as_str().unwrap().starts_with("Loop.txt -> "), "the first rename");
+    let last = renames[0]["last_detail"].as_str().unwrap();
+    assert!(last.starts_with("nnn") && last.chars().count() <= 200, "and the last one: {last}");
     // New versions: counted the same way.
     let auth = format!("Bearer {bt}");
     for _ in 0..3 {
@@ -558,9 +561,18 @@ fn repeated_events_are_counted_not_stored_one_by_one() {
     }
     let versions = s.audit(&at, "action=file.version");
     assert_eq!((versions.len(), versions[0]["count"].as_i64()), (1, Some(3)));
-    // A new folder is recorded.
-    assert_eq!(s.api("POST", "/api/folders", &bt, json!({ "name": "Archive" })).status, 201);
-    assert_eq!(s.audit(&at, "action=folder.create").len(), 1);
+    // New folders are recorded, counted per person and parent folder.
+    for i in 0..5 {
+        assert_eq!(s.api("POST", "/api/folders", &bt, json!({ "name": format!("Archive {i}") })).status, 201);
+    }
+    let folders = s.audit(&at, "action=folder.create");
+    assert_eq!((folders.len(), folders[0]["count"].as_i64()), (1, Some(5)));
+    assert!(folders[0]["last_detail"].as_str().unwrap().starts_with("Archive 4"));
+    // The admin page shows the count and the last detail.
+    let r = s.send("POST", "/admin/login", &[("Content-Type", "application/x-www-form-urlencoded"), ("Origin", ORIGIN)], Some(format!("username=alice&password={PW}").into_bytes()));
+    let cookie = r.header("set-cookie").unwrap().split(';').next().unwrap().to_string();
+    let page = s.send("GET", "/admin/audit?action=folder.create", &[("Cookie", &cookie)], None).text();
+    assert!(page.contains("x5 until") && page.contains("last: Archive 4"), "{page}");
 }
 
 #[test]

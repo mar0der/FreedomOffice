@@ -1255,7 +1255,7 @@ async fn audit_page(State(app): State<App>, headers: HeaderMap, Query(q): Query<
                     when(e.at),
                     if e.count > 1 { format!("{} <span class=\"tag\">x{} until {}</span>", esc(&e.action), e.count, when(e.last_at)) } else { esc(&e.action) },
                     esc(&e.target_user),
-                    esc(&e.detail),
+                    if e.count > 1 && !e.last_detail.is_empty() && e.last_detail != e.detail { format!("{}<div class=\"muted\">last: {}</div>", esc(&e.detail), esc(&e.last_detail)) } else { esc(&e.detail) },
                     esc(&e.ip)
                 ));
             }

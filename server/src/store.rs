@@ -443,6 +443,8 @@ pub struct AuditEvent {
     /// How many events this row stands for (repeats within a minute), and when the last was.
     pub count: i64,
     pub last_at: i64,
+    /// The detail of the latest repeat (empty while `count` is 1).
+    pub last_detail: String,
 }
 
 /// Which audit events to list: newest first, ids below `before`, at most `limit`.
@@ -663,15 +665,18 @@ CREATE TRIGGER audit_no_early_delete BEFORE DELETE ON audit
 END;
 "#;
 
-/// Version 4: repeated audit events are counted in one row (`count`, `last_at`, by `agg_key`
-/// within a minute). The only change a row may ever see is its count going up.
+/// Version 4: repeated audit events are counted in one row (`count`, `last_at`, `last_detail`, by
+/// `agg_key` within a minute). The only change a row may ever see is its count going up with
+/// `last_at` and `last_detail` (the first event's columns never change). The old trigger goes
+/// first: it would refuse the `UPDATE` that fills `last_at` on a database with events.
 const MIGRATION_V4: &str = r#"
+DROP TRIGGER audit_no_update;
 ALTER TABLE audit ADD COLUMN count INTEGER NOT NULL DEFAULT 1;
 ALTER TABLE audit ADD COLUMN last_at INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE audit ADD COLUMN last_detail TEXT NOT NULL DEFAULT '';
 ALTER TABLE audit ADD COLUMN agg_key TEXT;
 UPDATE audit SET last_at = at;
 CREATE INDEX audit_agg ON audit(agg_key, id);
-DROP TRIGGER audit_no_update;
 CREATE TRIGGER audit_count_only BEFORE UPDATE ON audit
     WHEN NOT (new.count > old.count AND new.last_at >= old.last_at AND new.id = old.id AND new.at = old.at
         AND new.actor_id = old.actor_id AND new.actor_name = old.actor_name AND new.ip = old.ip
@@ -848,9 +853,52 @@ pub struct Store {
     /// store call and cleared by a guard afterwards, see `Store::with_ip`; recorded in audit
     /// events).
     pub request_ip: std::cell::RefCell<String>,
-    /// Inside `atomic`: version files to delete once it commits (a rollback keeps them, as
-    /// the rows that refer to them come back).
-    deferred_deletes: std::cell::RefCell<Option<Vec<PathBuf>>>,
+    /// One frame per running `atomic` (innermost last): the files it touched.
+    frames: std::cell::RefCell<Vec<FileFrame>>,
+}
+
+/// The files a transaction (`Store::atomic`) touched.
+#[derive(Default)]
+struct FileFrame {
+    /// Version files it pruned: deleted once the outermost transaction commits (a rollback
+    /// keeps them, as the rows that refer to them come back).
+    deletes: Vec<PathBuf>,
+    /// Version files it wrote: removed if it rolls back (no row would refer to them).
+    created: Vec<PathBuf>,
+}
+
+/// Ends an `atomic` frame, also when its work panics: committed, the frame's files go to the
+/// enclosing frame (or, outermost, the pruned ones are deleted); rolled back, the files it
+/// wrote are removed and its deletions forgotten.
+struct FrameGuard<'a> {
+    s: &'a Store,
+    committed: bool,
+}
+
+impl Drop for FrameGuard<'_> {
+    fn drop(&mut self) {
+        let mut frames = self.s.frames.borrow_mut();
+        let frame = frames.pop().unwrap_or_default();
+        if !self.committed {
+            drop(frames);
+            for p in frame.created {
+                let _ = std::fs::remove_file(p);
+            }
+            return;
+        }
+        match frames.last_mut() {
+            Some(parent) => {
+                parent.deletes.extend(frame.deletes);
+                parent.created.extend(frame.created);
+            }
+            None => {
+                drop(frames);
+                for p in frame.deletes {
+                    let _ = std::fs::remove_file(p);
+                }
+            }
+        }
+    }
 }
 
 /// A transaction that nests: a SQLite savepoint. Rolled back when dropped without `commit`.
@@ -858,7 +906,8 @@ pub struct Store {
 /// can be one transaction around them, its audit event included.
 pub struct Tx<'a> {
     conn: &'a Connection,
-    name: String,
+    /// The savepoint's name; `None` for the outermost transaction (`BEGIN IMMEDIATE`).
+    name: Option<String>,
     done: bool,
 }
 
@@ -871,7 +920,10 @@ impl std::ops::Deref for Tx<'_> {
 
 impl Tx<'_> {
     pub fn commit(mut self) -> Res<()> {
-        self.conn.execute_batch(&format!("RELEASE {}", self.name))?;
+        match &self.name {
+            Some(n) => self.conn.execute_batch(&format!("RELEASE {n}"))?,
+            None => self.conn.execute_batch("COMMIT")?,
+        }
         self.done = true;
         Ok(())
     }
@@ -880,7 +932,10 @@ impl Tx<'_> {
 impl Drop for Tx<'_> {
     fn drop(&mut self) {
         if !self.done {
-            let _ = self.conn.execute_batch(&format!("ROLLBACK TO {0}; RELEASE {0}", self.name));
+            let _ = match &self.name {
+                Some(n) => self.conn.execute_batch(&format!("ROLLBACK TO {n}; RELEASE {n}")),
+                None => self.conn.execute_batch("ROLLBACK"),
+            };
         }
     }
 }
@@ -906,49 +961,53 @@ impl Store {
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         migrate(&conn)?;
-        Ok(Store { conn, files: files.to_path_buf(), versions_to_keep: versions_to_keep.max(1), allow_links: true, request_ip: Default::default(), deferred_deletes: Default::default() })
+        Ok(Store { conn, files: files.to_path_buf(), versions_to_keep: versions_to_keep.max(1), allow_links: true, request_ip: Default::default(), frames: Default::default() })
     }
 
-    /// A nested transaction (savepoint); see `Tx`.
+    /// A transaction: the outermost one is `BEGIN IMMEDIATE` (it takes the write lock at once,
+    /// so another process that wrote meanwhile can't make it fail half-way with
+    /// SQLITE_BUSY_SNAPSHOT; it waits up to the busy timeout instead), nested ones are
+    /// savepoints. See `Tx`.
     pub fn tx(&self) -> Res<Tx<'_>> {
+        if self.conn.is_autocommit() {
+            self.conn.execute_batch("BEGIN IMMEDIATE")?;
+            return Ok(Tx { conn: &self.conn, name: None, done: false });
+        }
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let name = format!("sp{}", SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
         self.conn.execute_batch(&format!("SAVEPOINT {name}"))?;
-        Ok(Tx { conn: &self.conn, name, done: false })
+        Ok(Tx { conn: &self.conn, name: Some(name), done: false })
     }
 
     /// Runs `f` as one transaction: everything it wrote (an action and its audit event) is
     /// kept only if it succeeds, so a failure (such as the audit write) never leaves a change
-    /// behind that the caller reports as failed.
+    /// behind that the caller reports as failed. Files follow the transaction (`FileFrame`):
+    /// version files it pruned are deleted only when the outermost one commits; files it
+    /// wrote are removed when it rolls back (also when `f` panics).
     pub fn atomic<T, E: From<StoreError>>(&self, f: impl FnOnce(&Store) -> Result<T, E>) -> Result<T, E> {
-        let outermost = self.deferred_deletes.borrow().is_none();
-        if outermost {
-            *self.deferred_deletes.borrow_mut() = Some(Vec::new());
-        }
-        let r = (|| {
-            let tx = self.tx()?;
-            let r = f(self)?;
-            tx.commit()?;
-            Ok(r)
-        })();
-        if outermost {
-            let doomed = self.deferred_deletes.borrow_mut().take().unwrap_or_default();
-            if r.is_ok() {
-                for p in doomed {
-                    let _ = std::fs::remove_file(p);
-                }
-            }
-        }
-        r
+        self.frames.borrow_mut().push(FileFrame::default());
+        let mut guard = FrameGuard { s: self, committed: false };
+        let tx = self.tx()?;
+        let r = f(self)?;
+        tx.commit()?;
+        guard.committed = true;
+        Ok(r)
     }
 
     /// Deletes a version file now, or when the surrounding `atomic` commits.
     fn delete_file_later(&self, path: PathBuf) {
-        match self.deferred_deletes.borrow_mut().as_mut() {
-            Some(list) => list.push(path),
+        match self.frames.borrow_mut().last_mut() {
+            Some(frame) => frame.deletes.push(path),
             None => {
                 let _ = std::fs::remove_file(path);
             }
+        }
+    }
+
+    /// A file was written that only the current transaction refers to: removed if it rolls back.
+    fn wrote_file(&self, path: &Path) {
+        if let Some(frame) = self.frames.borrow_mut().last_mut() {
+            frame.created.push(path.to_path_buf());
         }
     }
 
@@ -1593,6 +1652,7 @@ impl Store {
                 let dir = path.parent().ok_or_else(|| StoreError::Internal("bad path".into()))?;
                 std::fs::create_dir_all(dir)?;
                 std::fs::rename(staged, &path)?;
+                self.wrote_file(&path);
                 sync_dir(dir);
                 Ok(())
             }
@@ -1613,10 +1673,16 @@ impl Store {
             sync_dir(dir);
             Ok(())
         })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(&tmp);
+        match result {
+            Ok(()) => {
+                self.wrote_file(&path);
+                Ok(())
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                Err(e.into())
+            }
         }
-        Ok(result?)
     }
 
     pub fn read_content(&self, item: &Item, version: Option<i64>) -> Res<(Vec<u8>, Version)> {
@@ -2417,8 +2483,8 @@ impl Store {
         let t = now();
         if let Some(key) = &a.aggregate
             && self.conn.execute(
-                "UPDATE audit SET count = count + 1, last_at = ?1 WHERE id = (SELECT id FROM audit WHERE agg_key = ?2 AND at > ?1 - ?3 ORDER BY id DESC LIMIT 1)",
-                params![t, key, AUDIT_AGGREGATE_SECS],
+                "UPDATE audit SET count = count + 1, last_at = ?1, last_detail = ?4 WHERE id = (SELECT id FROM audit WHERE agg_key = ?2 AND at > ?1 - ?3 ORDER BY id DESC LIMIT 1)",
+                params![t, key, AUDIT_AGGREGATE_SECS, clip(&a.detail, AUDIT_DETAIL_MAX)],
             )? > 0
         {
             return Ok(());
@@ -2459,7 +2525,7 @@ impl Store {
 
     /// Audit events, newest first (see `AuditQuery`).
     pub fn audit_events(&self, q: &AuditQuery) -> Res<Vec<AuditEvent>> {
-        let mut sql = String::from("SELECT id, at, actor_id, actor_name, ip, action, org_id, item_id, target_user, detail, count, last_at FROM audit WHERE 1 = 1");
+        let mut sql = String::from("SELECT id, at, actor_id, actor_name, ip, action, org_id, item_id, target_user, detail, count, last_at, last_detail FROM audit WHERE 1 = 1");
         use rusqlite::types::Value as V;
         let mut args: Vec<V> = Vec::new();
         // Adds a value and gives its placeholder.
@@ -2506,6 +2572,7 @@ impl Store {
                     detail: r.get(9)?,
                     count: r.get(10)?,
                     last_at: r.get(11)?,
+                    last_detail: r.get(12)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -2607,10 +2674,32 @@ mod tests {
         assert!(versions_to_prune(&all, 10).is_empty());
     }
 
-    fn temp() -> PathBuf {
+    /// A throwaway directory, removed when dropped (also when the test fails).
+    struct TempDir(PathBuf);
+
+    impl std::ops::Deref for TempDir {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<Path> for TempDir {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn temp() -> TempDir {
         let d = std::env::temp_dir().join(format!("fo-store-test-{}", util::new_id()));
         std::fs::create_dir_all(&d).unwrap();
-        d
+        TempDir(d)
     }
 
     fn user_of(s: &Store, name: &str) -> Principal {
@@ -2677,7 +2766,7 @@ mod tests {
             conn.execute_batch(MIGRATION_V1).unwrap();
             conn.execute_batch("PRAGMA user_version = 1").unwrap();
             std::fs::create_dir_all(&files).unwrap();
-            let s = Store { conn, files: files.clone(), versions_to_keep: 25, allow_links: true, request_ip: Default::default(), deferred_deletes: Default::default() };
+            let s = Store { conn, files: files.clone(), versions_to_keep: 25, allow_links: true, request_ip: Default::default(), frames: Default::default() };
             let alice = s.create_user("alice", "Alice", "", "old-password-123", true).unwrap();
             let bob = s.create_user("bob", "Bob", "", "old-password-123", false).unwrap();
             let carol = s.create_user("carol", "Carol", "", "old-password-123", false).unwrap();
@@ -2730,7 +2819,7 @@ mod tests {
     fn migrates_a_schema_2_database() {
         let dir = temp();
         let (db, files) = (dir.join("freedomoffice.db"), dir.join("files"));
-        let (admin_secret, uid);
+        let (admin_secret, uid, file_id, team_id);
         {
             let conn = Connection::open(&db).unwrap();
             conn.pragma_update(None, "foreign_keys", "ON").unwrap();
@@ -2739,25 +2828,48 @@ mod tests {
             conn.execute_batch(MIGRATION_V2).unwrap();
             conn.execute_batch("PRAGMA user_version = 2").unwrap();
             std::fs::create_dir_all(&files).unwrap();
-            let s = Store { conn, files: files.clone(), versions_to_keep: 25, allow_links: true, request_ip: Default::default(), deferred_deletes: Default::default() };
+            let s = Store { conn, files: files.clone(), versions_to_keep: 25, allow_links: true, request_ip: Default::default(), frames: Default::default() };
             let u = s.create_user("ann", "Ann", "", "old-password-123", true).unwrap();
+            let bob = s.create_user("bob", "Bob", "", "old-password-123", false).unwrap();
             // What the version 2 code wrote: no kind column.
             let t = util::new_token();
             s.conn
                 .execute("INSERT INTO admin_sessions (user_id, hash, agent, created, expires, last_used) VALUES (?1, ?2, '', ?3, ?4, ?3)", params![u.id, util::token_hash(&t), now(), now() + 3600])
                 .unwrap();
+            // Documents, versions, an organisation and grants, as on the21th.
+            let team = s.create_org("Team", &u.id).unwrap();
+            s.set_member(&team, &bob, OrgRole::Admin, &u.id).unwrap();
+            let (f, _) = s.create_file(&team.root_id, "Plan.xlsx", b"one", &bob.id, OnConflict::Fail).unwrap();
+            s.write_content(&f, b"two", &bob.id).unwrap();
+            s.grant(&f, &u, Role::View, &bob.id).unwrap();
             assert!(s.conn.prepare("SELECT 1 FROM audit").is_err(), "a real schema 2 database");
-            (admin_secret, uid) = (t, u.id);
+            (admin_secret, uid, file_id, team_id) = (t, u.id, f.id, team.id);
         }
         let s = Store::open(&db, &files, 25).unwrap();
         assert_eq!(s.conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), SCHEMA_VERSION);
+        let fk: Vec<String> = s.conn.prepare("PRAGMA foreign_key_check").unwrap().query_map([], |r| r.get::<_, String>(0)).unwrap().collect::<Result<_, _>>().unwrap();
+        assert!(fk.is_empty(), "{fk:?}");
+        // The documents survive and keep working.
+        let f = s.item(&file_id).unwrap().unwrap();
+        assert_eq!((f.version, s.read_content(&f, None).unwrap().0), (2, b"two".to_vec()));
+        assert_eq!(s.versions(&f.id).unwrap().len(), 2);
+        assert_eq!(s.role(&user_of(&s, "ann"), &f, false).unwrap(), Some(Role::View));
+        assert_eq!(s.members(&team_id).unwrap().len(), 1);
+        let bob = s.user_by_name("bob").unwrap().unwrap();
+        s.atomic(|s| -> Res<()> {
+            let saved = s.write_content(&f, b"three", &bob.id)?;
+            s.audit(Audit::by(&bob, "file.version").item(&saved.id).aggregate("v"))?;
+            s.audit(Audit::by(&bob, "file.version").item(&saved.id).aggregate("v"))
+        })
+        .unwrap();
+        assert_eq!(s.audit_events(&AuditQuery { limit: 10, ..Default::default() }).unwrap()[0].count, 2);
         assert_eq!(s.admin_session(&admin_secret).unwrap().unwrap().1.kind, SessionKind::Admin);
         assert!(s.web_session(&admin_secret).unwrap().is_none(), "an admin session is no web session");
         let web = s.create_session(&uid, "browser", SessionKind::Web).unwrap();
         assert!(s.web_session(&web).unwrap().is_some());
         assert!(s.admin_session(&web).unwrap().is_none(), "and the other way round");
         s.audit(Audit::anonymous("sign_in.failed", "").target("ann")).unwrap();
-        assert_eq!(s.audit_events(&AuditQuery { limit: 10, ..Default::default() }).unwrap().len(), 1);
+        assert_eq!(s.audit_events(&AuditQuery { limit: 10, ..Default::default() }).unwrap().len(), 2);
         drop(s);
         // A version 2 server refuses it: its `migrate` stops at any user_version above 2.
         let conn = Connection::open(&db).unwrap();
@@ -2880,6 +2992,126 @@ mod tests {
         assert!(s.version(&f.id, 2).unwrap().is_none());
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A schema 3 database that has audit events (every real one) migrates to 4: the old
+    /// trigger would refuse filling `last_at`, so it goes first.
+    #[test]
+    fn migrates_a_schema_3_database_with_audit_events() {
+        let dir = temp();
+        let (db, files) = (dir.join("freedomoffice.db"), dir.join("files"));
+        let uid;
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+            for m in [SCHEMA_V0, MIGRATION_V1, MIGRATION_V2, MIGRATION_V3] {
+                conn.execute_batch(m).unwrap();
+            }
+            conn.execute_batch("PRAGMA user_version = 3").unwrap();
+            std::fs::create_dir_all(&files).unwrap();
+            let s = Store { conn, files: files.clone(), versions_to_keep: 25, allow_links: true, request_ip: Default::default(), frames: Default::default() };
+            let u = s.create_user("ann", "Ann", "", "old-password-123", true).unwrap();
+            // What the version 3 code wrote.
+            for (at, action) in [(now() - 100, "sign_in"), (now() - 50, "org.create"), (now() - 10, "item.rename")] {
+                s.conn.execute("INSERT INTO audit (at, actor_id, actor_name, ip, action, detail) VALUES (?1, ?2, 'ann', '192.0.2.1', ?3, 'x')", params![at, u.id, action]).unwrap();
+            }
+            assert!(s.conn.execute("UPDATE audit SET detail = 'y'", []).is_err(), "a real schema 3 trigger");
+            uid = u.id;
+        }
+        let s = Store::open(&db, &files, 25).unwrap();
+        assert_eq!(s.conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), SCHEMA_VERSION);
+        let all = s.audit_events(&AuditQuery { limit: 10, ..Default::default() }).unwrap();
+        assert_eq!(all.len(), 3);
+        assert!(all.iter().all(|e| e.count == 1 && e.last_at == e.at && e.last_detail.is_empty()));
+        assert!(s.conn.execute("UPDATE audit SET detail = 'y'", []).is_err(), "still append-only");
+        assert!(s.conn.execute("DELETE FROM audit", []).is_err(), "still no early deletion");
+        let u = s.user_by_id(&uid).unwrap().unwrap();
+        s.audit(Audit::by(&u, "item.rename").detail("a").aggregate("k")).unwrap();
+        s.audit(Audit::by(&u, "item.rename").detail("b").aggregate("k")).unwrap();
+        let e = &s.audit_events(&AuditQuery { limit: 1, ..Default::default() }).unwrap()[0];
+        assert_eq!((e.count, e.detail.as_str(), e.last_detail.as_str()), (2, "a", "b"));
+    }
+
+    /// A panic inside `atomic` rolls back and leaves the store working as before: later pruned
+    /// files are deleted, files the panicking work wrote are gone.
+    #[test]
+    fn a_panic_inside_atomic_leaves_no_state_behind() {
+        let dir = temp();
+        let s = Store::open(&dir.join("db"), &dir.join("files"), 1).unwrap();
+        let u = s.create_user("ann", "Ann", "", "old-password-123", true).unwrap();
+        let (f, _) = s.create_file(&u.root_id, "A.txt", b"one", &u.id, OnConflict::Fail).unwrap();
+        let f = s.write_content(&f, b"two", &u.id).unwrap();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: Res<()> = s.atomic(|s| {
+                s.write_content(&f, b"three", &u.id)?;
+                panic!("boom");
+            });
+        }));
+        assert!(r.is_err());
+        assert!(s.frames.borrow().is_empty(), "the frame was reset");
+        assert!(s.conn.is_autocommit(), "the transaction was rolled back");
+        assert_eq!(s.item(&f.id).unwrap().unwrap().version, 2);
+        assert!(!s.blob_path(&f.id, 3).unwrap().exists(), "the file the panicking work wrote is gone");
+        assert!(s.blob_path(&f.id, 2).unwrap().is_file());
+        s.atomic(|s| s.write_content(&f, b"three", &u.id).map(|_| ())).unwrap();
+        assert!(!s.blob_path(&f.id, 2).unwrap().exists(), "pruning deletes files again");
+    }
+
+    /// A nested `atomic` that rolls back keeps what it pruned and removes what it wrote, while
+    /// the enclosing one goes on and commits.
+    #[test]
+    fn a_rolled_back_nested_atomic_touches_no_files() {
+        let dir = temp();
+        let s = Store::open(&dir.join("db"), &dir.join("files"), 1).unwrap();
+        let u = s.create_user("ann", "Ann", "", "old-password-123", true).unwrap();
+        let (f, _) = s.create_file(&u.root_id, "A.txt", b"one", &u.id, OnConflict::Fail).unwrap();
+        let f = s.write_content(&f, b"two", &u.id).unwrap();
+        let (g, _) = s.create_file(&u.root_id, "B.txt", b"b", &u.id, OnConflict::Fail).unwrap();
+        s.atomic(|s| -> Res<()> {
+            let inner: Res<()> = s.atomic(|s| {
+                s.write_content(&f, b"three", &u.id)?; // prunes version 2, writes 3
+                Err(StoreError::Conflict("no".into()))
+            });
+            assert!(inner.is_err());
+            s.write_content(&g, b"b2", &u.id)?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(s.item(&f.id).unwrap().unwrap().version, 2);
+        assert!(s.blob_path(&f.id, 2).unwrap().is_file(), "the nested rollback's prune was forgotten");
+        assert!(!s.blob_path(&f.id, 3).unwrap().exists(), "and what it wrote removed");
+        assert_eq!(s.item(&g.id).unwrap().unwrap().version, 2, "the outer work stays");
+        assert!(s.blob_path(&g.id, 2).unwrap().is_file());
+        // An upload staged in and moved into place by work that rolls back leaves no orphan.
+        let staged = dir.join("staged.upload");
+        std::fs::write(&staged, b"big").unwrap();
+        let r: Res<()> = s.atomic(|s| {
+            s.write_content_from(&g, Blob::Staged { path: &staged, size: 3, hash: &util::sha256_hex(b"big") }, &u.id)?;
+            Err(StoreError::Conflict("no".into()))
+        });
+        assert!(r.is_err());
+        assert!(!s.blob_path(&g.id, 3).unwrap().exists());
+        let entries: Vec<_> = std::fs::read_dir(dir.join("files").join(&g.id)).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(entries.len(), 2, "only versions 1 and 2: {entries:?}");
+    }
+
+    /// The outermost transaction takes the write lock at once (BEGIN IMMEDIATE), so another
+    /// process can't change the database between its reads and its writes.
+    #[test]
+    fn the_outermost_transaction_takes_the_write_lock() {
+        let dir = temp();
+        let s = Store::open(&dir.join("db"), &dir.join("files"), 1).unwrap();
+        let other = Connection::open(dir.join("db")).unwrap();
+        other.busy_timeout(std::time::Duration::from_millis(0)).unwrap();
+        s.atomic(|s| -> Res<()> {
+            assert!(!s.conn.is_autocommit());
+            assert!(other.execute("CREATE TABLE x (a)", []).is_err(), "the other writer has to wait");
+            let n: i64 = other.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0)).unwrap();
+            assert_eq!(n, 0, "readers aren't blocked");
+            Ok(())
+        })
+        .unwrap();
+        assert!(other.execute("CREATE TABLE x (a)", []).is_ok());
     }
 
     /// Web admin sessions: absolute expiry, at most ADMIN_SESSIONS_PER_USER, ended by secret.
