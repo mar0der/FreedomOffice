@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use freedomoffice_server::config::{self, Config};
-use freedomoffice_server::store::{Store, User};
+use freedomoffice_server::store::{OrgRole, Store, User};
 use freedomoffice_server::util::iso;
 use freedomoffice_server::{open_store, serve};
 
@@ -27,6 +27,12 @@ COMMANDS:
     user enable USERNAME
     user reset-password USERNAME
     user make-admin USERNAME
+    org add NAME                 Create an organisation (with its own folder)
+    org list
+    org members ORG
+    org add-member ORG USERNAME [member|admin|owner]
+                                 Add a person (default: member) or change their role
+    org remove-member ORG USERNAME
     tokens list USERNAME         Signed-in devices of a user
     tokens revoke USERNAME       Sign a user out of every device
     backup DIR                   Consistent copy of the database and all documents into DIR
@@ -125,7 +131,7 @@ fn run(config_path: &Path, mut args: Vec<String>) -> Result<(), String> {
                     let email = take_opt(&mut args, "--email").unwrap_or_default();
                     let admin = take_flag(&mut args, "--admin");
                     let name = one_arg(&args, "a username")?;
-                    let pw = read_new_password(&format!("Password for {name}"))?;
+                    let pw = read_new_password(&format!("Password for {name}"), &name)?;
                     let u = s.create_user(&name, &display, &email, &pw, admin).map_err(|e| e.to_string())?;
                     println!("Created {}{}.", u.username, if u.is_admin { " (administrator)" } else { "" });
                 }
@@ -149,7 +155,7 @@ fn run(config_path: &Path, mut args: Vec<String>) -> Result<(), String> {
                 }
                 "reset-password" => {
                     let u = user(&s, &one_arg(&args, "a username")?)?;
-                    let pw = read_new_password(&format!("New password for {}", u.username))?;
+                    let pw = read_new_password(&format!("New password for {}", u.username), &u.username)?;
                     s.set_password(&u.id, &pw).map_err(|e| e.to_string())?;
                     let n = s.revoke_user_tokens(&u.id).map_err(|e| e.to_string())?;
                     println!("Password changed; {n} device(s) signed out.");
@@ -160,6 +166,55 @@ fn run(config_path: &Path, mut args: Vec<String>) -> Result<(), String> {
                     println!("{} is now an administrator.", u.username);
                 }
                 other => return Err(format!("Unknown user command '{other}'. See --help.")),
+            }
+            Ok(())
+        }
+        "org" => {
+            if args.is_empty() {
+                return Err("Expected an org command. See --help.".into());
+            }
+            let sub = args.remove(0);
+            let s = store(config_path)?;
+            let org = |name: &str| s.find_org(name).map_err(|e| e.to_string())?.ok_or_else(|| format!("There's no organisation named '{name}'."));
+            match sub.as_str() {
+                "add" => {
+                    let name = one_arg(&args, "an organisation name")?;
+                    let o = s.create_org(&name, "cli").map_err(|e| e.to_string())?;
+                    println!("Created the organisation {} (folder {}).", o.name, o.root_id);
+                }
+                "list" => {
+                    println!("{:<32} {:<8} {:<8} {}", "NAME", "MEMBERS", "DEFAULT", "CREATED");
+                    for o in s.orgs().map_err(|e| e.to_string())? {
+                        let n = s.members(&o.id).map_err(|e| e.to_string())?.len();
+                        println!("{:<32} {:<8} {:<8} {}", o.name, n, o.member_role.as_str(), iso(o.created));
+                    }
+                }
+                "members" => {
+                    let o = org(&one_arg(&args, "an organisation name")?)?;
+                    for m in s.members(&o.id).map_err(|e| e.to_string())? {
+                        println!("{:<24} {:<28} {}", m.user.username, m.user.display_name, m.role.as_str());
+                    }
+                }
+                "add-member" => {
+                    let (o, u, role) = match args.as_slice() {
+                        [o, u] => (o.clone(), u.clone(), "member".to_string()),
+                        [o, u, r] => (o.clone(), u.clone(), r.clone()),
+                        _ => return Err("Expected `org add-member ORG USERNAME [member|admin|owner]`.".into()),
+                    };
+                    let role = OrgRole::parse(&role).ok_or("The role must be member, admin or owner.")?;
+                    let (o, u) = (org(&o)?, user(&s, &u)?);
+                    let added = s.set_member(&o, &u, role, "cli").map_err(|e| e.to_string())?;
+                    println!("{} {} {} of {}.", u.username, if added { "joined as" } else { "is now" }, role.as_str(), o.name);
+                }
+                "remove-member" => {
+                    let [o, u] = args.as_slice() else { return Err("Expected `org remove-member ORG USERNAME`.".into()) };
+                    let (o, u) = (org(o)?, user(&s, u)?);
+                    if !s.remove_member(&o.id, &u.id).map_err(|e| e.to_string())? {
+                        return Err(format!("{} isn't a member of {}.", u.username, o.name));
+                    }
+                    println!("Removed {} from {}.", u.username, o.name);
+                }
+                other => return Err(format!("Unknown org command '{other}'. See --help.")),
             }
             Ok(())
         }
@@ -238,7 +293,7 @@ fn init(config_path: &Path, mut args: Vec<String>) -> Result<(), String> {
             if a.trim().is_empty() { "admin".into() } else { a.trim().to_string() }
         }
     };
-    let pw = read_new_password(&format!("Password for {name}"))?;
+    let pw = read_new_password(&format!("Password for {name}"), &name)?;
     let u = s.create_user(&name, "", "", &pw, true).map_err(|e| e.to_string())?;
     println!("Created the administrator {}. Start the server with `freedomoffice-server serve`.", u.username);
     Ok(())
@@ -256,18 +311,18 @@ fn prompt_line(prompt: &str) -> Result<String, String> {
 
 /// From the terminal without echo (asked twice), or one line of standard input when piped.
 /// Never from the command line, where it would end up in shell history and `ps`.
-fn read_new_password(what: &str) -> Result<String, String> {
+fn read_new_password(what: &str, username: &str) -> Result<String, String> {
     if std::io::stdin().is_terminal() {
         let a = rpassword::prompt_password(format!("{what}: ")).map_err(|e| e.to_string())?;
         let b = rpassword::prompt_password("Repeat the password: ").map_err(|e| e.to_string())?;
         if a != b {
             return Err("The passwords don't match.".into());
         }
-        freedomoffice_server::util::check_new_password(&a)?;
+        freedomoffice_server::util::check_new_password(&a, username)?;
         Ok(a)
     } else {
         let pw = prompt_line("")?;
-        freedomoffice_server::util::check_new_password(&pw)?;
+        freedomoffice_server::util::check_new_password(&pw, username)?;
         Ok(pw)
     }
 }

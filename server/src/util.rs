@@ -138,16 +138,62 @@ pub fn dummy_verify(pw: &str) {
     let _ = verify_password(pw, h);
 }
 
-pub const MIN_PASSWORD: usize = 8;
+pub const MIN_PASSWORD: usize = 12;
 
-pub fn check_new_password(pw: &str) -> Result<(), String> {
+const COMMON_PASSWORDS: &str = include_str!("common_passwords.txt");
+
+fn is_common(lower: &str) -> bool {
+    static SET: std::sync::OnceLock<std::collections::HashSet<&'static str>> = std::sync::OnceLock::new();
+    let set = SET.get_or_init(|| COMMON_PASSWORDS.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).collect());
+    // "Password2024!" is as weak as "password": also check without leading and trailing
+    // digits and symbols.
+    let core = lower.trim_matches(|c: char| !c.is_alphabetic());
+    set.contains(lower) || set.contains(core)
+}
+
+/// The rules for every new or changed password: at least `MIN_PASSWORD` characters, not the
+/// username (nor containing it), not a common password, not one character repeated.
+pub fn check_new_password(pw: &str, username: &str) -> Result<(), String> {
     if pw.chars().count() < MIN_PASSWORD {
         return Err(format!("The password must be at least {MIN_PASSWORD} characters long."));
     }
     if pw.len() > 1024 {
         return Err("The password is too long.".into());
     }
+    let lower = pw.to_lowercase();
+    let user = username.trim().to_lowercase();
+    if !user.is_empty() && (lower == user || (user.chars().count() >= 3 && lower.contains(&user))) {
+        return Err("The password can't contain the username.".into());
+    }
+    let mut chars = lower.chars();
+    let first = chars.next();
+    if chars.all(|c| Some(c) == first) {
+        return Err("The password can't be one character repeated.".into());
+    }
+    if is_common(&lower) {
+        return Err("That password is too common; choose one that is harder to guess.".into());
+    }
     Ok(())
+}
+
+/// A random temporary password: 20 characters from an alphabet without look-alikes (about
+/// 99 bits) in groups of four, e.g. "kq7m-x3tp-9wrd-hc4n-fz2v".
+pub fn temp_password() -> String {
+    const A: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
+    let mut out = String::with_capacity(24);
+    while out.len() < 24 {
+        for b in random_bytes::<32>() {
+            // Rejection sampling keeps every character equally likely.
+            if out.len() >= 24 || (b as usize) >= 256 - 256 % A.len() {
+                continue;
+            }
+            if out.len() % 5 == 4 {
+                out.push('-');
+            }
+            out.push(A[b as usize % A.len()] as char);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -188,5 +234,29 @@ mod tests {
         assert!(ct_eq(b"abc", b"abc"));
         assert!(!ct_eq(b"abc", b"abd"));
         assert!(!ct_eq(b"abc", b"ab"));
+    }
+
+    #[test]
+    fn password_policy() {
+        assert!(check_new_password("test-password-1", "bob").is_ok());
+        assert!(check_new_password("short-pw", "bob").is_err(), "too short");
+        assert!(check_new_password("aaaaaaaaaaaaaaaa", "bob").is_err(), "repeated");
+        assert!(check_new_password("password1234", "bob").is_err(), "common");
+        assert!(check_new_password("Password2024!", "bob").is_err(), "common plus digits");
+        assert!(check_new_password("qwertyuiop123", "bob").is_err());
+        assert!(check_new_password("!!Iloveyou!!", "bob").is_err());
+        assert!(check_new_password("Alice.Wonder-77", "alice").is_err(), "contains the username");
+        assert!(check_new_password("averylongusername", "AveryLongUsername").is_err(), "is the username");
+        assert!(check_new_password("x-correct-horse-battery", "x").is_ok(), "one-letter usernames don't ban letters");
+        assert!(check_new_password(&"ab".repeat(600), "bob").is_err(), "too long");
+    }
+
+    #[test]
+    fn temp_passwords() {
+        let a = temp_password();
+        assert_eq!(a.len(), 24);
+        assert_eq!(a.matches('-').count(), 4);
+        assert_ne!(a, temp_password());
+        assert!(check_new_password(&a, "someone").is_ok());
     }
 }
