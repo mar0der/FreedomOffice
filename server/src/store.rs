@@ -1313,10 +1313,10 @@ impl Store {
 
     /// By id, else by name.
     pub fn find_org(&self, name_or_id: &str) -> Res<Option<Org>> {
-        if util::valid_id(name_or_id) {
-            if let Some(o) = self.org(name_or_id)? {
-                return Ok(Some(o));
-            }
+        if util::valid_id(name_or_id)
+            && let Some(o) = self.org(name_or_id)?
+        {
+            return Ok(Some(o));
         }
         self.org_by_name(name_or_id)
     }

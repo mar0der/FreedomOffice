@@ -49,7 +49,7 @@ impl Resp {
 
 fn start() -> Srv {
     let dir = std::env::temp_dir().join(format!("fo-live-test-{}", freedomoffice_server::util::new_id()));
-    let cfg = Config { data_dir: dir.join("data"), ..Config::default() };
+    let cfg = Config { data_dir: dir.join("data"), login_delay_ms: 10, ..Config::default() };
     {
         let s = Store::open(&cfg.db_path(), &cfg.files_dir(), cfg.versions_to_keep).unwrap();
         s.create_user("alice", "Alice Admin", "", PW, true).unwrap();
@@ -526,4 +526,129 @@ fn snapshots_of_the_same_state_make_one_version() {
     assert_eq!(content.body, b"alice's copy");
     let versions = s.send("GET", &format!("/api/items/{id}/versions"), Some(&a), &[], None).json();
     assert_eq!(versions["versions"].as_array().map(|v| v.len()), Some(2));
+}
+
+// ---------------------------------------------------------------------------
+// Access changes while connected (SPEC.md §3 "Live changes")
+// ---------------------------------------------------------------------------
+
+impl Ws {
+    /// The next role/revoked message (skipping presence, joins and leaves).
+    fn recv_access(&mut self) -> ServerMsg {
+        match self.recv_data() {
+            m @ (ServerMsg::Role { .. } | ServerMsg::Revoked { .. }) => m,
+            m => panic!("expected role or revoked, got {m:?}"),
+        }
+    }
+}
+
+impl Srv {
+    fn share(&self, owner: &str, id: &str, user: &str, role: &str) {
+        let r = self.json("POST", &format!("/api/items/{id}/permissions"), Some(owner), json!({ "username": user, "role": role }));
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    }
+}
+
+#[test]
+fn a_lowered_role_takes_effect_in_open_sessions() {
+    let s = start();
+    let (a, b) = (s.login("alice"), s.login("bob"));
+    let id = s.new_file(&a, "Live.xlsx");
+    s.share(&a, &id, "bob", "edit");
+    let (mut wa, _) = s.join(&a, &id, "a");
+    let (mut wb, _) = s.join(&b, &id, "b");
+    wb.send(&ClientMsg::Ops { base: 0, id: 1, ops: vec![text(0, 0, "bob was here")] });
+    let ServerMsg::Ack { seq: 1, .. } = wb.recv_data() else { panic!() };
+    let ServerMsg::Ops { .. } = wa.recv_data() else { panic!() };
+    // Down to view: told at once; the owner isn't.
+    s.share(&a, &id, "bob", "view");
+    assert_eq!(wb.recv_access(), ServerMsg::Role { role: "view".into() });
+    assert!(wa.quiet(300));
+    // Back to edit: changes are accepted again.
+    s.share(&a, &id, "bob", "edit");
+    assert_eq!(wb.recv_access(), ServerMsg::Role { role: "edit".into() });
+    wb.send(&ClientMsg::Ops { base: 1, id: 2, ops: vec![text(0, 1, "again")] });
+    let ServerMsg::Ack { seq: 2, .. } = wb.recv_data() else { panic!() };
+    // View again; a change sent anyway closes the connection and isn't committed.
+    s.share(&a, &id, "bob", "view");
+    assert_eq!(wb.recv_access(), ServerMsg::Role { role: "view".into() });
+    wb.send(&ClientMsg::Ops { base: 2, id: 3, ops: vec![text(0, 2, "nope")] });
+    assert_eq!(wb.close_code(), Some(cosync::close::READ_ONLY));
+    let ServerMsg::Ops { seq: 2, .. } = wa.recv_data() else { panic!() };
+    assert!(wa.quiet(300), "the refused change never reaches others");
+}
+
+#[test]
+fn removed_access_ends_open_sessions() {
+    let s = start();
+    let (a, b, c) = (s.login("alice"), s.login("bob"), s.login("carol"));
+    let id = s.new_file(&a, "Gone.xlsx");
+    s.share(&a, &id, "bob", "edit");
+    s.share(&a, &id, "carol", "view");
+    let (mut wa, _) = s.join(&a, &id, "a");
+    let (mut wb, _) = s.join(&b, &id, "b");
+    let (mut wc, _) = s.join(&c, &id, "c");
+    assert_eq!(s.send("DELETE", &format!("/api/items/{id}/permissions/bob"), Some(&a), &[], None).status, 204);
+    let ServerMsg::Revoked { reason } = wb.recv_access() else { panic!() };
+    assert_eq!(reason, "Your access to this workbook was removed.");
+    assert_eq!(wb.close_code(), Some(cosync::close::REVOKED));
+    // The others stay; Bob can't come back.
+    while !matches!(wa.recv(), ServerMsg::Leave { .. }) {}
+    assert!(wc.quiet(200));
+    assert!(s.ws(Some(&b), "since=0&v=1&cid=b", &id).is_err());
+    // Signing out (token revoked) ends that device's sessions.
+    assert_eq!(s.send("POST", "/api/logout", Some(&c), &[], None).status, 204);
+    let ServerMsg::Revoked { reason } = wc.recv_access() else { panic!() };
+    assert_eq!(reason, "You were signed out.");
+    assert_eq!(wc.close_code(), Some(cosync::close::REVOKED));
+    // Disabling an account ends its sessions.
+    let c2 = s.login("carol");
+    let (mut wc, _) = s.join(&c2, &id, "c2");
+    assert_eq!(s.send("POST", "/api/users/carol/disable", Some(&a), &[], None).status, 204);
+    let ServerMsg::Revoked { reason } = wc.recv_access() else { panic!() };
+    assert_eq!(reason, "Your account was disabled.");
+    // Moving the workbook to the trash ends every session on it, the owner's too.
+    let b2 = s.login("bob");
+    s.share(&a, &id, "bob", "edit");
+    let (mut wb, _) = s.join(&b2, &id, "b2");
+    assert_eq!(s.send("DELETE", &format!("/api/items/{id}"), Some(&a), &[], None).status, 204);
+    let ServerMsg::Revoked { reason } = wb.recv_access() else { panic!() };
+    assert_eq!(reason, "This workbook was moved to the trash.");
+    let ServerMsg::Revoked { .. } = wa.recv_access() else { panic!() };
+}
+
+#[test]
+fn leaving_an_organisation_ends_its_sessions() {
+    let s = start();
+    let (a, b, c) = (s.login("alice"), s.login("bob"), s.login("carol"));
+    let r = s.json("POST", "/api/orgs", Some(&a), json!({ "name": "Team" })).json();
+    let (org, root) = (r["id"].as_str().unwrap().to_string(), r["root"].as_str().unwrap().to_string());
+    for (u, role) in [("bob", "admin"), ("carol", "member")] {
+        assert_eq!(s.json("POST", &format!("/api/orgs/{org}/members"), Some(&a), json!({ "username": u, "role": role })).status, 201);
+    }
+    let r = s.send("POST", &format!("/api/files?parent={root}&name=Org.xlsx&conflict=fail"), Some(&b), &[], Some(b"org file".to_vec()));
+    assert_eq!(r.status, 201);
+    let id = r.json()["id"].as_str().unwrap().to_string();
+    let (mut wb, _) = s.join(&b, &id, "b");
+    let (mut wc, _) = s.join(&c, &id, "c");
+    // The members' default role drops to view.
+    assert_eq!(s.json("PATCH", &format!("/api/orgs/{org}"), Some(&b), json!({ "member_role": "view" })).status, 200);
+    assert_eq!(wc.recv_access(), ServerMsg::Role { role: "view".into() });
+    // Promoted to admin: editor again.
+    assert_eq!(s.json("PATCH", &format!("/api/orgs/{org}/members/carol"), Some(&b), json!({ "role": "admin" })).status, 200);
+    assert_eq!(wc.recv_access(), ServerMsg::Role { role: "edit".into() });
+    // Removed from the org: the session ends.
+    assert_eq!(s.send("DELETE", &format!("/api/orgs/{org}/members/carol"), Some(&b), &[], None).status, 204);
+    let ServerMsg::Revoked { reason } = wc.recv_access() else { panic!() };
+    assert_eq!(reason, "Your access to this workbook was removed.");
+    assert_eq!(wc.close_code(), Some(cosync::close::REVOKED));
+    // Bob (admin) is unaffected and still edits.
+    wb.send(&ClientMsg::Ops { base: 0, id: 1, ops: vec![text(0, 0, "still here")] });
+    loop {
+        match wb.recv_data() {
+            ServerMsg::Ack { seq: 1, .. } => break,
+            ServerMsg::Role { .. } | ServerMsg::Revoked { .. } => panic!("bob's access didn't change"),
+            _ => {}
+        }
+    }
 }

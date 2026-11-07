@@ -34,6 +34,13 @@ pub struct Config {
     pub versions_to_keep: u32,
     /// Lifetime of the access tokens handed out for share links.
     pub link_access_hours: u64,
+    /// Share links ("anyone with the link"). When false, links can't be created or opened and
+    /// open link sessions end (e.g. for a public trial).
+    pub allow_links: bool,
+    /// The first sign-in delay after 3 failures for a username (doubling up to 8x). Not
+    /// configurable in server.toml; tests shorten it.
+    #[serde(skip)]
+    pub login_delay_ms: u64,
 }
 
 impl Default for Config {
@@ -52,6 +59,8 @@ impl Default for Config {
             max_upload_mb: 100,
             versions_to_keep: 25,
             link_access_hours: 12,
+            allow_links: true,
+            login_delay_ms: 1000,
         }
     }
 }
@@ -210,6 +219,9 @@ versions_to_keep = 25
 
 # How long a share link stays usable after it was opened, in hours.
 link_access_hours = 12
+
+# Share links ("anyone with the link can view/edit"). Set to false to switch them off.
+allow_links = true
 "#
     )
 }

@@ -183,7 +183,7 @@ fn run(config_path: &Path, mut args: Vec<String>) -> Result<(), String> {
                     println!("Created the organisation {} (folder {}).", o.name, o.root_id);
                 }
                 "list" => {
-                    println!("{:<32} {:<8} {:<8} {}", "NAME", "MEMBERS", "DEFAULT", "CREATED");
+                    println!("{:<32} {:<8} {:<8} CREATED", "NAME", "MEMBERS", "DEFAULT");
                     for o in s.orgs().map_err(|e| e.to_string())? {
                         let n = s.members(&o.id).map_err(|e| e.to_string())?.len();
                         println!("{:<32} {:<8} {:<8} {}", o.name, n, o.member_role.as_str(), iso(o.created));

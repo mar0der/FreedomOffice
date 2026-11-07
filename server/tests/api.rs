@@ -47,7 +47,7 @@ fn temp_dir() -> PathBuf {
 
 fn start_with(f: impl FnOnce(&mut Config)) -> Srv {
     let dir = temp_dir();
-    let mut cfg = Config { data_dir: dir.join("data"), ..Config::default() };
+    let mut cfg = Config { data_dir: dir.join("data"), login_delay_ms: 10, ..Config::default() };
     f(&mut cfg);
     {
         let s = Store::open(&cfg.db_path(), &cfg.files_dir(), cfg.versions_to_keep).unwrap();
@@ -571,4 +571,272 @@ fn backup_copies_database_and_files() {
     drop(copy);
     // A second run copies only new versions.
     assert_eq!(s.store().backup(&dest).unwrap().0, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Organisations, accounts, invites (SPEC.md §2, §3, §5)
+// ---------------------------------------------------------------------------
+
+impl Srv {
+    fn login_with(&self, user: &str, pw: &str) -> Resp {
+        self.json("POST", "/api/login", None, json!({ "username": user, "password": pw, "device": "test" }))
+    }
+
+    /// Alice (server administrator) creates an organisation; returns its id and root folder.
+    fn org(&self, a: &str, name: &str) -> (String, String) {
+        let r = self.json("POST", "/api/orgs", Some(a), json!({ "name": name }));
+        assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+        (r.json()["id"].as_str().unwrap().to_string(), r.json()["root"].as_str().unwrap().to_string())
+    }
+
+    fn add_member(&self, token: &str, org: &str, user: &str, role: &str) -> u16 {
+        self.json("POST", &format!("/api/orgs/{org}/members"), Some(token), json!({ "username": user, "role": role })).status
+    }
+}
+
+#[test]
+fn organisations_members_and_roles() {
+    let s = start();
+    let (a, b, c) = (s.login("alice"), s.login("bob"), s.login("carol"));
+    assert_eq!(s.json("POST", "/api/orgs", Some(&b), json!({ "name": "Nope" })).status, 403, "only the server administrator");
+    let (org, root) = s.org(&a, "Team");
+    assert_eq!(s.json("POST", "/api/orgs", Some(&a), json!({ "name": "team" })).status, 409);
+    // Not members yet: invisible.
+    assert_eq!(s.get(&format!("/api/orgs/{org}"), &b).status, 404);
+    assert_eq!(s.get(&format!("/api/items/{root}"), &b).status, 404);
+    assert_eq!(s.add_member(&b, &org, "carol", "member"), 404);
+    assert_eq!(s.add_member(&a, &org, "bob", "admin"), 201);
+    assert_eq!(s.add_member(&b, &org, "carol", "member"), 201, "org admins add people");
+    assert_eq!(s.add_member(&b, &org, "carol", "owner"), 403, "only owners make owners");
+    assert_eq!(s.add_member(&c, &org, "alice", "member"), 403, "members don't manage");
+    // The org folder shows up for members.
+    let me = s.get("/api/me", &c).json();
+    assert_eq!((me["orgs"][0]["name"].as_str(), me["orgs"][0]["root"].as_str(), me["orgs"][0]["role"].as_str()), (Some("Team"), Some(root.as_str()), Some("member")));
+    assert_eq!(s.get("/api/orgs", &c).json()["orgs"].as_array().unwrap().len(), 1);
+    // Members edit by default; files belong to the org.
+    let f = s.upload(&c, &root, "Plan.xlsx", b"p1");
+    assert_eq!(f.status, 201);
+    assert_eq!(f.json()["org"]["name"], "Team");
+    assert_eq!(f.json()["owner"]["display_name"], "Team");
+    let plan = id_of(&f);
+    assert_eq!(s.get(&format!("/api/items/{plan}"), &b).json()["role"], "owner", "org admins own the org's files");
+    assert_eq!(s.get(&format!("/api/items/{plan}"), &a).status, 404, "the server administrator sees no documents");
+    // A view-only default.
+    assert_eq!(s.json("PATCH", &format!("/api/orgs/{org}"), Some(&c), json!({ "member_role": "view" })).status, 403);
+    assert_eq!(s.json("PATCH", &format!("/api/orgs/{org}"), Some(&b), json!({ "member_role": "view" })).status, 200);
+    assert_eq!(s.get(&format!("/api/items/{plan}"), &c).json()["role"], "view");
+    assert_eq!(s.put(&c, &plan, None, b"p2").status, 403);
+    // Member list (emails only for managers), role change, rename (server admin only).
+    let m = s.get(&format!("/api/orgs/{org}/members"), &c).json();
+    assert_eq!(m["members"].as_array().unwrap().len(), 2);
+    assert!(m["members"][0].get("email").is_none());
+    assert_eq!(s.json("PATCH", &format!("/api/orgs/{org}/members/carol"), Some(&b), json!({ "role": "admin" })).status, 200);
+    assert_eq!(s.get(&format!("/api/items/{plan}"), &c).json()["role"], "owner");
+    assert_eq!(s.json("PATCH", &format!("/api/orgs/{org}"), Some(&b), json!({ "name": "Crew" })).status, 403);
+    assert_eq!(s.json("PATCH", &format!("/api/orgs/{org}"), Some(&a), json!({ "name": "Crew" })).json()["name"], "Crew");
+    assert_eq!(s.get(&format!("/api/items/{root}"), &c).json()["name"], "Crew");
+    // Leaving / removing ends access.
+    assert_eq!(s.send("DELETE", &format!("/api/orgs/Crew/members/carol"), Some(&c), &[], None).status, 204, "anyone may leave");
+    assert_eq!(s.get(&format!("/api/items/{plan}"), &c).status, 404);
+    assert_eq!(s.get(&format!("/api/orgs/{org}"), &c).status, 404);
+    // Storage use.
+    let st = s.get(&format!("/api/orgs/{org}/storage"), &b).json();
+    assert_eq!((st["files"].as_i64(), st["bytes"].as_i64()), (Some(1), Some(2)));
+    assert_eq!(s.get("/api/admin/storage", &b).status, 403);
+    let all = s.get("/api/admin/storage", &a).json();
+    assert_eq!(all["orgs"][0]["bytes"].as_i64(), Some(2));
+    assert!(all["users"].as_array().unwrap().iter().any(|u| u["username"] == "carol"));
+    // Delete: only an empty org.
+    assert_eq!(s.send("DELETE", &format!("/api/orgs/{org}"), Some(&b), &[], None).status, 403);
+    assert_eq!(s.send("DELETE", &format!("/api/orgs/{org}"), Some(&a), &[], None).status, 409);
+    assert_eq!(s.send("DELETE", &format!("/api/items/{plan}"), Some(&b), &[], None).status, 204);
+    assert_eq!(s.get("/api/trash", &b).json()["items"][0]["id"].as_str(), Some(plan.as_str()), "org admins see the org's trash");
+    assert_eq!(s.send("DELETE", &format!("/api/orgs/{org}"), Some(&a), &[], None).status, 204);
+    assert!(s.get("/api/me", &b).json()["orgs"].as_array().unwrap().is_empty());
+    // Organisation accounts never show up as people.
+    let names: Vec<String> = s.get("/api/users?query=", &a).json()["users"].as_array().unwrap().iter().map(|u| u["username"].as_str().unwrap().to_string()).collect();
+    assert_eq!(names, ["bob", "carol"]);
+}
+
+#[test]
+fn sharing_with_a_whole_organisation() {
+    let s = start();
+    let (a, b, c) = (s.login("alice"), s.login("bob"), s.login("carol"));
+    let (org, _) = s.org(&a, "Family");
+    assert_eq!(s.add_member(&a, &org, "carol", "member"), 201);
+    let root = s.root(&b);
+    let id = id_of(&s.upload(&b, &root, "Budget.xlsx", b"b"));
+    // Bob isn't in the org: he can't share with it (nor find out it exists).
+    let r = s.json("POST", &format!("/api/items/{id}/permissions"), Some(&b), json!({ "org": "Family", "role": "view" }));
+    assert_eq!(r.status, 404);
+    assert_eq!(s.add_member(&a, &org, "bob", "member"), 201);
+    let r = s.json("POST", &format!("/api/items/{id}/permissions"), Some(&b), json!({ "org": "Family", "role": "view" }));
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["orgs"][0]["org"]["name"], "Family");
+    assert_eq!(s.get(&format!("/api/items/{id}"), &c).json()["role"], "view");
+    assert_eq!(s.get("/api/shared-with-me", &c).json()["items"][0]["id"].as_str(), Some(id.as_str()));
+    let perms = s.get(&format!("/api/items/{id}/permissions"), &b).json();
+    assert_eq!((perms["orgs"][0]["role"].as_str(), perms["permissions"].as_array().unwrap().len()), (Some("view"), 0));
+    // By id works too, and raises the role.
+    s.json("POST", &format!("/api/items/{id}/permissions"), Some(&b), json!({ "org": org, "role": "edit" }));
+    assert_eq!(s.get(&format!("/api/items/{id}"), &c).json()["role"], "edit");
+    // Leaving the org ends the access that came with it.
+    assert_eq!(s.send("DELETE", &format!("/api/orgs/{org}/members/carol"), Some(&a), &[], None).status, 204);
+    assert_eq!(s.get(&format!("/api/items/{id}"), &c).status, 404);
+    assert_eq!(s.add_member(&a, &org, "carol", "member"), 201);
+    assert_eq!(s.send("DELETE", &format!("/api/items/{id}/permissions/org/Family"), Some(&b), &[], None).status, 204);
+    assert_eq!(s.get(&format!("/api/items/{id}"), &c).status, 404);
+    assert_eq!(s.send("DELETE", &format!("/api/items/{id}/permissions/org/Family"), Some(&b), &[], None).status, 404);
+}
+
+#[test]
+fn accounts_with_temporary_passwords() {
+    let s = start();
+    let (a, b) = (s.login("alice"), s.login("bob"));
+    assert_eq!(s.json("POST", "/api/users", Some(&b), json!({ "username": "dave" })).status, 403, "people need an org they manage");
+    let r = s.json("POST", "/api/users", Some(&a), json!({ "username": "dave", "display_name": "Dave D", "email": "dave@example.test" }));
+    assert_eq!(r.status, 201);
+    let temp = r.json()["temporary_password"].as_str().unwrap().to_string();
+    assert!(temp.len() >= 16);
+    assert_eq!(r.json()["user"]["must_change_password"], true);
+    assert_eq!(s.json("POST", "/api/users", Some(&a), json!({ "username": "dave" })).status, 409);
+    // Signed in with it, only the password change (and me, logout) works.
+    let l = s.login_with("dave", &temp);
+    assert_eq!(l.status, 200);
+    assert_eq!(l.json()["user"]["must_change_password"], true);
+    let d = l.json()["token"].as_str().unwrap().to_string();
+    let r = s.get("/api/root", &d);
+    assert_eq!((r.status, r.json()["code"].as_str()), (403, Some("password_change_required")));
+    assert_eq!(s.get("/api/me", &d).status, 200);
+    let change = |old: &str, new: &str| s.json("POST", "/api/me/password", Some(&d), json!({ "old_password": old, "new_password": new }));
+    assert_eq!(change("wrong-password-x", "a-much-better-passphrase").status, 403);
+    assert_eq!(change(&temp, "password1234").status, 400, "common");
+    assert_eq!(change(&temp, "dave-is-my-name-ok").status, 400, "contains the username");
+    assert_eq!(change(&temp, "short").status, 400);
+    let r = change(&temp, "a-much-better-passphrase");
+    assert_eq!(r.status, 200);
+    assert_eq!(r.json()["user"]["must_change_password"], false);
+    assert_eq!(s.get("/api/root", &d).status, 200, "the same device keeps working");
+    assert_eq!(s.login_with("dave", &temp).status, 401);
+    // An org admin creates accounts into the org.
+    let (org, root) = s.org(&a, "Club");
+    assert_eq!(s.add_member(&a, &org, "bob", "admin"), 201);
+    let r = s.json("POST", "/api/users", Some(&b), json!({ "username": "erin", "org": "Club", "role": "member" }));
+    assert_eq!(r.status, 201);
+    let temp = r.json()["temporary_password"].as_str().unwrap().to_string();
+    assert_eq!(s.json("POST", "/api/users", Some(&b), json!({ "username": "fred", "org": "Club", "role": "owner" })).status, 403);
+    let e = s.login_with("erin", &temp).json()["token"].as_str().unwrap().to_string();
+    s.json("POST", "/api/me/password", Some(&e), json!({ "old_password": temp, "new_password": "my-own-passphrase-77" }));
+    assert_eq!(s.get(&format!("/api/items/{root}"), &e).json()["role"], "edit");
+    // Reset by the server administrator: a new temporary password, devices signed out.
+    assert_eq!(s.send("POST", "/api/users/erin/reset-password", Some(&b), &[], None).status, 403);
+    let r = s.send("POST", "/api/users/erin/reset-password", Some(&a), &[], None);
+    assert_eq!(r.status, 200);
+    assert_eq!(s.get("/api/me", &e).status, 401);
+    let temp2 = r.json()["temporary_password"].as_str().unwrap().to_string();
+    assert_eq!(s.login_with("erin", &temp2).json()["user"]["must_change_password"], true);
+    // Disable / enable.
+    assert_eq!(s.send("POST", "/api/users/alice/disable", Some(&a), &[], None).status, 400);
+    assert_eq!(s.send("POST", "/api/users/erin/disable", Some(&a), &[], None).status, 204);
+    assert_eq!(s.login_with("erin", &temp2).status, 401);
+    assert_eq!(s.send("POST", "/api/users/erin/enable", Some(&a), &[], None).status, 204);
+    assert_eq!(s.login_with("erin", &temp2).status, 200);
+}
+
+#[test]
+fn invites_create_an_account_once() {
+    let s = start();
+    let (a, b, c) = (s.login("alice"), s.login("bob"), s.login("carol"));
+    let (org, root) = s.org(&a, "Choir");
+    assert_eq!(s.add_member(&a, &org, "bob", "admin"), 201);
+    assert_eq!(s.add_member(&a, &org, "carol", "member"), 201);
+    assert_eq!(s.json("POST", &format!("/api/orgs/{org}/invites"), Some(&c), json!({ "email": "x@example.test" })).status, 403);
+    let r = s.json("POST", &format!("/api/orgs/{org}/invites"), Some(&b), json!({ "email": "gina@example.test" }));
+    assert_eq!(r.status, 201);
+    let url = r.json()["url"].as_str().unwrap().to_string();
+    let token = url.rsplit('/').next().unwrap().to_string();
+    assert!(url.contains("/i/"));
+    assert_eq!(s.get(&format!("/api/orgs/{org}/invites"), &b).json()["invites"].as_array().unwrap().len(), 1);
+    let info = s.send("GET", &format!("/api/invites/{token}"), None, &[], None).json();
+    assert_eq!((info["org"]["name"].as_str(), info["email"].as_str()), (Some("Choir"), Some("gina@example.test")));
+    // The browser page has the form.
+    let page = s.send("GET", &format!("/i/{token}"), None, &[], None);
+    assert_eq!(page.status, 200);
+    assert!(String::from_utf8_lossy(&page.body).contains("Choir"));
+    // A weak password doesn't use the invite up.
+    let accept = |user: &str, pw: &str| s.json("POST", &format!("/api/invites/{token}"), None, json!({ "username": user, "password": pw, "display_name": "Gina" }));
+    assert_eq!(accept("gina", "gina-password").status, 400);
+    let r = accept("gina", "sings-in-the-choir-7");
+    assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+    let g = r.json()["token"].as_str().unwrap().to_string();
+    assert_eq!(s.get(&format!("/api/items/{root}"), &g).json()["role"], "edit");
+    assert_eq!(s.get("/api/me", &g).json()["email"], "gina@example.test");
+    assert_eq!(accept("gina2", "sings-in-the-choir-7").status, 404, "single use");
+    assert_eq!(s.send("GET", &format!("/i/{token}"), None, &[], None).status, 404);
+    assert!(s.get(&format!("/api/orgs/{org}/invites"), &b).json()["invites"].as_array().unwrap().is_empty());
+    // The HTML form works too, and invites can be withdrawn.
+    let r = s.json("POST", &format!("/api/orgs/{org}/invites"), Some(&b), json!({}));
+    let t2 = r.json()["url"].as_str().unwrap().rsplit('/').next().unwrap().to_string();
+    let form = s.send("POST", &format!("/i/{t2}"), None, &[("Content-Type", "application/x-www-form-urlencoded")], Some(b"username=hank&display_name=Hank+H&password=sings-bass-loudly-9".to_vec()));
+    assert_eq!(form.status, 200);
+    assert_eq!(s.login_with("hank", "sings-bass-loudly-9").status, 200);
+    let id3 = s.json("POST", &format!("/api/orgs/{org}/invites"), Some(&b), json!({})).json()["id"].as_str().unwrap().to_string();
+    assert_eq!(s.send("DELETE", &format!("/api/orgs/{org}/invites/{id3}"), Some(&b), &[], None).status, 204);
+    assert_eq!(s.send("GET", "/api/invites/not-a-real-token", None, &[], None).status, 404);
+}
+
+#[test]
+fn share_links_can_be_switched_off() {
+    let on = start();
+    let a = on.login("alice");
+    let root = on.root(&a);
+    let id = id_of(&on.upload(&a, &root, "L.xlsx", b"l"));
+    let url = on.json("POST", &format!("/api/items/{id}/links"), Some(&a), json!({ "role": "view" })).json()["url"].as_str().unwrap().to_string();
+    let token = url.rsplit('/').next().unwrap().to_string();
+    let access = on.send("GET", &format!("/api/links/{token}"), None, &[], None).json()["access_token"].as_str().unwrap().to_string();
+    assert_eq!(on.get(&format!("/api/items/{id}"), &access).status, 200);
+    // The same data with allow_links = false.
+    let mut s = on;
+    drop(s.run.take());
+    s.cfg.allow_links = false;
+    let run = freedomoffice_server::spawn(s.cfg.clone()).unwrap();
+    s.url = run.url();
+    s.run = Some(run);
+    assert_eq!(s.json("POST", &format!("/api/items/{id}/links"), Some(&a), json!({ "role": "view" })).status, 403);
+    assert_eq!(s.send("GET", &format!("/api/links/{token}"), None, &[], None).status, 404);
+    assert_eq!(s.send("GET", &format!("/l/{token}"), None, &[], None).status, 404);
+    assert_eq!(s.get(&format!("/api/items/{id}"), &access).status, 401, "link access tokens stop working");
+}
+
+#[test]
+fn repeated_failures_slow_sign_in_down() {
+    let s = start_with(|c| c.login_delay_ms = 300);
+    let wrong = || s.login_with("bob", "wrong-password-x").status;
+    for _ in 0..3 {
+        let t = std::time::Instant::now();
+        assert_eq!(wrong(), 401);
+        assert!(t.elapsed() < Duration::from_millis(300), "no delay for the first failures");
+    }
+    let t = std::time::Instant::now();
+    assert_eq!(s.login_with("bob", PW).status, 200);
+    assert!(t.elapsed() >= Duration::from_millis(300), "the 4th attempt waits (even with the right password)");
+    // Success clears the count.
+    let t = std::time::Instant::now();
+    assert_eq!(wrong(), 401);
+    assert!(t.elapsed() < Duration::from_millis(300));
+    // Other usernames aren't slowed.
+    let t = std::time::Instant::now();
+    s.login("carol");
+    assert!(t.elapsed() < Duration::from_millis(300));
+}
+
+#[test]
+fn new_passwords_follow_the_policy() {
+    let s = start();
+    let st = s.store();
+    for bad in ["short-one", "password12345", "bobby-rocks-2024", "zzzzzzzzzzzzzzz"] {
+        assert!(st.create_user("bobby", "", "", bad, false).is_err(), "{bad}");
+    }
+    let bob = st.user_by_name("bob").unwrap().unwrap();
+    assert!(st.set_password(&bob.id, "qwertyuiop123").is_err());
 }
