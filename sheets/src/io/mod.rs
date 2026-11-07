@@ -58,6 +58,12 @@ pub fn load_xlsx_bytes(bytes: &[u8]) -> Result<Workbook, String> {
     xlsx_read::read(std::io::Cursor::new(bytes))
 }
 
+/// Reads delimited text (comma separated, or tab separated when `tab`) from memory into a
+/// one-sheet workbook named `sheet_name`. Does not recalculate; cells starting with `=` stay text.
+pub fn load_delimited_bytes(bytes: &[u8], sheet_name: &str, tab: bool) -> Workbook {
+    delimited::read_bytes(bytes, sheet_name, if tab { b'\t' } else { b',' }, tab)
+}
+
 /// A workbook as the bytes of an .xlsx file.
 pub fn xlsx_bytes(wb: &Workbook) -> Result<Vec<u8>, String> {
     xlsx_write::to_bytes(wb)

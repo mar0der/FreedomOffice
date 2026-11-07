@@ -934,7 +934,8 @@
       // A new tab with the server's own PDF answer (Content-Disposition: inline).
       window.open(contentUrl(it.id), '_blank', 'noopener');
     } else if (isSheet(it)) {
-      openInSheets(it);
+      // In the browser (web Sheets: read-only today); "Open in Sheets" is the native app.
+      location.assign(`/drive/sheet/${encodeURIComponent(it.id)}`);
     } else {
       download(it);
     }

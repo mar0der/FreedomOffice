@@ -11,12 +11,17 @@ const INDEX: &str = include_str!("../web/index.html");
 const APP_JS: &str = include_str!("../web/app.js");
 const STYLE: &str = include_str!("../web/style.css");
 const ICON: &str = include_str!("../web/icon.svg");
+const SHEET: &str = include_str!("../web/sheet.html");
+const SHEET_JS: &str = include_str!("../web/sheet.js");
+const SHEET_CSS: &str = include_str!("../web/sheet.css");
 
 /// The files under `/drive/assets/`, with their content types (index.html is served at `/drive`).
 const ASSETS: &[(&str, &str, &str)] = &[
     ("app.js", APP_JS, "text/javascript; charset=utf-8"),
     ("style.css", STYLE, "text/css; charset=utf-8"),
     ("icon.svg", ICON, "image/svg+xml"),
+    ("sheet.js", SHEET_JS, "text/javascript; charset=utf-8"),
+    ("sheet.css", SHEET_CSS, "text/css; charset=utf-8"),
 ];
 
 /// A short hash of every asset (FNV-1a, 64 bit): changes whenever any of them does.
@@ -40,11 +45,23 @@ fn index() -> &'static [u8] {
     I.get_or_init(|| INDEX.replace("{{v}}", version())).as_bytes()
 }
 
-/// The embedded file at `path` ("index.html", "app.js", "style.css", "icon.svg") and its
-/// content type, or `None`.
+/// `sheet.html` (web Sheets, served at `/drive/sheet/<id>`) with the asset version filled in.
+fn sheet_page() -> &'static [u8] {
+    static I: OnceLock<String> = OnceLock::new();
+    I.get_or_init(|| SHEET.replace("{{v}}", version())).as_bytes()
+}
+
+/// The pages: Drive and web Sheets. They are not served under `/drive/assets/`.
+pub const PAGES: &[&str] = &["index.html", "sheet.html"];
+
+/// The embedded file at `path` ("index.html", "sheet.html", "app.js", "style.css", "sheet.js",
+/// "sheet.css", "icon.svg") and its content type, or `None`.
 pub fn asset(path: &str) -> Option<(&'static [u8], &'static str)> {
     if path == "index.html" {
         return Some((index(), "text/html; charset=utf-8"));
+    }
+    if path == "sheet.html" {
+        return Some((sheet_page(), "text/html; charset=utf-8"));
     }
     ASSETS.iter().find(|(n, _, _)| *n == path).map(|(_, body, ct)| (body.as_bytes(), *ct))
 }
@@ -55,7 +72,7 @@ mod tests {
 
     #[test]
     fn assets_are_there() {
-        for p in ["index.html", "app.js", "style.css", "icon.svg"] {
+        for p in ["index.html", "sheet.html", "app.js", "style.css", "sheet.js", "sheet.css", "icon.svg"] {
             let (body, ct) = asset(p).unwrap_or_else(|| panic!("{p}"));
             assert!(!body.is_empty() && !ct.is_empty(), "{p}");
         }
@@ -86,7 +103,7 @@ mod tests {
     /// them out of the source so nothing silently breaks or tempts a looser policy.
     #[test]
     fn html_has_no_inline_script_or_style() {
-        for t in tags(INDEX) {
+        for t in tags(INDEX).into_iter().chain(tags(SHEET)) {
             let lower = t.to_ascii_lowercase();
             if lower.starts_with("script") {
                 assert!(lower.contains(" src="), "inline <script> in index.html: <{t}>");
@@ -101,7 +118,7 @@ mod tests {
             for attr in ["src=\"", "href=\""] {
                 if let Some(i) = lower.find(attr) {
                     let v = &lower[i + attr.len()..];
-                    assert!(v.starts_with("/drive/") || v.starts_with("/admin") || v.starts_with('#'), "external reference in index.html: <{t}>");
+                    assert!(v.starts_with("/drive") || v.starts_with("/admin") || v.starts_with('#'), "external reference in index.html: <{t}>");
                 }
             }
         }
@@ -128,6 +145,16 @@ mod tests {
             "srcdoc",
         ] {
             assert!(!APP_JS.contains(bad), "app.js contains `{bad}`");
+        }
+        // sheet.js draws on a canvas and sizes two elements through CSSOM (allowed by the CSP,
+        // unlike style attributes), so `.style.` is fine there; the rest applies.
+        for bad in ["innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(", "new Function", "setAttribute(\"on", "setAttribute('on", "setAttribute('style", "setAttribute(\"style", "style=", "javascript:", "localStorage", "sessionStorage", "createContextualFragment", "DOMParser", "srcdoc", "XMLHttpRequest", "importScripts"] {
+            assert!(!SHEET_JS.contains(bad), "sheet.js contains `{bad}`");
+        }
+        for (n, line) in SHEET_JS.lines().enumerate() {
+            for bad in ["http://", "https://", "//cdn", "fonts.googleapis"] {
+                assert!(!line.contains(bad), "sheet.js line {} refers to another origin: {line}", n + 1);
+            }
         }
         // No other origins: requests, links and resources are relative to this server (the
         // one marked exception is the FreedomSheets download page, a plain link).

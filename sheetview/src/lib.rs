@@ -1,0 +1,483 @@
+//! Web Sheets, the data side: turns a workbook (a saved file version, plus the live log of a
+//! co-editing session that has not been snapshotted yet) into the compact JSON the browser
+//! viewer draws. The workbook is read and calculated by the app's own engine (`freedom_sheets`),
+//! so what the browser shows is what FreedomSheets shows: displayed values with number formats,
+//! styles, merges, widths and heights, frozen panes, hidden rows and columns, sheet tabs.
+//!
+//! Nothing here trusts the file: [`Book::open`] refuses archives that would expand beyond
+//! [`MAX_UNPACKED_BYTES`] or hold absurdly many parts before the reader sees them, catches
+//! panics, and refuses workbooks with more than [`MAX_CELLS`] cells. Time limits and the
+//! number of conversions running at once are the caller's job (the server runs [`Book::open`]
+//! on a thread of its own with a timeout).
+//!
+//! Large sheets are sent as windows (`Book::window`), never whole.
+
+use std::collections::HashMap;
+use std::io::Cursor;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+
+use cosync::Op;
+use freedom_sheets::live;
+use freedom_sheets::model::{BorderLine, HAlign, Range, Sheet, Style, VAlign, Value, Workbook};
+use freedom_sheets::numfmt;
+use serde_json::{json, Value as Json};
+
+/// An archive that unpacks to more than this is refused.
+pub const MAX_UNPACKED_BYTES: u64 = 120 * 1024 * 1024;
+/// Parts in an archive.
+pub const MAX_PARTS: usize = 4000;
+/// Cells in a workbook (all sheets).
+pub const MAX_CELLS: usize = 3_000_000;
+/// Cells in one window.
+pub const MAX_WINDOW_CELLS: u64 = 40_000;
+/// Rows in one window.
+pub const MAX_WINDOW_ROWS: u32 = 1000;
+/// Displayed text longer than this is cut in a window (the whole text is in [`Book::cell`]).
+pub const MAX_DISPLAY_CHARS: usize = 1000;
+/// Entries of the lists in the sheet metadata (row heights, hidden rows...).
+const MAX_LIST: usize = 100_000;
+
+/// Why a file can't be shown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoadError {
+    /// A format the viewer doesn't read (.xls, .ods...). The message says what to do.
+    Unsupported(String),
+    /// The file is damaged or isn't what its name says.
+    Invalid(String),
+    /// Too big or too complex to open in the browser.
+    TooLarge(String),
+}
+
+impl LoadError {
+    pub fn message(&self) -> &str {
+        match self {
+            LoadError::Unsupported(m) | LoadError::Invalid(m) | LoadError::TooLarge(m) => m,
+        }
+    }
+
+    pub fn code(&self) -> &'static str {
+        match self {
+            LoadError::Unsupported(_) => "unsupported",
+            LoadError::Invalid(_) => "unreadable",
+            LoadError::TooLarge(_) => "too_large",
+        }
+    }
+}
+
+/// The live part of a document's current state: what a joining client would start from.
+#[derive(Default, Clone)]
+pub struct LiveInput {
+    /// The lossless live state stored with the saved version (`GET .../live/state`), if any.
+    pub state: Option<Vec<u8>>,
+    /// The sheets' live ids and order keys of the saved version ("id:pos,...").
+    pub sheets: String,
+    /// Committed batches after the saved version, in order.
+    pub batches: Vec<Vec<Op>>,
+}
+
+/// A workbook ready to be shown.
+pub struct Book {
+    wb: Workbook,
+    cells: usize,
+}
+
+fn extension(name: &str) -> String {
+    name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default()
+}
+
+/// A sheet name made from a file name (for csv files): no characters Excel forbids, at most 31.
+fn sheet_name_of(file: &str) -> String {
+    let stem = file.rsplit_once('.').map_or(file, |(s, _)| s);
+    let clean: String = stem.chars().filter(|c| !matches!(c, '[' | ']' | ':' | '*' | '?' | '/' | '\\') && !c.is_control()).take(31).collect();
+    let clean = clean.trim_matches('\'').trim().to_string();
+    if clean.is_empty() { "Sheet1".into() } else { clean }
+}
+
+/// Looks at an archive's directory before the reader unpacks anything.
+fn check_archive(bytes: &[u8]) -> Result<(), LoadError> {
+    let mut z = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|_| LoadError::Invalid("This file isn't a valid .xlsx workbook (it isn't a zip archive).".into()))?;
+    if z.len() > MAX_PARTS {
+        return Err(LoadError::TooLarge("This workbook has too many parts to open in the browser.".into()));
+    }
+    let mut total: u64 = 0;
+    for i in 0..z.len() {
+        let f = z.by_index_raw(i).map_err(|_| LoadError::Invalid("This workbook's archive is damaged.".into()))?;
+        total = total.saturating_add(f.size());
+        if total > MAX_UNPACKED_BYTES {
+            return Err(LoadError::TooLarge("This workbook is too large to open in the browser. Download it instead.".into()));
+        }
+    }
+    Ok(())
+}
+
+impl Book {
+    /// Reads `bytes` (a file called `name`) and brings it to its current state with `live`.
+    pub fn open(name: &str, bytes: &[u8], live: &LiveInput) -> Result<Book, LoadError> {
+        let ext = extension(name);
+        match ext.as_str() {
+            "xlsx" | "xlsm" | "xltx" | "xltm" | "csv" | "tsv" => {}
+            "xls" | "xlsb" | "ods" | "xla" | "xlam" => {
+                return Err(LoadError::Unsupported(format!("The browser can't open .{ext} files yet. Download it, or open it in FreedomSheets.")));
+            }
+            "fsheet" => return Err(LoadError::Unsupported("The browser can't open .fsheet files. Download it, or open it in FreedomSheets.".into())),
+            _ => return Err(LoadError::Unsupported("This isn't a spreadsheet the browser can open. Download it instead.".into())),
+        }
+        let r = catch_unwind(AssertUnwindSafe(|| Book::build(name, &ext, bytes, live)));
+        match r {
+            Ok(r) => r,
+            Err(_) => Err(LoadError::Invalid("This file couldn't be read (it is damaged or uses something the reader doesn't handle).".into())),
+        }
+    }
+
+    fn build(name: &str, ext: &str, bytes: &[u8], live: &LiveInput) -> Result<Book, LoadError> {
+        let mut wb = match ext {
+            "csv" | "tsv" => freedom_sheets::io::load_delimited_bytes(bytes, &sheet_name_of(name), ext == "tsv"),
+            _ => {
+                check_archive(bytes)?;
+                freedom_sheets::io::load_xlsx_bytes(bytes).map_err(|e| LoadError::Invalid(format!("This workbook couldn't be read: {}", short(&e))))?
+            }
+        };
+        if wb.sheets.is_empty() {
+            wb.sheets.push(Sheet::new("Sheet1"));
+        }
+        // As a joining client does it: the sheets' live ids, the lossless live state, the order.
+        live::assign_ids(&mut wb, &live.sheets);
+        if live.state.is_some() {
+            wb = live::join_workbook(wb, live.state.as_deref());
+        }
+        live::sort_sheets(&mut wb);
+        let cells: usize = wb.sheets.iter().map(|s| s.rows.values().map(|r| r.len()).sum::<usize>()).sum();
+        if cells > MAX_CELLS {
+            return Err(LoadError::TooLarge(format!("This workbook has {cells} cells; the browser opens up to {MAX_CELLS}. Download it instead.")));
+        }
+        let mut st = live::ApplyState::default();
+        for b in &live.batches {
+            live::apply_ops(&mut wb, b, true, &mut st);
+        }
+        wb.recalc();
+        Ok(Book { wb, cells })
+    }
+
+    /// Number of non-empty cells.
+    pub fn cell_count(&self) -> usize {
+        self.cells
+    }
+
+    pub fn workbook(&self) -> &Workbook {
+        &self.wb
+    }
+
+    /// The sheets and what the viewer needs to lay each one out (no cells).
+    pub fn meta(&self) -> Json {
+        let sheets: Vec<Json> = self.wb.sheets.iter().enumerate().map(|(i, s)| sheet_meta(i, s)).collect();
+        json!({ "sheets": sheets, "active": self.wb.active.min(self.wb.sheets.len().saturating_sub(1)) })
+    }
+
+    /// [`Book::window`] for a rectangle given as numbers (checked).
+    pub fn window_at(&self, sheet: usize, r1: u32, c1: u32, r2: u32, c2: u32) -> Result<Json, String> {
+        use freedom_sheets::model::{MAX_COLS, MAX_ROWS};
+        if r1 > r2 || c1 > c2 || r2 >= MAX_ROWS || c2 >= MAX_COLS {
+            return Err("Invalid window.".into());
+        }
+        self.window(sheet, Range::new(r1, c1, r2, c2))
+    }
+
+    /// The cells of a window of one sheet with their displayed text and styles.
+    pub fn window(&self, sheet: usize, rg: Range) -> Result<Json, String> {
+        let sh = self.wb.sheets.get(sheet).ok_or("No such sheet.")?;
+        if rg.rows() > MAX_WINDOW_ROWS || u64::from(rg.rows()) * u64::from(rg.cols()) > MAX_WINDOW_CELLS {
+            return Err(format!("A window is at most {MAX_WINDOW_ROWS} rows and {MAX_WINDOW_CELLS} cells."));
+        }
+        let mut styles: Vec<Json> = Vec::new();
+        let mut style_ix: HashMap<u32, usize> = HashMap::new();
+        let mut cells: Vec<Json> = Vec::new();
+        let mut push = |r: u32, c: u32, cells: &mut Vec<Json>, styles: &mut Vec<Json>| {
+            if let Some(cell) = self.shown(sh, r, c, styles, &mut style_ix) {
+                cells.push(cell);
+            }
+        };
+        // Cells with something to show: content, spilled values, or a style.
+        let mut seen: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
+        for (r, c, _) in sh.iter_range(rg) {
+            seen.insert((r, c));
+            push(r, c, &mut cells, &mut styles);
+        }
+        if !sh.spill.cells.is_empty() {
+            for &(r, c) in sh.spill.cells.keys() {
+                if rg.contains(r, c) && seen.insert((r, c)) {
+                    push(r, c, &mut cells, &mut styles);
+                }
+            }
+        }
+        // Merged areas touching the window: their anchor cell comes along even when it lies outside.
+        let mut merges: Vec<Json> = Vec::new();
+        for m in sh.merges.iter().filter(|m| m.intersects(&rg)) {
+            merges.push(json!([m.r1, m.c1, m.r2, m.c2]));
+            if !rg.contains(m.r1, m.c1) && seen.insert((m.r1, m.c1)) {
+                push(m.r1, m.c1, &mut cells, &mut styles);
+            }
+            if merges.len() >= 2000 {
+                break;
+            }
+        }
+        Ok(json!({ "sheet": sheet, "r1": rg.r1, "r2": rg.r2, "c1": rg.c1, "c2": rg.c2, "styles": styles, "cells": cells, "merges": merges }))
+    }
+
+    /// One cell as the formula bar shows it: the entered text (formula, number as typed), the
+    /// displayed text, and where it sits in a merged area. Formulas hidden by sheet protection
+    /// are not given out.
+    pub fn cell(&self, sheet: usize, r: u32, c: u32) -> Result<Json, String> {
+        let sh = self.wb.sheets.get(sheet).ok_or("No such sheet.")?;
+        if r >= freedom_sheets::model::MAX_ROWS || c >= freedom_sheets::model::MAX_COLS {
+            return Err("No such cell.".into());
+        }
+        let (ar, ac) = sh.merge_at(r, c).map_or((r, c), |m| (m.r1, m.c1));
+        let cell = sh.get(ar, ac);
+        let st = self.wb.style(cell.map_or(0, |x| x.style));
+        let value = sh.display_value(ar, ac);
+        let shown = numfmt::format_value(value, &st.num_fmt).text;
+        let hidden = cell.is_some_and(|x| x.formula.is_some()) && sh.protection.is_some() && st.hide_formula;
+        let mut input = String::new();
+        let mut formula = false;
+        if !hidden {
+            if let Some(x) = cell {
+                formula = x.formula.is_some();
+                input = cut(&self.edit_text(x, st), 32_768);
+            }
+        }
+        let mut out = json!({ "r": ar, "c": ac, "input": input, "text": cut(&shown, 32_768), "formula": formula, "hidden_formula": hidden });
+        if let Some(note) = sh.notes.get(&(ar, ac)) {
+            out["note"] = json!(cut(note, 4000));
+        }
+        if let Some(link) = sh.links.get(&(ar, ac)) {
+            out["link"] = json!(cut(link, 2000));
+        }
+        Ok(out)
+    }
+
+    /// What the formula bar shows (dates as dates).
+    fn edit_text(&self, cell: &freedom_sheets::model::Cell, st: &Style) -> String {
+        if cell.formula.is_none() {
+            if let Value::Number(n) = cell.value {
+                if numfmt::is_date_format(&st.num_fmt) && n >= 0.0 {
+                    return numfmt::edit_date(n);
+                }
+            }
+        }
+        cell.input_text()
+    }
+
+    /// The cell at (r, c) as `[r, c, text, kind, style]` (kind: n number, s text, b bool, e
+    /// error, f a number shown as a date or other format... only the first four are sent), or
+    /// None when there is nothing to show.
+    fn shown(&self, sh: &Sheet, r: u32, c: u32, styles: &mut Vec<Json>, ix: &mut HashMap<u32, usize>) -> Option<Json> {
+        let cell = sh.get(r, c);
+        let value = sh.display_value(r, c);
+        let style_id = cell.map_or(0, |x| x.style);
+        if value.is_empty() && style_id == 0 {
+            return None;
+        }
+        let st = self.wb.style(style_id);
+        let f = numfmt::format_value(value, &st.num_fmt);
+        let kind = match value {
+            Value::Number(_) => "n",
+            Value::Text(_) => "s",
+            Value::Bool(_) => "b",
+            Value::Error(_) => "e",
+            Value::Empty => "",
+        };
+        // Style index in this window's table; a number format's colour is part of the style.
+        let key = style_id;
+        let mut si = 0usize;
+        if style_id != 0 || f.color.is_some() {
+            let slot = if f.color.is_none() { ix.get(&key).copied() } else { None };
+            si = match slot {
+                Some(i) => i,
+                None => {
+                    let mut j = style_json(st);
+                    if let Some(col) = f.color {
+                        j["c"] = json!(hex(col));
+                    }
+                    styles.push(j);
+                    let i = styles.len();
+                    if f.color.is_none() {
+                        ix.insert(key, i);
+                    }
+                    i
+                }
+            };
+        }
+        // Rich text is shown plain; links get a flag (the viewer underlines them).
+        let mut text = f.text;
+        if let Some((cut_at, _)) = text.char_indices().nth(MAX_DISPLAY_CHARS) {
+            text.truncate(cut_at);
+        }
+        let mut out = json!([r, c, text, kind, si]);
+        if sh.links.contains_key(&(r, c)) {
+            out.as_array_mut().expect("array").push(json!(1));
+        }
+        Some(out)
+    }
+
+    /// The whole sheet as CSV text (displayed values), for the download button.
+    pub fn csv(&self, sheet: usize) -> Result<String, String> {
+        let sh = self.wb.sheets.get(sheet).ok_or("No such sheet.")?;
+        let mut out = String::new();
+        let Some((mr, mc)) = sh.extent_with_spills() else { return Ok(out) };
+        for r in 0..=mr.min(1_048_575) {
+            let line: Vec<String> = (0..=mc)
+                .map(|c| {
+                    let v = sh.display_value(r, c);
+                    let st = self.wb.style(sh.get(r, c).map_or(0, |x| x.style));
+                    csv_field(&numfmt::format_value(v, &st.num_fmt).text)
+                })
+                .collect();
+            out.push_str(&line.join(","));
+            out.push('\n');
+        }
+        Ok(out)
+    }
+}
+
+/// A CSV field; text that a spreadsheet would run as a formula gets a leading apostrophe.
+fn csv_field(s: &str) -> String {
+    let danger = matches!(s.chars().next(), Some('=' | '+' | '-' | '@' | '\t' | '\r'));
+    let s = if danger && s.parse::<f64>().is_err() { format!("'{s}") } else { s.to_string() };
+    if s.contains([',', '"', '\n', '\r']) { format!("\"{}\"", s.replace('"', "\"\"")) } else { s }
+}
+
+fn short(e: &str) -> String {
+    cut(e, 200)
+}
+
+fn cut(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((i, _)) => s[..i].to_string(),
+        None => s.to_string(),
+    }
+}
+
+fn hex(c: u32) -> String {
+    format!("#{:06x}", c & 0xff_ffff)
+}
+
+fn line_code(l: BorderLine) -> u8 {
+    match l {
+        BorderLine::None => 0,
+        BorderLine::Thin => 1,
+        BorderLine::Medium => 2,
+        BorderLine::Thick => 3,
+        BorderLine::Double => 4,
+        BorderLine::Dashed => 5,
+        BorderLine::Dotted => 6,
+    }
+}
+
+/// A style as the viewer reads it; only what differs from the default is present.
+/// `b` bold, `i` italic, `u` underline, `x` strike, `c` text colour, `f` fill, `h` l/c/r,
+/// `v` t/c, `w` wrap, `z` size in points, `n` indent, `d` borders [left,right,top,bottom]
+/// (0 none, 1 thin, 2 medium, 3 thick, 4 double, 5 dashed, 6 dotted).
+fn style_json(st: &Style) -> Json {
+    let mut j = serde_json::Map::new();
+    if st.bold {
+        j.insert("b".into(), json!(1));
+    }
+    if st.italic {
+        j.insert("i".into(), json!(1));
+    }
+    if st.underline {
+        j.insert("u".into(), json!(1));
+    }
+    if st.strike {
+        j.insert("x".into(), json!(1));
+    }
+    if let Some(c) = st.color {
+        j.insert("c".into(), json!(hex(c)));
+    }
+    if let Some(c) = st.fill {
+        j.insert("f".into(), json!(hex(c)));
+    }
+    match st.halign {
+        HAlign::General => {}
+        HAlign::Left => {
+            j.insert("h".into(), json!("l"));
+        }
+        HAlign::Center => {
+            j.insert("h".into(), json!("c"));
+        }
+        HAlign::Right => {
+            j.insert("h".into(), json!("r"));
+        }
+    }
+    match st.valign {
+        VAlign::Bottom => {}
+        VAlign::Top => {
+            j.insert("v".into(), json!("t"));
+        }
+        VAlign::Center => {
+            j.insert("v".into(), json!("c"));
+        }
+    }
+    if st.wrap {
+        j.insert("w".into(), json!(1));
+    }
+    if st.size10 != 0 && st.size10 != 110 {
+        j.insert("z".into(), json!(f64::from(st.size10) / 10.0));
+    }
+    if st.indent > 0 {
+        j.insert("n".into(), json!(st.indent));
+    }
+    let b = &st.border;
+    let d = [line_code(b.left), line_code(b.right), line_code(b.top), line_code(b.bottom)];
+    if d.iter().any(|x| *x != 0) {
+        j.insert("d".into(), json!(d));
+    }
+    Json::Object(j)
+}
+
+/// Runs of consecutive indices as [first, last] pairs.
+fn runs(mut v: Vec<u32>) -> Vec<Json> {
+    v.sort_unstable();
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    for k in v {
+        match out.last_mut() {
+            Some((_, b)) if *b + 1 == k => *b = k,
+            _ => out.push((k, k)),
+        }
+    }
+    out.into_iter().take(MAX_LIST).map(|(a, b)| json!([a, b])).collect()
+}
+
+fn sheet_meta(i: usize, s: &Sheet) -> Json {
+    let (mut rows, mut cols) = s.extent_with_spills().map_or((0, 0), |(r, c)| (r + 1, c + 1));
+    for m in &s.merges {
+        rows = rows.max(m.r2 + 1);
+        cols = cols.max(m.c2 + 1);
+    }
+    let mut col_w: Vec<(u32, f32)> = s.col_w.iter().map(|(c, w)| (*c, *w)).collect();
+    col_w.sort_unstable_by_key(|x| x.0);
+    let mut row_h: Vec<(u32, f32)> = s.row_h.iter().map(|(r, h)| (*r, *h)).collect();
+    row_h.sort_unstable_by_key(|x| x.0);
+    let merges: Vec<Json> = s.merges.iter().take(20_000).map(|m| json!([m.r1, m.c1, m.r2, m.c2])).collect();
+    json!({
+        "i": i,
+        "name": s.name,
+        "hidden": s.hidden,
+        "tab": s.tab_color.map(hex),
+        "rows": rows,
+        "cols": cols,
+        "freeze": [s.freeze.0, s.freeze.1],
+        "col_w": col_w.into_iter().take(MAX_LIST).map(|(c, w)| json!([c, w])).collect::<Vec<_>>(),
+        "row_h": row_h.into_iter().take(MAX_LIST).map(|(r, h)| json!([r, h])).collect::<Vec<_>>(),
+        "default_col_w": freedom_sheets::model::DEFAULT_COL_W,
+        "default_row_h": freedom_sheets::model::DEFAULT_ROW_H,
+        "hidden_rows": runs(s.hidden_rows.iter().copied().collect()),
+        "hidden_cols": runs(s.hidden_cols.iter().copied().collect()),
+        "merges": merges,
+        "gridlines": s.gridlines,
+        "protected": s.protection.is_some(),
+    })
+}
+
+#[cfg(test)]
+mod tests;

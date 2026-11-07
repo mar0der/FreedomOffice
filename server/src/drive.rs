@@ -20,7 +20,7 @@ use crate::api::App;
 pub const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
 
 pub fn routes() -> Router<App> {
-    Router::new().route("/drive", get(index)).route("/drive/", get(index)).route("/drive/assets/{*path}", get(asset))
+    Router::new().route("/drive", get(index)).route("/drive/", get(index)).route("/drive/sheet/{id}", get(sheet_page)).route("/drive/assets/{*path}", get(asset))
 }
 
 fn respond(status: StatusCode, body: &'static [u8], content_type: &'static str, cache: &'static str) -> Response {
@@ -41,9 +41,16 @@ async fn index() -> Response {
     respond(StatusCode::OK, body, ct, "no-store")
 }
 
+/// Web Sheets: `/drive/sheet/<item id>`. The page is the same for every id (it reads the id from
+/// its address and asks the API, which decides who may see what); no-store like the Drive page.
+async fn sheet_page(Path(_id): Path<String>) -> Response {
+    let (body, ct) = freedomoffice_drive::asset("sheet.html").expect("sheet.html is embedded");
+    respond(StatusCode::OK, body, ct, "no-store")
+}
+
 async fn asset(Path(path): Path<String>, RawQuery(query): RawQuery) -> Response {
     // The page itself only at /drive (one address, one set of caching rules).
-    let found = if path == "index.html" { None } else { freedomoffice_drive::asset(&path) };
+    let found = if freedomoffice_drive::PAGES.contains(&path.as_str()) { None } else { freedomoffice_drive::asset(&path) };
     let Some((body, ct)) = found else {
         return respond(StatusCode::NOT_FOUND, b"Not found\n", "text/plain; charset=utf-8", "no-store");
     };

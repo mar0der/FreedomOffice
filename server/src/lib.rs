@@ -7,6 +7,7 @@ pub mod config;
 pub mod content;
 pub mod drive;
 pub mod live;
+pub mod sheetweb;
 pub mod store;
 pub mod tls;
 pub mod util;

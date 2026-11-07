@@ -1245,11 +1245,13 @@ dependencies = [
  "axum",
  "cosync",
  "freedomoffice-drive",
+ "freedomoffice-sheetview",
  "futures-util",
  "getrandom 0.3.4",
  "libc",
  "rpassword",
  "rusqlite",
+ "rust_xlsxwriter",
  "rustls-acme",
  "serde",
  "serde_json",
@@ -1261,6 +1263,18 @@ dependencies = [
  "tracing-subscriber",
  "tungstenite",
  "ureq",
+ "zip",
+]
+
+[[package]]
+name = "freedomoffice-sheetview"
+version = "26.45.2"
+dependencies = [
+ "cosync",
+ "freedom-sheets",
+ "rust_xlsxwriter",
+ "serde_json",
+ "zip",
 ]
 
 [[package]]
