@@ -2793,7 +2793,7 @@ fn live_busy(s: &Store, hub: &crate::live::Hub, it: &Item) -> Result<bool, ApiEr
     })
 }
 
-/// `GET /api/items/{id}/live?since=<seq>[&v=<version>]&cid=<client>[&ticket=<t>]`: the
+/// `GET /api/items/{id}/live?since=<seq>[&v=<version>]&cid=<client>[&agent=1][&ticket=<t>]`: the
 /// co-editing WebSocket. Editors may send changes; viewers only receive.
 async fn live(
     State(app): State<App>,
@@ -2840,7 +2840,8 @@ async fn live(
     if cid.is_empty() || since < 0 {
         return Err(ApiError::bad("cid is required."));
     }
-    let join = crate::live::Join { actor: actor(&who), item, version, who, role, since: since as u64, cid };
+    let agent = q.get("agent").is_some_and(|v| v == "1");
+    let join = crate::live::Join { actor: actor(&who), item, version, who, role, since: since as u64, cid, agent };
     let (store, hub) = (app.store.clone(), app.hub.clone());
     Ok(ws.max_message_size(cosync::MAX_MESSAGE_BYTES).max_frame_size(cosync::MAX_MESSAGE_BYTES).on_upgrade(move |socket| crate::live::run(store, hub, socket, join)))
 }

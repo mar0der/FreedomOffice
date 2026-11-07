@@ -395,12 +395,12 @@ fn replay_sheets(log: &mut Log, from: u64) {
 }
 
 /// Who a participant is shown as.
-fn peer_of(who: &Principal, role: Role, id: u64) -> Peer {
+fn peer_of(who: &Principal, role: Role, id: u64, agent: bool) -> Peer {
     let (name, user) = match who {
         Principal::User { user, .. } => (user.display_name.clone(), user.username.clone()),
         Principal::Link { .. } => (if role >= Role::Edit { "Guest (link)".to_string() } else { "Guest viewer (link)".to_string() }, String::new()),
     };
-    Peer { id, name, user, color: 0, editor: role >= Role::Edit, presence: None }
+    Peer { id, name, user, color: 0, editor: role >= Role::Edit, agent, presence: None }
 }
 
 /// A simple token bucket.
@@ -439,6 +439,8 @@ pub struct Join {
     pub actor: String,
     pub since: u64,
     pub cid: String,
+    /// The client says it is a headless agent (`agent=1`); shown to others in presence.
+    pub agent: bool,
 }
 
 /// Runs one participant's connection until it closes.
@@ -454,7 +456,7 @@ pub async fn run(store: Arc<Mutex<Store>>, hub: Arc<Hub>, socket: WebSocket, j: 
     let item_id = j.item.id.clone();
     let setup = {
         let (store, hub, kick, end) = (store.clone(), hub.clone(), kick.clone(), end.clone());
-        let (item_id, who, since, version, cid, actor) = (j.item.id.clone(), j.who.clone(), j.since, j.version, j.cid.clone(), j.actor.clone());
+        let (item_id, who, since, version, cid, actor, agent) = (j.item.id.clone(), j.who.clone(), j.since, j.version, j.cid.clone(), j.actor.clone(), j.agent);
         // The last field: registered (false: only the queued farewell goes out, nothing is read).
         type Setup = (Arc<Mutex<Doc>>, mpsc::Sender<Out>, mpsc::Receiver<Out>, Role, bool);
         tokio::task::spawn_blocking(move || -> Result<Setup, String> {
@@ -480,7 +482,7 @@ pub async fn run(store: Arc<Mutex<Store>>, hub: Arc<Hub>, socket: WebSocket, j: 
                 }
             };
             let mut d = lock(&doc);
-            let mut peer = peer_of(&who, role, conn_id);
+            let mut peer = peer_of(&who, role, conn_id, agent);
             let replay = if version.is_none_or(|v| v == current) { d.log.since(since).map(<[_]>::to_vec) } else { None };
             let Some(replay) = replay else {
                 // The client's copy is older than what the session follows: it must reload. If its
@@ -726,7 +728,7 @@ mod tests {
         let store = Mutex::new(store);
         let hub = Hub::default();
         let (tx, mut rx) = mpsc::channel(16);
-        let peer = Peer { id: 1, name: String::new(), user: String::new(), color: 0, editor: false, presence: None };
+        let peer = Peer { id: 1, name: String::new(), user: String::new(), color: 0, editor: false, agent: false, presence: None };
         let mut d = Doc { log: Log::new(0), conns: vec![], unsnapped: 0, unsnapped_since: None, last_commit: None, last_snap: None, snap_asked: None, snap_turn: 0 };
         d.conns.push(Conn { peer, tx, kick: Arc::new(Notify::new()), who: Principal::Link { link }, role: Role::View, revoked: true, end: Arc::new(Notify::new()) });
         let doc = Arc::new(Mutex::new(d));
@@ -744,7 +746,7 @@ mod tests {
     /// instead of the server queueing for it without bound.
     #[test]
     fn a_connection_that_does_not_read_is_kicked() {
-        let peer = |id| Peer { id, name: String::new(), user: String::new(), color: 0, editor: true, presence: None };
+        let peer = |id| Peer { id, name: String::new(), user: String::new(), color: 0, editor: true, agent: false, presence: None };
         let (tx, _rx) = mpsc::channel(2);
         let kick = Arc::new(Notify::new());
         let d = Doc { log: Log::new(0), conns: vec![Conn { peer: peer(1), tx, kick: kick.clone(), who: link(), role: Role::Edit, revoked: false, end: Arc::new(Notify::new()) }], unsnapped: 0, unsnapped_since: None, last_commit: None, last_snap: None, snap_asked: None, snap_turn: 0 };
@@ -760,7 +762,7 @@ mod tests {
     /// minutes), but idle snapshots don't flood the version history.
     #[test]
     fn a_pause_in_editing_asks_for_a_snapshot() {
-        let peer = |id| Peer { id, name: String::new(), user: String::new(), color: 0, editor: true, presence: None };
+        let peer = |id| Peer { id, name: String::new(), user: String::new(), color: 0, editor: true, agent: false, presence: None };
         let (tx, mut rx) = mpsc::channel(16);
         let ago = |s: u64| Instant::now().checked_sub(Duration::from_secs(s));
         let mut d = Doc { log: Log::new(0), conns: vec![Conn { peer: peer(1), tx, kick: Arc::new(Notify::new()), who: link(), role: Role::Edit, revoked: false, end: Arc::new(Notify::new()) }], unsnapped: 1, unsnapped_since: ago(1), last_commit: ago(1), last_snap: None, snap_asked: None, snap_turn: 0 };
