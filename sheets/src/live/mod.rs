@@ -253,6 +253,47 @@ fn apply_op(wb: &mut Workbook, op: &Op, remote: bool, st: &mut ApplyState, out: 
             }
             out.cells.push((i, Range::cell(*r, *c)));
         }
+        Op::Content { s, r, c, v, adj } => {
+            // The value, formula and rich text; the format the cell has stays.
+            let style = wb.sheets[i].get(*r, *c).map_or(0, |x| x.style);
+            match v {
+                None => {
+                    let sh = &mut wb.sheets[i];
+                    sh.rich.remove(&(*r, *c));
+                    sh.set(*r, *c, Some(Cell { style, ..Cell::default() }));
+                }
+                Some(d) => {
+                    let mut cell = cell_from_data(wb, *s, &CellData { st: None, ..(**d).clone() }, adj);
+                    cell.style = style;
+                    let sh = &mut wb.sheets[i];
+                    match d.rich.as_ref().and_then(|j| serde_json::from_value(j.clone()).ok()) {
+                        Some(rt) => {
+                            sh.rich.insert((*r, *c), rt);
+                        }
+                        None => {
+                            sh.rich.remove(&(*r, *c));
+                        }
+                    }
+                    sh.set(*r, *c, Some(cell));
+                }
+            }
+            out.cells.push((i, Range::cell(*r, *c)));
+        }
+        Op::Format { r, c, st, .. } => {
+            // The style; the cell's content stays.
+            let style = match st {
+                Some(j) => match serde_json::from_value::<Style>(j.clone()) {
+                    Ok(x) => wb.intern_style(x),
+                    Err(_) => 0,
+                },
+                None => 0,
+            };
+            let sh = &mut wb.sheets[i];
+            let mut cell = sh.get(*r, *c).cloned().unwrap_or_default();
+            cell.style = style;
+            sh.set(*r, *c, Some(cell));
+            out.cells.push((i, Range::cell(*r, *c)));
+        }
         Op::Note { r, c, text, author, .. } => {
             let sh = &mut wb.sheets[i];
             match text {

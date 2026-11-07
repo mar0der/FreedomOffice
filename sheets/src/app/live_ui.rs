@@ -87,6 +87,44 @@ struct Undo {
     blocked: bool,
 }
 
+/// One of this person's cell edits that someone else's concurrent edit replaced ("Your change to
+/// B3 was replaced by Alice's"), kept until it is dismissed so they can look at it or restore it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReplacedNote {
+    pub sheet: SheetId,
+    pub r: u32,
+    pub c: u32,
+    /// Who replaced it.
+    pub by: String,
+    /// True when it was the cell's format, not its value.
+    pub format: bool,
+    /// What this person had entered (the formula, the value, or a description of the format).
+    pub mine: String,
+    /// The edit itself, to apply again.
+    pub(super) op: Op,
+    at: Instant,
+}
+
+/// How long a replaced-change message stays up without being dismissed, and how many are kept.
+const REPLACED_SECS: u64 = 90;
+const REPLACED_KEEP: usize = 20;
+
+/// What a value/formula edit entered, as the person typed it.
+fn content_text(op: &Op) -> String {
+    use cosync::Val;
+    match op {
+        Op::Content { v: Some(d), .. } => match (&d.f, &d.v) {
+            (Some(f), _) => format!("={f}"),
+            (None, Val::Text(t)) | (None, Val::Err(t)) => t.clone(),
+            (None, Val::Num(n)) => crate::numfmt::value_to_text(&crate::model::Value::Number(*n)),
+            (None, Val::Bool(b)) => if *b { "TRUE" } else { "FALSE" }.to_string(),
+            (None, Val::Empty) => "(empty)".to_string(),
+        },
+        Op::Content { v: None, .. } => "(empty)".to_string(),
+        _ => String::new(),
+    }
+}
+
 enum Job {
     Snapshot(u64, Result<DriveItem, String>),
     Reloaded(Result<CloudDoc, String>),
@@ -135,6 +173,8 @@ pub struct Live {
     pub stopped: Option<String>,
     /// The yellow message bar (access changed).
     pub notice: Option<Notice>,
+    /// Own edits that others' concurrent edits replaced (newest last).
+    pub replaced: Vec<ReplacedNote>,
     /// A Welcome arrived (the role it gave is known).
     welcomed: bool,
     snap_wanted: bool,
@@ -187,6 +227,7 @@ impl Live {
             backoff: 0,
             stopped: None,
             notice: None,
+            replaced: Vec::new(),
             welcomed: false,
             snap_wanted: false,
             snap_busy: false,
@@ -427,7 +468,7 @@ impl App {
             }
             let Some(i) = op.sheet().and_then(|s| live::index_of(&self.wb, s)) else { continue };
             match op {
-                Op::Cell { r, c, .. } => {
+                Op::Cell { r, c, .. } | Op::Content { r, c, .. } | Op::Format { r, c, .. } => {
                     let rg = Range::cell(*r, *c);
                     cells.entry(i).and_modify(|x| *x = x.union(&rg)).or_insert(rg);
                 }
@@ -686,7 +727,7 @@ impl App {
                 let sheets: Vec<SheetId> = self.wb.sheets.iter().map(|s| s.uid).collect();
                 if let Some(l) = &mut self.live {
                     if let Some(c) = &l.conn {
-                        c.send(ClientMsg::Hello { sheets });
+                        c.send(ClientMsg::Hello { sheets, proto: cosync::PROTO });
                     }
                     l.last_presence = None;
                 }
@@ -723,6 +764,7 @@ impl App {
                         self.live_view_only(true);
                         return;
                     }
+                    (Some(cosync::close::UPGRADE), _) => Some("This version of FreedomOffice Sheets is too old for live editing on this server. Please update the app.".to_string()),
                     (Some(cosync::close::INVALID), _) => Some(format!("The server refused a change ({reason}). Reopen the workbook.")),
                     (Some(cosync::close::REVOKED), _) => {
                         self.live_revoked(&reason);
@@ -753,8 +795,18 @@ impl App {
 
     fn live_msg(&mut self, m: ServerMsg) {
         match m {
-            ServerMsg::Welcome { seq, you, peers } => {
+            ServerMsg::Welcome { seq, you, peers, proto } => {
                 let Some(l) = &mut self.live else { return };
+                if proto < cosync::PROTO {
+                    // An older server would refuse the cell content/format operations.
+                    let msg = "This server is older than this version of FreedomOffice Sheets and can't be edited live with it. Ask the server's administrator to update it.".to_string();
+                    l.conn = None;
+                    l.online = false;
+                    l.sess.offline();
+                    l.stopped = Some(msg.clone());
+                    self.status = Some(msg);
+                    return;
+                }
                 if l.welcomed && l.editor && !you.editor && !l.sess.has_pending() {
                     // Made a viewer while disconnected (with nothing unsent; see live_caught_up).
                     self.live_view_only(false);
@@ -775,7 +827,7 @@ impl App {
                 l.backoff = 0;
                 self.live_caught_up();
             }
-            ServerMsg::Ops { seq, cid, id, ops, .. } => {
+            ServerMsg::Ops { seq, cid, id, by, base, ops } => {
                 self.live_flush();
                 let Some(l) = &mut self.live else { return };
                 if seq != l.sess.seq + 1 {
@@ -799,7 +851,9 @@ impl App {
                     l.units.clear();
                     l.sent_units = 0;
                 }
-                let step = l.sess.remote(seq, &cid, id, ops);
+                let step = l.sess.remote_based(seq, &cid, id, base, ops);
+                let who = l.peers.get(&by).map(|p| p.peer.name.clone()).unwrap_or_else(|| "someone else".to_string());
+                self.live_replaced(&step.replaced, &who);
                 self.live_step(step);
                 self.live_caught_up();
             }
@@ -855,6 +909,103 @@ impl App {
             }
             ServerMsg::Revoked { reason } => self.live_revoked(&reason),
         }
+    }
+
+    /// Own edits that `who`'s concurrent edit replaced: remembered for the message bar.
+    fn live_replaced(&mut self, replaced: &[cosync::client::Replaced], who: &str) {
+        let Some(l) = &mut self.live else { return };
+        for r in replaced {
+            let format = r.part == cosync::CellWrite::Format;
+            let mine = if format { "formatting".to_string() } else { content_text(&r.mine) };
+            l.replaced.retain(|n| !(n.sheet == r.s && n.r == r.r && n.c == r.c && n.format == format));
+            l.replaced.push(ReplacedNote { sheet: r.s, r: r.r, c: r.c, by: who.to_string(), format, mine, op: r.mine.clone(), at: Instant::now() });
+        }
+        let extra = l.replaced.len().saturating_sub(REPLACED_KEEP);
+        l.replaced.drain(..extra);
+    }
+
+    /// The text of a replaced-change message: which cell, who, and what was typed.
+    fn replaced_text(&self, n: &ReplacedNote) -> String {
+        let cell = crate::model::cell_name(n.r, n.c);
+        let name = live::index_of(&self.wb, n.sheet).filter(|i| *i != self.wb.active).map(|i| format!("{}!{cell}", self.wb.sheets[i].name)).unwrap_or(cell);
+        let who = if n.by == "someone else" { "someone else's".to_string() } else { format!("{}'s", n.by) };
+        format!("Your {} {name} was replaced by {who}", if n.format { "formatting of" } else { "change to" })
+    }
+
+    /// The replaced-change messages still showing (newest last).
+    pub(super) fn live_replaced_notes(&self) -> Vec<&ReplacedNote> {
+        let ttl = Duration::from_secs(REPLACED_SECS);
+        self.live.as_ref().map(|l| l.replaced.iter().filter(|n| n.at.elapsed() < ttl).collect()).unwrap_or_default()
+    }
+
+    /// The small bar under the formula bar: "Your change to B3 was replaced by Alice's." with
+    /// "Show" (go to the cell), "Restore mine" (enter what was typed again, as a new change)
+    /// and a close button. Not modal; it goes away by itself.
+    pub(super) fn live_replaced_ui(&mut self, ui: &mut egui::Ui) {
+        let notes: Vec<ReplacedNote> = self.live_replaced_notes().into_iter().cloned().collect();
+        let Some(n) = notes.last().cloned() else { return };
+        let dark = super::theme::is_dark();
+        let (text, fill) = if dark { (super::theme::rgb(0xDCE8F5), super::theme::rgb(0x1F3347)) } else { (super::theme::rgb(0x0B2E4F), super::theme::rgb(0xE5F1FB)) };
+        let (mut show, mut restore, mut close) = (false, false, false);
+        let line = self.replaced_text(&n);
+        egui::Frame::NONE.fill(fill).inner_margin(egui::Margin { left: 12, right: 8, top: 4, bottom: 4 }).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("↺").size(15.0).color(text));
+                let more = if notes.len() > 1 { format!(" (and {} more)", notes.len() - 1) } else { String::new() };
+                let resp = ui.label(egui::RichText::new(format!("{line}.{more}")).size(13.0).color(text));
+                resp.on_hover_text(format!("You {}: {}", if n.format { "set" } else { "entered" }, n.mine));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(egui::Button::new(egui::RichText::new("✕").size(12.0).color(text)).frame(false)).on_hover_text("Dismiss").clicked() {
+                        close = true;
+                    }
+                    if ui.button("Restore mine").on_hover_text(if n.format { "Apply your formatting to the cell again".to_string() } else { format!("Enter {} in the cell again", n.mine) }).clicked() {
+                        restore = true;
+                    }
+                    if ui.button("Show").on_hover_text("Go to the cell").clicked() {
+                        show = true;
+                    }
+                });
+            });
+        });
+        ui.ctx().request_repaint_after(Duration::from_secs(5));
+        if show {
+            if let Some(i) = live::index_of(&self.wb, n.sheet) {
+                self.wb.active = i;
+                self.select(n.r, n.c, false);
+            }
+        }
+        if restore {
+            self.live_restore(&n);
+        }
+        if close || restore {
+            if let Some(l) = &mut self.live {
+                l.replaced.retain(|x| x != &n);
+            }
+        }
+    }
+
+    /// Puts back what a replaced edit had written, as a new change of this person (so it wins
+    /// over what replaced it, and goes through undo like any edit).
+    fn live_restore(&mut self, n: &ReplacedNote) {
+        if self.live_read_only() {
+            return;
+        }
+        let Some(si) = live::index_of(&self.wb, n.sheet) else {
+            self.status = Some("That sheet was deleted.".into());
+            return;
+        };
+        self.live_flush();
+        self.push_undo(&[Scope::Range(si, Range::cell(n.r, n.c))]);
+        let Some(l) = &mut self.live else { return };
+        let mut st = l.state.clone();
+        live::apply_ops(&mut self.wb, std::slice::from_ref(&n.op), false, &mut st);
+        if let Some(l) = &mut self.live {
+            l.state = st;
+        }
+        self.changed();
+        self.live_flush();
+        self.status = Some(format!("Restored your {} in {}.", if n.format { "formatting" } else { "change" }, crate::model::cell_name(n.r, n.c)));
     }
 
     fn live_doc_name(&self) -> String {
@@ -1570,6 +1721,21 @@ impl App {
 
     pub(crate) fn live_snap_seq(&self) -> u64 {
         self.live.as_ref().map_or(0, |l| l.snap_seq)
+    }
+
+    /// The replaced-change messages: (message, what was entered).
+    pub(crate) fn live_replaced_for_test(&self) -> Vec<(String, String)> {
+        self.live_replaced_notes().into_iter().map(|n| (self.replaced_text(n), n.mine.clone())).collect()
+    }
+
+    pub(crate) fn live_restore_for_test(&mut self, i: usize) {
+        let n = self.live_replaced_notes().get(i).map(|n| (*n).clone());
+        if let Some(n) = n {
+            self.live_restore(&n);
+            if let Some(l) = &mut self.live {
+                l.replaced.retain(|x| x != &n);
+            }
+        }
     }
 
     pub(crate) fn live_notice_for_test(&self) -> Option<Notice> {

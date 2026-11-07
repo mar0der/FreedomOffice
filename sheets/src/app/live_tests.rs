@@ -233,6 +233,37 @@ fn undo_never_overwrites_someone_elses_later_value() {
     assert_eq!(crate::numfmt::value_to_text(app.wb.sheets[0].display_value(0, 0)), "theirs");
 }
 
+/// A value and a format change are different operations (so they can't overwrite each other);
+/// a command changing both (paste, clear) is one whole cell.
+#[test]
+fn value_and_format_changes_are_separate_operations() {
+    use cosync::Op;
+    let (_ctx, mut app) = super::data_ui::sample_app();
+    app.live_for_test();
+    // The operations the last command produced.
+    let last = |app: &mut App, from: &mut usize| -> Vec<Op> {
+        app.live_flush();
+        let ops = app.live_pending_ops();
+        let new = ops[*from..].to_vec();
+        *from = ops.len();
+        new
+    };
+    let mut n = 0;
+    type_at(&mut app, 30, 0, "plain");
+    let ops = last(&mut app, &mut n);
+    assert!(matches!(&ops[..], [Op::Content { .. }]), "{ops:?}");
+    app.select(30, 0, false);
+    app.toggle_bold();
+    let ops = last(&mut app, &mut n);
+    assert!(matches!(&ops[..], [Op::Format { .. }]), "{ops:?}");
+    // Clearing a formatted cell changes both parts: one whole cell.
+    app.select(30, 0, false);
+    app.clear(true, true);
+    let ops = last(&mut app, &mut n);
+    assert!(matches!(&ops[..], [Op::Cell { v: None, .. }]), "{ops:?}");
+    assert!(app.live_errors().is_empty());
+}
+
 /// An editor made a viewer while changes are unsent: the session ends (instead of resending
 /// them on every reconnect), the changes stay in the window, and the message bar offers to save
 /// a copy. The same whichever way the server says it: the `role` message while connected, the
@@ -252,7 +283,7 @@ fn becoming_a_viewer_with_unsent_changes_ends_the_session() {
             "welcome" => {
                 // Reconnecting after access was changed: the server says we are a viewer.
                 let you = cosync::Peer { id: 1, name: "Me".into(), user: "me".into(), color: 0, editor: false, agent: false, presence: None };
-                app.live_event_for_test(Event::Msg(cosync::ServerMsg::Welcome { seq: 0, you, peers: vec![] }));
+                app.live_event_for_test(Event::Msg(cosync::ServerMsg::Welcome { seq: 0, you, peers: vec![], proto: cosync::PROTO }));
             }
             // Sending them was refused.
             _ => app.live_event_for_test(Event::Closed { code: Some(cosync::close::READ_ONLY), http: None, reason: "view-only".into() }),
@@ -1023,6 +1054,115 @@ mod e2e {
         open(&mut d, &id);
         settle(&mut [&mut a, &mut b, &mut d], "late joiner");
         assert_same(&a, &d, "late joiner after random edits");
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two throwaway accounts sharing one workbook with a few numbers in column A.
+    fn two_people(name: &str) -> (freedomoffice_server::Running, std::path::PathBuf, Client, Client, String) {
+        let dir = std::env::temp_dir().join(format!("fo-live-{name}-{}", freedomoffice_server::util::new_id()));
+        let cfg = Config { data_dir: dir.join("data"), versions_to_keep: 50, ..Config::default() };
+        {
+            let st = Store::open(&cfg.db_path(), &cfg.files_dir(), cfg.versions_to_keep).unwrap();
+            st.create_user("ann", "Ann Lee", "", PW, false).unwrap();
+            st.create_user("ben", "Ben Ode", "", PW, false).unwrap();
+        }
+        let server = freedomoffice_server::spawn(cfg).unwrap();
+        let url = server.url();
+        let mut start = crate::model::Workbook::new();
+        for r in 0..8 {
+            let c = crate::model::cell_from_input(&mut start, &format!("{}", r + 1), 0);
+            start.sheets[0].set(r, 0, c);
+        }
+        let file = dir.join("start.xlsx");
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::io::save(&start, &file).unwrap();
+        let mut a = client(&url, "ann", &dir);
+        let id = a.session.upload_new("root", "Split.xlsx", &std::fs::read(&file).unwrap(), "fail").unwrap().id;
+        a.session.grant(&id, "ben", true).unwrap();
+        let mut b = client(&url, "ben", &dir);
+        open(&mut a, &id);
+        open(&mut b, &id);
+        settle(&mut [&mut a, &mut b], "both joined");
+        pump(&mut [&mut a, &mut b], "each sees the other", |cs| !cs[0].app.live_peer_names().is_empty() && !cs[1].app.live_peer_names().is_empty());
+        (server, dir, a, b, id)
+    }
+
+    fn is_bold(c: &Client, r: u32, col: u32) -> bool {
+        let sh = &c.app.wb.sheets[0];
+        sh.get(r, col).is_some_and(|x| c.app.wb.style(x.style).bold)
+    }
+
+    /// A types a value while B makes the same cell bold, at the same time: both survive on both
+    /// sides, and nobody is told anything was replaced (they edited different things).
+    #[test]
+    fn a_value_and_bold_on_one_cell_both_survive() {
+        let (server, dir, mut a, mut b, _) = two_people("split");
+        b.app.select(2, 1, false);
+        type_at(&mut a.app, 2, 1, "typed by Ann");
+        b.app.toggle_bold();
+        settle(&mut [&mut a, &mut b], "value and bold");
+        assert_same(&a, &b, "value and bold");
+        for c in [&a, &b] {
+            assert_eq!(text(c, "Sheet1", 2, 1), "typed by Ann");
+            assert!(is_bold(c, 2, 1), "the cell is bold");
+        }
+        assert!(a.app.live_replaced_for_test().is_empty() && b.app.live_replaced_for_test().is_empty());
+        // The other way round, with a formula, a fill, and then a clear: the content goes, the format stays.
+        a.app.select(3, 1, false);
+        type_at(&mut b.app, 3, 1, "=SUM(A1:A3)");
+        a.app.apply_style(|s| s.fill = Some(0xFFEE00));
+        settle(&mut [&mut a, &mut b], "formula and fill");
+        assert_same(&a, &b, "formula and fill");
+        assert_eq!(text(&a, "Sheet1", 3, 1), "6");
+        assert!(a.app.wb.sheets[0].get(3, 1).is_some_and(|x| a.app.wb.style(x.style).fill == Some(0xFFEE00)));
+        assert!(a.app.live_replaced_for_test().is_empty() && b.app.live_replaced_for_test().is_empty());
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// "Your change to B3 was replaced by Alice's": only for a concurrent edit of the same part
+    /// of the cell, never for one made after seeing the first; and it can be restored.
+    #[test]
+    fn a_concurrent_value_tells_the_one_who_lost_and_a_later_one_does_not() {
+        let (server, dir, mut a, mut b, _) = two_people("replaced");
+        // Sequential: Ann types, Ben sees it, then types over it. Nothing is replaced behind anyone's back.
+        type_at(&mut a.app, 2, 1, "first");
+        settle(&mut [&mut a, &mut b], "sequential 1");
+        type_at(&mut b.app, 2, 1, "second");
+        settle(&mut [&mut a, &mut b], "sequential 2");
+        assert_eq!(text(&a, "Sheet1", 2, 1), "second");
+        assert!(a.app.live_replaced_for_test().is_empty(), "{:?}", a.app.live_replaced_for_test());
+        assert!(b.app.live_replaced_for_test().is_empty());
+
+        // At the same time: neither has seen the other's. Whoever the server committed last wins; the other is told.
+        type_at(&mut a.app, 3, 1, "from Ann");
+        type_at(&mut b.app, 3, 1, "from Ben");
+        settle(&mut [&mut a, &mut b], "concurrent");
+        assert_same(&a, &b, "concurrent");
+        let winner = text(&a, "Sheet1", 3, 1);
+        let (loser, won, lost_text, winner_name) = if winner == "from Ben" { (&mut a, &b, "from Ann", "Ben Ode") } else { (&mut b, &a, "from Ben", "Ann Lee") };
+        assert!(won.app.live_replaced_for_test().is_empty(), "the winner is told nothing");
+        let notes = loser.app.live_replaced_for_test();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(notes[0].0, format!("Your change to B4 was replaced by {winner_name}'s"));
+        assert_eq!(notes[0].1, lost_text, "what was typed is kept");
+        // Restoring puts it back as a new change everyone gets.
+        loser.app.live_restore_for_test(0);
+        assert!(loser.app.live_replaced_for_test().is_empty());
+        let mut cs = [&mut a, &mut b];
+        settle(&mut cs, "restored");
+        assert_same(&a, &b, "restored");
+        assert_eq!(text(&a, "Sheet1", 3, 1), lost_text);
+        // Formats alone never conflict with values, but two formats do.
+        a.app.select(5, 1, false);
+        b.app.select(5, 1, false);
+        a.app.toggle_bold();
+        b.app.apply_style(|s| s.fill = Some(0x00FF00));
+        settle(&mut [&mut a, &mut b], "two formats");
+        assert_same(&a, &b, "two formats");
+        let told = a.app.live_replaced_for_test().len() + b.app.live_replaced_for_test().len();
+        assert_eq!(told, 1, "exactly the one whose formatting lost is told");
         drop(server);
         let _ = std::fs::remove_dir_all(&dir);
     }

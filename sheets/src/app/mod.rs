@@ -1190,6 +1190,10 @@ impl App {
             if self.live_notice().is_some() {
                 egui::TopBottomPanel::top("live_notice").frame(egui::Frame::NONE).show_separator_line(false).show(ctx, |ui| self.live_notice_ui(ui));
             }
+            // Someone else's concurrent edit replaced one of ours.
+            if !self.live_replaced_notes().is_empty() {
+                egui::TopBottomPanel::top("live_replaced").frame(egui::Frame::NONE).show_separator_line(false).show(ctx, |ui| self.live_replaced_ui(ui));
+            }
             egui::TopBottomPanel::bottom("status")
                 .exact_height(24.0)
                 .frame(egui::Frame::NONE.fill(theme::chrome()))
