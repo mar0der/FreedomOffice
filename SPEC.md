@@ -43,9 +43,14 @@ Versions kept: the newest `versions_to_keep` (default 25) plus the first version
 
 - **Super-admin** (`users.is_admin`, Petar): creates organisations, manages any account. Being super-admin
   does **not** grant access to other people's documents (privacy); it manages accounts and orgs only.
+  **Accepted policy:** the super-admin can reset anyone's password and is shown the new temporary password
+  once, so they could sign in as that person (as a Microsoft 365 admin can). Every reset is logged as a
+  warning (who reset whom, never the password) and signs the person out of every device.
 - **Organisation**: name, root folder, members. Member roles:
-  - `owner` / `admin`: add and remove people, change roles, reset passwords of members, see storage use,
-    full control over everything in the org folder.
+  - `owner` / `admin`: add and remove people, change roles, see storage use, full control over everything
+    in the org folder. (Password resets: super-admin only for now.) They add directly only people who
+    already share an organisation with them; anyone else gets an invite. An organisation keeps at least
+    one owner.
   - `member`: gets the org's default role on the org folder (`edit` by default, settable to `view`).
 - A person can belong to several organisations (family + a team).
 - Adding people:
@@ -129,7 +134,8 @@ to it and invites are deleted, the org account and any trashed items stay (unrea
 | `POST /api/users/{username}/disable`, `/enable` | super-admin |
 | `GET /api/orgs` (super-admin: all), `POST /api/orgs {name}` | members / super-admin |
 | `GET /api/orgs/{org}` (id or name; with `member_list`), `PATCH {name?, member_role?}`, `DELETE` | rename/delete: super-admin; member_role: org owner/admin |
-| `GET /api/orgs/{org}/members`, `POST {username, role?}`, `PATCH .../{username} {role}`, `DELETE .../{username}` | org owner/admin (anyone may leave); only owners (or super-admin) add/change/remove owners |
+| `GET /api/orgs/{org}/members`, `POST {username, role?}`, `PATCH .../{username} {role}`, `DELETE .../{username}` | org owner/admin (anyone may leave, except the last owner); only owners (or super-admin) add/change/remove owners; org admins add only people sharing an org with them (else 403 `invite_required`); emails are listed for the super-admin only |
+| `GET /api/users?query=` (share dialog) | people sharing an org with the caller, plus an exact username match (super-admin: everyone) |
 | `GET/POST /api/orgs/{org}/invites {email, role?}` → `url` once, `DELETE .../{id}` | org owner/admin |
 | `GET /api/invites/{token}`, `POST {username, password, display_name?, device?}` → `{token, user, org}` | anyone with the link |
 | `GET/POST /i/{token}`: the same as a plain HTML form for browsers | anyone with the link |
@@ -138,11 +144,13 @@ to it and invites are deleted, the org account and any trashed items stay (unrea
 
 Errors keep the `{"error": "..."}` shape; some add `"code"`: `password_change_required` (403, every
 endpoint except `/api/me`, `/api/me/password`, `/api/logout` while a temporary password is set),
-`wrong_password`, `links_disabled`.
+`wrong_password`, `links_disabled`, `invite_required`.
 
 Temporary passwords: 20 random characters (about 99 bits), returned once in the response, never logged.
 Invites: 32-byte random token (only SHA-256 stored), single use, 7 days; a failed attempt (weak password,
-taken username) doesn't use it up; invalid tokens count towards the per-address limit.
+taken username) doesn't use it up; invalid tokens count towards the per-address limit. Accepting is one
+transaction and only works while whoever made the invite may still add people with its role (an owner
+invite needs an owner; the super-admin always may).
 
 Passwords (`util::check_new_password`, all new and changed passwords including the CLI): at least 12
 characters, not the username and not containing it (usernames of 3+ characters), not one repeated
@@ -150,8 +158,14 @@ character, not in the embedded list `server/src/common_passwords.txt` — also a
 trailing digits and symbols ("Password2024!" is refused).
 
 Sign-in: after 3 failures for a username within 15 minutes, every attempt for it (right or wrong) first
-waits 1 s, 2 s, 4 s, then 8 s (async sleep); the 10-failure lockout per address and username stays.
-Failures are logged as `failed sign-in for user '<name>' from <ip>` (never the password).
+waits 1 s, 2 s, 4 s, then 8 s (async sleep); the 10-failure lockout per address and username stays. Each
+attempt counts as a failure in the same step as the limit check (taken back when it succeeds), so
+parallel attempts can't get past the limit. Text that can't be a username is refused before the limiter,
+the database and Argon2. Failures are logged as `failed sign-in for user '<name>' from <ip>` (or
+`... with an invalid username from <ip>`; never the password). The limiter keeps at most 100 000 keys.
+
+Argon2 (about 19 MiB and one core per run) runs at most once per core at a time, never under the store
+lock; requests waiting for it hold no thread.
 
 `allow_links = false` in server.toml: creating a link answers 403 (`links_disabled`), opening one 404, and
 link access tokens no longer authenticate.
@@ -164,7 +178,10 @@ CLI: `org add NAME`, `org list`, `org members ORG`, `org add-member ORG USER [me
 After every API change that can affect access (grant/revoke to a person or org, membership add/remove/role,
 org `member_role`, org delete, account disable, password reset, sign-out, share link removed, item moved or
 trashed) the server re-checks every open live connection before answering; it also re-checks every 30 s for
-changes made by the CLI in another process. Per connection:
+changes made by the CLI in another process. Re-checks run one at a time, and a connection checks its access
+and registers without a re-check in between, so the guarantee is: **once the HTTP response of the change
+has arrived, every live connection affected has been told** (and a connection that lost access never gets
+it back from an older check). Live tickets are re-checked when used. Per connection:
 
 - role now view (was edit) → `{"t":"role","role":"view"}`; changes it sends afterwards close the connection
   with `4403` (`close::READ_ONLY`) and are not committed;
@@ -174,6 +191,17 @@ changes made by the CLI in another process. Per connection:
 
 Not yet: other participants aren't told that someone's role changed (their peer list keeps the old
 `editor` flag until that person reconnects).
+
+### Known limits
+
+- Anyone can lock a username out for 15 minutes with 10 wrong passwords (per-username lockout DoS).
+- Every sign-out, grant or membership change re-checks all live connections (fine at this scale).
+- Live tickets (60 s, single use) aren't limited in number per user.
+- Clients older than this server don't know the `role`/`revoked` messages and close codes; they treat
+  the close as a lost connection and keep trying to reconnect (each attempt answers 401/404).
+- Share-link (`/l/`) and invite (`/i/`) tokens are in URL paths: the server redacts them in its log, but a
+  reverse proxy logs them unless told not to (the deploy notes must say so for nginx/Caddy).
+- No storage quotas yet (usage is reported only).
 
 ## 4. Admin UI
 

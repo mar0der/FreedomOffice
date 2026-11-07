@@ -714,7 +714,7 @@ fn concurrent_joins_leaves_commits_and_rechecks_finish() {
                 loop {
                     match w.recv_data() {
                         ServerMsg::Ack { seq: q, .. } => {
-                            seq = q;
+                            seq = seq.max(q);
                             break;
                         }
                         ServerMsg::Ops { seq: q, .. } => seq = q,

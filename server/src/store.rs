@@ -699,10 +699,10 @@ impl Store {
             .into_iter()
             .filter(|u| q.is_empty() || u.username.to_lowercase().contains(&q) || u.display_name.to_lowercase().contains(&q))
             .collect();
-        if let Some(exact) = self.user_by_name(&q)?.filter(|u| !u.disabled) {
-            if !out.iter().any(|u| u.id == exact.id) {
-                out.insert(0, exact);
-            }
+        if let Some(exact) = self.user_by_name(&q)?.filter(|u| !u.disabled)
+            && !out.iter().any(|u| u.id == exact.id)
+        {
+            out.insert(0, exact);
         }
         out.truncate(limit);
         Ok(out)

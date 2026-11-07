@@ -710,7 +710,10 @@ struct AccountBody {
 
 /// Who may create the account in `b` and into which organisation (checked before the password
 /// is hashed and again when the account is stored).
-fn account_target(s: &Store, headers: &HeaderMap, b: &AccountBody) -> Result<(User, Option<(Org, OrgRole)>, String), ApiError> {
+/// (the caller, the organisation and role the account joins, the checked username)
+type AccountTarget = (User, Option<(Org, OrgRole)>, String);
+
+fn account_target(s: &Store, headers: &HeaderMap, b: &AccountBody) -> Result<AccountTarget, ApiError> {
     let who = auth(s, headers)?;
     let me = user_of(&who)?.clone();
     let org = match b.org.as_deref().filter(|o| !o.trim().is_empty()) {
@@ -758,7 +761,7 @@ async fn reset_password(State(app): State<App>, headers: HeaderMap, Path(usernam
         .run(move |s| {
             let who = auth(s, &h)?;
             need_admin(user_of(&who)?)?;
-            Ok(person_by_name(s, &n)?)
+            person_by_name(s, &n)
         })
         .await?;
     let pw = util::temp_password_for(&target.username);
