@@ -5,6 +5,7 @@
 //! macOS in a file only the user can read (`~/.local/share/freedomoffice/servers.bin`).
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::{json, Value};
 
@@ -18,6 +19,66 @@ pub struct Account {
     pub display_name: String,
     pub token: String,
 }
+
+/// An organisation the signed-in person belongs to (from `/api/me`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct OrgInfo {
+    pub id: String,
+    pub name: String,
+    /// The organisation's root folder.
+    pub root: String,
+    /// The person's role in it: "owner", "admin" or "member".
+    pub role: String,
+}
+
+impl OrgInfo {
+    /// Owners and admins manage the organisation (on the server's admin page).
+    pub fn manages(&self) -> bool {
+        matches!(self.role.as_str(), "owner" | "admin")
+    }
+}
+
+/// The signed-in person as the server sees them (`/api/me`).
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct Me {
+    pub username: String,
+    pub display_name: String,
+    pub is_admin: bool,
+    /// Signed in with a temporary password: every other request answers
+    /// `password_change_required` until a new one is chosen.
+    pub must_change_password: bool,
+    pub orgs: Vec<OrgInfo>,
+}
+
+impl Me {
+    pub fn from_json(v: &Value) -> Self {
+        let orgs = v["orgs"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|o| OrgInfo { id: s(&o["id"]), name: s(&o["name"]), root: s(&o["root"]), role: s(&o["role"]) })
+                    .filter(|o| !o.id.is_empty() && !o.root.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        Me {
+            username: s(&v["username"]),
+            display_name: s(&v["display_name"]),
+            is_admin: v["is_admin"].as_bool().unwrap_or(false),
+            must_change_password: v["must_change_password"].as_bool().unwrap_or(false),
+            orgs,
+        }
+    }
+
+    /// May use the server's admin page: the server administrator, or an owner or admin of an
+    /// organisation.
+    pub fn can_manage(&self) -> bool {
+        self.is_admin || self.orgs.iter().any(OrgInfo::manages)
+    }
+}
+
+/// The 403 code of requests made before a temporary password was replaced.
+pub const PASSWORD_CHANGE_REQUIRED: &str = "password_change_required";
 
 /// A version in a file's history.
 #[derive(Clone, Debug, PartialEq)]
@@ -83,9 +144,27 @@ pub fn accounts_path() -> Option<PathBuf> {
     super::local_dir().map(|d| d.join("servers.bin"))
 }
 
+/// How this device is listed among the account's sign-ins: "FreedomOffice Sheets on <computer>".
 pub fn device_name() -> String {
-    let pc = std::env::var("COMPUTERNAME").ok().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "this PC".into());
+    let pc = computer_name().unwrap_or_else(|| if cfg!(windows) { "this PC".into() } else { "this computer".into() });
     format!("FreedomOffice Sheets on {pc}")
+}
+
+/// The computer's name: COMPUTERNAME on Windows; elsewhere the host name (/etc/hostname, the
+/// kernel's host name, HOSTNAME, then `hostname`, as on macOS).
+fn computer_name() -> Option<String> {
+    let clean = |s: &str| {
+        let t: String = s.trim().chars().filter(|c| !c.is_control()).take(64).collect();
+        (!t.is_empty()).then_some(t)
+    };
+    if cfg!(windows) {
+        return std::env::var("COMPUTERNAME").ok().and_then(|s| clean(&s));
+    }
+    ["/etc/hostname", "/proc/sys/kernel/hostname"]
+        .iter()
+        .find_map(|p| std::fs::read_to_string(p).ok().and_then(|s| clean(s.lines().next().unwrap_or(""))))
+        .or_else(|| std::env::var("HOSTNAME").ok().and_then(|s| clean(&s)))
+        .or_else(|| std::process::Command::new("hostname").output().ok().and_then(|o| clean(&String::from_utf8_lossy(&o.stdout))))
 }
 
 fn accounts_json(accounts: &[Account]) -> String {
@@ -168,6 +247,11 @@ pub fn version_of_etag(etag: &str) -> Option<i64> {
     etag.trim_matches('"').strip_prefix('v')?.split('-').next()?.parse().ok()
 }
 
+/// The `code` of a server error (`{"error": "...", "code": "..."}`), or "".
+fn error_code(r: &Response) -> String {
+    serde_json::from_slice::<Value>(&r.body).ok().map(|v| s(&v["code"])).unwrap_or_default()
+}
+
 fn error_text(r: &Response, host: &str) -> String {
     match r.status {
         401 => format!("Your sign-in to {host} has expired or was revoked. Sign in again (File > Account)."),
@@ -182,11 +266,24 @@ fn error_text(r: &Response, host: &str) -> String {
 pub struct ServerSession {
     pub account: Account,
     http: Box<dyn Transport>,
+    /// The server asked for a new password (a request answered `password_change_required`, or
+    /// `/api/me` / the sign-in said so). The UI shows "Choose a new password" while it is set.
+    needs_password: AtomicBool,
 }
 
 impl ServerSession {
     pub fn new(account: Account, http: Box<dyn Transport>) -> Self {
-        ServerSession { account, http }
+        ServerSession { account, http, needs_password: AtomicBool::new(false) }
+    }
+
+    /// The server wants a new password before anything else works.
+    pub fn needs_password_change(&self) -> bool {
+        self.needs_password.load(Ordering::SeqCst)
+    }
+
+    /// Forgets the request (the dialog was closed); the next refused request sets it again.
+    pub fn dismiss_password_change(&self) {
+        self.needs_password.store(false, Ordering::SeqCst);
     }
 
     /// Signs in with a username and password (sent only to this server) and gets a device token.
@@ -206,7 +303,9 @@ impl ServerSession {
             return Err("That address didn't answer like a FreedomOffice server.".into());
         }
         let account = Account { url, username: s(&v["user"]["username"]), display_name: s(&v["user"]["display_name"]), token };
-        Ok(ServerSession { account, http })
+        let session = ServerSession::new(account, http);
+        session.needs_password.store(v["user"]["must_change_password"].as_bool().unwrap_or(false), Ordering::SeqCst);
+        Ok(session)
     }
 
     pub fn host(&self) -> String {
@@ -220,7 +319,11 @@ impl ServerSession {
     fn call(&self, mut req: Request) -> Result<Response, String> {
         req.url = format!("{}{}", self.account.url, req.url);
         req.headers.push(("Authorization", format!("Bearer {}", self.account.token)));
-        self.http.send(req)
+        let r = self.http.send(req)?;
+        if r.status == 403 && error_code(&r) == PASSWORD_CHANGE_REQUIRED {
+            self.needs_password.store(true, Ordering::SeqCst);
+        }
+        Ok(r)
     }
 
     fn json_ok(&self, req: Request) -> Result<Value, String> {
@@ -237,7 +340,32 @@ impl ServerSession {
 
     /// Checks the device token; returns the display name.
     pub fn me(&self) -> Result<String, String> {
-        Ok(s(&self.get("/api/me")?["display_name"]))
+        Ok(self.me_info()?.display_name)
+    }
+
+    /// Who is signed in, with their organisations (works with a temporary password too).
+    pub fn me_info(&self) -> Result<Me, String> {
+        let me = Me::from_json(&self.get("/api/me")?);
+        self.needs_password.store(me.must_change_password, Ordering::SeqCst);
+        Ok(me)
+    }
+
+    /// Replaces the password (also the way out of a temporary one). The server signs the
+    /// account's other devices out; this one stays signed in. Returns how many were signed out.
+    /// The passwords go only into the request body: never logged, never kept.
+    pub fn change_password(&self, old: &str, new: &str) -> Result<u64, String> {
+        let r = self.call(Request::new("POST", "/api/me/password").json(&json!({ "old_password": old, "new_password": new })))?;
+        if r.ok() {
+            self.needs_password.store(false, Ordering::SeqCst);
+            return Ok(r.json().ok().and_then(|v| v["signed_out_devices"].as_u64()).unwrap_or(0));
+        }
+        Err(match (r.status, error_code(&r).as_str()) {
+            (403, "wrong_password") => "The current password is incorrect.".into(),
+            // The password policy (too short, too common, contains the username...) in the
+            // server's words.
+            (400, _) | (409, _) => r.error_message(),
+            _ => error_text(&r, &self.host()),
+        })
     }
 
     /// Revokes this device's token on the server.
@@ -373,8 +501,15 @@ impl ServerSession {
         self.json_ok(Request::new("POST", format!("/api/items/{}/permissions", pct_encode(id))).json(&body)).map(|_| ())
     }
 
-    /// Owner, people (direct and inherited from folders) and share links, as share-dialog rows.
-    /// People rows have the username as id; link rows `link:<id>`.
+    /// Shares with everyone in an organisation the person belongs to (`org`: its id or name).
+    pub fn grant_org(&self, id: &str, org: &str, edit: bool) -> Result<(), String> {
+        let body = json!({ "org": org, "role": if edit { "edit" } else { "view" } });
+        self.json_ok(Request::new("POST", format!("/api/items/{}/permissions", pct_encode(id))).json(&body)).map(|_| ())
+    }
+
+    /// Owner, people and organisations (direct and inherited from folders) and share links, as
+    /// share-dialog rows. People rows have the username as id, organisation rows `org:<id>`,
+    /// link rows `link:<id>`.
     pub fn permissions(&self, id: &str) -> Result<Vec<Permission>, String> {
         let v = self.get(&format!("/api/items/{}/permissions", pct_encode(id)))?;
         let mut out = Vec::new();
@@ -396,6 +531,16 @@ impl ServerSession {
                 detail: s(&p["username"]),
                 is_link: false,
                 inherited: p["inherited"].as_bool().unwrap_or(false),
+            });
+        }
+        for g in v["orgs"].as_array().into_iter().flatten() {
+            out.push(Permission {
+                id: format!("org:{}", s(&g["org"]["id"])),
+                roles: vec![if g["role"].as_str() == Some("edit") { "write".into() } else { "read".into() }],
+                who: format!("Everyone in {}", s(&g["org"]["name"])),
+                detail: "Organisation".into(),
+                is_link: false,
+                inherited: g["inherited"].as_bool().unwrap_or(false),
             });
         }
         // Links are listed for people who can edit; viewers get 403 and just see people.
@@ -423,11 +568,15 @@ impl ServerSession {
         Ok(out)
     }
 
-    /// Removes a person (`username`) or a link (`link:<id>`) from an item.
+    /// Removes a person (`username`), an organisation (`org:<id>`) or a link (`link:<id>`)
+    /// from an item (usernames can't contain ':').
     pub fn remove_permission(&self, id: &str, perm_id: &str) -> Result<(), String> {
-        let path = match perm_id.strip_prefix("link:") {
-            Some(link) => format!("/api/items/{}/links/{}", pct_encode(id), pct_encode(link)),
-            None => format!("/api/items/{}/permissions/{}", pct_encode(id), pct_encode(perm_id)),
+        let path = if let Some(link) = perm_id.strip_prefix("link:") {
+            format!("/api/items/{}/links/{}", pct_encode(id), pct_encode(link))
+        } else if let Some(org) = perm_id.strip_prefix("org:") {
+            format!("/api/items/{}/permissions/org/{}", pct_encode(id), pct_encode(org))
+        } else {
+            format!("/api/items/{}/permissions/{}", pct_encode(id), pct_encode(perm_id))
         };
         self.json_ok(Request::new("DELETE", path)).map(|_| ())
     }
@@ -511,6 +660,18 @@ mod tests {
         assert_eq!(host_of("https://files.example.com/office"), "files.example.com");
         assert_eq!(host_of("http://localhost:8080"), "localhost:8080");
         assert_eq!(version_copy_name("Book.xlsx", 3), "Book (version 3).xlsx");
+    }
+
+    #[test]
+    fn device_names_say_which_computer() {
+        let d = device_name();
+        assert!(d.starts_with("FreedomOffice Sheets on ") && d.len() > "FreedomOffice Sheets on ".len(), "{d}");
+        #[cfg(target_os = "linux")]
+        if let Ok(h) = std::fs::read_to_string("/proc/sys/kernel/hostname") {
+            assert!(!d.ends_with("this PC") && !d.ends_with("this computer"), "{d}");
+            let file = std::fs::read_to_string("/etc/hostname").unwrap_or_default();
+            assert!(d.ends_with(h.trim()) || d.ends_with(file.trim()), "{d} vs {h}");
+        }
     }
 
     #[test]
@@ -656,6 +817,93 @@ mod e2e {
         assert!(ann.list(&Target::Recent).unwrap().iter().any(|i| i.id == created.id));
         ann.logout().unwrap();
         assert!(ann.me().unwrap_err().contains("expired or was revoked"));
+        drop(server);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Organisation folders, sharing with a whole organisation, and temporary passwords.
+    #[test]
+    fn organisations_and_passwords() {
+        use freedomoffice_server::store::OrgRole;
+        let dir = std::env::temp_dir().join(format!("fo-sheets-orgs-{}", freedomoffice_server::util::new_id()));
+        let cfg = Config { data_dir: dir.join("data"), ..Config::default() };
+        let (org_id, org_root) = {
+            let st = Store::open(&cfg.db_path(), &cfg.files_dir(), cfg.versions_to_keep).unwrap();
+            let ann = st.create_user("ann", "Ann Lee", "", PW, false).unwrap();
+            let ben = st.create_user("ben", "Ben Ode", "", PW, false).unwrap();
+            st.create_user("cam", "Cam Out", "", PW, false).unwrap();
+            // Dan got a temporary password from an admin.
+            let dan = st.create_account("dan", "Dan New", "", "temporary-password-20", false, true).unwrap();
+            let org = st.create_org("Lab Team", "test").unwrap();
+            st.set_member(&org, &ann, OrgRole::Owner, "test").unwrap();
+            st.set_member(&org, &ben, OrgRole::Member, "test").unwrap();
+            st.set_member(&org, &dan, OrgRole::Member, "test").unwrap();
+            (org.id.clone(), org.root_id.clone())
+        };
+        let server = freedomoffice_server::spawn(cfg).unwrap();
+        let url = server.url();
+        let login = |u: &str, pw: &str| ServerSession::login(Box::new(Http::new()), &url, u, pw, "test").unwrap();
+        let (ann, ben, cam) = (login("ann", PW), login("ben", PW), login("cam", PW));
+
+        // /api/me lists the organisations with their folders and the person's role.
+        let me = ann.me_info().unwrap();
+        assert_eq!(me.orgs, [OrgInfo { id: org_id.clone(), name: "Lab Team".into(), root: org_root.clone(), role: "owner".into() }]);
+        assert!(me.can_manage() && !me.must_change_password);
+        assert!(!ben.me_info().unwrap().can_manage(), "members don't manage");
+        assert!(cam.me_info().unwrap().orgs.is_empty());
+
+        // Saving into and opening from the organisation's folder.
+        let target = Target::Folder(org_root.clone());
+        assert!(ann.list(&target).unwrap().is_empty());
+        let conn = crate::cloud::Conn::Server(std::sync::Arc::new(ServerSession::new(ann.account.clone(), Box::new(Http::new()))));
+        assert_eq!(conn.folder_of(&target).as_deref(), Some(org_root.as_str()), "Save As can save there");
+        let f = conn.upload_new(&org_root, "Lab.xlsx", b"lab data", "fail").unwrap();
+        let listed = ben.list(&target).unwrap();
+        assert_eq!(listed.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(), ["Lab.xlsx"], "members see it");
+        let doc = ben.open(&listed[0], &dir.join("ben")).unwrap();
+        assert_eq!((std::fs::read(&doc.local).unwrap(), doc.parent.as_deref()), (b"lab data".to_vec(), Some(org_root.as_str())));
+        assert!(cam.item(&f.id).is_err() && cam.list(&target).is_err(), "outsiders don't");
+
+        // Sharing a personal file with the whole organisation, as view; then removing it.
+        let mine = ann.upload_new("root", "Mine.xlsx", b"mine", "fail").unwrap();
+        assert!(ben.item(&mine.id).is_err());
+        ann.grant_org(&mine.id, &org_id, false).unwrap();
+        assert_eq!(ben.item(&mine.id).unwrap().name, "Mine.xlsx");
+        assert!(ben.upload(&mine.id, None, b"ben's").is_err(), "view only");
+        let perms = ann.permissions(&mine.id).unwrap();
+        let org_row = perms.iter().find(|p| p.id == format!("org:{org_id}")).expect("the org grant is listed");
+        assert_eq!((org_row.who.as_str(), org_row.role_label(), org_row.removable()), ("Everyone in Lab Team", "Can view", true));
+        ann.grant_org(&mine.id, "Lab Team", true).unwrap();
+        assert!(ann.permissions(&mine.id).unwrap().iter().any(|p| p.id == org_row.id && p.role_label() == "Can edit"), "by name too, now edit");
+        assert!(cam.grant_org(&cam.upload_new("root", "C.xlsx", b"c", "fail").unwrap().id, &org_id, true).is_err(), "only members share with an org");
+        ann.remove_permission(&mine.id, &org_row.id).unwrap();
+        assert!(ben.item(&mine.id).is_err());
+        assert!(!ann.permissions(&mine.id).unwrap().iter().any(|p| p.id.starts_with("org:")));
+
+        // People search: people sharing an organisation, plus exact usernames.
+        assert_eq!(ann.search_users("be").unwrap(), [("ben".to_string(), "Ben Ode".to_string())]);
+        assert!(ann.search_users("ca").unwrap().is_empty());
+        assert_eq!(ann.search_users("cam").unwrap(), [("cam".to_string(), "Cam Out".to_string())]);
+
+        // A temporary password: the sign-in says so, every request is refused until it changes.
+        let dan = login("dan", "temporary-password-20");
+        assert!(dan.needs_password_change());
+        dan.dismiss_password_change();
+        let e = dan.list(&Target::MyFiles).unwrap_err();
+        assert!(e.contains("new password"), "{e}");
+        assert!(dan.needs_password_change(), "a refused request asks for a new password");
+        assert!(dan.me_info().unwrap().must_change_password);
+        assert_eq!(dan.change_password("wrong-password-123", "a-much-better-passphrase-77").unwrap_err(), "The current password is incorrect.");
+        let weak = dan.change_password("temporary-password-20", "short").unwrap_err();
+        assert!(weak.contains("12"), "the server's policy message is shown: {weak}");
+        let common = dan.change_password("temporary-password-20", "Password2024!").unwrap_err();
+        assert!(!common.is_empty() && common != weak, "{common}");
+        assert!(dan.needs_password_change());
+        dan.change_password("temporary-password-20", "a-much-better-passphrase-77").unwrap();
+        assert!(!dan.needs_password_change());
+        assert!(dan.list(&Target::MyFiles).is_ok(), "this device stays signed in");
+        assert!(!dan.me_info().unwrap().must_change_password);
+        assert!(ServerSession::login(Box::new(Http::new()), &url, "dan", "a-much-better-passphrase-77", "test").is_ok());
         drop(server);
         let _ = std::fs::remove_dir_all(dir);
     }
