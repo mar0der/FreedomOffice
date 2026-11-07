@@ -237,6 +237,8 @@ pub struct Live {
     /// The server speaks protocol 1 (its Welcome has no `proto`): only whole `Cell` operations
     /// are sent, without `made`, and no "replaced" messages are shown.
     pub legacy: bool,
+    /// The server understands comment threads (protocol 3; known once it has said Welcome).
+    pub comments: bool,
     /// A Welcome arrived (the role it gave is known).
     welcomed: bool,
     snap_wanted: bool,
@@ -305,6 +307,7 @@ impl Live {
             notice: None,
             replaced: Vec::new(),
             legacy: false,
+            comments: false,
             welcomed: false,
             snap_wanted: false,
             snap_busy: false,
@@ -501,7 +504,12 @@ impl App {
         let befores = std::mem::take(&mut l.befores);
         let structs = std::mem::take(&mut l.structs);
         let scopes = std::mem::take(&mut l.scopes);
-        let ch = live::diff(befores, &structs, &mut self.wb);
+        let mut ch = live::diff(befores, &structs, &mut self.wb);
+        // Who deleted or edited which comment is set here (the comparison doesn't know).
+        let who = self.comment_who();
+        live::comments::stamp(&mut ch.ops, &who);
+        live::comments::stamp(&mut ch.inverse, &who);
+        live::comments::drop_foreign_restores(&mut ch.inverse, &who.user);
         if self.pointer_down() && !scopes.is_empty() {
             // Mid-drag: what follows belongs to the same command; keep recording it.
             self.live_snap_scopes(&scopes);
@@ -1057,7 +1065,8 @@ impl App {
                 let Some(l) = &mut self.live else { return };
                 // An older server only knows whole cells: send only those (also what was made
                 // before this Welcome and is still waiting).
-                l.legacy = proto < cosync::PROTO;
+                l.legacy = proto < cosync::MIN_PROTO;
+                l.comments = proto >= cosync::COMMENTS_PROTO;
                 if l.legacy {
                     if let Some(b) = &mut l.sess.inflight {
                         b.ops = live::collapse_cells(&self.wb, &b.ops);
@@ -1690,6 +1699,12 @@ impl App {
                 }
             }
         }
+    }
+
+    /// The server connection of the live session and its document.
+    pub(super) fn live_server(&self) -> Option<(Arc<ServerSession>, String)> {
+        let l = self.live.as_ref()?;
+        Some((l.server.clone()?, l.item.clone()))
     }
 
     /// Uploads the workbook (which holds everything up to our sequence number) as a version.

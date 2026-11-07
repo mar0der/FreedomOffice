@@ -56,7 +56,7 @@ impl Drop for Conn {
 /// The WebSocket URL of a document's live session.
 pub fn ws_url(t: &Target) -> String {
     let base = if let Some(rest) = t.url.strip_prefix("https://") { format!("wss://{rest}") } else { t.url.replacen("http://", "ws://", 1) };
-    let mut u = format!("{base}/api/items/{}/live?since={}&cid={}", crate::cloud::pct_encode(&t.item), t.since, crate::cloud::pct_encode(&t.cid));
+    let mut u = format!("{base}/api/items/{}/live?since={}&cid={}&proto={}", crate::cloud::pct_encode(&t.item), t.since, crate::cloud::pct_encode(&t.cid), cosync::PROTO);
     if let Some(v) = t.version {
         u.push_str(&format!("&v={v}"));
     }

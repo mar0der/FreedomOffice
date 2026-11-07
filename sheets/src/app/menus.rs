@@ -287,6 +287,11 @@ impl App {
             }
         });
         ui.separator();
+        let has_thread = self.sheet().threads.iter().any(|t| (t.r, t.c) == (ar, ac));
+        if ui.button(if has_thread { "Open Comment" } else { "New Comment" }).on_hover_text("Ctrl+Alt+M").clicked() {
+            self.comment_new();
+            ui.close();
+        }
         let has_note = self.sheet().notes.contains_key(&(ar, ac));
         if ui.button(if has_note { "Edit Note" } else { "New Note" }).clicked() {
             self.edit_note();

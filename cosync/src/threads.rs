@@ -160,7 +160,7 @@ pub fn shift_threads(list: &mut Vec<Thread>, rows: bool, at: u32, n: i32) {
     let max = if rows { MAX_ROWS } else { MAX_COLS };
     list.retain_mut(|t| {
         let p = if rows { &mut t.r } else { &mut t.c };
-        match map_index(*p, at, n as i32, max) {
+        match map_index(*p, at, n, max) {
             Some(q) => {
                 *p = q;
                 true

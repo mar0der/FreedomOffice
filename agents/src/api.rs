@@ -382,6 +382,7 @@ impl Api {
             &[
                 ("Content-Type", "application/octet-stream"),
                 ("X-Live-Sheets", sheets),
+                ("X-Live-Proto", &cosync::PROTO.to_string()),
                 ("X-Live-State-Offset", &data.len().to_string()),
             ],
             Some([data, state].concat()),
@@ -413,9 +414,10 @@ impl Api {
             self.url.replacen("http://", "ws://", 1)
         };
         let mut u = format!(
-            "{base}/api/items/{}/live?since={since}&cid={}",
+            "{base}/api/items/{}/live?since={since}&cid={}&proto={}",
             pct_encode(id),
-            pct_encode(cid)
+            pct_encode(cid),
+            cosync::PROTO
         );
         if let Some(v) = version {
             u.push_str(&format!("&v={v}"));

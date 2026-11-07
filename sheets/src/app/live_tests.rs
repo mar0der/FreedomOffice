@@ -28,7 +28,7 @@ fn rg(s: &str) -> Range {
 #[test]
 fn colours_follow_the_user_and_agents_look_different() {
     use super::live_ui::{presence_alpha, presence_label, user_color};
-    let peer = |user: &str, color: u8, agent: bool| cosync::Peer { id: color as u64, name: user.into(), user: user.into(), color, editor: true, agent, presence: None };
+    let peer = |user: &str, color: u8, agent: bool| cosync::Peer { id: color as u64, name: user.into(), user: user.into(), color, editor: true, manager: false, agent, presence: None };
     // Same user: same colour whatever the session's slot or window; case doesn't matter.
     assert_eq!(user_color(&peer("ann", 0, false)), user_color(&peer("ann", 5, false)));
     assert_eq!(user_color(&peer("Ann", 1, false)), user_color(&peer("ann", 2, false)));
@@ -367,7 +367,7 @@ fn becoming_a_viewer_with_unsent_changes_ends_the_session() {
             "role" => app.live_event_for_test(Event::Msg(cosync::ServerMsg::Role { role: "view".into() })),
             "welcome" => {
                 // Reconnecting after access was changed: the server says we are a viewer.
-                let you = cosync::Peer { id: 1, name: "Me".into(), user: "me".into(), color: 0, editor: false, agent: false, presence: None };
+                let you = cosync::Peer { id: 1, name: "Me".into(), user: "me".into(), color: 0, editor: false, manager: false, agent: false, presence: None };
                 app.live_event_for_test(Event::Msg(cosync::ServerMsg::Welcome { seq: 0, you, peers: vec![], proto: cosync::PROTO }));
             }
             // Sending them was refused.
@@ -578,7 +578,7 @@ fn view_only_participants_change_nothing() {
 #[test]
 fn live_messages_are_cleared_by_new_or_open() {
     use crate::live::conn::Event;
-    let join = Event::Msg(cosync::ServerMsg::Join { peer: cosync::Peer { id: 7, name: "PO Client B".into(), user: "pob".into(), color: 1, editor: true, agent: false, presence: None } });
+    let join = Event::Msg(cosync::ServerMsg::Join { peer: cosync::Peer { id: 7, name: "PO Client B".into(), user: "pob".into(), color: 1, editor: true, manager: false, agent: false, presence: None } });
     let (_ctx, mut app) = super::data_ui::sample_app();
     app.live_for_test();
     app.live_event_for_test(join);
@@ -1151,6 +1151,7 @@ mod e2e {
             let st = Store::open(&cfg.db_path(), &cfg.files_dir(), cfg.versions_to_keep).unwrap();
             st.create_user("ann", "Ann Lee", "", PW, false).unwrap();
             st.create_user("ben", "Ben Ode", "", PW, false).unwrap();
+            st.create_user("cam", "Cam Viewer", "", PW, false).unwrap();
         }
         let server = freedomoffice_server::spawn(cfg).unwrap();
         let url = server.url();
@@ -1748,4 +1749,92 @@ mod e2e {
         drop(server);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    fn threads(c: &Client) -> Vec<cosync::Thread> {
+        c.app.wb.sheets[0].threads.clone()
+    }
+
+    /// Comment threads: appear for the others at once, replies, edits, resolving and deleting
+    /// follow the rules (own comments; the owner manages), they move with rows, survive a
+    /// snapshot, and viewers can read but not write.
+    #[test]
+    fn comment_threads_are_shared_live_and_follow_the_rules() {
+        let (server, dir, mut a, mut b, id) = two_people("comments");
+        // Ann is the owner (manages the document), Ben an editor.
+        assert!(a.app.live.as_ref().unwrap().me.as_ref().unwrap().manager);
+        assert!(!b.app.live.as_ref().unwrap().me.as_ref().unwrap().manager);
+        a.session.grant(&id, "cam", false).unwrap();
+        let mut c = client(&server.url(), "cam", &dir);
+
+        a.app.select(1, 1, false);
+        let th = a.app.comment_add(1, 1, "Is B2 right? @Ben Ode").expect("added");
+        super::check(&mut a.app, "adding a thread");
+        settle(&mut [&mut a, &mut b], "thread added");
+        assert_same(&a, &b, "the thread reaches Ben");
+        let t = &threads(&b)[0];
+        assert_eq!((t.id.as_str(), t.r, t.c, t.comments[0].by.as_str(), t.comments[0].name.as_str()), (th.as_str(), 1, 1, "ann", "Ann Lee"));
+
+        // Ben replies and resolves; Ann edits hers. A viewer can't write.
+        assert!(b.app.comment_reply(&th, "Yes, checked."));
+        assert!(b.app.comment_resolve(&th, true));
+        assert!(a.app.comment_edit(&th, &th, "Is B2 right? @Ben Ode (edited)"));
+        settle(&mut [&mut a, &mut b], "reply, resolve, edit");
+        super::check(&mut b.app, "reply and resolve");
+        assert_same(&a, &b, "reply, resolve and edit");
+        let t = &threads(&a)[0];
+        assert!(t.done && t.comments.len() == 2 && t.comments[0].edited > 0, "{t:?}");
+        let reply = t.comments[1].id.clone();
+
+        // The rules: Ben can't edit or delete Ann's comment; Ann (owner) can delete Ben's reply.
+        assert!(!b.app.comment_edit(&th, &th, "hijacked"));
+        assert!(!b.app.comment_delete(&th, &th));
+        assert!(b.app.status.as_deref().is_some_and(|s| s.contains("your own")));
+        settle(&mut [&mut a, &mut b], "refusals change nothing");
+        assert_same(&a, &b, "refused edits");
+        assert!(a.app.comment_delete(&th, &reply), "an owner deletes anyone's comment");
+        settle(&mut [&mut a, &mut b], "owner deleted a reply");
+        assert_eq!(threads(&b)[0].comments.len(), 1);
+
+        // At the same time: Ann inserts a row above the thread, Ben replies and Ann's cell edit lands.
+        b.app.comment_reply(&th, "second reply");
+        a.app.select_range(rg("1:1"));
+        a.app.insert_rows();
+        settle(&mut [&mut a, &mut b], "concurrent reply and row insert");
+        assert_same(&a, &b, "concurrent reply and row insert");
+        assert_eq!((threads(&b)[0].r, threads(&b)[0].comments.len()), (2, 2), "the thread moved down with its cell");
+
+        // A viewer reads the thread and can't write; Ben can't be talked into deleting the row's thread.
+        open(&mut c, &id);
+        settle(&mut [&mut a, &mut b, &mut c], "viewer joined");
+        assert_same(&a, &c, "the viewer sees the thread");
+        assert!(!c.app.live_editor());
+        assert!(c.app.comment_add(5, 5, "from a viewer").is_none());
+        assert!(!c.app.comment_reply(&th, "nope"));
+        assert_eq!(threads(&c).len(), 1);
+
+        // Two threads on one cell at once, and a snapshot: a late joiner has exactly the same.
+        let (x, y) = (a.app.comment_add(3, 3, "from ann").unwrap(), b.app.comment_add(3, 3, "from ben").unwrap());
+        settle(&mut [&mut a, &mut b, &mut c], "two threads on one cell");
+        assert_same(&a, &b, "two threads on one cell");
+        assert_eq!(threads(&a).len(), 3);
+        a.app.live_snapshot();
+        let seq = a.app.live_seq();
+        pump(&mut [&mut a, &mut b, &mut c], "snapshot", |cs| cs[0].app.live_snap_seq() == seq);
+        let mut d = client(&server.url(), "ben", &dir);
+        open(&mut d, &id);
+        settle(&mut [&mut a, &mut b, &mut c, &mut d], "late joiner");
+        assert_same(&a, &d, "snapshot plus replay carries the threads");
+        assert!(threads(&d).iter().any(|t| t.id == x) && threads(&d).iter().any(|t| t.id == y));
+        // The saved xlsx has them too (what Excel and LibreOffice open).
+        let v = a.session.versions(&id).unwrap();
+        assert!(v.len() >= 2);
+        let path = dir.join("version.xlsx");
+        a.session.download_version(&id, v[0].version, &path).unwrap();
+        let wb = crate::io::load(&path).unwrap();
+        assert_eq!(wb.sheets[0].threads.len(), 3, "threaded comments are in the saved file");
+        drop((c, d));
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
+

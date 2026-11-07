@@ -59,10 +59,10 @@ impl Layout {
             self.cols.last().map(|c| c.0).unwrap_or(0)
         }
     }
-    fn row_span(&self, r: u32) -> Option<(f32, f32)> {
+    pub(super) fn row_span(&self, r: u32) -> Option<(f32, f32)> {
         self.rows.iter().find(|x| x.0 == r).map(|x| (x.1, x.1 + x.2))
     }
-    fn col_span(&self, c: u32) -> Option<(f32, f32)> {
+    pub(super) fn col_span(&self, c: u32) -> Option<(f32, f32)> {
         self.cols.iter().find(|x| x.0 == c).map(|x| (x.1, x.1 + x.2))
     }
 
@@ -1249,6 +1249,15 @@ impl App {
             }
         }
 
+        // Comment threads: a purple marker, bigger than a note's and on top of it
+        for t in &self.wb.sheets[si].threads {
+            if let (Some((top, _)), Some((_, rx))) = (lay.row_span(t.r), lay.col_span(t.c)) {
+                let s = 9.0 * z.max(0.7);
+                let col = if t.done { super::comments_ui::MARKER.gamma_multiply(0.45) } else { super::comments_ui::MARKER };
+                cp.add(egui::Shape::convex_polygon(vec![Pos2::new(rx - s - 1.0, top), Pos2::new(rx - 1.0, top), Pos2::new(rx - 1.0, top + s)], col, Stroke::NONE));
+            }
+        }
+
         // Page breaks (after Print Preview / Page Setup, like the desktop app)
         self.paint_page_breaks(&cp, lay);
 
@@ -1445,6 +1454,17 @@ impl App {
                 lp.galley(origin + Vec2::new(6.0, 5.0), g, Color32::BLACK);
             }
         }
+
+        // The thread of the hovered cell
+        if self.edit.is_none() && self.drag == Drag::None {
+            if let Some((r, c)) = self.hover_cell {
+                if let (Some(t), Some((top, _)), Some((_, rx))) = (self.wb.sheets[si].threads.iter().find(|t| (t.r, t.c) == (r, c)), lay.row_span(r), lay.col_span(c)) {
+                    let lp = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("cell_threads")));
+                    self.paint_thread_card(&lp, (top, rx), t);
+                }
+            }
+        }
+        self.comments_marker_click(ui, lay);
 
         // Headers
         if self.show_headings {

@@ -5,6 +5,7 @@ mod chart_draw;
 mod chart_pane;
 mod chart_view;
 mod chrome;
+mod comments_ui;
 mod cloud_ui;
 mod condfmt_ui;
 mod data_ui;
@@ -189,6 +190,8 @@ pub struct App {
     prev_alt: bool,
     pub hover_cell: Option<(u32, u32)>,
     pub show_all_notes: bool,
+    /// Comment threads: the pane and its drafts.
+    pub comments: comments_ui::CommentsUi,
     pub print: print_ui::PrintState,
     /// Counts workbook edits (cache key for print layout and page breaks).
     pub edits: u64,
@@ -317,6 +320,7 @@ impl App {
             prev_alt: false,
             hover_cell: None,
             show_all_notes: false,
+            comments: Default::default(),
             print: Default::default(),
             edits: 0,
             hwnd,
@@ -1213,6 +1217,7 @@ impl App {
                 .show(ctx, |ui| self.sheet_tabs_ui(ui));
             self.chart_format_pane(ctx);
             self.pivot_field_pane(ctx);
+            self.comments_pane(ctx);
             egui::CentralPanel::default().frame(egui::Frame::NONE.fill(egui::Color32::WHITE)).show(ctx, |ui| self.grid_ui(ui));
             self.popups_ui(ctx);
             self.keytips_ui(ctx);

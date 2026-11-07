@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use cosync::{Op, Rect, SheetId};
+use cosync::{Comment, Op, Rect, SheetId, Thread};
 
 use super::{apply_struct, cell_data, feature_changed, feature_get, index_of, prop_get, prop_same, ApplyState, FEATURES, PROPS};
 use crate::model::{Cell, Range, Sheet, Workbook};
@@ -222,6 +222,44 @@ fn assign_positions(e: &[(SheetId, Option<f64>)]) -> Vec<f64> {
     }
 }
 
+/// Comment-thread differences. Who did it (`by`, `adm`) is not known here: the app sets it
+/// (`live::stamp_threads`) when it sends the operations.
+fn thread_pair(s: SheetId, x: &[Thread], y: &[Thread], fwd: &mut Vec<Op>, inv: &mut Vec<Op>) {
+    let del = |th: &str| Op::ThreadDel { s, th: th.to_string(), by: String::new(), adm: false };
+    let add = |t: &Thread| Op::ThreadAdd { s, r: t.r, c: t.c, th: Box::new(t.clone()) };
+    for t in y.iter().filter(|t| !x.iter().any(|o| o.id == t.id)) {
+        fwd.push(add(t));
+        inv.push(del(&t.id));
+    }
+    for t in x.iter().filter(|t| !y.iter().any(|o| o.id == t.id)) {
+        fwd.push(del(&t.id));
+        inv.push(add(t));
+    }
+    for (a, b) in x.iter().filter_map(|a| y.iter().find(|b| b.id == a.id).map(|b| (a, b))) {
+        if a.done != b.done {
+            fwd.push(Op::ThreadDone { s, th: a.id.clone(), done: b.done });
+            inv.push(Op::ThreadDone { s, th: a.id.clone(), done: a.done });
+        }
+        let cdel = |id: &str| Op::CommentDel { s, th: a.id.clone(), id: id.to_string(), by: String::new(), adm: false };
+        let cadd = |cm: &Comment| Op::CommentAdd { s, th: a.id.clone(), cm: Box::new(cm.clone()) };
+        for cm in b.comments.iter().filter(|c| !a.comments.iter().any(|o| o.id == c.id)) {
+            fwd.push(cadd(cm));
+            inv.push(cdel(&cm.id));
+        }
+        for cm in a.comments.iter().filter(|c| !b.comments.iter().any(|o| o.id == c.id)) {
+            fwd.push(cdel(&cm.id));
+            inv.push(cadd(cm));
+        }
+        for (o, n) in a.comments.iter().filter_map(|o| b.comments.iter().find(|n| n.id == o.id).map(|n| (o, n))) {
+            if o.text != n.text {
+                let edit = |t: &Comment, at: i64| Op::CommentEdit { s, th: a.id.clone(), id: t.id.clone(), text: t.text.clone(), at, by: String::new() };
+                fwd.push(edit(n, n.edited));
+                inv.push(edit(o, n.edited));
+            }
+        }
+    }
+}
+
 fn data_of(w: &Workbook, sh: &Sheet, r: u32, c: u32) -> Option<Box<cosync::CellData>> {
     sh.get(r, c).filter(|x| !x.is_blank()).map(|x| Box::new(cell_data(w, sh, r, c, x)))
 }
@@ -251,6 +289,7 @@ pub(super) fn sheet_pair(wx: &Workbook, x: &Sheet, wy: &Workbook, y: &Sheet, fwd
             inv.push(Op::Note { s, r: k.0, c: k.1, text: nx.0.cloned(), author: nx.1.cloned() });
         }
     }
+    thread_pair(s, &x.threads, &y.threads, fwd, inv);
     let keys: BTreeSet<(u32, u32)> = x.links.keys().chain(y.links.keys()).copied().collect();
     for k in keys {
         if x.links.get(&k) != y.links.get(&k) {

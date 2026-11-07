@@ -5,6 +5,8 @@
 //! * `GET /api/items/{id}/sheet/cells?sheet=&r1=&r2=&c1=&c2=`: the cells of a window.
 //! * `GET /api/items/{id}/sheet/cell?sheet=&r=&c=`: one cell for the formula bar.
 //! * `GET /api/items/{id}/sheet/csv?sheet=`: a sheet as CSV (displayed values).
+//! * `GET /api/items/{id}/sheet/comments?sheet=`: the comment threads of a sheet (also listed,
+//!   for all sheets, as `threads` in `/sheet`; shape in SPEC.md "Comments").
 //!
 //! Access is the content endpoint's: the same authentication (bearer token, web session, share
 //! link) and a viewer role is enough. The workbook is the saved file version plus the live log
@@ -256,9 +258,60 @@ pub(crate) async fn meta(State(app): State<App>, headers: HeaderMap, Path(id): P
     v["rev"] = json!(l.rev);
     v["cells"] = json!(l.book.cell_count());
     v["role"] = json!(if p.role >= Role::Edit { "edit" } else { "view" });
+    v["threads"] = threads_json(l.book.workbook().sheets.iter().map(|s| s.threads.as_slice()), None);
     v["live"] = json!(app.hub.connected(&p.item.id));
     v["link"] = json!(p.link);
     json_ok(v)
+}
+
+/// The comment threads of a sheet (or of all, when `only` is None) for the browser: anchored
+/// cell (zero-based `r`, `c` and `ref` like `B3`), resolved flag, and the comments with author
+/// (`by` = user name, `name` = display name), time (`at`, milliseconds since 1970 UTC) and
+/// plain text (a mention is written `@Name`). At most `MAX_THREADS` are listed.
+fn threads_json<'a>(sheets: impl Iterator<Item = &'a [cosync::Thread]>, only: Option<usize>) -> Value {
+    const MAX_THREADS: usize = 5000;
+    let mut out = Vec::new();
+    for (si, threads) in sheets.enumerate().filter(|(i, _)| only.is_none_or(|o| o == *i)) {
+        for t in threads {
+            if out.len() >= MAX_THREADS {
+                break;
+            }
+            let cs: Vec<Value> = t
+                .comments
+                .iter()
+                .map(|c| {
+                    let mut o = json!({ "id": c.id, "by": c.by, "name": c.name, "at": c.at, "text": c.text });
+                    if c.edited != 0 {
+                        o["edited"] = json!(c.edited);
+                    }
+                    o
+                })
+                .collect();
+            out.push(json!({ "sheet": si, "id": t.id, "r": t.r, "c": t.c, "ref": a1(t.r, t.c), "done": t.done, "comments": cs }));
+        }
+    }
+    Value::Array(out)
+}
+
+/// `B3` for zero-based row 2, column 1.
+fn a1(r: u32, c: u32) -> String {
+    let mut col = String::new();
+    let mut n = c + 1;
+    while n > 0 {
+        col.insert(0, (b'A' + ((n - 1) % 26) as u8) as char);
+        n = (n - 1) / 26;
+    }
+    format!("{col}{}", r + 1)
+}
+
+pub(crate) async fn comments(State(app): State<App>, headers: HeaderMap, Path(id): Path<String>, Query(q): Query<HashMap<String, String>>) -> ApiResult {
+    let sheet = num(&q, "sheet")? as usize;
+    let (_, l) = book(&app, &headers, &id).await?;
+    let wb = l.book.workbook();
+    if sheet >= wb.sheets.len() {
+        return Err(ApiError::bad("No such sheet."));
+    }
+    json_ok(json!({ "sheet": sheet, "threads": threads_json(wb.sheets.iter().map(|s| s.threads.as_slice()), Some(sheet)), "rev": l.rev }))
 }
 
 pub(crate) async fn cells(State(app): State<App>, headers: HeaderMap, Path(id): Path<String>, Query(q): Query<HashMap<String, String>>) -> ApiResult {

@@ -281,7 +281,7 @@ fn two_editors_converge_and_reconnect_replays() {
     }
     assert_eq!(n, 2);
     // The workbook and the client's lossless state in one body, split at the offset.
-    let snap = s.send("POST", &format!("/api/items/{id}/live/snapshot?seq=2"), Some(&a), &[("X-Live-Sheets", "1:0"), ("X-Live-State-Offset", "13")], Some(b"snapshot at 2STATE".to_vec()));
+    let snap = s.send("POST", &format!("/api/items/{id}/live/snapshot?seq=2"), Some(&a), &[("X-Live-Proto", "3"), ("X-Live-Sheets", "1:0"), ("X-Live-State-Offset", "13")], Some(b"snapshot at 2STATE".to_vec()));
     assert_eq!(snap.status, 200, "{}", String::from_utf8_lossy(&snap.body));
     assert_eq!(snap.json()["version"], 2);
     let content = s.send("GET", &format!("/api/items/{id}/content"), Some(&a), &[], None);
@@ -289,9 +289,9 @@ fn two_editors_converge_and_reconnect_replays() {
     let state = s.send("GET", &format!("/api/items/{id}/live/state?version=2"), Some(&b), &[], None);
     assert_eq!((state.status, state.body.as_slice()), (200, &b"STATE"[..]));
     assert_eq!(s.send("GET", &format!("/api/items/{id}/live/state?version=1"), Some(&a), &[], None).status, 404);
-    assert_eq!(s.send("POST", &format!("/api/items/{id}/live/snapshot?seq=2"), Some(&a), &[("X-Live-State-Offset", "99")], Some(b"x".to_vec())).status, 400);
+    assert_eq!(s.send("POST", &format!("/api/items/{id}/live/snapshot?seq=2"), Some(&a), &[("X-Live-Proto", "3"), ("X-Live-State-Offset", "99")], Some(b"x".to_vec())).status, 400);
     // An older snapshot is refused.
-    assert_eq!(s.send("POST", &format!("/api/items/{id}/live/snapshot?seq=1"), Some(&a), &[], Some(b"x".to_vec())).status, 409);
+    assert_eq!(s.send("POST", &format!("/api/items/{id}/live/snapshot?seq=1"), Some(&a), &[("X-Live-Proto", "3")], Some(b"x".to_vec())).status, 409);
     drop(wc);
     std::thread::sleep(Duration::from_millis(300));
     // Joining now starts from the snapshot.
@@ -326,7 +326,7 @@ fn viewers_receive_but_cannot_edit() {
     assert_eq!(wc.close_code(), Some(cosync::close::READ_ONLY));
     assert!(wa.quiet(300));
     // Viewers can't upload snapshots either.
-    assert_eq!(s.send("POST", &format!("/api/items/{id}/live/snapshot?seq=1"), Some(&c), &[], Some(b"x".to_vec())).status, 403);
+    assert_eq!(s.send("POST", &format!("/api/items/{id}/live/snapshot?seq=1"), Some(&c), &[("X-Live-Proto", "3")], Some(b"x".to_vec())).status, 403);
 
     // Share links: a view link joins as a viewer, an edit link as an editor.
     for (role, editor) in [("view", false), ("edit", true)] {
@@ -389,7 +389,7 @@ fn tickets_garbage_and_limits() {
     assert_eq!(code, Some(cosync::close::RATE));
     // A stale copy (older version) is told to reload.
     let ServerMsg::Welcome { seq: head, .. } = s.ws(Some(&a), "since=0&v=1&cid=h", &id).unwrap().recv() else { panic!("no welcome") };
-    assert_eq!(s.send("POST", &format!("/api/items/{id}/live/snapshot?seq={head}"), Some(&a), &[], Some(b"snap".to_vec())).status, 200);
+    assert_eq!(s.send("POST", &format!("/api/items/{id}/live/snapshot?seq={head}"), Some(&a), &[("X-Live-Proto", "3")], Some(b"snap".to_vec())).status, 200);
     std::thread::sleep(Duration::from_millis(300));
     let mut w = s.ws(Some(&a), "since=0&v=1&cid=old", &id).unwrap();
     assert_eq!(w.recv(), ServerMsg::Reload);
@@ -428,7 +428,7 @@ fn reconnecting_after_a_plain_save_reloads() {
     wa.send(&ClientMsg::Ops { base: 0, id: 1, made: None, ops: vec![text(0, 0, "x")] });
     assert!(matches!(wa.recv_data(), ServerMsg::Ack { seq: 1, .. }));
     // The client snapshots everything, then its connection drops (laptop sleeps).
-    assert_eq!(s.send("POST", &format!("/api/items/{id}/live/snapshot?seq=1"), Some(&a), &[("X-Live-Sheets", "1:0")], Some(b"snap".to_vec())).status, 200);
+    assert_eq!(s.send("POST", &format!("/api/items/{id}/live/snapshot?seq=1"), Some(&a), &[("X-Live-Proto", "3"), ("X-Live-Sheets", "1:0")], Some(b"snap".to_vec())).status, 200);
     drop(wa);
     std::thread::sleep(Duration::from_millis(300));
     // Someone replaces the content while nobody is connected (allowed: nothing unsaved).
@@ -457,7 +457,7 @@ fn share_links_get_the_live_state_of_the_current_version_only() {
         while !matches!(wa.recv_data(), ServerMsg::Ack { .. }) {}
         let mut body = b"snap".to_vec();
         body.extend_from_slice(state.as_bytes());
-        assert_eq!(s.send("POST", &format!("/api/items/{id}/live/snapshot?seq={seq}"), Some(&a), &[("X-Live-State-Offset", "4")], Some(body)).status, 200);
+        assert_eq!(s.send("POST", &format!("/api/items/{id}/live/snapshot?seq={seq}"), Some(&a), &[("X-Live-Proto", "3"), ("X-Live-State-Offset", "4")], Some(body)).status, 200);
     }
     let link = s.json("POST", &format!("/api/items/{id}/links"), Some(&a), json!({ "role": "edit" })).json();
     let token = link["url"].as_str().unwrap().rsplit('/').next().unwrap().to_string();
@@ -485,7 +485,7 @@ fn reload_tells_a_client_its_last_batch_was_committed() {
     // Two snapshots prune past the client's base; then everyone leaves (the session is
     // loaded from the database again).
     for seq in [2, 4] {
-        assert_eq!(s.send("POST", &format!("/api/items/{id}/live/snapshot?seq={seq}"), Some(&a), &[("X-Live-Sheets", "1:0")], Some(b"snap".to_vec())).status, 200);
+        assert_eq!(s.send("POST", &format!("/api/items/{id}/live/snapshot?seq={seq}"), Some(&a), &[("X-Live-Proto", "3"), ("X-Live-Sheets", "1:0")], Some(b"snap".to_vec())).status, 200);
     }
     drop((wa, wb));
     std::thread::sleep(Duration::from_millis(300));
@@ -514,7 +514,7 @@ fn snapshots_of_the_same_state_make_one_version() {
     assert!(matches!(wa.recv_data(), ServerMsg::Ack { seq: 1, .. }));
     let before = s.send("GET", &format!("/api/items/{id}"), Some(&a), &[], None).json();
     std::thread::sleep(Duration::from_millis(1100));
-    let snap = |who: &str, body: &[u8]| s.send("POST", &format!("/api/items/{id}/live/snapshot?seq=1"), Some(who), &[("X-Live-Sheets", "1:0")], Some(body.to_vec()));
+    let snap = |who: &str, body: &[u8]| s.send("POST", &format!("/api/items/{id}/live/snapshot?seq=1"), Some(who), &[("X-Live-Proto", "3"), ("X-Live-Sheets", "1:0")], Some(body.to_vec()));
     let first = snap(&a, b"alice's copy");
     assert_eq!(first.status, 200);
     assert_eq!(first.json()["version"], 2);
@@ -824,7 +824,7 @@ fn live_snapshots_list_their_contributors_and_labels_can_be_set() {
     assert!(matches!(wb.recv_data(), ServerMsg::Ops { .. }));
     wb.send(&ClientMsg::Ops { base: 1, id: 1, made: None, ops: vec![text(1, 0, "b")] });
     assert!(matches!(wb.recv_data(), ServerMsg::Ack { seq: 2, .. }));
-    let snap = |seq: u32, who: &str| s.send("POST", &format!("/api/items/{id}/live/snapshot?seq={seq}"), Some(who), &[("X-Live-Sheets", "1:0")], Some(format!("snapshot {seq}").into_bytes()));
+    let snap = |seq: u32, who: &str| s.send("POST", &format!("/api/items/{id}/live/snapshot?seq={seq}"), Some(who), &[("X-Live-Proto", "3"), ("X-Live-Sheets", "1:0")], Some(format!("snapshot {seq}").into_bytes()));
     assert_eq!(snap(2, &a).status, 200);
     let list = s.send("GET", &format!("/api/items/{id}/versions"), Some(&c), &[], None).json();
     let v2 = &list["versions"][0];

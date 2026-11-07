@@ -1345,6 +1345,18 @@ impl App {
     }
 
     fn review_tab(&mut self, ui: &mut egui::Ui) {
+        self.group(ui, "Comments", |app, ui| {
+            let (r, c) = app.active();
+            let has = app.sheet().threads.iter().any(|t| (t.r, t.c) == (r, c));
+            let job = icon_job("💬", false, if has { "Open\nComment" } else { "New\nComment" }, 20.0, true, theme::text());
+            if big_btn(ui, job, 62.0, false).on_hover_text("Ctrl+Alt+M").clicked() {
+                app.comment_new();
+            }
+            let job = icon_job("☰", false, "Show\nComments", 20.0, true, theme::text());
+            if big_btn(ui, job, 62.0, app.comments.open).on_hover_text("List all comments on this sheet").clicked() {
+                app.comments_toggle();
+            }
+        });
         self.group(ui, "Notes", |app, ui| {
             let (r, c) = app.active();
             let has = app.sheet().notes.contains_key(&(r, c));

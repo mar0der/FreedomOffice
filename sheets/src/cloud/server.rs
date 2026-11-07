@@ -469,6 +469,7 @@ impl ServerSession {
         let mut req = Request::new("POST", format!("/api/items/{}/live/snapshot?seq={seq}", pct_encode(id)))
             .header("Content-Type", "application/octet-stream")
             .header("X-Live-Sheets", sheets)
+            .header("X-Live-Proto", cosync::PROTO.to_string())
             .header("X-Live-State-Offset", data.len().to_string());
         req.body = [data, state].concat();
         let r = self.call(req)?;
@@ -476,6 +477,25 @@ impl ServerSession {
             return Err(error_text(&r, &self.host()));
         }
         Ok(item_from_json(&r.json()?))
+    }
+
+    /// The people who can be mentioned in comments on a document: (user name, display name) of
+    /// the members of the organisation it belongs to (none for a personal file).
+    pub fn document_members(&self, id: &str) -> Result<Vec<(String, String)>, String> {
+        let item = self.get(&format!("/api/items/{}", pct_encode(id)))?;
+        let Some(org) = item["org"]["id"].as_str() else { return Ok(Vec::new()) };
+        let o = self.get(&format!("/api/orgs/{}", pct_encode(org)))?;
+        Ok(o["member_list"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|m| !m["disabled"].as_bool().unwrap_or(false))
+            .filter_map(|m| {
+                let user = m["username"].as_str()?.to_string();
+                let name = m["display_name"].as_str().filter(|n| !n.is_empty()).unwrap_or(&user).to_string();
+                Some((user, name))
+            })
+            .collect())
     }
 
     /// The device token (for the live connection's Authorization header).

@@ -379,12 +379,7 @@ pub enum ServerMsg {
     /// Your access changed while connected (a share, organisation membership or role changed):
     /// `role` is "view" (changes you send from now on are refused: the connection is closed
     /// with `close::READ_ONLY`) or "edit" (you may send changes again).
-    Role {
-        role: String,
-        /// The connection may delete anyone's comments (see `Peer::manager`).
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        manager: bool,
-    },
+    Role { role: String },
     /// Your access to this document ended (`reason` is for people, e.g. "Your access to this
     /// workbook was removed."); the server closes the connection with `close::REVOKED` next.
     Revoked { reason: String },

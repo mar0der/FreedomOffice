@@ -7,6 +7,7 @@ mod fidelity;
 mod filter;
 mod page;
 mod pivot;
+mod threads;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -34,6 +35,7 @@ pub fn to_bytes(wb: &Workbook) -> Result<Vec<u8>, String> {
     let bytes = fidelity::patch_protection(wb, bytes)?;
     let bytes = charts::patch_explosions(bytes, &explosions)?;
     let bytes = analysis::patch(wb, bytes)?;
+    let bytes = threads::patch(wb, bytes)?;
     pivot::patch(wb, bytes)
 }
 
@@ -104,7 +106,14 @@ fn write_sheet(wb: &Workbook, sh: &Sheet, ws: &mut Worksheet, formats: &mut Hash
     for &r in sh.hidden_rows.iter().filter(|r| **r < MAX_ROWS) {
         ws.set_row_hidden(r)?;
     }
-    let mut notes: Vec<_> = sh.notes.iter().filter(|((r, c), _)| *r < MAX_ROWS && *c < MAX_COLS).collect();
+    // A cell with a comment thread has a legacy comment that stands for it (see `threads`);
+    // a plain note on the same cell goes into that comment's text and the custom part.
+    let threaded = threads::by_cell(sh);
+    for (&(r, c), list) in &threaded {
+        let (text, author) = threads::legacy_note(list, sh.notes.get(&(r, c)).map(String::as_str));
+        ws.insert_note(r, c as u16, &rust_xlsxwriter::Note::new(text).set_author(author).add_author_prefix(false))?;
+    }
+    let mut notes: Vec<_> = sh.notes.iter().filter(|((r, c), _)| *r < MAX_ROWS && *c < MAX_COLS && !threaded.contains_key(&(*r, *c))).collect();
     notes.sort_by_key(|(k, _)| **k);
     for (&(r, c), text) in notes {
         let note = match sh.note_authors.get(&(r, c)) {

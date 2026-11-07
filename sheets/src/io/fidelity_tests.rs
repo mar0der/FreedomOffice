@@ -211,7 +211,7 @@ fn picture_round_trip() {
 }
 
 #[test]
-fn threaded_comments_become_notes() {
+fn threaded_comments_from_excel_are_threads() {
     use std::io::Write;
     // Minimal package: a sheet with a threaded comment and one reply.
     let path = temp("threaded.xlsx");
@@ -235,13 +235,130 @@ fn threaded_comments_become_notes() {
 
     let wb = load(&path).unwrap();
     let s = &wb.sheets[0];
-    assert_eq!(s.notes.get(&(1, 1)).map(String::as_str), Some("Is this right?\n\nBob:\nYes."));
-    assert_eq!(s.note_authors.get(&(1, 1)).map(String::as_str), Some("Ann"));
-    // Saved back as a note with its author.
+    // A thread (not a note; the legacy stand-in comment is dropped), with its reply.
+    assert!(s.notes.is_empty() && s.note_authors.is_empty(), "{:?}", s.notes);
+    assert_eq!(s.threads.len(), 1);
+    let t = &s.threads[0];
+    assert_eq!((t.id.as_str(), t.r, t.c, t.done), ("{T1}", 1, 1, false));
+    let texts: Vec<_> = t.comments.iter().map(|c| (c.name.as_str(), c.text.as_str())).collect();
+    assert_eq!(texts, [("Ann", "Is this right?"), ("Bob", "Yes.")]);
+    assert_eq!(t.comments[0].at, 1_704_067_200_000, "2024-01-01T00:00:00 UTC");
+    // Saved back as a thread again (and a legacy comment, which is not read as a note).
     let back = round_trip(&wb, "threaded_back.xlsx");
-    assert_eq!(back.sheets[0].notes.get(&(1, 1)), s.notes.get(&(1, 1)));
-    assert_eq!(back.sheets[0].note_authors.get(&(1, 1)).map(String::as_str), Some("Ann"));
+    assert!(back.sheets[0].notes.is_empty());
+    assert_eq!(back.sheets[0].threads, s.threads);
 }
+
+fn sample_threads() -> Workbook {
+    use cosync::{Comment, Thread};
+    let mut wb = Workbook::empty_with(vec![Sheet::new("A"), Sheet::new("B")]);
+    put(&mut wb, 0, 1, 1, "value");
+    let cm = |id: &str, by: &str, name: &str, at: i64, text: &str| Comment { id: id.into(), by: by.into(), name: name.into(), at, text: text.into(), edited: 0 };
+    wb.sheets[0].threads = vec![
+        Thread {
+            id: "{AAAAAAAA-0000-4000-8000-000000000001}".into(),
+            r: 1,
+            c: 1,
+            done: true,
+            comments: vec![
+                cm("{AAAAAAAA-0000-4000-8000-000000000001}", "ann", "Ann Lee", 1_700_000_000_123, "Is this <right> & \"complete\"?\nSecond line, ünïcode ✓"),
+                Comment { edited: 1_700_000_050_000, ..cm("{AAAAAAAA-0000-4000-8000-000000000002}", "ben", "Ben", 1_700_000_010_000, "@Ann Lee yes") },
+                cm("{AAAAAAAA-0000-4000-8000-000000000003}", "ann", "Ann Lee", 1_700_000_020_000, "thanks"),
+            ],
+        },
+        Thread { id: "{AAAAAAAA-0000-4000-8000-000000000009}".into(), r: 5, c: 0, done: false, comments: vec![cm("{AAAAAAAA-0000-4000-8000-000000000009}", "ben", "Ben", 1_700_000_100_000, "open question")] },
+    ];
+    wb.sheets[1].threads = vec![Thread { id: "{BBBBBBBB-0000-4000-8000-000000000001}".into(), r: 0, c: 0, done: false, comments: vec![cm("{BBBBBBBB-0000-4000-8000-000000000001}", "", "", 5, "guest")] }];
+    wb
+}
+
+#[test]
+fn threads_round_trip_exactly() {
+    let wb = sample_threads();
+    let back = round_trip(&wb, "threads.xlsx");
+    for (a, b) in wb.sheets.iter().zip(&back.sheets) {
+        assert_eq!(a.threads, b.threads, "sheet {}", a.name);
+    }
+    assert!(back.sheets.iter().all(|s| s.notes.is_empty()), "the legacy stand-ins are not notes");
+    assert_eq!(back.sheets[0].get(1, 1).map(|c| c.value.clone()), Some(Value::Text("value".into())));
+}
+
+#[test]
+fn threads_are_written_the_way_excel_does() {
+    use std::io::Read;
+    let path = temp("excel_shape.xlsx");
+    save(&sample_threads(), &path).unwrap();
+    let mut z = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+    let mut text = |name: &str| {
+        let mut s = String::new();
+        z.by_name(name).unwrap_or_else(|_| panic!("{name}")).read_to_string(&mut s).unwrap();
+        s
+    };
+    let tc = text("xl/threadedComments/threadedComment1.xml");
+    assert!(tc.contains("<threadedComment ref=\"B2\" dT=\"2023-11-14T22:13:20.123\"") && tc.contains("done=\"1\"") && tc.contains("parentId=\"{AAAAAAAA-0000-4000-8000-000000000001}\""), "{tc}");
+    assert!(tc.contains("&lt;right&gt; &amp;"), "escaped");
+    assert!(text("xl/threadedComments/threadedComment2.xml").contains("ref=\"A1\""));
+    let persons = text("xl/persons/person.xml");
+    assert!(persons.contains("displayName=\"Ann Lee\"") && persons.contains("userId=\"ann\"") && persons.contains("providerId=\"None\""), "{persons}");
+    // Every part is registered and related, and the legacy comment is the stand-in Excel expects.
+    let types = text("[Content_Types].xml");
+    assert!(types.contains("/xl/threadedComments/threadedComment1.xml\" ContentType=\"application/vnd.ms-excel.threadedcomments+xml\""));
+    assert!(types.contains("/xl/persons/person.xml\" ContentType=\"application/vnd.ms-excel.person+xml\""));
+    assert!(text("xl/_rels/workbook.xml.rels").contains("relationships/person\" Target=\"persons/person.xml\""));
+    assert!(text("xl/worksheets/_rels/sheet1.xml.rels").contains("relationships/threadedComment\" Target=\"../threadedComments/threadedComment1.xml\""));
+    let legacy = text("xl/comments1.xml");
+    assert!(legacy.contains("tc={AAAAAAAA-0000-4000-8000-000000000001}") && legacy.contains("[Threaded comment]") && legacy.contains("Comment by Ann Lee:"), "{legacy}");
+    // No custom part when nothing needs one (but the edit time of the reply does).
+    assert!(z.by_name("xl/freedomoffice/comments.json").is_ok());
+}
+
+#[test]
+fn what_the_standard_format_cannot_hold_survives_in_the_custom_part() {
+    use cosync::{Comment, Thread};
+    let mut wb = sample_threads();
+    // A second thread on a commented cell, and a plain note on a cell that has a thread.
+    let cm = |id: &str| Comment { id: id.into(), by: "cy".into(), name: "Cy".into(), at: 9, text: "second thread".into(), edited: 0 };
+    wb.sheets[0].threads.push(Thread { id: "{CCCCCCCC-0000-4000-8000-000000000001}".into(), r: 1, c: 1, done: false, comments: vec![cm("{CCCCCCCC-0000-4000-8000-000000000001}")] });
+    wb.sheets[0].threads.sort_by(|a, b| (a.comments[0].at, &a.id).cmp(&(b.comments[0].at, &b.id)));
+    wb.sheets[0].notes.insert((5, 0), "a note on a thread's cell".into());
+    wb.sheets[0].note_authors.insert((5, 0), "Zed".into());
+    wb.sheets[0].notes.insert((7, 7), "a plain note".into());
+    let back = round_trip(&wb, "threads_custom.xlsx");
+    assert_eq!(back.sheets[0].threads, wb.sheets[0].threads);
+    assert_eq!(back.sheets[0].notes.get(&(5, 0)).map(String::as_str), Some("a note on a thread's cell"));
+    assert_eq!(back.sheets[0].note_authors.get(&(5, 0)).map(String::as_str), Some("Zed"));
+    assert_eq!(back.sheets[0].notes.get(&(7, 7)).map(String::as_str), Some("a plain note"));
+    assert_eq!(back.sheets[0].notes.len(), 2);
+}
+
+#[test]
+fn a_file_edited_elsewhere_keeps_its_threads_and_drops_stale_custom_data() {
+    // Excel (or LibreOffice) saved over our file: the standard parts win, the custom part only adds.
+    let wb = sample_threads();
+    let path = temp("threads_plain.xlsx");
+    save(&wb, &path).unwrap();
+    let plain = load(&path).unwrap();
+    assert_eq!(plain.sheets[0].threads.len(), 2);
+    // Without the threaded parts (e.g. LibreOffice) the legacy comments stay as notes with their text.
+    let mut z = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+    let out = temp("threads_stripped.xlsx");
+    let mut w = zip::ZipWriter::new(std::fs::File::create(&out).unwrap());
+    for i in 0..z.len() {
+        let f = z.by_index(i).unwrap();
+        let name = f.name().unwrap().to_string();
+        if name.contains("threadedComments") || name.contains("persons") || name.contains("freedomoffice") {
+            continue;
+        }
+        w.raw_copy_file(f).unwrap();
+    }
+    w.finish().unwrap();
+    let stripped = load(&out).unwrap();
+    assert!(stripped.sheets[0].threads.is_empty());
+    let note = stripped.sheets[0].notes.get(&(1, 1)).expect("the legacy comment is a note");
+    assert!(note.contains("Is this <right>") && note.contains("yes"), "{note}");
+}
+
+
 
 #[test]
 fn default_table_style_is_known() {

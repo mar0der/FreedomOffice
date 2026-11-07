@@ -1380,6 +1380,4 @@ fn comment_operations_round_trip_and_validate() {
     // An old client's JSON (no comment fields on a peer or a role message) still parses.
     let p: Peer = serde_json::from_str(r#"{"id":1,"name":"a","user":"a","color":0,"editor":true}"#).unwrap();
     assert!(!p.manager);
-    let r: ServerMsg = serde_json::from_str(r#"{"t":"role","role":"edit"}"#).unwrap();
-    assert_eq!(r, ServerMsg::Role { role: "edit".into(), manager: false });
 }

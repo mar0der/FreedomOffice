@@ -420,6 +420,7 @@ impl App {    pub fn handle_keys(&mut self, ctx: &egui::Context) {
             Key::F3 if m.shift && ctrl => self.open_create_names(),
             Key::F3 if m.shift => self.dialog = Some(Dialog::insert_function()),
             Key::F3 if ctrl => self.dialog = Some(Dialog::NameManager { name: String::new(), refers: self.sel_abs_ref(), error: None }),
+            Key::M if m.alt && ctrl => self.comment_new(),
             Key::F5 if m.alt && ctrl => self.pivot_refresh_all(),
             Key::F5 if m.alt => self.pivot_refresh_active(),
             Key::F5 => self.dialog = Some(Dialog::GoTo { text: String::new(), focus: true }),
