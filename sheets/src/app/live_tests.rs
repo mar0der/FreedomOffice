@@ -234,30 +234,103 @@ fn undo_never_overwrites_someone_elses_later_value() {
 }
 
 /// An editor made a viewer while changes are unsent: the session ends (instead of resending
-/// them on every reconnect) and the changes stay in the window.
+/// them on every reconnect), the changes stay in the window, and the message bar offers to save
+/// a copy. The same whichever way the server says it: the `role` message while connected, the
+/// Welcome after reconnecting, or refusing the changes (4403).
 #[test]
 fn becoming_a_viewer_with_unsent_changes_ends_the_session() {
     use crate::live::conn::Event;
-    for welcome in [false, true] {
+    for how in ["role", "welcome", "refused"] {
         let (_ctx, mut app) = super::data_ui::sample_app();
         app.live_for_test();
         type_at(&mut app, 0, 0, "unsent");
         app.live_flush();
         assert!(!app.live_pending_ops().is_empty());
-        if welcome {
-            // Reconnecting after access was changed: the server says we are a viewer.
-            let you = cosync::Peer { id: 1, name: "Me".into(), user: "me".into(), color: 0, editor: false, presence: None };
-            app.live_event_for_test(Event::Msg(cosync::ServerMsg::Welcome { seq: 0, you, peers: vec![] }));
-        } else {
+        match how {
+            // Told while connected.
+            "role" => app.live_event_for_test(Event::Msg(cosync::ServerMsg::Role { role: "view".into() })),
+            "welcome" => {
+                // Reconnecting after access was changed: the server says we are a viewer.
+                let you = cosync::Peer { id: 1, name: "Me".into(), user: "me".into(), color: 0, editor: false, presence: None };
+                app.live_event_for_test(Event::Msg(cosync::ServerMsg::Welcome { seq: 0, you, peers: vec![] }));
+            }
             // Sending them was refused.
-            app.live_event_for_test(Event::Closed { code: Some(cosync::close::READ_ONLY), http: None, reason: "view-only".into() });
+            _ => app.live_event_for_test(Event::Closed { code: Some(cosync::close::READ_ONLY), http: None, reason: "view-only".into() }),
         }
         let (stopped, retry) = app.live_stopped();
-        assert!(stopped.is_some_and(|m| m.contains("view-only")), "the user is told (welcome: {welcome})");
-        assert!(!retry, "no reconnect that would resend them (welcome: {welcome})");
+        assert!(stopped.is_some_and(|m| m.contains("view-only")), "the user is told ({how})");
+        assert!(!retry, "no reconnect that would resend them ({how})");
         assert!(!app.live_editor() && !app.live_quiet());
         assert!(!app.live_pending_ops().is_empty(), "the changes are kept");
         assert_eq!(crate::numfmt::value_to_text(app.wb.sheets[app.wb.active].display_value(0, 0)), "unsent");
+        let n = app.live_notice_for_test().expect("the message bar");
+        assert!(n.save_copy && n.text.contains("you can now only view this workbook"), "{n:?} ({how})");
+        // Typing is refused now.
+        app.select(1, 0, false);
+        app.begin_edit(Some("more".into()), EditMode::Enter);
+        assert!(app.edit.is_none(), "read-only ({how})");
+    }
+}
+
+/// Made a viewer while connected with nothing unsent: read-only at once with the message bar,
+/// still connected (others' changes keep coming); edit access back: editable again.
+#[test]
+fn live_role_changes_switch_read_only_and_back() {
+    use crate::live::conn::Event;
+    let (_ctx, mut app) = super::data_ui::sample_app();
+    app.live_for_test();
+    let name = app.wb.file_name();
+    app.select(0, 0, false);
+    app.begin_edit(Some("half typed".into()), EditMode::Enter);
+    app.live_event_for_test(Event::Msg(cosync::ServerMsg::Role { role: "view".into() }));
+    assert!(!app.live_editor() && app.edit.is_none(), "read-only at once (the open editor is closed)");
+    assert_eq!(app.live_notice_for_test(), Some(super::live_ui::Notice { text: format!("{name}: you can now only view this workbook"), save_copy: false }));
+    assert_eq!(app.live_stopped(), (None, false), "the session goes on");
+    let before = app.wb.clone();
+    app.select_range(rg("2:3"));
+    app.delete_rows();
+    app.begin_edit(Some("nope".into()), EditMode::Enter);
+    assert!(app.edit.is_none());
+    app.live_flush();
+    assert!(app.live_pending_ops().is_empty() && crate::live::compare(&before, &app.wb).is_empty());
+
+    app.live_event_for_test(Event::Msg(cosync::ServerMsg::Role { role: "edit".into() }));
+    assert!(app.live_editor() && app.live_notice_for_test().is_none());
+    type_at(&mut app, 0, 0, "editable again");
+    app.live_flush();
+    assert!(!app.live_pending_ops().is_empty());
+}
+
+/// Access removed (the `revoked` message, or only the 4401 close, or a refused reconnect): the
+/// session ends for good, the workbook stays open read-only, and a copy is offered.
+#[test]
+fn removed_access_ends_the_session_read_only() {
+    use crate::live::conn::Event;
+    let revoked = Event::Msg(cosync::ServerMsg::Revoked { reason: "This workbook was moved to the trash.".into() });
+    let closed = Event::Closed { code: Some(cosync::close::REVOKED), http: None, reason: "Your access to this workbook was removed.".into() };
+    let refused = Event::Closed { code: None, http: Some(404), reason: "HTTP 404".into() };
+    for (ev, text) in [
+        (revoked, "Your access to this file was removed (This workbook was moved to the trash)."),
+        (closed, "Your access to this file was removed."),
+        (refused, "Your access to this file was removed (The workbook is no longer shared with you, or it was deleted)."),
+    ] {
+        let (_ctx, mut app) = super::data_ui::sample_app();
+        app.live_for_test();
+        type_at(&mut app, 0, 0, "mine");
+        app.live_event_for_test(ev);
+        assert_eq!(app.live_stopped(), (Some(text.to_string()), false), "no reconnect");
+        assert_eq!(app.live_notice_for_test(), Some(super::live_ui::Notice { text: text.into(), save_copy: true }));
+        assert!(!app.live_editor());
+        assert_eq!(crate::numfmt::value_to_text(app.wb.sheets[app.wb.active].display_value(0, 0)), "mine", "the workbook stays");
+        app.select(3, 3, false);
+        app.begin_edit(Some("x".into()), EditMode::Enter);
+        assert!(app.edit.is_none(), "read-only");
+        // A later close or reconnect attempt changes nothing.
+        app.poll_live();
+        assert_eq!(app.live_stopped().1, false);
+        // Save a copy: File > Save As.
+        app.live_save_copy();
+        assert!(app.backstage == Some(super::chrome::Backstage::SaveAs));
     }
 }
 
@@ -668,6 +741,72 @@ mod e2e {
         eframe::App::on_exit(&mut a.app, None);
         let wb = crate::io::load(&recovery).expect("recovery copy kept");
         assert_eq!(crate::numfmt::value_to_text(wb.sheets[0].display_value(0, 0)), "unconfirmed");
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The owner changes Ben's access while he is in the workbook: view-only (read-only at once,
+    /// still live), edit again, then removed (the session ends, the workbook stays read-only
+    /// with "Save a copy").
+    #[test]
+    fn access_changes_reach_a_live_window_at_once() {
+        let dir = std::env::temp_dir().join(format!("fo-live-role-{}", freedomoffice_server::util::new_id()));
+        let cfg = Config { data_dir: dir.join("data"), ..Config::default() };
+        {
+            let st = Store::open(&cfg.db_path(), &cfg.files_dir(), cfg.versions_to_keep).unwrap();
+            st.create_user("ann", "Ann Lee", "", PW, false).unwrap();
+            st.create_user("ben", "Ben Ode", "", PW, false).unwrap();
+        }
+        let server = freedomoffice_server::spawn(cfg).unwrap();
+        let url = server.url();
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("start.xlsx");
+        crate::io::save(&crate::model::Workbook::new(), &file).unwrap();
+        let mut a = client(&url, "ann", &dir);
+        let id = a.session.upload_new("root", "Roles.xlsx", &std::fs::read(&file).unwrap(), "fail").unwrap().id;
+        a.session.grant(&id, "ben", true).unwrap();
+        let mut b = client(&url, "ben", &dir);
+        open(&mut a, &id);
+        open(&mut b, &id);
+        settle(&mut [&mut a, &mut b], "joined");
+        type_at(&mut b.app, 0, 0, "ben was here");
+        settle(&mut [&mut a, &mut b], "ben typed");
+
+        // View only: once the owner's change has answered, Ben's window is told.
+        a.session.grant(&id, "ben", false).unwrap();
+        pump(&mut [&mut b], "ben is a viewer", |cs| !cs[0].app.live_editor());
+        let n = b.app.live_notice_for_test().expect("message bar");
+        assert_eq!((n.text.as_str(), n.save_copy), ("Roles.xlsx: you can now only view this workbook", false));
+        assert_eq!(b.app.live_stopped(), (None, false));
+        assert!(b.app.cloud_title_suffix().contains("Read-only"));
+        let _ = b.ctx.run(egui::RawInput::default(), |ctx| b.app.frame(ctx));
+        b.app.select(1, 0, false);
+        b.app.begin_edit(Some("refused".into()), super::EditMode::Enter);
+        assert!(b.app.edit.is_none());
+        type_at(&mut a.app, 2, 0, "ann still edits");
+        settle(&mut [&mut a, &mut b], "a viewer still sees changes");
+        assert_same(&a, &b, "viewer");
+
+        // Edit access back.
+        a.session.grant(&id, "ben", true).unwrap();
+        pump(&mut [&mut b], "ben edits again", |cs| cs[0].app.live_editor());
+        assert!(b.app.live_notice_for_test().is_none());
+        type_at(&mut b.app, 3, 0, "editing again");
+        settle(&mut [&mut a, &mut b], "ben edits again");
+        assert_same(&a, &b, "editor again");
+
+        // Removed: the session ends for good; the workbook stays, read-only; Save offers a copy.
+        a.session.remove_permission(&id, "ben").unwrap();
+        pump(&mut [&mut b], "ben's access removed", |cs| cs[0].app.live_stopped().0.is_some());
+        assert_eq!(b.app.live_stopped(), (Some("Your access to this file was removed.".into()), false));
+        assert!(b.app.live_notice_for_test().is_some_and(|n| n.save_copy));
+        assert_eq!(text(&b, "Sheet1", 3, 0), "editing again");
+        b.app.begin_edit(Some("refused".into()), super::EditMode::Enter);
+        assert!(b.app.edit.is_none());
+        assert!(!b.app.cloud_save(), "Save can't go to the server any more");
+        assert!(b.app.backstage == Some(crate::app::chrome::Backstage::SaveAs), "it offers Save As (a copy)");
+        b.app.backstage = None;
+        let _ = b.ctx.run(egui::RawInput::default(), |ctx| b.app.frame(ctx));
         drop(server);
         let _ = std::fs::remove_dir_all(&dir);
     }

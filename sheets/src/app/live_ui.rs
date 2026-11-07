@@ -53,7 +53,25 @@ fn wait_for(h: &std::thread::JoinHandle<()>, end: Instant) {
 const RETRY_MAX_SHIFT: u32 = 3;
 
 /// The session ends when access became view-only; unsent changes stay in the window.
-const VIEW_ONLY_NOW: &str = "You now have view-only access to this workbook, so your latest changes weren't saved to the server. They are still in this window: use Save As to keep a copy.";
+const VIEW_ONLY_NOW: &str = "You now have view-only access to this workbook, so your latest changes weren't saved to the server. They are still in this window: use Save a copy to keep them.";
+
+/// The message bar above the grid when access to a live workbook changed (yellow, like
+/// Office's message bars), and whether it offers "Save a copy...".
+#[derive(Clone, Debug, PartialEq)]
+pub struct Notice {
+    pub text: String,
+    pub save_copy: bool,
+}
+
+/// "Your access to this file was removed (<reason>)" — the reason left out when it says the same.
+fn access_removed(reason: &str) -> String {
+    let r = reason.trim().trim_end_matches('.');
+    if r.is_empty() || r.to_lowercase().starts_with("your access to this") {
+        "Your access to this file was removed.".into()
+    } else {
+        format!("Your access to this file was removed ({r}).")
+    }
+}
 
 /// Someone else in the session.
 pub struct Seen {
@@ -115,6 +133,10 @@ pub struct Live {
     backoff: u32,
     /// Fatal: don't reconnect (access removed, item gone).
     pub stopped: Option<String>,
+    /// The yellow message bar (access changed).
+    pub notice: Option<Notice>,
+    /// A Welcome arrived (the role it gave is known).
+    welcomed: bool,
     snap_wanted: bool,
     snap_busy: bool,
     pub snap_seq: u64,
@@ -164,6 +186,8 @@ impl Live {
             retry_at: None,
             backoff: 0,
             stopped: None,
+            notice: None,
+            welcomed: false,
             snap_wanted: false,
             snap_busy: false,
             snap_seq: seq,
@@ -673,15 +697,22 @@ impl App {
                 l.peers.clear();
                 let fatal = match (code, http) {
                     (_, Some(401)) => Some("Your sign-in has expired. Sign in again (File > Account) to keep editing live.".to_string()),
-                    (_, Some(404)) => Some("The workbook is no longer shared with you, or it was deleted.".to_string()),
+                    (_, Some(404)) => {
+                        // Reconnecting after the access was removed (or the file deleted).
+                        self.live_revoked("The workbook is no longer shared with you, or it was deleted.");
+                        return;
+                    }
                     (_, Some(426)) | (_, Some(501)) => Some("This server doesn't support live co-editing.".to_string()),
                     (Some(cosync::close::READ_ONLY), _) => {
-                        // Resending what is pending would only be refused again.
-                        l.editor = false;
-                        Some(VIEW_ONLY_NOW.to_string())
+                        // Our changes were refused: resending them would only be refused again.
+                        self.live_view_only(true);
+                        return;
                     }
                     (Some(cosync::close::INVALID), _) => Some(format!("The server refused a change ({reason}). Reopen the workbook.")),
-                    (Some(cosync::close::REVOKED), _) => Some(reason.clone()),
+                    (Some(cosync::close::REVOKED), _) => {
+                        self.live_revoked(&reason);
+                        return;
+                    }
                     _ => None,
                 };
                 if let Some(msg) = fatal {
@@ -705,6 +736,15 @@ impl App {
         match m {
             ServerMsg::Welcome { seq, you, peers } => {
                 let Some(l) = &mut self.live else { return };
+                if l.welcomed && l.editor && !you.editor && !l.sess.has_pending() {
+                    // Made a viewer while disconnected (with nothing unsent; see live_caught_up).
+                    self.live_view_only(false);
+                }
+                let Some(l) = &mut self.live else { return };
+                if you.editor && !l.editor && l.stopped.is_none() {
+                    l.notice = None;
+                }
+                l.welcomed = true;
                 l.editor = you.editor;
                 l.me = Some(you);
                 l.peers = peers.into_iter().map(|p| (p.id, Seen { peer: p, moved: Instant::now() })).collect();
@@ -775,13 +815,113 @@ impl App {
             }
             ServerMsg::Reload => self.live_reload(),
             ServerMsg::Error { message } => self.status = Some(message),
-            // Full handling (read-only switch, saving unsent changes as a copy) comes with the
-            // organisations work in Sheets; for now say what happened.
             ServerMsg::Role { role } => {
-                self.status = Some(if role == "view" { "Your access to this workbook was changed to view-only.".into() } else { "You can edit this workbook again.".into() });
+                let Some(l) = &mut self.live else { return };
+                match role.as_str() {
+                    "view" if l.editor => self.live_view_only(false),
+                    "edit" if !l.editor => {
+                        l.editor = true;
+                        if let Some(me) = &mut l.me {
+                            me.editor = true;
+                        }
+                        l.notice = None;
+                        self.status = Some(format!("{}: you can edit this workbook again.", self.live_doc_name()));
+                    }
+                    _ => {}
+                }
             }
-            ServerMsg::Revoked { reason } => self.status = Some(reason),
+            ServerMsg::Revoked { reason } => self.live_revoked(&reason),
         }
+    }
+
+    fn live_doc_name(&self) -> String {
+        self.cloud.doc.as_ref().map(|d| d.name.clone()).unwrap_or_else(|| self.wb.file_name())
+    }
+
+    /// Access became view-only: the window is read-only at once, with the message bar. Changes
+    /// the server doesn't have yet stay in the window (offered as a copy) and the session ends,
+    /// because sending them would only be refused (`refused`: the server already did).
+    fn live_view_only(&mut self, refused: bool) {
+        let name = self.live_doc_name();
+        self.cancel_edit();
+        let Some(l) = &mut self.live else { return };
+        l.editor = false;
+        if let Some(me) = &mut l.me {
+            me.editor = false;
+        }
+        if refused || l.sess.has_pending() {
+            l.conn = None;
+            l.online = false;
+            l.sess.offline();
+            l.peers.clear();
+            l.retry_at = None;
+            l.stopped = Some(VIEW_ONLY_NOW.to_string());
+            l.notice = Some(Notice { text: format!("{name}: you can now only view this workbook. Your latest changes weren't saved to the server; they are still in this window."), save_copy: true });
+            self.status = Some(VIEW_ONLY_NOW.to_string());
+        } else {
+            l.notice = Some(Notice { text: format!("{name}: you can now only view this workbook"), save_copy: false });
+            self.status = Some("You now have view-only access to this workbook. You still see everyone's changes.".into());
+        }
+    }
+
+    /// Access to the workbook ended: no reconnecting; the window keeps the workbook, read-only,
+    /// and offers to save a copy (with any changes the server didn't get).
+    fn live_revoked(&mut self, reason: &str) {
+        self.cancel_edit();
+        let Some(l) = &mut self.live else { return };
+        let text = access_removed(reason);
+        l.conn = None;
+        l.online = false;
+        l.sess.offline();
+        l.peers.clear();
+        l.retry_at = None;
+        l.editor = false;
+        l.stopped = Some(text.clone());
+        l.notice = Some(Notice { text: text.clone(), save_copy: true });
+        self.status = Some(text);
+    }
+
+    /// The yellow message bar above the grid, when access to the live workbook changed.
+    pub(super) fn live_notice(&self) -> Option<&Notice> {
+        self.live.as_ref().and_then(|l| l.notice.as_ref())
+    }
+
+    pub(super) fn live_notice_ui(&mut self, ui: &mut egui::Ui) {
+        let Some(n) = self.live_notice().cloned() else { return };
+        let (text, fill) = if super::theme::is_dark() { (super::theme::rgb(0xF3E7B5), super::theme::rgb(0x4A3F12)) } else { (super::theme::rgb(0x3B3000), super::theme::rgb(0xFFF4CE)) };
+        let mut copy = false;
+        let mut close = false;
+        egui::Frame::NONE.fill(fill).inner_margin(egui::Margin { left: 12, right: 8, top: 5, bottom: 5 }).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("⚠").size(15.0).color(super::theme::rgb(0x9D5D00)));
+                ui.label(egui::RichText::new(&n.text).size(13.0).color(text));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(egui::Button::new(egui::RichText::new("✕").size(12.0).color(text)).frame(false)).on_hover_text("Close the message").clicked() {
+                        close = true;
+                    }
+                    if n.save_copy && ui.button("Save a copy…").on_hover_text("Keep this workbook, with your changes, as a new file").clicked() {
+                        copy = true;
+                    }
+                });
+            });
+        });
+        if copy {
+            self.live_save_copy();
+        }
+        if close {
+            if let Some(l) = &mut self.live {
+                l.notice = None;
+            }
+        }
+    }
+
+    /// "Save a copy...": Save As (on this computer or a server) keeps the workbook as it is in
+    /// this window, including changes the server refused or never got.
+    pub(super) fn live_save_copy(&mut self) {
+        self.cloud.save_name = format!("{} (copy).xlsx", self.wb.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "Book1".into()));
+        self.cloud.browser.root = None;
+        self.backstage = Some(super::chrome::Backstage::SaveAs);
     }
 
     /// After the replay since our base: resend what is pending.
@@ -794,11 +934,7 @@ impl App {
         l.catch_up = None;
         if !l.editor && l.sess.has_pending() {
             // Access was changed to view-only while our changes were unsent.
-            l.conn = None;
-            l.sess.offline();
-            l.peers.clear();
-            l.stopped = Some(VIEW_ONLY_NOW.to_string());
-            self.status = Some(VIEW_ONLY_NOW.to_string());
+            self.live_view_only(true);
             return;
         }
         l.online = true;
@@ -1372,6 +1508,10 @@ impl App {
 
     pub(crate) fn live_snap_seq(&self) -> u64 {
         self.live.as_ref().map_or(0, |l| l.snap_seq)
+    }
+
+    pub(crate) fn live_notice_for_test(&self) -> Option<Notice> {
+        self.live_notice().cloned()
     }
 
     pub(crate) fn live_editor(&self) -> bool {

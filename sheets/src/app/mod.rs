@@ -1185,6 +1185,10 @@ impl App {
                     .show_separator_line(false)
                     .show(ctx, |ui| self.formula_bar_ui(ui));
             }
+            // Access to a live workbook changed (view-only, removed).
+            if self.live_notice().is_some() {
+                egui::TopBottomPanel::top("live_notice").frame(egui::Frame::NONE).show_separator_line(false).show(ctx, |ui| self.live_notice_ui(ui));
+            }
             egui::TopBottomPanel::bottom("status")
                 .exact_height(24.0)
                 .frame(egui::Frame::NONE.fill(theme::chrome()))

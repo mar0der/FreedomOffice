@@ -911,6 +911,13 @@ impl App {
     /// Ctrl+S on a cloud document: write the local copy, then upload in the background.
     pub fn cloud_save(&mut self) -> bool {
         let Some(doc) = self.cloud.doc.clone() else { return false };
+        if let Some(why) = self.live.as_ref().filter(|l| !l.editor).and_then(|l| l.stopped.clone()) {
+            // Access ended or became view-only with changes the server refused: only a copy
+            // can keep what is in this window.
+            self.status = Some(why);
+            self.live_save_copy();
+            return false;
+        }
         if self.live.is_some() {
             // Live: every change is already on the server; Save stores a version now.
             self.live_flush();
