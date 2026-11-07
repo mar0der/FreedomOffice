@@ -115,7 +115,8 @@ enum Event {
     Listing(u64, Result<Vec<DriveItem>, String>),
     Opened(Result<CloudDoc, String>),
     /// `opened`: a new server file downloaded again as Open does (where its live session starts).
-    Uploaded { kind: UploadKind, local: PathBuf, conn: Conn, result: Result<DriveItem, UploadError>, opened: Option<Result<CloudDoc, String>> },
+    /// `edits`: the change counter when the upload started (later changes aren't in it).
+    Uploaded { kind: UploadKind, local: PathBuf, conn: Conn, result: Result<DriveItem, UploadError>, opened: Option<Result<CloudDoc, String>>, edits: u64 },
     Invited(Result<usize, String>),
     Link(Result<String, String>),
     Permissions(Result<Vec<Permission>, String>),
@@ -271,8 +272,28 @@ pub struct CloudState {
     pub add_server: AddServer,
     pub versions: Option<VersionsState>,
     pub password: Option<PasswordForm>,
-    /// Tests: local copies of cloud documents go here instead of the user's data folder.
-    pub cache_override: Option<PathBuf>,
+    /// Tests: local copies of cloud documents go here instead of the user's data folder
+    /// (removed with the app).
+    #[cfg(test)]
+    pub cache_override: Option<TestDir>,
+}
+
+/// A folder of a test, deleted when dropped.
+#[cfg(test)]
+pub struct TestDir(pub PathBuf);
+
+#[cfg(test)]
+impl TestDir {
+    pub fn new(name: &str) -> Self {
+        TestDir(std::env::temp_dir().join(format!("{name}-{}-{}", std::process::id(), crate::model::new_sheet_uid())))
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 impl Default for CloudState {
@@ -308,6 +329,7 @@ impl Default for CloudState {
             add_server: AddServer::default(),
             versions: None,
             password: None,
+            #[cfg(test)]
             cache_override: None,
         }
     }
@@ -382,10 +404,11 @@ impl App {
 
     /// Where documents of this connection are kept on this computer.
     fn cache_root_of(&self, conn: &Conn) -> Option<PathBuf> {
-        match &self.cloud.cache_override {
-            Some(d) => Some(d.join(cloud::place_name(&conn.provider()).replace(':', "_"))),
-            None => conn.cache_root(),
+        #[cfg(test)]
+        if let Some(d) = &self.cloud.cache_override {
+            return Some(d.0.join(cloud::place_name(&conn.provider()).replace(':', "_")));
         }
+        conn.cache_root()
     }
 
     fn browser_conn(&self) -> Option<Conn> {
@@ -584,7 +607,7 @@ impl App {
                     Err(e) => self.dialog = Some(Dialog::Message { title: "Open".into(), text: format!("Sorry, we couldn't open the file from the cloud.\n\n{e}") }),
                 }
             }
-            Event::Uploaded { kind, local, conn, result, opened } => self.cloud_uploaded(kind, local, conn, result, opened),
+            Event::Uploaded { kind, local, conn, result, opened, edits } => self.cloud_uploaded(kind, local, conn, result, opened, edits),
             Event::Invited(result) => {
                 if let Some(sh) = &mut self.cloud.share {
                     sh.busy = false;
@@ -797,14 +820,28 @@ impl App {
         }
     }
 
-    fn cloud_uploaded(&mut self, kind: UploadKind, local: PathBuf, conn: Conn, result: Result<DriveItem, UploadError>, opened: Option<Result<CloudDoc, String>>) {
+    fn cloud_uploaded(&mut self, kind: UploadKind, local: PathBuf, conn: Conn, result: Result<DriveItem, UploadError>, opened: Option<Result<CloudDoc, String>>, edits: u64) {
         self.cloud.uploading = false;
         let place = cloud::place_name(&conn.provider());
+        // Changed while it was uploading: what was uploaded isn't what the window holds.
+        let changed_since = self.edits != edits;
         // A new server file joins its live session at once, as if opened from the server: the
         // downloaded copy is exactly what was uploaded (else someone changed it in between and
-        // it is joined when reopened).
+        // it is joined when reopened), and nothing changed here meanwhile (those changes would
+        // never be sent: they were made outside the session).
         let joinable = match (&result, opened) {
-            (Ok(item), Some(Ok(doc))) if doc.live.is_some() && server::version_of_etag(&doc.etag) == server::version_of_etag(&item.etag) => Some(doc),
+            (Ok(item), Some(Ok(doc))) => {
+                let same = matches!((server::version_of_etag(&doc.etag), server::version_of_etag(&item.etag)), (Some(a), Some(b)) if a == b);
+                if doc.live.is_some() && same && !changed_since {
+                    Some(doc)
+                } else {
+                    // Not joined: the second download isn't needed.
+                    if doc.local != local {
+                        remove_local_copy(&doc.local);
+                    }
+                    None
+                }
+            }
             _ => None,
         };
         if let (Some(doc), UploadKind::Copy | UploadKind::New { .. }) = (joinable, &kind) {
@@ -841,8 +878,17 @@ impl App {
                     doc.drive_id = self.cloud.doc.as_ref().map(|d| d.drive_id.clone()).unwrap_or_default();
                 }
                 self.status = Some(format!("Saved to {place} as {}.", doc.name));
+                self.wb.path = Some(doc.local.clone());
                 self.cloud.doc = Some(doc);
                 self.cloud.upload_failed = false;
+                if changed_since {
+                    // Changes made while it uploaded: they still have to go there (a normal
+                    // save with the new file's eTag, so nothing is overwritten silently).
+                    self.dirty = true;
+                    self.cloud.upload_again = false;
+                    self.cloud_save();
+                    return;
+                }
             }
             (UploadKind::Save, Err(UploadError::Conflict)) => {
                 self.cloud.upload_failed = true;
@@ -1040,6 +1086,7 @@ impl App {
         self.cloud.uploading = true;
         self.status = Some(format!("Saving to {place} ({})...", size_label(data.len())));
         let root = self.cache_root_of(&conn);
+        let edits = self.edits;
         self.cloud_spawn(move || {
             let result = match &kind {
                 UploadKind::Save => conn.upload(&doc, check.then_some(doc.etag.as_str()), &data),
@@ -1050,7 +1097,7 @@ impl App {
                 UploadKind::New { folder, name } => conn.upload_new(folder, name, &data, if check { "fail" } else { "replace" }),
             };
             let opened = if matches!(kind, UploadKind::Save) { None } else { reopen_new(&conn, root.as_deref(), &result) };
-            Event::Uploaded { kind, local: doc.local.clone(), conn, result, opened }
+            Event::Uploaded { kind, local: doc.local.clone(), conn, result, opened, edits }
         });
     }
 
@@ -1092,10 +1139,11 @@ impl App {
         self.cloud.uploading = true;
         self.status = Some(format!("Saving {name} to {}...", cloud::place_name(&conn.provider())));
         let root = self.cache_root_of(&conn);
+        let edits = self.edits;
         self.cloud_spawn(move || {
             let result = conn.upload_new(&folder, &name, &data, if replace { "replace" } else { "fail" });
             let opened = reopen_new(&conn, root.as_deref(), &result);
-            Event::Uploaded { kind: UploadKind::New { folder, name }, local, conn, result, opened }
+            Event::Uploaded { kind: UploadKind::New { folder, name }, local, conn, result, opened, edits }
         });
     }
 
@@ -1796,11 +1844,13 @@ impl App {
             }
             job.append("Share", if g.is_empty() { 0.0 } else { 6.0 }, egui::TextFormat { font_id: theme::ui_font(13.0), color: Color32::WHITE, valign: Align::Center, ..Default::default() });
             let galley = ui.painter().layout_job(job);
-            let (rect, resp) = ui.allocate_exact_size(Vec2::new(galley.size().x + 24.0, 26.0), Sense::click());
-            let fill = if resp.hovered() { share_green().gamma_multiply(0.85) } else { share_green() };
+            let share_ok = self.cloud_share_enabled();
+            let (rect, resp) = ui.allocate_exact_size(Vec2::new(galley.size().x + 24.0, 26.0), if share_ok { Sense::click() } else { Sense::hover() });
+            let fill = if !share_ok { share_green().gamma_multiply(0.45) } else if resp.hovered() { share_green().gamma_multiply(0.85) } else { share_green() };
             ui.painter().rect_filled(rect, 4.0, fill);
             ui.painter().galley(Pos2::new(rect.center().x - galley.size().x / 2.0, rect.center().y - galley.size().y / 2.0), galley, Color32::WHITE);
-            if resp.on_hover_text("Share this workbook with others").clicked() {
+            let tip = if share_ok { "Share this workbook with others" } else { "This window is no longer connected to the workbook on the server, so it can't be shared from here. Save a copy to share that." };
+            if resp.on_hover_text(tip).clicked() && share_ok {
                 self.commit_edit(false);
                 self.cloud_open_share();
             }
@@ -1818,7 +1868,7 @@ impl App {
             // AutoSave toggle (cloud documents only)
             let live = self.live.is_some();
             let enabled = self.cloud.doc.is_some() && !live;
-            let on = (self.cloud.autosave && self.cloud.doc.is_some()) || live;
+            let (label, on, tip) = self.cloud_autosave_state();
             let (tr, tresp) = ui.allocate_exact_size(Vec2::new(36.0, 18.0), Sense::click());
             let p = ui.painter();
             let alpha = if enabled { 1.0 } else { 0.45 };
@@ -1829,17 +1879,43 @@ impl App {
                 p.rect_stroke(tr, 9.0, Stroke::new(1.0, theme::text_dim().gamma_multiply(alpha)), StrokeKind::Inside);
                 p.circle_filled(Pos2::new(tr.left() + 9.0, tr.center().y), 5.0, theme::text_dim().gamma_multiply(alpha));
             }
-            let tip = match self.cloud.doc.as_ref().map(|d| &d.provider) {
-                Some(Provider::FreedomServer(url)) if live => format!("Everyone's changes are saved to {} as they are made. AutoSave stays on while a workbook is edited live.", server::host_of(url)),
-                Some(Provider::FreedomServer(url)) => format!("AutoSave saves your changes to {} a few seconds after you stop editing.", server::host_of(url)),
-                Some(_) => "AutoSave saves your changes to OneDrive a few seconds after you stop editing.".into(),
-                None => "AutoSave works for files in OneDrive, SharePoint and on FreedomOffice servers.".into(),
-            };
-            if tresp.on_hover_text(tip).clicked() && enabled {
+            if tresp.on_hover_text(tip.clone()).clicked() && enabled {
                 self.cloud.autosave = !self.cloud.autosave;
             }
-            ui.label(RichText::new(if on { "AutoSave On" } else { "AutoSave Off" }).size(12.0).color(if enabled || live { theme::text() } else { theme::text_dim() }));
+            let bright = enabled || (live && on);
+            ui.label(RichText::new(label).size(12.0).color(if bright { theme::text() } else { theme::text_dim() })).on_hover_text(tip);
         });
+    }
+
+    /// Share works unless the window's live session has ended (access removed, signed out).
+    pub(super) fn cloud_share_enabled(&self) -> bool {
+        self.live.as_ref().is_none_or(|l| l.stopped.is_none())
+    }
+
+    /// The AutoSave label, whether the switch shows on, and its tooltip. A live window that is
+    /// view-only or no longer connected says so instead of "AutoSave On".
+    pub(super) fn cloud_autosave_state(&self) -> (String, bool, String) {
+        let host = match self.cloud.doc.as_ref().map(|d| &d.provider) {
+            Some(Provider::FreedomServer(url)) => server::host_of(url),
+            Some(Provider::Microsoft) => "OneDrive".into(),
+            None => String::new(),
+        };
+        if let Some(l) = &self.live {
+            if let Some(why) = &l.stopped {
+                return ("Not connected".into(), false, format!("Nothing in this window is saved to {host} any more: {why}"));
+            }
+            if !l.editor {
+                return ("Read-only".into(), false, format!("You can only view this workbook. You see everyone's changes; nothing you do here is saved to {host}."));
+            }
+            return ("AutoSave On".into(), true, format!("Everyone's changes are saved to {host} as they are made. AutoSave stays on while a workbook is edited live."));
+        }
+        let on = self.cloud.autosave && self.cloud.doc.is_some();
+        let tip = match self.cloud.doc.as_ref().map(|d| &d.provider) {
+            Some(Provider::FreedomServer(_)) => format!("AutoSave saves your changes to {host} a few seconds after you stop editing."),
+            Some(_) => "AutoSave saves your changes to OneDrive a few seconds after you stop editing.".into(),
+            None => "AutoSave works for files in OneDrive, SharePoint and on FreedomOffice servers.".into(),
+        };
+        ((if on { "AutoSave On" } else { "AutoSave Off" }).into(), on, tip)
     }
 
     pub fn cloud_open_share(&mut self) {
@@ -2479,6 +2555,20 @@ fn reopen_new(conn: &Conn, root: Option<&std::path::Path>, result: &Result<Drive
     Some(s.open(item, root))
 }
 
+/// Deletes a downloaded copy that isn't used (with its live state and the item's folder when
+/// that is empty then).
+fn remove_local_copy(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
+    if let Some(name) = path.file_name() {
+        let mut live = name.to_os_string();
+        live.push(".live");
+        let _ = std::fs::remove_file(path.with_file_name(live));
+    }
+    if let Some(d) = path.parent() {
+        let _ = std::fs::remove_dir(d);
+    }
+}
+
 /// Manage access rows; returns the id of a row whose Remove button was clicked.
 fn permissions_list_ui(ui: &mut egui::Ui, sh: &ShareState) -> Option<String> {
     let mut remove: Option<String> = None;
@@ -2554,7 +2644,7 @@ impl App {
     pub(super) fn cloud_for_test(&mut self, session: Arc<ServerSession>) {
         self.cloud.started = true;
         if self.cloud.cache_override.is_none() {
-            self.cloud.cache_override = Some(std::env::temp_dir().join(format!("fo-sheets-cache-{}", std::process::id())));
+            self.cloud.cache_override = Some(TestDir::new("fo-sheets-cache"));
         }
         let me = session.me_info().ok();
         self.cloud.servers.push(ServerEntry { session, error: None, me });
@@ -2563,7 +2653,7 @@ impl App {
     /// No saved accounts or sign-ins are read from this PC (tests).
     pub(super) fn no_cloud_for_test(&mut self) {
         self.cloud.started = true;
-        self.cloud.cache_override = Some(std::env::temp_dir().join(format!("fo-sheets-cache-{}", std::process::id())));
+        self.cloud.cache_override = Some(TestDir::new("fo-sheets-cache"));
     }
 
     /// As if the cloud browser had downloaded `doc` (tests).

@@ -69,7 +69,7 @@ fn client(t: &Setup, user: &str, pw: &str) -> (egui::Context, App, Arc<ServerSes
     let ctx = egui::Context::default();
     let mut app = App::with_context(&ctx, 0, None);
     app.dialog = None;
-    app.cloud.cache_override = Some(t.dir.join(format!("{user}-cache-{}", crate::model::new_sheet_uid())));
+    app.cloud.cache_override = Some(TestDir(t.dir.join(format!("{user}-cache-{}", crate::model::new_sheet_uid()))));
     let session = Arc::new(ServerSession::login(Box::new(Http::new()), url, user, pw, "test").unwrap());
     app.cloud_for_test(session.clone());
     (ctx, app, session)
@@ -99,7 +99,7 @@ fn organisation_folders_are_places_in_open_and_save_as() {
     // Saved to the server: the window joins the file's live session right away, as when it is
     // opened from the server (the local copy is where Open keeps it).
     assert!(doc.live.is_some() && app.live.is_some(), "live after Save As");
-    assert!(doc.local.starts_with(app.cloud.cache_override.as_ref().unwrap()) && doc.local.ends_with(std::path::Path::new(&doc.item_id).join("Lab plan.xlsx")));
+    assert!(doc.local.starts_with(&app.cloud.cache_override.as_ref().unwrap().0) && doc.local.ends_with(std::path::Path::new(&doc.item_id).join("Lab plan.xlsx")));
     assert_eq!(app.wb.path.as_ref(), Some(&doc.local));
     until(&ctx, &mut app, "ann is live", |a| a.live_quiet());
     assert!(app.cloud_title_suffix().contains("Saved to"), "{}", app.cloud_title_suffix());
@@ -240,3 +240,74 @@ fn a_temporary_password_asks_for_a_new_one() {
 }
 
 use super::Event as Event2;
+
+/// The latest content of a server file, cell (r, c) of the first sheet.
+fn server_cell(s: &ServerSession, id: &str, dir: &std::path::Path, r: u32, c: u32) -> String {
+    let doc = s.open(&s.item(id).unwrap(), &dir.join(format!("check-{}", crate::model::new_sheet_uid()))).unwrap();
+    let wb = crate::io::load(&doc.local).unwrap();
+    crate::numfmt::value_to_text(wb.sheets[0].display_value(r, c))
+}
+
+fn type_in(app: &mut App, r: u32, c: u32, text: &str) {
+    app.select(r, c, false);
+    app.begin_edit(Some(text.into()), super::super::EditMode::Enter);
+    assert!(app.commit_edit(false));
+}
+
+/// A small workbook file for uploads.
+fn save_sample(dir: &std::path::Path) -> std::path::PathBuf {
+    let p = dir.join("sample.xlsx");
+    crate::io::save(&crate::model::Workbook::new(), &p).unwrap();
+    p
+}
+
+/// Typing (and Ctrl+S) while Save As / Save a Copy is still uploading: those changes reach the
+/// server; they are never dropped by joining the live session of a file that doesn't have them.
+#[test]
+fn edits_during_a_save_as_upload_are_not_lost() {
+    let t = setup();
+    for (case, ctrl_s) in [("typed", false), ("typed and saved", true)] {
+        let (ctx, mut app, ann) = client(&t, "ann", PW);
+        type_in(&mut app, 0, 0, "before");
+        let name = format!("During {}", crate::model::new_sheet_uid());
+        app.cloud_save_as(Conn::Server(ann.clone()), "root".into(), name, false);
+        assert!(app.cloud.uploading);
+        // While it uploads (its answer is handled on a later frame).
+        type_in(&mut app, 1, 0, "while uploading");
+        if ctrl_s {
+            assert!(app.save());
+        }
+        until(&ctx, &mut app, "uploaded", |a| !a.cloud.uploading && a.cloud.doc.is_some());
+        until(&ctx, &mut app, "the later changes are saved", |a| !a.cloud.uploading && !a.dirty);
+        let doc = app.cloud.doc.clone().unwrap();
+        assert!(app.live.is_none(), "not joined live with changes the session doesn't have ({case})");
+        assert!(doc.local.exists(), "the local copy stays ({case})");
+        let host = crate::cloud::server::host_of(&t.url).replace(':', "_");
+        let second = app.cloud.cache_override.as_ref().unwrap().0.join(host).join(&doc.item_id);
+        assert!(!second.exists(), "the download made for joining is removed when not joined ({case})");
+        assert!(!app.cloud.upload_failed, "{case}: {:?}", app.status);
+        assert_eq!(server_cell(&ann, &doc.item_id, &t.dir, 1, 0), "while uploading", "{case}");
+        assert_eq!(server_cell(&ann, &doc.item_id, &t.dir, 0, 0), "before");
+    }
+
+    // Save a Copy (after a conflict) the same way.
+    let (ctx, mut app, ann) = client(&t, "ann", PW);
+    let item = ann.upload_new("root", "Original.xlsx", &std::fs::read(save_sample(&t.dir)).unwrap(), "fail").unwrap();
+    let doc = ann.open(&item, &t.dir.join("orig")).unwrap();
+    app.open_path(doc.local.clone());
+    app.cloud.doc = Some(CloudDoc { live: None, ..doc });
+    app.cloud_upload(UploadKind::Copy, true);
+    type_in(&mut app, 2, 0, "copy edit");
+    until(&ctx, &mut app, "copy uploaded and saved again", |a| !a.cloud.uploading && !a.dirty && a.cloud.doc.as_ref().is_some_and(|d| d.item_id != item.id));
+    let copy = app.cloud.doc.clone().unwrap();
+    assert!(app.live.is_none());
+    assert_eq!(server_cell(&ann, &copy.item_id, &t.dir, 2, 0), "copy edit");
+
+    // Nothing changed meanwhile: joined live at once.
+    let (ctx, mut app, ann) = client(&t, "ann", PW);
+    app.cloud_save_as(Conn::Server(ann.clone()), "root".into(), "Quiet.xlsx".into(), false);
+    until(&ctx, &mut app, "uploaded", |a| !a.cloud.uploading && a.cloud.doc.is_some());
+    assert!(app.live.is_some());
+    drop(t.server);
+    let _ = std::fs::remove_dir_all(&t.dir);
+}
