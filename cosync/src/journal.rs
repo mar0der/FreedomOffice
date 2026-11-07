@@ -152,14 +152,12 @@ impl Journal {
 /// Creates `path`'s directory (mode 0700) and writes the file atomically with mode 0600.
 pub fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    if let Some(d) = path.parent() {
-        if !d.exists() {
-            std::fs::create_dir_all(d)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700));
-            }
+    if let Some(d) = path.parent().filter(|d| !d.exists()) {
+        std::fs::create_dir_all(d)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700));
         }
     }
     let tmp = path.with_extension(format!("tmp{}", std::process::id()));

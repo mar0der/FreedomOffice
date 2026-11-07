@@ -2,7 +2,7 @@
 //! (cells, row/column inserts and deletes, presence) with random disconnects and reconnects;
 //! at the end every client and a freshly joined one must hold identical cell maps.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use cosync::{CellData, Op, SheetId, Val};

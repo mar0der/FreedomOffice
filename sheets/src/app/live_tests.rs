@@ -1170,6 +1170,10 @@ mod e2e {
         b.app.toggle_bold();
         a.app.select(3, 1, false);
         a.app.toggle_bold();
+        // A's whole cell is committed first (B hasn't seen it), then B's value, which wins the
+        // content part: without this the two arrive in either order on a loaded machine.
+        a.app.live_flush();
+        pump(&mut [&mut a], "a's bold is committed", |cs| cs[0].app.live_quiet());
         type_at(&mut b.app, 3, 1, "from b");
         settle(&mut [&mut a, &mut b], "mixed protocol edits");
         assert_same(&a, &b, "mixed protocol edits");

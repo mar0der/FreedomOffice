@@ -297,6 +297,47 @@ value-vs-format, never report. The app shows a non-modal bar "Your change to B3 
 with Show, Restore mine (writes our value again as a new change) and a close button; `fsheets` logs it to
 stderr, MCP `write_range` and `replaced_changes` return it under `replaced`.
 
+**Offline, restarts and the journal (M3).** A client that loses the connection keeps editing: changes
+are buffered, the status bar says "Offline — changes will be sent when you're back online (N waiting)"
+with the countdown to the next attempt (2, 4, then 8 s, jittered), and nothing blocks editing. On
+reconnecting it sends `since=<last seq applied>`; the server replays what it has, the client transforms
+its pending changes over it and resends. When the server no longer has that base it answers `reload`
+(first an `ack` if the client's last batch did commit): the client downloads the latest version and puts
+every pending change on top of it as one new batch (tests: 40 changes on one side, 40 plus row/column
+inserts and deletes on the other, two snapshots in between). Unsent changes also survive the program
+ending, offline or in the middle of sending (`cosync::journal`, used by the app and `fsheets`):
+
+- *File.* One JSON file per (server, account, document) under the data folder
+  (`<local data>/freedomoffice/LiveJournal/`, `~/.local/share/freedomsheets-agents/journal/` for
+  `fsheets`, or `$FSHEETS_JOURNAL_DIR`), mode 0600 in a 0700 folder, written atomically (temp file,
+  fsync, rename) with every local change and whenever a remote batch or acknowledgement moves the
+  pending changes (a journal of more than 2000 operations is written at most once a second on such
+  events), removed as soon as nothing is pending. It holds the client id, the sequence number the pending
+  changes are based on, the batch in flight (id, base, made, operations), the buffered operations, the
+  number of changes they stand for, and where the document came from. No password and no token (those
+  stay in the sign-in stores).
+- *Resuming.* On the next start the app looks for journals, and opens the document of the first one by
+  itself (when the window is still the empty one; the others when their document is opened) by asking
+  the server for the item (a 404/403 means gone or no longer shared; a network problem retries every
+  15 s and keeps the journal). Opening downloads the latest version at seq S as for any join and joins
+  with the journal's client id. The journal's changes were made at seq B: the window is read-only for
+  the moment it takes the replay to reach B, then the changes are put back (applied to the workbook,
+  state for the server's view kept for the usual repair at quiescence) and handled as after a lost
+  connection. A batch that did commit before the crash (ack lost) comes back in the replay with the same
+  (cid, batch id) and is recognised, not applied twice; the rest is sent. When the file is already newer
+  than B (someone's snapshot passed it) the changes are re-based on it like after a long offline period;
+  a batch in doubt may then be applied twice if it was committed before that snapshot (known limit).
+  Done, the status says "3 changes made offline were saved to the server".
+- *Access lost.* If the item is gone or not shared any more at the start, the changes are applied to the
+  local copy kept from the last open/snapshot (with its live state next to it) and saved as a copy in
+  `LiveJournal/kept/`, which opens with a message; if the account may only view now (at the start, or
+  while running), the workbook stays in the window with the changes, read-only, with "Save a copy" and the
+  same kept copy; the journal is retired only after that copy was written. If a copy can't be written the
+  journal stays. A sign-in that expired keeps the journal and the changes are sent after signing in again
+  and reopening.
+- *Not covered:* the cell being typed in and the frame's last command are in the journal only from the next
+  frame; two app instances on one document and account share a journal file.
+
 ### Known limits
 
 - Anyone can lock a username out for 15 minutes with 10 wrong passwords (per-username lockout DoS).
