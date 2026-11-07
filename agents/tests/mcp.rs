@@ -364,6 +364,10 @@ fn an_agent_edits_through_mcp_and_people_see_it() {
             .iter()
             .any(|p| p["user"] == "agent" && p["you"] == true && p["agent"] == true)
     );
+    let people = who["people"].as_array().unwrap();
+    let me = people.iter().find(|p| p["you"] == true).unwrap();
+    assert_eq!(me["working_on"]["sheet"], "Agent");
+    assert_eq!(me["working_on"]["range"], "A1:B1");
 
     // Leaving saves a version of the file with the agent's work in it.
     let left = c.tool("leave_session", json!({})).unwrap();

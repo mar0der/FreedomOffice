@@ -488,7 +488,15 @@ pub fn peers(live: &Live) -> Json {
         });
         json!({ "name": p.name, "user": p.user, "agent": p.agent, "editor": p.editor, "you": you, "working_on": at })
     };
-    let mut list: Vec<Json> = live.me.iter().map(|p| one(p, true)).collect();
+    let mut list: Vec<Json> = live
+        .me
+        .iter()
+        .map(|p| {
+            let mut p = p.clone();
+            p.presence = live.my_presence.clone();
+            one(&p, true)
+        })
+        .collect();
     list.extend(
         live.peers
             .values()

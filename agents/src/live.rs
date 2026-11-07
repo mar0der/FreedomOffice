@@ -66,6 +66,8 @@ pub struct Live {
     caught_up: bool,
     catch_target: u64,
     pub me: Option<Peer>,
+    /// The presence last sent (the server doesn't echo it back to us).
+    pub my_presence: Option<Presence>,
     pub peers: BTreeMap<u64, Peer>,
     pub editor: bool,
     pub stats: Stats,
@@ -154,6 +156,7 @@ impl Live {
             caught_up: false,
             catch_target: 0,
             me: None,
+            my_presence: None,
             peers: BTreeMap::new(),
             editor: true,
             stats: Stats::default(),
@@ -488,6 +491,7 @@ impl Live {
             sel,
             editing,
         };
+        self.my_presence = Some(p.clone());
         self.send(ClientMsg::Presence { p });
     }
 
