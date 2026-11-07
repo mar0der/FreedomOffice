@@ -455,7 +455,8 @@ pub async fn run(store: Arc<Mutex<Store>>, hub: Arc<Hub>, socket: WebSocket, j: 
     let setup = {
         let (store, hub, kick, end) = (store.clone(), hub.clone(), kick.clone(), end.clone());
         let (item_id, who, since, version, cid, actor) = (j.item.id.clone(), j.who.clone(), j.since, j.version, j.cid.clone(), j.actor.clone());
-        type Setup = (Arc<Mutex<Doc>>, mpsc::Sender<Out>, mpsc::Receiver<Out>, Role);
+        // The last field: registered (false: only the queued farewell goes out, nothing is read).
+        type Setup = (Arc<Mutex<Doc>>, mpsc::Sender<Out>, mpsc::Receiver<Out>, Role, bool);
         tokio::task::spawn_blocking(move || -> Result<Setup, String> {
             // No re-check runs from here until the connection is registered: the access checked
             // now is the one every later re-check starts from.
@@ -475,7 +476,7 @@ pub async fn run(store: Arc<Mutex<Store>>, hub: Arc<Hub>, socket: WebSocket, j: 
                     let (tx, rx) = mpsc::channel(2);
                     let _ = tx.try_send(Out::Text(json(&ServerMsg::Revoked { reason: reason.into() })));
                     let _ = tx.try_send(Out::Close(close::REVOKED, reason.into()));
-                    return Ok((doc, tx, rx, Role::View));
+                    return Ok((doc, tx, rx, Role::View, false));
                 }
             };
             let mut d = lock(&doc);
@@ -491,7 +492,7 @@ pub async fn run(store: Arc<Mutex<Store>>, hub: Arc<Hub>, socket: WebSocket, j: 
                 }
                 let _ = tx.try_send(Out::Text(json(&ServerMsg::Reload)));
                 let _ = tx.try_send(Out::Close(1000, "reload".into()));
-                return Ok((doc.clone(), tx, rx, role));
+                return Ok((doc.clone(), tx, rx, role, false));
             };
             let (tx, rx) = mpsc::channel(QUEUE + 1 + replay.len());
             let used: Vec<u8> = d.conns.iter().map(|c| c.peer.color).collect();
@@ -504,11 +505,11 @@ pub async fn run(store: Arc<Mutex<Store>>, hub: Arc<Hub>, socket: WebSocket, j: 
             }
             d.broadcast(conn_id, &ServerMsg::Join { peer: peer.clone() });
             d.conns.push(Conn { peer, tx: tx.clone(), kick, who, role, revoked: false, end });
-            Ok((doc.clone(), tx, rx, role))
+            Ok((doc.clone(), tx, rx, role, true))
         })
         .await
     };
-    let (doc, tx, mut rx, role) = match setup {
+    let (doc, tx, mut rx, role, registered) = match setup {
         Ok(Ok(d)) => d,
         Ok(Err(e)) => {
             hub.release(&item_id);
@@ -549,6 +550,10 @@ pub async fn run(store: Arc<Mutex<Store>>, hub: Arc<Hub>, socket: WebSocket, j: 
     };
     let mut kicked = false;
     loop {
+        // Not registered (access ended, or must reload): ignore whatever the client sends.
+        if !registered {
+            break;
+        }
         tokio::select! {
             msg = stream.next() => {
                 let Some(Ok(msg)) = msg else { break };

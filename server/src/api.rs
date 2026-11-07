@@ -75,8 +75,15 @@ impl App {
     /// Password hashing or checking (Argon2): never under the store lock, at most one per core
     /// at a time (waiting requests hold no thread and no memory).
     async fn argon<T: Send + 'static>(&self, f: impl FnOnce() -> T + Send + 'static) -> Result<T, ApiError> {
-        let _permit = self.argon.acquire().await.map_err(|_| ApiError::internal())?;
-        tokio::task::spawn_blocking(f).await.map_err(|_| ApiError::internal())
+        // The permit lives in the blocking task: a client that disconnects drops this future,
+        // but the hashing it started keeps its slot until it really ends.
+        let permit = self.argon.clone().acquire_owned().await.map_err(|_| ApiError::internal())?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            f()
+        })
+        .await
+        .map_err(|_| ApiError::internal())
     }
 
     /// Checks a new password against the policy, then hashes it (see `argon`).
@@ -628,7 +635,10 @@ async fn change_password(State(app): State<App>, headers: HeaderMap, body: Bytes
         })
         .await?;
     let key = format!("user:{}", user.username.to_lowercase());
-    if b.old_password.len() > 1024 || app.attempt(std::slice::from_ref(&key)).is_none() {
+    if b.old_password.len() > 1024 {
+        return Err(ApiError::coded(StatusCode::FORBIDDEN, "wrong_password", "The current password is incorrect."));
+    }
+    if app.attempt(std::slice::from_ref(&key)).is_none() {
         return Err(too_many());
     }
     let (old, new, current) = (b.old_password, b.new_password.clone(), hash.clone());
