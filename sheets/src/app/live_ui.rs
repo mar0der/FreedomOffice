@@ -21,11 +21,41 @@ use crate::live::{self, ApplyState, Before};
 use crate::model::{Range, Workbook};
 
 /// Excel-like colours for other people's cursors.
-const COLORS: [u32; 8] = [0x0078D4, 0xC239B3, 0x00A36C, 0xCA5010, 0x8764B8, 0xE3008C, 0x038387, 0x986F0B];
+const COLORS: [u32; 12] = [0x0078D4, 0xC239B3, 0x00A36C, 0xCA5010, 0x8764B8, 0xE3008C, 0x038387, 0x986F0B, 0x4F6BED, 0x498205, 0xAE4F4F, 0x6B6B00];
+/// Agents (scripts, MCP tools) are drawn in this slate colour, dashed, whoever they act for.
+const AGENT_COLOR: u32 = 0x5C6B7A;
 
 pub fn peer_color(slot: u8) -> Color32 {
     super::theme::rgb(COLORS[slot as usize % COLORS.len()])
 }
+
+/// A person's colour: from their user id, so it is the same for everyone, in every window
+/// and session (not the server's per-session slot). People with a link (no user id) keep
+/// the server's slot.
+pub fn user_color(p: &Peer) -> Color32 {
+    if p.agent {
+        return super::theme::rgb(AGENT_COLOR);
+    }
+    if p.user.is_empty() {
+        return peer_color(p.color);
+    }
+    // FNV-1a
+    let h = p.user.to_lowercase().bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3));
+    super::theme::rgb(COLORS[(h % COLORS.len() as u64) as usize])
+}
+
+/// Presence opacity: fades in after joining, and dims when the person has been still for a
+/// while (Excel shows idle people less prominently).
+pub fn presence_alpha(joined: Duration, idle: Duration) -> f32 {
+    let fade_in = (joined.as_secs_f32() / 0.3).clamp(0.0, 1.0);
+    let dim = if idle > IDLE_AFTER { 1.0 - 0.55 * ((idle - IDLE_AFTER).as_secs_f32() / 20.0).min(1.0) } else { 1.0 };
+    fade_in * dim
+}
+
+/// Still for this long: dimmed.
+const IDLE_AFTER: Duration = Duration::from_secs(60);
+/// A person who left fades out over this long.
+const LEAVE_FADE: Duration = Duration::from_millis(400);
 
 /// How long a name flag stays up after someone moves.
 const FLAG_SECS: f32 = 3.0;
@@ -78,6 +108,28 @@ fn access_removed(reason: &str) -> String {
 pub struct Seen {
     pub peer: Peer,
     pub moved: Instant,
+    pub joined: Instant,
+}
+
+impl Seen {
+    fn new(peer: Peer) -> Self {
+        let now = Instant::now();
+        Seen { peer, moved: now, joined: now }
+    }
+
+    /// The key of a person: the user name, or `#id` for someone with a link.
+    fn key(&self) -> String {
+        if self.peer.user.is_empty() { format!("#{}", self.peer.id) } else { self.peer.user.clone() }
+    }
+}
+
+/// Who is being followed (the view jumps along with their cursor): their key, the position
+/// last jumped to, and where that left our own cursor.
+struct Follow {
+    key: String,
+    name: String,
+    at: Option<(SheetId, u32, u32)>,
+    mine: Option<(usize, u32, u32)>,
 }
 
 /// One undoable local change: the operations that reverse it (in the state left by undoing
@@ -148,6 +200,9 @@ pub struct Live {
     pub editor: bool,
     pub me: Option<Peer>,
     pub peers: BTreeMap<u64, Seen>,
+    /// People who just left, fading out (never counted as present).
+    pub(crate) gone: Vec<(Seen, Instant)>,
+    follow: Option<Follow>,
     befores: Vec<Before>,
     structs: Vec<(SheetId, bool, u32, i64)>,
     /// Undo scopes of the change being recorded.
@@ -227,6 +282,8 @@ impl Live {
             editor: true,
             me: None,
             peers: BTreeMap::new(),
+            gone: Vec::new(),
+            follow: None,
             befores: Vec::new(),
             structs: Vec::new(),
             scopes: Vec::new(),
@@ -912,6 +969,8 @@ impl App {
             if let Some(c) = &self.ctx {
                 if l.retry_at.is_some() {
                     c.request_repaint_after(Duration::from_millis(500));
+                } else if !l.gone.is_empty() || l.peers.values().any(|p| p.joined.elapsed() < Duration::from_millis(400)) {
+                    c.request_repaint_after(Duration::from_millis(40));
                 } else if !l.peers.is_empty() {
                     c.request_repaint_after(Duration::from_millis(1000));
                 }
@@ -938,6 +997,7 @@ impl App {
                 l.online = false;
                 l.sess.offline();
                 l.peers.clear();
+                l.gone.clear();
                 let fatal = match (code, http) {
                     (_, Some(401)) => {
                         // Signed out (elsewhere, or the token was revoked): nothing more reaches the
@@ -1019,7 +1079,7 @@ impl App {
                 l.welcomed = true;
                 l.editor = you.editor;
                 l.me = Some(you);
-                l.peers = peers.into_iter().map(|p| (p.id, Seen { peer: p, moved: Instant::now() })).collect();
+                l.peers = peers.into_iter().map(|p| (p.id, Seen::new(p))).collect();
                 l.catch_up = Some(seq);
                 l.backoff = 0;
                 self.live_caught_up();
@@ -1065,13 +1125,14 @@ impl App {
                 let Some(l) = &mut self.live else { return };
                 let name = peer.name.clone();
                 let editor = peer.editor;
-                l.peers.insert(peer.id, Seen { peer, moved: Instant::now() });
+                l.peers.insert(peer.id, Seen::new(peer));
                 self.status = Some(format!("{name} joined{}.", if editor { "" } else { " (viewing)" }));
             }
             ServerMsg::Leave { id } => {
                 let Some(l) = &mut self.live else { return };
                 if let Some(p) = l.peers.remove(&id) {
                     self.status = Some(format!("{} left.", p.peer.name));
+                    l.gone.push((p, Instant::now()));
                 }
             }
             ServerMsg::Presence { id, p } => {
@@ -1661,6 +1722,8 @@ impl App {
         l.conn = None;
         l.online = false;
         l.sess.offline();
+        l.peers.clear();
+        l.gone.clear();
         l.reloading = true;
         let tx = l.tx.clone();
         let ctx = self.ctx.clone();
@@ -1758,6 +1821,10 @@ impl App {
     // ------------------------------------------------------------------
 
     fn live_presence(&mut self) {
+        if let Some(l) = &mut self.live {
+            l.gone.retain(|g| g.1.elapsed() < LEAVE_FADE);
+        }
+        self.live_follow_step();
         let Some(sh) = self.wb.sheets.get(self.wb.active) else { return };
         let v = &sh.view;
         let p = Presence { s: sh.uid, r: v.active.0, c: v.active.1, sel: rect_of(v.sel), editing: self.edit.is_some() };
@@ -1772,18 +1839,75 @@ impl App {
         l.presence_at = Instant::now();
     }
 
-    /// Others' selections on the active sheet: coloured borders, the active cell thicker, a
-    /// tinted cell while they type, and a name flag for a few seconds after they move (or
-    /// while the pointer is over their cell).
+    /// Follow mode: the view goes where the followed person goes, until we move ourselves,
+    /// they leave, or their picture is clicked again.
+    fn live_follow_step(&mut self) {
+        let here = self.wb.sheets.get(self.wb.active).map(|sh| (self.wb.active, sh.view.active.0, sh.view.active.1));
+        let Some(l) = &mut self.live else { return };
+        let Some(f) = &mut l.follow else { return };
+        let seen = l.peers.values().find(|s| s.key() == f.key);
+        let target = seen.and_then(|s| s.peer.presence.clone());
+        let gone = seen.is_none();
+        if f.mine.is_some() && f.mine != here {
+            let name = std::mem::take(&mut f.name);
+            l.follow = None;
+            self.status = Some(format!("Stopped following {name}."));
+            return;
+        }
+        if gone {
+            let name = std::mem::take(&mut f.name);
+            l.follow = None;
+            self.status = Some(format!("{name} left; no longer following."));
+            return;
+        }
+        let Some(p) = target else { return };
+        let pos = (p.s, p.r, p.c);
+        if f.at == Some(pos) {
+            return;
+        }
+        f.at = Some(pos);
+        if let Some(i) = live::index_of(&self.wb, p.s) {
+            self.switch_sheet(i);
+            self.select(p.r, p.c, false);
+            let here = self.wb.sheets.get(self.wb.active).map(|sh| (self.wb.active, sh.view.active.0, sh.view.active.1));
+            if let Some(f) = self.live.as_mut().and_then(|l| l.follow.as_mut()) {
+                f.mine = here;
+            }
+        }
+    }
+
+    /// Starts or stops following a person (`key` as in `Seen::key`).
+    pub(crate) fn live_toggle_follow(&mut self, key: &str, name: &str) {
+        let Some(l) = &mut self.live else { return };
+        if l.follow.as_ref().is_some_and(|f| f.key == key) {
+            l.follow = None;
+            self.status = Some(format!("Stopped following {name}."));
+        } else {
+            l.follow = Some(Follow { key: key.to_string(), name: name.to_string(), at: None, mine: None });
+            self.status = Some(format!("Following {name}. Move anywhere yourself, or click their picture again, to stop."));
+        }
+    }
+
+    pub(crate) fn live_following(&self) -> Option<String> {
+        self.live.as_ref()?.follow.as_ref().map(|f| f.name.clone())
+    }
+
+    /// Others' selections on the active sheet: coloured borders (their own colour per person,
+    /// dashed for agents), the active cell thicker, a tinted cell while they type, and a name
+    /// flag for a few seconds after they move (or while the pointer is over their cell).
+    /// New arrivals fade in, people who sit still dim, people who left fade out.
     pub(super) fn paint_presence(&self, p: &egui::Painter, lay: &super::grid::Layout, hover: Option<Pos2>) {
         let Some(l) = &self.live else { return };
         let Some(sh) = self.wb.sheets.get(self.wb.active) else { return };
-        for seen in l.peers.values() {
+        let fading = l.gone.iter().map(|(s, at)| (s, 1.0 - at.elapsed().as_secs_f32() / LEAVE_FADE.as_secs_f32()));
+        let present = l.peers.values().map(|s| (s, presence_alpha(s.joined.elapsed(), s.moved.elapsed())));
+        for (seen, alpha) in present.chain(fading) {
             let Some(pr) = &seen.peer.presence else { continue };
-            if pr.s != sh.uid {
+            if pr.s != sh.uid || alpha <= 0.0 {
                 continue;
             }
-            let col = peer_color(seen.peer.color);
+            let alpha = alpha.clamp(0.0, 1.0);
+            let col = user_color(&seen.peer).gamma_multiply(alpha);
             let sel = Range::new(pr.sel.r1, pr.sel.c1, pr.sel.r2, pr.sel.c2);
             let cell = sh.merge_at(pr.r, pr.c).unwrap_or(Range::cell(pr.r, pr.c));
             let cr = self.range_rect(lay, cell);
@@ -1795,29 +1919,58 @@ impl App {
             if pr.editing {
                 p.rect_filled(cr, 0.0, col.gamma_multiply(0.18));
             }
-            p.rect_stroke(cr.shrink(1.0), 0.0, Stroke::new(2.0, col), StrokeKind::Middle);
+            let outline = cr.shrink(1.0);
+            if seen.peer.agent {
+                let pts = [outline.left_top(), outline.right_top(), outline.right_bottom(), outline.left_bottom(), outline.left_top()];
+                p.extend(egui::Shape::dashed_line(&pts, Stroke::new(2.0, col), 5.0, 3.0));
+            } else {
+                p.rect_stroke(outline, 0.0, Stroke::new(2.0, col), StrokeKind::Middle);
+            }
             let hovered = hover.is_some_and(|h| cr.contains(h));
             if hovered || seen.moved.elapsed().as_secs_f32() < FLAG_SECS || pr.editing {
-                let label = if pr.editing { format!("{} (editing)", seen.peer.name) } else { seen.peer.name.clone() };
+                let mut label = presence_label(&seen.peer);
+                if pr.editing {
+                    label.push_str(" (editing)");
+                }
                 let font = super::theme::ui_font(11.0);
-                let g = p.layout_no_wrap(label, font, Color32::WHITE);
+                let white = Color32::WHITE.gamma_multiply(alpha);
+                let g = p.layout_no_wrap(label, font, white);
                 let flag = Rect::from_min_size(Pos2::new(cr.right() - 1.0, cr.top() - g.size().y - 3.0), g.size() + Vec2::new(8.0, 3.0));
-                p.rect_filled(flag, 2.0, col);
-                p.galley(flag.min + Vec2::new(4.0, 1.5), g, Color32::WHITE);
+                p.rect_filled(flag, if seen.peer.agent { 7.0 } else { 2.0 }, col);
+                p.galley(flag.min + Vec2::new(4.0, 1.5), g, white);
+            }
+        }
+        if !l.gone.is_empty() {
+            if let Some(c) = &self.ctx {
+                c.request_repaint_after(Duration::from_millis(40));
             }
         }
     }
 
-    /// Avatars of the others next to Share; click one to go to their cell.
+    /// Everyone in the file next to Share: a picture (initials) per person in their colour,
+    /// yourself last, agents as rounded squares; a dot while someone types, dimmed while still;
+    /// click one to follow them (the view goes where they go; click again to stop).
     pub(super) fn live_avatars_ui(&mut self, ui: &mut egui::Ui) {
         let Some(l) = &self.live else { return };
         // One avatar per person (several windows of the same user count once).
-        let mut people: Vec<(String, String, u8, bool, Option<Presence>)> = Vec::new();
+        struct Who {
+            key: String,
+            peer: Peer,
+            editor: bool,
+            typing: bool,
+            alpha: f32,
+        }
+        let mut people: Vec<Who> = Vec::new();
         for s in l.peers.values() {
-            let key = if s.peer.user.is_empty() { format!("#{}", s.peer.id) } else { s.peer.user.clone() };
-            match people.iter_mut().find(|p| p.0 == key) {
-                Some(p) => p.3 |= s.peer.editor,
-                None => people.push((key, s.peer.name.clone(), s.peer.color, s.peer.editor, s.peer.presence.clone())),
+            let alpha = presence_alpha(s.joined.elapsed(), s.moved.elapsed());
+            let typing = s.peer.presence.as_ref().is_some_and(|p| p.editing);
+            match people.iter_mut().find(|p| p.key == s.key()) {
+                Some(p) => {
+                    p.editor |= s.peer.editor;
+                    p.alpha = p.alpha.max(alpha);
+                    p.typing |= typing;
+                }
+                None => people.push(Who { key: s.key(), peer: s.peer.clone(), editor: s.peer.editor, typing, alpha }),
             }
         }
         let status = match (&l.stopped, l.online) {
@@ -1825,35 +1978,62 @@ impl App {
             (None, false) => Some("Reconnecting...".to_string()),
             _ => None,
         };
-        let mut jump = None;
+        let following = l.follow.as_ref().map(|f| f.key.clone());
+        let me = l.me.clone();
+        let my_editing = self.edit.is_some();
+        let list: String = std::iter::once(format!("{} (you) \u{2014} {}", me.as_ref().map_or("You".to_string(), |m| m.name.clone()), if l.editor { "Editing" } else { "Viewing" }))
+            .chain(people.iter().map(|p| format!("{} \u{2014} {}", presence_label(&p.peer), if p.typing { "Typing" } else if p.editor { "Editing" } else { "Viewing" })))
+            .collect::<Vec<_>>()
+            .join("
+");
         if let Some(st) = status {
             ui.label(egui::RichText::new(if l.stopped.is_some() { "Offline" } else { "Reconnecting..." }).size(12.0).color(super::theme::text_dim())).on_hover_text(st);
         }
-        let list: String = std::iter::once(format!("{} (you) — {}", l.me.as_ref().map_or("You".to_string(), |m| m.name.clone()), if l.editor { "Editing" } else { "Viewing" }))
-            .chain(people.iter().map(|p| format!("{} — {}", p.1, if p.3 { "Editing" } else { "Viewing" })))
-            .collect::<Vec<_>>()
-            .join("\n");
-        for (i, (_, name, color, _, presence)) in people.iter().enumerate().rev() {
-            if i >= 5 {
-                continue;
-            }
+        let mut follow: Option<(String, String)> = None;
+        let ring = super::theme::chrome();
+        let avatar = |ui: &mut egui::Ui, peer: &Peer, alpha: f32, typing: bool, followed: bool, tip: String| -> egui::Response {
             let (rect, resp) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::click());
-            let col = peer_color(*color);
-            ui.painter().circle_filled(rect.center(), 12.0, if resp.hovered() { col.gamma_multiply(0.8) } else { col });
-            ui.painter().circle_stroke(rect.center(), 12.0, Stroke::new(1.5, super::theme::chrome()));
-            ui.painter().text(rect.center(), Align2::CENTER_CENTER, initials(name), super::theme::ui_bold(10.0), Color32::WHITE);
-            if resp.on_hover_text(format!("{list}\n\nClick to go to {name}'s location.")).clicked() {
-                jump = presence.clone();
+            let col = user_color(peer).gamma_multiply(alpha.clamp(0.3, 1.0));
+            let col = if resp.hovered() { col.gamma_multiply(0.85) } else { col };
+            if peer.agent {
+                ui.painter().rect_filled(rect.shrink(1.0), 6.0, col);
+                ui.painter().rect_stroke(rect.shrink(1.0), 6.0, Stroke::new(1.5, ring), StrokeKind::Middle);
+            } else {
+                ui.painter().circle_filled(rect.center(), 12.0, col);
+                ui.painter().circle_stroke(rect.center(), 12.0, Stroke::new(1.5, ring));
+            }
+            if followed {
+                ui.painter().circle_stroke(rect.center(), 13.5, Stroke::new(2.0, user_color(peer)));
+            }
+            let text = if peer.agent { "AI".to_string() } else { initials(&peer.name) };
+            ui.painter().text(rect.center(), Align2::CENTER_CENTER, text, super::theme::ui_bold(10.0), Color32::WHITE);
+            if typing {
+                let dot = rect.right_bottom() - Vec2::new(3.0, 3.0);
+                ui.painter().circle_filled(dot, 4.5, Color32::from_rgb(0xF2, 0xA9, 0x00));
+                ui.painter().circle_stroke(dot, 4.5, Stroke::new(1.0, ring));
+            }
+            resp.on_hover_text(tip)
+        };
+        let shown = people.len().min(5);
+        for p in people.iter().take(shown).rev() {
+            let followed = following.as_deref() == Some(p.key.as_str());
+            let tip = format!("{list}
+
+Click to {} {}.", if followed { "stop following" } else { "follow" }, p.peer.name);
+            if avatar(ui, &p.peer, p.alpha, p.typing, followed, tip).clicked() {
+                follow = Some((p.key.clone(), p.peer.name.clone()));
             }
         }
         if people.len() > 5 {
-            ui.label(egui::RichText::new(format!("+{}", people.len() - 5)).size(12.0)).on_hover_text(list);
+            ui.label(egui::RichText::new(format!("+{}", people.len() - 5)).size(12.0)).on_hover_text(list.clone());
         }
-        if let Some(p) = jump {
-            if let Some(i) = live::index_of(&self.wb, p.s) {
-                self.switch_sheet(i);
-                self.select(p.r, p.c, false);
-            }
+        if let Some(me) = &me {
+            avatar(ui, me, 1.0, my_editing, false, format!("{list}
+
+This is you."));
+        }
+        if let Some((key, name)) = follow {
+            self.live_toggle_follow(&key, &name);
         }
     }
 
@@ -1893,17 +2073,33 @@ impl App {
         Some(t)
     }
 
-    /// Title bar suffix for live documents.
-    pub(super) fn live_title(&self) -> Option<String> {
+    /// The save state in words, for the title and the status bar: "Saving...", "Saved to
+    /// server", "Offline (N waiting)". Driven by the acknowledgements (nothing pending) and the
+    /// journal's count of changes not yet sent.
+    pub(crate) fn live_save_text(&self) -> Option<String> {
         let l = self.live.as_ref()?;
-        Some(match (&l.stopped, l.online, l.sess.has_pending()) {
-            (Some(_), _, _) => " - Not connected".into(),
-            (None, false, _) => " - Reconnecting...".into(),
-            (None, true, true) => " - Saving...".into(),
-            (None, true, false) if !l.editor => " - Read-only".into(),
-            (None, true, false) => format!(" - Saved to {}", crate::cloud::server::host_of(&l.url)),
+        Some(match (&l.stopped, l.online) {
+            (Some(_), _) => "Not connected".into(),
+            (None, false) => match l.waiting() {
+                0 if !l.welcomed => "Connecting...".into(),
+                0 => "Offline".into(),
+                n => format!("Offline ({n} waiting)"),
+            },
+            (None, true) if l.sess.has_pending() => "Saving...".into(),
+            (None, true) if !l.editor => "Read-only".into(),
+            (None, true) => "Saved to server".into(),
         })
     }
+
+    /// Title bar suffix for live documents.
+    pub(super) fn live_title(&self) -> Option<String> {
+        self.live_save_text().map(|t| format!(" - {t}"))
+    }
+}
+
+/// How a participant is named on flags and in lists: agents carry "(bot)".
+pub fn presence_label(p: &Peer) -> String {
+    if p.agent { format!("{} (bot)", p.name) } else { p.name.clone() }
 }
 
 /// The live state stored next to the local copy of a document.

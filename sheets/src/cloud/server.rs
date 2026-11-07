@@ -88,6 +88,10 @@ pub struct VersionInfo {
     pub modified: String,
     pub modified_by: String,
     pub current: bool,
+    /// A name given to the version ("" = none); named versions are never pruned.
+    pub label: String,
+    /// People whose live changes are in this version (live snapshots).
+    pub contributors: Vec<String>,
 }
 
 /// Checks a server address typed by the user: https:// only (http:// for localhost testing).
@@ -633,10 +637,18 @@ impl ServerSession {
                         modified: s(&x["modified"]),
                         modified_by: s(&x["modified_by"]),
                         current: x["current"].as_bool().unwrap_or(false),
+                        label: s(&x["label"]),
+                        contributors: x["contributors"].as_array().map(|c| c.iter().map(s).collect()).unwrap_or_default(),
                     })
                     .collect()
             })
             .unwrap_or_default())
+    }
+
+    /// Names a version (empty clears the name); returns the name as stored.
+    pub fn label_version(&self, id: &str, version: i64, label: &str) -> Result<String, String> {
+        let v = self.json_ok(Request::new("PUT", format!("/api/items/{}/versions/{version}", pct_encode(id))).json(&json!({ "label": label })))?;
+        Ok(s(&v["label"]))
     }
 
     /// Makes an old version the current one (as a new version).

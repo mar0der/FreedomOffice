@@ -532,6 +532,13 @@ impl App {
                 ui.add_space(16.0);
                 ui.label(RichText::new(m).size(12.0).color(theme::text_dim()));
             }
+            if let Some(t) = self.live_save_text() {
+                ui.add_space(16.0);
+                let amber = if theme::is_dark() { theme::rgb(0xF3C77A) } else { theme::rgb(0x9D5D00) };
+                let ok = t.starts_with("Saved");
+                let text = RichText::new(t).size(12.0).color(if ok { theme::text_dim() } else { amber });
+                ui.label(if ok { text } else { text.strong() }).on_hover_text("Changes are sent to the server as you make them.");
+            }
             if let Some(t) = self.live_offline_text() {
                 // Editing goes on; this only says where the changes are.
                 ui.add_space(16.0);

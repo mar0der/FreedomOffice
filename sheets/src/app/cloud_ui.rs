@@ -129,6 +129,7 @@ enum Event {
     FolderCreated(Result<DriveItem, String>),
     Versions(Result<Vec<VersionInfo>, String>),
     VersionRestored(Result<DriveItem, String>),
+    VersionLabelled(i64, Result<String, String>),
     VersionCopy(Result<PathBuf, String>),
 }
 
@@ -268,6 +269,8 @@ pub struct VersionsState {
     pub list: Option<Vec<VersionInfo>>,
     pub busy: bool,
     pub error: Option<String>,
+    /// The version being named and the text typed so far.
+    pub naming: Option<(i64, String)>,
 }
 
 pub struct CloudState {
@@ -962,7 +965,27 @@ impl App {
                     }
                 }
             }
+            Event::VersionLabelled(n, result) => {
+                if let Some(v) = &mut self.cloud.versions {
+                    v.busy = false;
+                    match result {
+                        Ok(label) => {
+                            v.naming = None;
+                            if let Some(x) = v.list.as_mut().and_then(|l| l.iter_mut().find(|x| x.version == n)) {
+                                x.label = label;
+                            }
+                        }
+                        Err(e) => v.error = Some(e),
+                    }
+                }
+            }
             Event::VersionRestored(result) => match result {
+                // In a live session the server tells every window (this one too) to reload the
+                // restored file, and the unsent changes are kept on top of it.
+                Ok(_) if self.live.as_ref().is_some_and(|l| l.stopped.is_none()) => {
+                    self.cloud.versions = None;
+                    self.status = Some("Version restored. Getting it...".into());
+                }
                 Ok(item) => {
                     self.cloud.versions = None;
                     self.status = Some("Version restored. Opening it...".into());
@@ -2156,7 +2179,7 @@ impl App {
             return;
         };
         let id = doc.item_id.clone();
-        self.cloud.versions = Some(VersionsState { doc, list: None, busy: true, error: None });
+        self.cloud.versions = Some(VersionsState { doc, list: None, busy: true, error: None, naming: None });
         self.cloud_spawn(move || Event::Versions(s.versions(&id)));
     }
 
@@ -2738,6 +2761,8 @@ impl App {
             ui.add_space(6.0);
             let mut restore = None;
             let mut copy = None;
+            let mut name: Option<(i64, String)> = None;
+            let live = self.live.is_some();
             match &v.list {
                 None => {
                     ui.horizontal(|ui| {
@@ -2750,22 +2775,38 @@ impl App {
                 }
                 Some(list) => {
                     egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                        egui::Grid::new("server_versions").num_columns(5).spacing([14.0, 6.0]).striped(true).show(ui, |ui| {
-                            for h in ["Version", "Modified", "Modified by", "Size", ""] {
+                        egui::Grid::new("server_versions").num_columns(6).spacing([14.0, 6.0]).striped(true).show(ui, |ui| {
+                            for h in ["Version", "Modified", "Name", "Changes by", "Size", ""] {
                                 ui.label(RichText::new(h).size(12.0).color(theme::text_dim()));
                             }
                             ui.end_row();
                             for x in list {
                                 ui.label(if x.current { format!("{} (current)", x.version) } else { x.version.to_string() });
                                 ui.label(graph::short_date(&x.modified));
-                                ui.label(&x.modified_by);
+                                match &mut v.naming {
+                                    Some((n, text)) if *n == x.version => {
+                                        let r = ui.add(egui::TextEdit::singleline(text).desired_width(120.0).hint_text("Name"));
+                                        if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                            name = Some((x.version, text.clone()));
+                                        }
+                                        r.request_focus();
+                                    }
+                                    _ => {
+                                        let t = if x.label.is_empty() { RichText::new("-").color(theme::text_dim()) } else { RichText::new(&x.label).strong() };
+                                        if ui.add_enabled(!v.busy, egui::Label::new(t).sense(egui::Sense::click())).on_hover_text("Click to name this version (kept from clean-up)").clicked() {
+                                            v.naming = Some((x.version, x.label.clone()));
+                                        }
+                                    }
+                                }
+                                let who = if x.contributors.is_empty() { x.modified_by.clone() } else { x.contributors.join(", ") };
+                                ui.label(&who).on_hover_text(format!("Saved by {}", x.modified_by));
                                 ui.label(size_label(x.size as usize));
                                 ui.horizontal(|ui| {
                                     if ui.add_enabled(!v.busy, egui::Button::new("Open a copy")).clicked() {
                                         copy = Some(x.version);
                                     }
                                     if !x.current {
-                                        let b = ui.add_enabled(!v.busy && !dirty, egui::Button::new("Restore"));
+                                        let b = ui.add_enabled(!v.busy && (!dirty || live), egui::Button::new("Restore"));
                                         if b.on_disabled_hover_text("Save or undo your changes first").clicked() {
                                             restore = Some(x.version);
                                         }
@@ -2791,6 +2832,12 @@ impl App {
                 v.error = None;
                 let id = v.doc.item_id.clone();
                 self.cloud_spawn(move || Event::VersionRestored(s.restore_version(&id, n)));
+            }
+            if let (Some((n, label)), Some(s)) = (name, session.clone()) {
+                v.busy = true;
+                v.error = None;
+                let id = v.doc.item_id.clone();
+                self.cloud_spawn(move || Event::VersionLabelled(n, s.label_version(&id, n, &label)));
             }
             if let (Some(n), Some(s)) = (copy, session.clone()) {
                 let dest = v.doc.local.parent().map(|d| d.join("versions").join(server::version_copy_name(&v.doc.name, n)));
