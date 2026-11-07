@@ -18,19 +18,21 @@ use std::time::{Duration, Instant};
 use serde_json::{Value as Json, json};
 
 use crate::api::Api;
-use crate::live::Live;
+use crate::live::{Live, ReplacedEvent};
 use crate::work;
 
 const LATEST: &str = "2025-06-18";
 const SUPPORTED: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
-const INSTRUCTIONS: &str = "FreedomOffice Sheets. Find a workbook with list_files, then give its id as `item` to the other tools (after open_file or join_session the item may be left out). read_range returns calculated values and formula text; write_range takes a 2D array whose strings starting with = are formulas. Edits made while joined (join_session) are seen live by the people who have the workbook open and show this agent in their presence; leave_session when done so the work is saved as a version.";
+const INSTRUCTIONS: &str = "FreedomOffice Sheets. Find a workbook with list_files, then give its id as `item` to the other tools (after open_file or join_session the item may be left out). read_range returns calculated values and formula text; write_range takes a 2D array whose strings starting with = are formulas and leaves cell formats alone; when someone else's simultaneous edit replaced one of your earlier cell changes, write_range (or replaced_changes) lists it under `replaced`. Edits made while joined (join_session) are seen live by the people who have the workbook open and show this agent in their presence; leave_session when done so the work is saved as a version.";
 
 pub struct Mcp {
     api: Api,
     sessions: BTreeMap<String, Live>,
     current: Option<String>,
     last_reconnect: Instant,
+    /// This agent's own changes that others replaced, not yet reported to the model.
+    replaced: Vec<ReplacedEvent>,
 }
 
 fn text_of(v: &Json) -> String {
@@ -67,6 +69,7 @@ impl Mcp {
             sessions: BTreeMap::new(),
             current: None,
             last_reconnect: Instant::now(),
+            replaced: Vec::new(),
         }
     }
 
@@ -76,6 +79,7 @@ impl Mcp {
         let retry = self.last_reconnect.elapsed() > Duration::from_secs(2);
         for (item, l) in self.sessions.iter_mut() {
             l.pump(Duration::from_millis(1));
+            self.replaced.extend(l.take_replaced());
             if !l.connected()
                 && l.stopped.is_none()
                 && retry
@@ -128,6 +132,7 @@ impl Mcp {
             if write && !l.wait_synced(Duration::from_secs(20)) {
                 return Err("The server didn't confirm the change yet; it will be sent when the connection is back.".into());
             }
+            self.replaced.extend(l.take_replaced());
             return Ok((out, None));
         }
         // The saved file lacks what was edited live since; joining replays it.
@@ -144,6 +149,7 @@ impl Mcp {
         } else {
             Ok(None)
         };
+        self.replaced.extend(l.take_replaced());
         l.disconnect();
         Ok((out?, version?))
     }
@@ -231,6 +237,12 @@ impl Mcp {
                     .0)
             }
             "list_versions" => work::versions(&self.api, &self.item(a)?),
+            "replaced_changes" => {
+                self.tick();
+                let mut out = json!({ "replaced": [] });
+                self.report_replaced(&mut out);
+                Ok(out)
+            }
             "join_session" => {
                 let item = self.item(a)?;
                 self.current = Some(item.clone());
@@ -310,7 +322,19 @@ impl Mcp {
         if let Some(v) = version {
             out["saved_version"] = json!(v);
         }
+        self.report_replaced(out);
         self.current = Some(item.to_string());
+    }
+
+    /// Adds the earlier changes of this agent that others replaced to a tool result (and
+    /// forgets them): `replaced` lists them, `replaced_notice` says it in words.
+    fn report_replaced(&mut self, out: &mut Json) {
+        if self.replaced.is_empty() {
+            return;
+        }
+        let events = std::mem::take(&mut self.replaced);
+        out["replaced"] = Json::Array(events.iter().map(|e| e.to_json()).collect());
+        out["replaced_notice"] = json!(events.iter().map(|e| e.message()).collect::<Vec<_>>().join(" "));
     }
 
     /// Leaves every session cleanly (snapshot included).
@@ -505,6 +529,12 @@ fn tools() -> Json {
             "Writes the workbook to a local file: .xlsx (all sheets) or .csv/.tsv (one sheet, as formatted). Refuses to replace an existing file unless overwrite is true.",
             json!({ "item": item, "sheet": sheet, "path": { "type": "string", "description": "Local file path ending in .xlsx, .csv or .tsv." }, "overwrite": { "type": "boolean" } }),
             &["path"]
+        ),
+        tool(
+            "replaced_changes",
+            "Your own earlier changes to cells that someone else changed at the same time without seeing yours, so theirs won (last writer wins, as in Excel Online). Reported once; write_range also includes any new ones. Changes to a cell's value and to its format never replace each other. Empty when nothing was replaced.",
+            json!({}),
+            &[]
         ),
         tool(
             "list_versions",

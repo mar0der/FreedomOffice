@@ -129,8 +129,14 @@ fn concurrent_edits_of_one_cell() {
     let (apis, item) = shared_workbook(&s, "tasks");
     let p = soak::probe_conflicts(&apis[0], &apis[1], &item).unwrap();
     println!("{p:#?}");
-    // Last writer wins per cell: the value and the format are one target, so one is lost.
-    assert!(p.value_survived != p.format_survived);
+    // A cell's content and format are separate targets: both survive.
+    assert!(p.value_survived && p.format_survived, "{}", p.value_vs_format);
+    assert!(!p.value_vs_format.contains("told something was replaced: true"));
+    // Two values: the later commit wins and the loser, and only the loser, is told.
+    assert!(p.told_loser, "{}", p.value_vs_value);
+    // An edit made after seeing the other's reports nothing.
+    assert!(p.sequential_quiet);
+    assert!(p.format_vs_format.contains("A was told: Your formatting of"), "{}", p.format_vs_format);
     assert!(p.insert_vs_edit_ok, "{}", p.insert_vs_edit);
 }
 

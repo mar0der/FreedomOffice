@@ -41,6 +41,22 @@ pub fn value_of(v: &Val) -> Value {
     }
 }
 
+/// What a single-part cell write (`Content` or `Format`) entered, as a person would say it: the
+/// formula (`=...`) or value typed, "(empty)" for a cleared cell, "formatting" for a format.
+pub fn entered_text(op: &Op) -> String {
+    match op {
+        Op::Content { v: Some(d), .. } => match (&d.f, &d.v) {
+            (Some(f), _) => format!("={f}"),
+            (None, Val::Text(t)) | (None, Val::Err(t)) => t.clone(),
+            (None, Val::Num(n)) => crate::numfmt::value_to_text(&Value::Number(*n)),
+            (None, Val::Bool(b)) => if *b { "TRUE" } else { "FALSE" }.to_string(),
+            (None, Val::Empty) => "(empty)".to_string(),
+        },
+        Op::Content { v: None, .. } => "(empty)".to_string(),
+        _ => "formatting".to_string(),
+    }
+}
+
 /// Style content (None for the default style).
 pub fn style_json(st: &Style) -> Option<Json> {
     if *st == Style::default() { None } else { serde_json::to_value(st).ok() }

@@ -508,7 +508,7 @@ fn validation_rejects_garbage() {
     assert!(validate(&[bad_adj]).is_err());
     assert!(validate(&[text(1, 5, 5, "ok"), rows(1, 0, -3), Op::Cell { s: 1, r: 0, c: 0, v: None, adj: vec![rows(1, 0, 1)] }]).is_ok());
     // Wire format round trip.
-    let msg = ClientMsg::Ops { base: 3, id: 9, ops: vec![formula(1, 2, 3, "A1+1"), rows(1, 4, -2)] };
+    let msg = ClientMsg::Ops { base: 3, id: 9, made: None, ops: vec![formula(1, 2, 3, "A1+1"), rows(1, 4, -2)] };
     let s = serde_json::to_string(&msg).unwrap();
     assert_eq!(serde_json::from_str::<ClientMsg>(&s).unwrap(), msg);
     assert!(serde_json::from_str::<ClientMsg>(r#"{"t":"ops","base":1}"#).is_err());
@@ -1079,7 +1079,7 @@ impl Pair {
         let b = self.sess[who].local(ops).expect("batch");
         let cid = self.sess[who].cid.clone();
         let Commit::New { seq, ops, .. } = self.log.commit(b.base, &cid, b.id, "u", b.ops).unwrap() else { panic!() };
-        self.sent.push((seq, who, b.id, b.base, ops));
+        self.sent.push((seq, who, b.id, b.made, ops));
         (b.id, seq)
     }
 
@@ -1189,4 +1189,36 @@ fn replaced_cells_are_not_reported_when_we_wrote_them_again() {
     // A types again before B's change reaches it: A's newer edit will win, nothing was lost.
     p.sess[0].local(vec![content(1, 0, 0, "second")]);
     assert!(p.deliver(sb).is_empty());
+}
+
+#[test]
+fn an_edit_made_offline_replaces_ours_even_though_it_is_sent_after_catching_up() {
+    let mut p = Pair::new();
+    // B types while offline (nothing sent); A types into the same cell and is committed.
+    p.sess[1].offline();
+    p.sess[1].local(vec![content(1, 0, 0, "from B, offline")]);
+    let (ida, sa) = p.edit(0, vec![content(1, 0, 0, "from A")]);
+    p.ack(0, ida);
+    // B reconnects: gets A's batch, then sends its own, now based on seq 1 but made against 0.
+    assert!(p.deliver_to(sa, 1).is_empty());
+    let b = p.sess[1].resume().expect("resend");
+    assert_eq!((b.base, b.made), (1, 0));
+    let Commit::New { seq, ops, .. } = p.log.commit_made(b.base, b.made, "s1", b.id, "u", b.ops).unwrap() else { panic!() };
+    p.sent.push((seq, 1, b.id, b.made, ops));
+    p.sess[1].ack(b.id, seq, vec![]);
+    let r = p.deliver_to(seq, 0);
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0].mine, content(1, 0, 0, "from A"));
+}
+
+#[test]
+fn changes_buffered_while_a_batch_was_in_flight_keep_the_older_made() {
+    let mut s = Session::new("x", 5);
+    let b1 = s.local(vec![content(1, 0, 0, "one")]).unwrap();
+    assert_eq!((b1.base, b1.made), (5, 5));
+    // Typed while the first batch is in flight, then someone else's batch arrives.
+    assert!(s.local(vec![content(1, 1, 0, "two")]).is_none());
+    s.remote(6, "y", 1, vec![content(1, 9, 9, "z")]);
+    let b2 = s.ack(b1.id, 7, vec![]).send.unwrap();
+    assert_eq!((b2.base, b2.made), (7, 5));
 }

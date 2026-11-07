@@ -109,22 +109,6 @@ pub struct ReplacedNote {
 const REPLACED_SECS: u64 = 90;
 const REPLACED_KEEP: usize = 20;
 
-/// What a value/formula edit entered, as the person typed it.
-fn content_text(op: &Op) -> String {
-    use cosync::Val;
-    match op {
-        Op::Content { v: Some(d), .. } => match (&d.f, &d.v) {
-            (Some(f), _) => format!("={f}"),
-            (None, Val::Text(t)) | (None, Val::Err(t)) => t.clone(),
-            (None, Val::Num(n)) => crate::numfmt::value_to_text(&crate::model::Value::Number(*n)),
-            (None, Val::Bool(b)) => if *b { "TRUE" } else { "FALSE" }.to_string(),
-            (None, Val::Empty) => "(empty)".to_string(),
-        },
-        Op::Content { v: None, .. } => "(empty)".to_string(),
-        _ => String::new(),
-    }
-}
-
 enum Job {
     Snapshot(u64, Result<DriveItem, String>),
     Reloaded(Result<CloudDoc, String>),
@@ -250,7 +234,7 @@ impl Live {
                 self.sent_units = self.units.len();
             }
             if let Some(c) = &self.conn {
-                c.send(ClientMsg::Ops { base: b.base, id: b.id, ops: b.ops });
+                c.send(ClientMsg::Ops { base: b.base, id: b.id, made: (b.made < b.base).then_some(b.made), ops: b.ops });
             }
         }
     }
@@ -916,7 +900,7 @@ impl App {
         let Some(l) = &mut self.live else { return };
         for r in replaced {
             let format = r.part == cosync::CellWrite::Format;
-            let mine = if format { "formatting".to_string() } else { content_text(&r.mine) };
+            let mine = live::entered_text(&r.mine);
             l.replaced.retain(|n| !(n.sheet == r.s && n.r == r.r && n.c == r.c && n.format == format));
             l.replaced.push(ReplacedNote { sheet: r.s, r: r.r, c: r.c, by: who.to_string(), format, mine, op: r.mine.clone(), at: Instant::now() });
         }

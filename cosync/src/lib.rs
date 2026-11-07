@@ -253,7 +253,16 @@ pub enum ClientMsg {
         proto: u32,
     },
     /// A batch of changes made against the state at `base`.
-    Ops { base: u64, id: u64, ops: Vec<Op> },
+    /// `made`: the sequence number the person had seen when they made these changes, when
+    /// that is older than `base` (changes made offline, or while an earlier batch was in
+    /// flight, are sent against a newer base after being transformed); absent = `base`.
+    Ops {
+        base: u64,
+        id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        made: Option<u64>,
+        ops: Vec<Op>,
+    },
     Presence { p: Presence },
 }
 
@@ -273,10 +282,10 @@ pub enum ServerMsg {
     },
     /// A committed batch. `cid`/`id` identify the sender's client and batch (so a client
     /// recognises its own batch when it is replayed after a reconnect). `base`: the sequence
-    /// number the sender had seen when it sent the batch (absent when not known, e.g. for
-    /// batches replayed from storage): a batch with `base` below the sequence number of one of
-    /// your own was made without seeing it, which is how "your change was replaced" is told
-    /// apart from a later, deliberate edit.
+    /// number the sender had seen when it made the changes (`made`, else `base`, of its
+    /// batch; absent when not known, e.g. for batches replayed from storage): a batch with
+    /// `base` below the sequence number of one of your own was made without seeing it, which
+    /// is how "your change was replaced" is told apart from a later, deliberate edit.
     Ops {
         seq: u64,
         cid: String,

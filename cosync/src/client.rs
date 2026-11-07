@@ -30,6 +30,8 @@ pub struct Replaced {
 pub struct Batch {
     pub id: u64,
     pub base: u64,
+    /// The sequence number the person had seen when they made these changes (<= `base`).
+    pub made: u64,
     pub ops: Vec<Op>,
 }
 
@@ -64,6 +66,8 @@ pub struct Session {
     pub seq: u64,
     pub inflight: Option<Batch>,
     pub buffer: Vec<Op>,
+    /// The sequence number seen when the oldest buffered change was made.
+    buffer_since: Option<u64>,
     next_id: u64,
     /// Cell writes of our recently acknowledged batches (sequence number, single-part
     /// operations), kept in the coordinates of the latest state.
@@ -74,7 +78,7 @@ pub struct Session {
 
 impl Session {
     pub fn new(cid: impl Into<String>, seq: u64) -> Self {
-        Session { cid: cid.into(), seq, inflight: None, buffer: Vec::new(), next_id: 1, recent: VecDeque::new(), online: true }
+        Session { cid: cid.into(), seq, inflight: None, buffer: Vec::new(), buffer_since: None, next_id: 1, recent: VecDeque::new(), online: true }
     }
 
     /// Unacknowledged local changes, oldest first.
@@ -92,7 +96,8 @@ impl Session {
         if !self.online || self.inflight.is_some() || self.buffer.is_empty() {
             return None;
         }
-        let b = Batch { id: self.next_id, base: self.seq, ops: std::mem::take(&mut self.buffer) };
+        let made = self.buffer_since.take().unwrap_or(self.seq).min(self.seq);
+        let b = Batch { id: self.next_id, base: self.seq, made, ops: std::mem::take(&mut self.buffer) };
         self.next_id += 1;
         self.inflight = Some(b.clone());
         Some(b)
@@ -100,6 +105,9 @@ impl Session {
 
     /// Local changes (already applied to the local workbook).
     pub fn local(&mut self, ops: Vec<Op>) -> Option<Batch> {
+        if self.buffer.is_empty() && !ops.is_empty() {
+            self.buffer_since = Some(self.seq);
+        }
         self.buffer.extend(ops);
         self.flush()
     }
@@ -233,6 +241,7 @@ impl Session {
         let ops = self.pending();
         self.inflight = None;
         self.buffer = ops.clone();
+        self.buffer_since = (!ops.is_empty()).then_some(seq);
         self.seq = seq;
         ops
     }

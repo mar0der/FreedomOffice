@@ -368,15 +368,23 @@ pub fn write_range(
             let (r, c) = (r0 + i as u32, c0 + j as u32);
             let style = live.wb.sheets[si].get(r, c).map_or(0, |x| x.style);
             let cell = cell_from_json(&mut live.wb, v, style, (r, c))?;
-            let new = cell.map(|cell| {
+            // Only the content is written (value, formula): the cell's format stays, and
+            // stays whatever someone else is doing to it at the same time.
+            let content = |d: CellData| {
+                let d = CellData {
+                    st: None,
+                    rich: None,
+                    ..d
+                };
+                (!d.v.is_empty() || d.f.is_some()).then(|| Box::new(d))
+            };
+            let new = cell.and_then(|cell| {
                 let sh = &live.wb.sheets[si];
-                let mut d: CellData = live::cell_data(&live.wb, sh, r, c, &cell);
-                d.rich = None;
-                Box::new(d)
+                content(live::cell_data(&live.wb, sh, r, c, &cell))
             });
             // Unchanged cells make no operations.
-            if new.as_deref() != live.cell_data(uid, r, c).as_ref() {
-                ops.push(Op::Cell {
+            if new.as_deref() != live.cell_data(uid, r, c).and_then(content).as_deref() {
+                ops.push(Op::Content {
                     s: uid,
                     r,
                     c,

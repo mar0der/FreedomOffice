@@ -22,6 +22,8 @@ pub struct Config {
     pub disconnect_pct: f64,
     /// Chance (percent) per action of a row/column insert or delete.
     pub structure_pct: f64,
+    /// Chance (percent) per action of a format edit (bold, italic, fill) of a cell.
+    pub format_pct: f64,
     /// Edits land in the top-left `hot_rows` x `hot_cols` cells so clients collide often.
     pub hot_rows: u32,
     pub hot_cols: u32,
@@ -36,6 +38,7 @@ impl Default for Config {
             interval_ms: 40,
             disconnect_pct: 3.0,
             structure_pct: 8.0,
+            format_pct: 25.0,
             hot_rows: 12,
             hot_cols: 6,
         }
@@ -77,6 +80,10 @@ impl Report {
         println!(
             "  server closes {:?}, snapshot requests {}, snapshots uploaded {}",
             t.closes, t.snapshot_requests, t.snapshots
+        );
+        println!(
+            "  own edits replaced by someone's concurrent edit (told to the editor): {}",
+            t.replaced
         );
         println!(
             "  final seq {}, {} cells, digest {}",
@@ -136,6 +143,18 @@ fn add(a: &mut Stats, b: &Stats) {
     a.closes.extend(b.closes.iter().copied());
     a.snapshot_requests += b.snapshot_requests;
     a.snapshots += b.snapshots;
+    a.replaced += b.replaced;
+}
+
+/// A random cell format (a few attributes, so concurrent format edits collide often).
+fn random_style(rng: &mut Rng) -> Option<serde_json::Value> {
+    let fills = [0xFFEE00u32, 0x66CCFF, 0xFF9999, 0xCCFFCC];
+    freedom_sheets::live::style_json(&freedom_sheets::model::Style {
+        bold: rng.chance(50.0),
+        italic: rng.chance(25.0),
+        fill: rng.chance(60.0).then(|| fills[rng.below(fills.len() as u64) as usize]),
+        ..Default::default()
+    })
 }
 
 fn first_sheet(l: &Live) -> Result<SheetId, String> {
@@ -187,22 +206,38 @@ fn client(api: Api, item: String, cfg: Config, idx: usize) -> Result<(Live, u64)
         } else if roll < cfg.structure_pct + 8.0 {
             live.send_presence(sheet, r, c, rng.chance(50.0));
         } else if roll < cfg.structure_pct + 16.0 {
-            live.set_cell(sheet, r, c, None);
+            // Clear the content, reset the format, or clear the whole cell (what protocol 1 did).
+            match rng.below(3) {
+                0 => live.set_content(sheet, r, c, None),
+                1 => live.set_format(sheet, r, c, None),
+                _ => live.set_cell(sheet, r, c, None),
+            }
+        } else if roll < cfg.structure_pct + 16.0 + cfg.format_pct {
+            live.set_format(sheet, r, c, random_style(&mut rng));
         } else {
             let v = if rng.chance(50.0) {
                 Val::Num(rng.below(1000) as f64)
             } else {
                 Val::Text(format!("c{idx}-{i}"))
             };
-            live.set_cell(
-                sheet,
-                r,
-                c,
-                Some(CellData {
-                    v,
-                    ..Default::default()
-                }),
-            );
+            let data = CellData {
+                v,
+                ..Default::default()
+            };
+            if rng.chance(90.0) {
+                live.set_content(sheet, r, c, Some(data));
+            } else {
+                // Now and then a whole cell with a format, like an older client or a paste.
+                live.set_cell(
+                    sheet,
+                    r,
+                    c,
+                    Some(CellData {
+                        st: random_style(&mut rng),
+                        ..data
+                    }),
+                );
+            }
         }
         if live.connected() {
             live.pump(pause);
@@ -320,12 +355,18 @@ pub fn run(apis: &[Api], item: &str, cfg: &Config) -> Result<Report, String> {
 /// What two people editing one cell at the same time end up with.
 #[derive(Debug)]
 pub struct ProbeReport {
-    /// Both edited the same cell: A its value, B its format (each sent the whole cell).
+    /// Both edited the same cell at once: A its value, B its format.
     pub value_vs_format: String,
     pub value_survived: bool,
     pub format_survived: bool,
     /// Both typed different values into one cell.
     pub value_vs_value: String,
+    /// The one whose value was overwritten was told so (and the other was not).
+    pub told_loser: bool,
+    /// An edit made after seeing the other's did not report anything.
+    pub sequential_quiet: bool,
+    /// Both formatted one cell differently: the later format won, and the loser was told.
+    pub format_vs_format: String,
     /// A inserted a row above the cell B was editing.
     pub insert_vs_edit: String,
     pub insert_vs_edit_ok: bool,
@@ -349,94 +390,94 @@ pub fn probe_conflicts(api_a: &Api, api_b: &Api, item: &str) -> Result<ProbeRepo
     let s = first_sheet(&a)?;
     let wait = |a: &mut Live, b: &mut Live| settle(a, b);
     wait(&mut a, &mut b);
+    let text = |t: &str| {
+        Some(CellData {
+            v: Val::Text(t.into()),
+            ..Default::default()
+        })
+    };
+    let bold = freedom_sheets::live::style_json(&freedom_sheets::model::Style {
+        bold: true,
+        ..Default::default()
+    });
+    let fill = freedom_sheets::live::style_json(&freedom_sheets::model::Style {
+        fill: Some(0x66CCFF),
+        ..Default::default()
+    });
+    // The two reconnect one after the other: A first, so B's edit is the later commit.
+    let reconnect = |a: &mut Live, b: &mut Live| -> Result<(), String> {
+        a.connect()?;
+        a.wait_synced(Duration::from_secs(10));
+        b.connect()?;
+        wait(a, b);
+        Ok(())
+    };
+    a.take_replaced();
+    b.take_replaced();
     // Value vs format on one cell.
     let (r, c) = (40, 3);
     a.disconnect();
     b.disconnect();
-    a.set_cell(
-        s,
-        r,
-        c,
-        Some(CellData {
-            v: Val::Text("typed by A".into()),
-            ..Default::default()
-        }),
-    );
-    b.set_cell(
-        s,
-        r,
-        c,
-        Some(CellData {
-            st: freedom_sheets::live::style_json(&freedom_sheets::model::Style {
-                bold: true,
-                ..Default::default()
-            }),
-            ..Default::default()
-        }),
-    );
-    a.connect()?;
-    a.wait_synced(Duration::from_secs(10));
-    b.connect()?;
-    wait(&mut a, &mut b);
+    a.set_content(s, r, c, text("typed by A"));
+    b.set_format(s, r, c, bold.clone());
+    reconnect(&mut a, &mut b)?;
     let end = a.cell_data(s, r, c).unwrap_or_default();
     let (value_survived, format_survived) =
         (end.v == Val::Text("typed by A".into()), end.st.is_some());
     let same = a.cell_data(s, r, c) == b.cell_data(s, r, c);
+    let quiet = a.take_replaced().is_empty() && b.take_replaced().is_empty();
     let value_vs_format = format!(
-        "A typed a value, B made it bold, both offline; A reconnected first: final cell {} (clients agree: {same})",
-        serde_json::to_string(&end).unwrap_or_default()
+        "A typed a value, B made it bold, both offline; A reconnected first: final cell {} (clients agree: {same}; anyone told something was replaced: {})",
+        serde_json::to_string(&end).unwrap_or_default(),
+        !quiet
     );
     // Value vs value.
     let (r2, c2) = (41, 3);
     a.disconnect();
     b.disconnect();
-    a.set_cell(
-        s,
-        r2,
-        c2,
-        Some(CellData {
-            v: Val::Text("from A".into()),
-            ..Default::default()
-        }),
-    );
-    b.set_cell(
-        s,
-        r2,
-        c2,
-        Some(CellData {
-            v: Val::Text("from B".into()),
-            ..Default::default()
-        }),
-    );
-    a.connect()?;
-    a.wait_synced(Duration::from_secs(10));
-    b.connect()?;
-    wait(&mut a, &mut b);
+    a.set_content(s, r2, c2, text("from A"));
+    b.set_content(s, r2, c2, text("from B"));
+    reconnect(&mut a, &mut b)?;
     let end2 = a
         .cell_data(s, r2, c2)
         .map(|d| val_text(&d.v))
         .unwrap_or_default();
+    let (told_a, told_b) = (a.take_replaced(), b.take_replaced());
+    let told_loser = told_a.len() == 1 && told_b.is_empty() && end2 == "from B";
     let value_vs_value = format!(
-        "A and B both typed in one cell, A reconnected first: final value '{end2}' (the later commit wins; B is not told that A's edit was replaced, A is not told that its edit was overwritten)"
+        "A and B both typed in one cell, A reconnected first: final value '{end2}' (the later commit wins). A was told: {}; B was told: {}",
+        told_a.first().map(|e| e.message()).unwrap_or_else(|| "nothing".into()),
+        told_b.first().map(|e| e.message()).unwrap_or_else(|| "nothing".into()),
+    );
+    // Sequential: B's edit is made after seeing A's, so nobody is told anything.
+    let (r4, c4) = (42, 3);
+    a.set_content(s, r4, c4, text("first, A"));
+    wait(&mut a, &mut b);
+    b.set_content(s, r4, c4, text("then B"));
+    wait(&mut a, &mut b);
+    let sequential_quiet = a.take_replaced().is_empty()
+        && b.take_replaced().is_empty()
+        && a.cell_data(s, r4, c4) == b.cell_data(s, r4, c4);
+    // Format vs format.
+    let (r5, c5) = (43, 3);
+    a.disconnect();
+    b.disconnect();
+    a.set_format(s, r5, c5, bold);
+    b.set_format(s, r5, c5, fill);
+    reconnect(&mut a, &mut b)?;
+    let told5 = a.take_replaced();
+    let format_vs_format = format!(
+        "A made a cell bold, B filled it, both offline; A reconnected first: final format {} (B's, the later); A was told: {}",
+        serde_json::to_string(&a.cell_data(s, r5, c5).and_then(|d| d.st)).unwrap_or_default(),
+        told5.first().map(|e| e.message()).unwrap_or_else(|| "nothing".into())
     );
     // Row insert above an edit.
     let (r3, c3) = (50, 1);
     a.disconnect();
     b.disconnect();
     a.edit(vec![Op::Rows { s, at: 45, n: 1 }]);
-    b.set_cell(
-        s,
-        r3,
-        c3,
-        Some(CellData {
-            v: Val::Text("below the insert".into()),
-            ..Default::default()
-        }),
-    );
-    a.connect()?;
-    a.wait_synced(Duration::from_secs(10));
-    b.connect()?;
-    wait(&mut a, &mut b);
+    b.set_content(s, r3, c3, text("below the insert"));
+    reconnect(&mut a, &mut b)?;
     let moved = a
         .cell_data(s, r3 + 1, c3)
         .is_some_and(|d| d.v == Val::Text("below the insert".into()))
@@ -449,6 +490,9 @@ pub fn probe_conflicts(api_a: &Api, api_b: &Api, item: &str) -> Result<ProbeRepo
         value_survived,
         format_survived,
         value_vs_value,
+        told_loser,
+        sequential_quiet,
+        format_vs_format,
         insert_vs_edit,
         insert_vs_edit_ok: moved && a.differences(&b).is_empty(),
     })
