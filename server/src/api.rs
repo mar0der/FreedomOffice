@@ -560,6 +560,7 @@ pub fn router(app: App) -> Router {
         .route("/api/links/{token}", get(open_link).post(open_link_password))
         .route("/l/{token}", get(link_page))
         .route("/l/{token}/download", get(link_download).post(link_download_form))
+        .merge(crate::admin::routes())
         .fallback(|| async { ApiError::not_found() })
         .layer(DefaultBodyLimit::max(JSON_LIMIT))
         .layer(middleware::from_fn(log_requests))
