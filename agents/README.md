@@ -37,6 +37,7 @@ fsheets add-sheet --item ID --name NAME
 fsheets versions --item ID
 fsheets mcp   [--server URL --user NAME --password-file F] [--token-file F]
 fsheets soak  --server URL --item ID --users a,b,c --secrets-dir DIR [--clients 4] [--edits 150] [--seed N] [--restart-pct 2] [--journal-dir D]
+fsheets logout --token-file F    # end the sign-in on the server and delete the file
 fsheets journal [--discard ID]   # changes an earlier run made but the server never confirmed
 fsheets probe --server URL --item ID --users a,b --secrets-dir DIR
 fsheets seed  --token-file F --folder ID
@@ -151,6 +152,7 @@ Runs on this branch:
 |---|---|---|
 | in-process test, seed 0x5eed | 3 x 80 actions | 211 ops in 138 batches, 138 acks, 276 remote batches applied, 5 forced disconnects/5 reconnects, converged yes (fresh joiner too), 3.5 s |
 | shared test instance (Tailscale, TLS), Budget.xlsx | 4 x 200 actions | 732 ops in 607 batches, 605 acks, 1821 remote batches applied, 18 forced disconnects/18 reconnects, final seq 607, 173 cells, converged yes (fresh joiner too), 9.9 s |
+| shared test instance, soak-m3.xlsx (M3: clients killed right after an edit and restarted from their journals) | 4 x 200 / 300 / 400 / 300 actions, kill chance 3 / 5 / 8 / 12 % per action | seeds 3001-3004: 734 to 1449 ops, 24 / 64 / 131 / 147 kills with 22 / 62 / 119 / 138 journals put back, 19 to 44 forced disconnects, 3 snapshots and (seed 3004) 3 reloads, up to 52013 remote batches applied; converged yes (fresh joiner too) and no journal left in all four, 11 to 23 s each |
 
 ## Shared test instance
 

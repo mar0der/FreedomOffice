@@ -21,6 +21,8 @@ standard input, never from arguments.
 USAGE:
     fsheets login --server URL --user NAME [--token-file FILE] [--password-file FILE]
                                   Sign in (password from the file or standard input) and save a token
+    fsheets logout --token-file FILE
+                                  Sign out on the server (the token stops working) and delete the file
     fsheets ls [--folder ID]      List the places to start from (My files, organisation folders,
                                   shared with you), or the items of a folder
     fsheets new --folder ID --name NAME [--sheets A,B]
@@ -348,6 +350,14 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
                     .unwrap_or_default()
             );
         }
+        "logout" => {
+            // Ends the sign-in on the server and deletes the token file.
+            let path = opt(&mut args, "--token-file").map(PathBuf::from).ok_or("--token-file is required.")?;
+            let api = Api::from_token_file(&path)?;
+            api.logout()?;
+            std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+            println!("signed out; {} deleted", path.display());
+        }
         "versions" => {
             let api = token(&mut args)?;
             let item = need(opt(&mut args, "--item"), "--item")?;
@@ -410,7 +420,12 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
                 Some(v) => v.parse().map_err(|_| "--seed must be a number")?,
                 None => fsheets::rng::Rng::random_seed(),
             };
-            let report = soak::run(&apis, &item, &cfg)?;
+            let report = soak::run(&apis, &item, &cfg);
+            // The sign-ins made for this run end with it.
+            for a in &apis {
+                let _ = a.logout();
+            }
+            let report = report?;
             report.print();
             if !report.converged() {
                 return Err("The clients did not converge.".into());
@@ -444,7 +459,11 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
                 &need(opt(&mut args, "--secrets-dir"), "--secrets-dir")?,
             )?;
             let b = apis.get(1).unwrap_or(&apis[0]);
-            let p = soak::probe_conflicts(&apis[0], b, &item)?;
+            let p = soak::probe_conflicts(&apis[0], b, &item);
+            for a in &apis {
+                let _ = a.logout();
+            }
+            let p = p?;
             println!(
                 "{}\n  value kept: {}, format kept: {}\n{}\n  the loser was told: {}; a sequential edit told nobody: {}\n{}\n{}",
                 p.value_vs_format,

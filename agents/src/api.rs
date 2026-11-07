@@ -392,6 +392,12 @@ impl Api {
         Ok(Item::from_json(&r.json()))
     }
 
+    /// Ends this device's sign-in on the server (the token stops working).
+    pub fn logout(&self) -> Result<(), String> {
+        let r = self.send("POST", "/api/logout", &[], None)?;
+        if r.ok() { Ok(()) } else { Err(format!("sign-out failed (HTTP {})", r.status)) }
+    }
+
     /// The WebSocket URL of an item's live session.
     pub fn live_url(
         &self,
