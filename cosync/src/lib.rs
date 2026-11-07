@@ -241,6 +241,13 @@ pub enum ServerMsg {
     /// The changes since your `since` are no longer kept: download the latest version.
     Reload,
     Error { message: String },
+    /// Your access changed while connected (a share, organisation membership or role changed):
+    /// `role` is "view" (changes you send from now on are refused: the connection is closed
+    /// with `close::READ_ONLY`) or "edit" (you may send changes again).
+    Role { role: String },
+    /// Your access to this document ended (`reason` is for people, e.g. "Your access to this
+    /// workbook was removed."); the server closes the connection with `close::REVOKED` next.
+    Revoked { reason: String },
 }
 
 /// WebSocket close codes the server uses.
@@ -253,6 +260,9 @@ pub mod close {
     pub const RATE: u16 = 4429;
     /// No heartbeat.
     pub const IDLE: u16 = 4408;
+    /// Access to the document ended while connected (after `ServerMsg::Revoked`); reconnecting
+    /// won't help.
+    pub const REVOKED: u16 = 4401;
 }
 
 /// Limits the server enforces on what clients send.
