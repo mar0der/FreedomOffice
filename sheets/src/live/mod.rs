@@ -61,27 +61,68 @@ pub fn entered_text(op: &Op) -> String {
 /// Protocol 1 mode (the server's `Welcome` has no `proto`): that server only knows whole `Cell`
 /// operations. Replaces every `Content`/`Format` by one `Cell` carrying the cell's full current
 /// data in `wb` (the workbook the operations were just applied to, whose formulas already
-/// include any structure changes), at the place of the first operation on that cell. Other
-/// operations are kept as they are.
+/// include any structure changes). Other operations are kept as they are.
+///
+/// `wb` is the state *after* `ops` (and `later`, operations that follow `ops` and are already
+/// applied too), but each operation names its cell in the coordinates of its own moment: rows
+/// and columns inserted or deleted by later operations have moved it since. So a cell is found
+/// in `wb` where those later structure changes put it (one deleted by them is left out), and
+/// the whole cells are written after the other operations, in these final coordinates, with
+/// the final data: the result applied to the state before `ops` gives exactly `wb`. (Reading
+/// `wb` at the old coordinates wrote other cells' data into the wrong cells, which the sender
+/// itself did not have: clients drifted apart. This happens when changes are made before the
+/// server's `Welcome` says which protocol it speaks, and are converted at that moment.)
 pub fn collapse_cells(wb: &Workbook, ops: &[Op]) -> Vec<Op> {
+    collapse_cells_before(wb, ops, &[])
+}
+
+/// [`collapse_cells`] for operations followed by `later` ones already applied to `wb`.
+pub fn collapse_cells_before(wb: &Workbook, ops: &[Op], later: &[Op]) -> Vec<Op> {
     let mut out: Vec<Op> = Vec::with_capacity(ops.len());
+    let mut cells = Vec::new();
     let mut done = std::collections::HashSet::new();
-    for op in ops {
+    for (i, op) in ops.iter().enumerate() {
         match op {
             Op::Content { s, r, c, .. } | Op::Format { s, r, c, .. } => {
-                if !done.insert((*s, *r, *c)) {
-                    continue;
+                let Some((r, c)) = moved_by(ops[i + 1..].iter(), *s, *r, *c) else { continue };
+                if done.insert((*s, r, c)) {
+                    // (the data is read where `later` operations have moved the cell, if they did)
+                    cells.push((*s, r, c, moved_by(later.iter(), *s, r, c)));
                 }
-                let v = index_of(wb, *s).and_then(|i| {
-                    let sh = &wb.sheets[i];
-                    sh.get(*r, *c).filter(|x| !x.is_blank()).map(|x| Box::new(cell_data(wb, sh, *r, *c, x)))
-                });
-                out.push(Op::Cell { s: *s, r: *r, c: *c, v, adj: Vec::new() });
             }
             _ => out.push(op.clone()),
         }
     }
+    for (s, r, c, now) in cells {
+        let v = now.and_then(|(nr, nc)| index_of(wb, s).and_then(|i| {
+            let sh = &wb.sheets[i];
+            sh.get(nr, nc).filter(|x| !x.is_blank()).map(|x| Box::new(cell_data(wb, sh, nr, nc, x)))
+        }));
+        out.push(Op::Cell { s, r, c, v, adj: Vec::new() });
+    }
     out
+}
+
+/// Where the cell (`r`, `c`) of sheet `s` is after `ops` (None: deleted by them).
+fn moved_by<'a>(ops: impl Iterator<Item = &'a Op>, s: SheetId, mut r: u32, mut c: u32) -> Option<(u32, u32)> {
+    for op in ops {
+        match op {
+            Op::Rows { s: t, at, n } if *t == s => r = cosync::map_index(r, *at, *n, cosync::MAX_ROWS)?,
+            Op::Cols { s: t, at, n } if *t == s => c = cosync::map_index(c, *at, *n, cosync::MAX_COLS)?,
+            Op::DelSheet { s: t, .. } if *t == s => return None,
+            _ => {}
+        }
+    }
+    Some((r, c))
+}
+
+/// Protocol 1 mode: the batch in flight and the buffered changes, converted to whole cells
+/// (see [`collapse_cells`]; `wb` has both applied).
+pub fn collapse_pending(wb: &Workbook, inflight: Option<&mut Vec<Op>>, buffer: &mut Vec<Op>) {
+    if let Some(ops) = inflight {
+        *ops = collapse_cells_before(wb, ops, buffer);
+    }
+    *buffer = collapse_cells(wb, buffer);
 }
 
 /// Style content (None for the default style).

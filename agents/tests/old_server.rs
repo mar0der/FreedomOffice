@@ -20,6 +20,10 @@ use fsheets::{sample, soak};
 
 const PW: &str = "old-server-test-password";
 
+/// Seeds of the soaks against the real old servers (3, 9 and 17 were the first three; the others
+/// diverged before the journals of clients signed in as one account were kept apart).
+const SEEDS: [u64; 6] = [3, 9, 17, 1, 2, 4];
+
 struct OldServer {
     child: Child,
     dir: PathBuf,
@@ -134,12 +138,21 @@ fn fsheets_works_against_the_real_pre_m2_server() {
 
     // The soak, leaving a backlog without snapshot first so that joins race the snapshot.
     let item = workbook(&api, "Proto1-soak.xlsx");
-    for seed in [3u64, 9, 17] {
+    for seed in SEEDS {
         // (No comment actions: the old server has none, and the same random edits as before are made.)
         let cfg = soak::Config { clients: 3, edits: 120, seed, comment_pct: 0.0, ..Default::default() };
         let report = soak::run(std::slice::from_ref(&api), &item, &cfg).unwrap();
         report.print();
-        assert!(report.converged(), "{:?}", report.difference);
+        assert!(report.converged(), "seed {seed}: {:?}", report.difference);
+    }
+    // Clients that lose the connection much more often, also before their first Welcome (they
+    // then hold changes whose protocol is not known yet; seeds 8 and 9 diverged on that once).
+    for seed in [8u64, 9] {
+        let item = workbook(&api, &format!("Proto1-flaky-{seed}.xlsx"));
+        let cfg = soak::Config { clients: 3, edits: 60, seed, disconnect_pct: 30.0, comment_pct: 0.0, ..Default::default() };
+        let report = soak::run(std::slice::from_ref(&api), &item, &cfg).unwrap();
+        report.print();
+        assert!(report.converged(), "flaky seed {seed}: {:?}", report.difference);
     }
 }
 
@@ -163,8 +176,10 @@ fn fsheets_works_against_the_real_m4_server_without_comments() {
     assert!(fsheets::comments::list(&mut a, None, false).unwrap()["count"] == 0);
     assert!(a.wait_synced(Duration::from_secs(10)) && a.stopped.is_none());
     drop(a);
-    let cfg = soak::Config { clients: 3, edits: 100, seed: 5, comment_pct: 30.0, ..Default::default() };
-    let report = soak::run(std::slice::from_ref(&api), &item, &cfg).unwrap();
-    report.print();
-    assert!(report.converged() && report.comment_actions == 0, "{:?}", report.difference);
+    for seed in [5u64, 9, 17, 1, 2, 4] {
+        let cfg = soak::Config { clients: 3, edits: 100, seed, comment_pct: 30.0, ..Default::default() };
+        let report = soak::run(std::slice::from_ref(&api), &item, &cfg).unwrap();
+        report.print();
+        assert!(report.converged() && report.comment_actions == 0, "seed {seed}: {:?}", report.difference);
+    }
 }
